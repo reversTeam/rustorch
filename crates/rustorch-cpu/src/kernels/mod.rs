@@ -4,6 +4,7 @@
 
 pub mod conv;
 pub mod loss;
+pub mod pool;
 pub mod reduction;
 pub mod shape_ops;
 pub mod softmax;

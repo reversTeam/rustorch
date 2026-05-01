@@ -84,6 +84,36 @@ impl Conv2d {
     }
 }
 
+/// 2-D max-pooling layer (stateless, no parameters).
+pub struct MaxPool2d {
+    kernel_size: (usize, usize),
+    stride: (usize, usize),
+}
+
+impl MaxPool2d {
+    /// Build a square-kernel max-pool with matching stride.
+    pub fn new(kernel_size: usize) -> Self {
+        MaxPool2d {
+            kernel_size: (kernel_size, kernel_size),
+            stride: (kernel_size, kernel_size),
+        }
+    }
+
+    /// Build with explicit kernel and stride.
+    pub fn with_stride(kernel_size: (usize, usize), stride: (usize, usize)) -> Self {
+        MaxPool2d {
+            kernel_size,
+            stride,
+        }
+    }
+}
+
+impl Module for MaxPool2d {
+    fn forward(&self, input: &Variable) -> Result<Variable, ModuleError> {
+        ops::max_pool2d(input, self.kernel_size, self.stride)
+    }
+}
+
 impl Module for Conv2d {
     fn forward(&self, input: &Variable) -> Result<Variable, ModuleError> {
         ops::conv2d(
@@ -183,5 +213,43 @@ mod tests {
         let names: Vec<String> = np.iter().map(|(n, _)| n.clone()).collect();
         assert!(names.contains(&"weight".to_string()));
         assert!(names.contains(&"bias".to_string()));
+    }
+
+    #[test]
+    fn maxpool2d_2x2_halves_spatial() {
+        let pool = MaxPool2d::new(2);
+        let x = Variable::new(
+            Tensor::from_vec([1usize, 1, 4, 4], (0..16).map(|i| i as f32).collect()).unwrap(),
+        );
+        let y = pool.forward(&x).unwrap();
+        assert_eq!(y.tensor().shape(), &[1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn maxpool2d_backward_scatters_to_argmax() {
+        let pool = MaxPool2d::new(2);
+        let x = Variable::leaf(
+            Tensor::from_vec([1usize, 1, 2, 2], vec![1.0_f32, 5.0, 3.0, 2.0]).unwrap(),
+        );
+        let y = pool.forward(&x).unwrap();
+        let s = ops::sum(&y).unwrap();
+        backward(&s, None).unwrap();
+        let g = x.grad().unwrap();
+        // Grad should land only at the argmax position (index 1, value 5.0).
+        assert_eq!(g.as_slice::<f32>().unwrap(), &[0.0_f32, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn conv2d_then_maxpool_chains_correctly() {
+        // Conv2d(1→2, 3x3) → MaxPool2d(2x2). Output should be sensible.
+        let conv = Conv2d::new(1, 2, 3);
+        let pool = MaxPool2d::new(2);
+        let x = Variable::new(Tensor::from_vec([1usize, 1, 6, 6], vec![1.0_f32; 36]).unwrap());
+        let h = conv.forward(&x).unwrap();
+        // After conv: [1, 2, 4, 4]
+        assert_eq!(h.tensor().shape(), &[1, 2, 4, 4]);
+        let y = pool.forward(&h).unwrap();
+        // After pool: [1, 2, 2, 2]
+        assert_eq!(y.tensor().shape(), &[1, 2, 2, 2]);
     }
 }

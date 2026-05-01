@@ -34,7 +34,7 @@ pub use activation::{
 };
 pub use attention::{scaled_dot_product_attention, SingleHeadAttention};
 pub use container::{ModuleDict, ModuleList};
-pub use conv::Conv2d;
+pub use conv::{Conv2d, MaxPool2d};
 pub use embedding::Embedding;
 pub use hooks::{HookHandle, HookedModule};
 pub use init::{calculate_fan, init, init_with_seed, FanMode, Init, Nonlinearity};

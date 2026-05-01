@@ -1506,6 +1506,54 @@ impl Node for Conv2dBackward {
     }
 }
 
+// --------------------------------------------------------------------------
+// maxpool2d — backward scatters grad to argmax positions
+// --------------------------------------------------------------------------
+
+struct MaxPool2dBackward {
+    in_shape: Vec<usize>,
+    argmax_idx: Tensor,
+    edges: [Edge; 1],
+}
+
+impl Node for MaxPool2dBackward {
+    fn name(&self) -> &'static str {
+        "MaxPool2dBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let din =
+            rustorch_cpu::kernels::pool::maxpool2d_backward(grad, &self.argmax_idx, &self.in_shape)
+                .expect("maxpool2d backward");
+        vec![Some(din)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// Autograd-aware MaxPool2d. Returns the pooled output; argmax indices
+/// are saved internally for backward.
+pub fn max_pool2d(
+    input: &Variable,
+    kernel_size: (usize, usize),
+    stride: (usize, usize),
+) -> Result<Variable, BackwardError> {
+    let (out, idx) =
+        rustorch_cpu::kernels::pool::maxpool2d_forward(&input.tensor(), kernel_size, stride)
+            .map_err(|e| backend_err("max_pool2d", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && input.requires_grad {
+        let node = std::sync::Arc::new(MaxPool2dBackward {
+            in_shape: input.tensor().shape().to_vec(),
+            argmax_idx: idx,
+            edges: [input.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
 /// Autograd-aware conv2d (stride=1, configurable padding).
 pub fn conv2d(
     input: &Variable,
