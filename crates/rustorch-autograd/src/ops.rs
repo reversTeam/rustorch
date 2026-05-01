@@ -1363,6 +1363,58 @@ impl Node for BmmBackward {
     }
 }
 
+// --------------------------------------------------------------------------
+// transpose(d0, d1) — swap two axes; backward is itself a transpose
+// --------------------------------------------------------------------------
+
+struct TransposeBackward {
+    d0: usize,
+    d1: usize,
+    edges: [Edge; 1],
+}
+
+impl Node for TransposeBackward {
+    fn name(&self) -> &'static str {
+        "TransposeBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // Backward of transpose(d0, d1) is transpose(d0, d1) again on
+        // the upstream gradient. Materialise contiguous so downstream
+        // ops that require contiguous F32 don't break.
+        let g = grad
+            .transpose(self.d0, self.d1)
+            .expect("transpose bw: dim valid")
+            .contiguous();
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `src.transpose(d0, d1)` (autograd-aware, contiguous output).
+pub fn transpose(src: &Variable, d0: usize, d1: usize) -> Result<Variable, BackwardError> {
+    let out_view = src
+        .tensor()
+        .transpose(d0, d1)
+        .map_err(|e| BackwardError::Backend {
+            op: "transpose",
+            message: format!("{e}"),
+        })?;
+    let out = out_view.contiguous();
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(TransposeBackward {
+            d0,
+            d1,
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
 /// Batched matmul `[B, M, K] @ [B, K, N] = [B, M, N]` (autograd-aware).
 pub fn bmm(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
     let out = bmm_forward(&lhs.tensor(), &rhs.tensor())?;

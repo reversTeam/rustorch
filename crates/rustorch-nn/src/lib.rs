@@ -15,6 +15,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod activation;
+pub mod attention;
 pub mod container;
 pub mod embedding;
 pub mod init;
@@ -29,6 +30,7 @@ pub use activation::{
     leaky_relu, log_softmax, relu, sigmoid, silu, softmax, tanh, LeakyRelu, LogSoftmax, Relu,
     Sigmoid, Silu, Softmax, Tanh,
 };
+pub use attention::{scaled_dot_product_attention, SingleHeadAttention};
 pub use container::{ModuleDict, ModuleList};
 pub use embedding::Embedding;
 pub use init::{calculate_fan, init, init_with_seed, FanMode, Init, Nonlinearity};
