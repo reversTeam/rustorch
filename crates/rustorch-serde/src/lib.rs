@@ -9,8 +9,10 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod checkpoint;
 pub mod safetensors;
 
+pub use checkpoint::{Cadence, Checkpoint, Direction};
 pub use safetensors::{read_from, read_path, write_path, write_to, SafetensorsError};
 
 /// Crate version reported at runtime.
