@@ -341,6 +341,15 @@ impl Backend for CpuBackend {
             }),
         }
     }
+
+    fn cast(&self, src: &Tensor, target: Dtype) -> Result<Tensor, BackendError> {
+        // Tensor::to_dtype already implements the full 8x8 matrix with
+        // saturating semantics: Rust 1.45+ defines `f as i` as
+        // saturating (NaN → 0, +Inf → MAX, -Inf → MIN), and Bool
+        // conversions are explicit (any nonzero → true; true → 1.0,
+        // false → 0.0). We just delegate.
+        Ok(src.to_dtype(target))
+    }
 }
 
 /// Compare-kinds shared by eq/ne/lt/le/gt/ge.

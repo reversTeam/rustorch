@@ -150,6 +150,19 @@ pub trait Backend: Send + Sync {
     fn isfinite(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
         Err(unsupported("isfinite", self.name()))
     }
+
+    /// Convert a tensor from its current dtype to `target` dtype.
+    ///
+    /// **Saturating** float→int conversions (NaN → 0, +Inf → MAX,
+    /// -Inf → MIN), matching `torch.Tensor.to(dtype)` semantics. Bool
+    /// conversion follows: any nonzero → true; true → 1; false → 0.
+    fn cast(
+        &self,
+        _src: &Tensor,
+        _target: rustorch_core::tensor::dtype::Dtype,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("cast", self.name()))
+    }
 }
 
 #[allow(unused)]
