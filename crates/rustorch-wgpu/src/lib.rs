@@ -22,6 +22,7 @@ pub mod backend;
 pub mod cache;
 pub mod elementwise;
 pub mod error;
+pub mod matmul;
 pub mod shaders;
 pub mod storage;
 pub mod transfer;
@@ -29,6 +30,7 @@ pub mod transfer;
 pub use backend::WgpuBackend;
 pub use elementwise::{dispatch_binary, dispatch_unary};
 pub use error::WgpuError;
+pub use matmul::matmul;
 pub use storage::WgpuStorage;
 pub use transfer::{to_cpu, to_gpu};
 
