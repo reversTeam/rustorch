@@ -682,3 +682,214 @@ pub fn mse_loss(
     }
     Ok(out_var)
 }
+
+// --------------------------------------------------------------------------
+// silu — y = x * sigmoid(x); dy/dx = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+// --------------------------------------------------------------------------
+
+struct SiluBackward {
+    saved_input: Tensor,
+    edges: [Edge; 1],
+}
+
+impl Node for SiluBackward {
+    fn name(&self) -> &'static str {
+        "SiluBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // s = sigmoid(x); local = s * (1 + x * (1 - s))
+        let s = cpu_backend()
+            .sigmoid(&self.saved_input)
+            .expect("silu bw: sigmoid");
+        let one = Tensor::scalar(1.0);
+        let one_minus_s = cpu_backend().sub(&one, &s).expect("silu bw: 1-s");
+        let x_one_minus_s = cpu_backend()
+            .mul(&self.saved_input, &one_minus_s)
+            .expect("silu bw: x*(1-s)");
+        let inner = cpu_backend()
+            .add(&one, &x_one_minus_s)
+            .expect("silu bw: 1 + x*(1-s)");
+        let local = cpu_backend().mul(&s, &inner).expect("silu bw: local");
+        let g = cpu_backend()
+            .mul(grad, &local)
+            .expect("silu bw: grad*local");
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `silu(src)` = `src * sigmoid(src)` (a.k.a. swish, autograd-aware).
+pub fn silu(src: &Variable) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .silu(&src.tensor())
+        .map_err(|e| backend_err("silu", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(SiluBackward {
+            saved_input: src.tensor().clone(),
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// leaky_relu(x, slope) — dy/dx = 1 if x>0 else slope
+// --------------------------------------------------------------------------
+
+struct LeakyReluBackward {
+    saved_input: Tensor,
+    slope: f64,
+    edges: [Edge; 1],
+}
+
+impl Node for LeakyReluBackward {
+    fn name(&self) -> &'static str {
+        "LeakyReluBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // mask: 1 if x>0 else slope, computed via slope + (1 - slope) * (x > 0)
+        // We materialise it as f32 elementwise on the saved input.
+        let x = self.saved_input.as_slice::<f32>().expect("f32 input");
+        let g = grad.as_slice::<f32>().expect("f32 grad");
+        let s = self.slope as f32;
+        let mut out = Vec::with_capacity(x.len());
+        for i in 0..x.len() {
+            let m = if x[i] > 0.0 { 1.0_f32 } else { s };
+            out.push(g[i] * m);
+        }
+        let g_t =
+            Tensor::from_vec(self.saved_input.shape().to_vec(), out).expect("leaky_relu bw shape");
+        vec![Some(g_t)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `leaky_relu(src, slope)` (autograd-aware).
+pub fn leaky_relu(src: &Variable, slope: f64) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .leaky_relu(&src.tensor(), slope)
+        .map_err(|e| backend_err("leaky_relu", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(LeakyReluBackward {
+            saved_input: src.tensor().clone(),
+            slope,
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// softmax(x, dim) — y = softmax(x, dim); grad_j = y_j * (g_j - sum_i(g_i * y_i))
+// --------------------------------------------------------------------------
+
+struct SoftmaxBackward {
+    saved_out: Tensor,
+    dim: usize,
+    edges: [Edge; 1],
+}
+
+impl Node for SoftmaxBackward {
+    fn name(&self) -> &'static str {
+        "SoftmaxBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // dot = sum_along_dim(grad * y, dim, keepdim=true)
+        let gy = cpu_backend()
+            .mul(grad, &self.saved_out)
+            .expect("softmax bw: g*y");
+        let dot = cpu_backend()
+            .sum_dim(&gy, &[self.dim], true)
+            .expect("softmax bw: sum_dim");
+        // diff = grad - dot (broadcast)
+        let diff = cpu_backend().sub(grad, &dot).expect("softmax bw: g - dot");
+        let g = cpu_backend()
+            .mul(&self.saved_out, &diff)
+            .expect("softmax bw: y*diff");
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `softmax(src, dim)` (numerically stable, autograd-aware).
+pub fn softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .softmax(&src.tensor(), dim)
+        .map_err(|e| backend_err("softmax", e))?;
+    let mut out_var = Variable::new(out.clone());
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(SoftmaxBackward {
+            saved_out: out,
+            dim,
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// log_softmax(x, dim) — y = log_softmax(x, dim); grad_j = g_j - softmax_j * sum_i(g_i)
+// --------------------------------------------------------------------------
+
+struct LogSoftmaxBackward {
+    saved_out: Tensor, // log_softmax output
+    dim: usize,
+    edges: [Edge; 1],
+}
+
+impl Node for LogSoftmaxBackward {
+    fn name(&self) -> &'static str {
+        "LogSoftmaxBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // softmax = exp(log_softmax); grad_x = grad - softmax * sum_along(grad, dim, keepdim)
+        let s = cpu_backend()
+            .exp(&self.saved_out)
+            .expect("log_softmax bw: exp");
+        let sum_g = cpu_backend()
+            .sum_dim(grad, &[self.dim], true)
+            .expect("log_softmax bw: sum_dim");
+        let s_sum = cpu_backend()
+            .mul(&s, &sum_g)
+            .expect("log_softmax bw: s*sum_g");
+        let g = cpu_backend()
+            .sub(grad, &s_sum)
+            .expect("log_softmax bw: grad - s*sum_g");
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `log_softmax(src, dim)` (autograd-aware).
+pub fn log_softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .log_softmax(&src.tensor(), dim)
+        .map_err(|e| backend_err("log_softmax", e))?;
+    let mut out_var = Variable::new(out.clone());
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(LogSoftmaxBackward {
+            saved_out: out,
+            dim,
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}

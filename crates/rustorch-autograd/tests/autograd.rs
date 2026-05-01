@@ -6,7 +6,8 @@
 //! - chain-rule properties
 
 use rustorch_autograd::ops::{
-    add, cross_entropy, matmul, mean, mse_loss, mul, neg, relu, sigmoid, sub, sum, tanh,
+    add, cross_entropy, leaky_relu, log_softmax, matmul, mean, mse_loss, mul, neg, relu, sigmoid,
+    silu, softmax, sub, sum, tanh,
 };
 use rustorch_autograd::{backward, no_grad, with_grad, Variable};
 use rustorch_core::tensor::tensor_impl::Tensor;
@@ -355,4 +356,135 @@ fn mlp_one_step_descends_loss() {
         initial_loss,
         new_loss
     );
+}
+
+// -------------------- new activations: silu, leaky_relu, softmax, log_softmax --------------------
+
+#[test]
+fn silu_backward_at_zero_is_half() {
+    // silu(0) = 0; d/dx silu(x) at x=0 = sigmoid(0) * (1 + 0*(1-sigmoid(0))) = 0.5
+    let x = Variable::leaf(Tensor::from_vec([1usize], vec![0.0_f32]).unwrap());
+    let y = silu(&x).unwrap();
+    backward(&y, None).unwrap();
+    let dx = x.grad().unwrap();
+    let v = dx.as_slice::<f32>().unwrap()[0];
+    assert!((v - 0.5).abs() < 1e-5, "silu'(0) = 0.5, got {v}");
+}
+
+#[test]
+fn silu_finite_difference() {
+    // d/dx silu sum at x = [1, -1] checked vs central finite difference.
+    let x_v = vec![1.0_f32, -1.0];
+    let x = Variable::leaf(Tensor::from_vec([2usize], x_v.clone()).unwrap());
+    let s = sum(&silu(&x).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    let dx_v = dx.as_slice::<f32>().unwrap();
+    let h = 1e-3_f32;
+    for i in 0..2 {
+        let mut xp = x_v.clone();
+        let mut xm = x_v.clone();
+        xp[i] += h;
+        xm[i] -= h;
+        let xp_v = Variable::new(Tensor::from_vec([2usize], xp).unwrap());
+        let xm_v = Variable::new(Tensor::from_vec([2usize], xm).unwrap());
+        let sp: f32 = silu(&xp_v)
+            .unwrap()
+            .tensor()
+            .as_slice::<f32>()
+            .unwrap()
+            .iter()
+            .sum();
+        let sm: f32 = silu(&xm_v)
+            .unwrap()
+            .tensor()
+            .as_slice::<f32>()
+            .unwrap()
+            .iter()
+            .sum();
+        let fd = (sp - sm) / (2.0 * h);
+        assert!(
+            (dx_v[i] - fd).abs() < 1e-2,
+            "silu'@{} = analytic {}, finite-diff {}",
+            x_v[i],
+            dx_v[i],
+            fd
+        );
+    }
+}
+
+#[test]
+fn leaky_relu_backward_mask() {
+    // d/dx leaky_relu(x, 0.1) at x = [1, -2, 0.5, -0.1] = [1, 0.1, 1, 0.1]
+    let x = Variable::leaf(Tensor::from_vec([4usize], vec![1.0_f32, -2.0, 0.5, -0.1]).unwrap());
+    let s = sum(&leaky_relu(&x, 0.1).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    let dx_v = dx.as_slice::<f32>().unwrap();
+    for (got, expected) in dx_v.iter().zip(&[1.0_f32, 0.1, 1.0, 0.1]) {
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "got {got}, expected {expected}"
+        );
+    }
+}
+
+#[test]
+fn softmax_finite_difference_dim_minus_one() {
+    // d/dx softmax(x).sum() = 0 (softmax sums to 1 → derivative of constant
+    // sum is zero). Strictly: J^T 1 = y - y = 0 because y * (1 - sum(y)) = 0.
+    let x_v = vec![1.0_f32, 2.0, 3.0];
+    let x = Variable::leaf(Tensor::from_vec([3usize], x_v).unwrap());
+    let s = sum(&softmax(&x, 0).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    let dx_v = dx.as_slice::<f32>().unwrap();
+    for &v in dx_v {
+        assert!(v.abs() < 1e-5, "softmax sum gradient ≈ 0, got {v}");
+    }
+}
+
+#[test]
+fn log_softmax_finite_difference() {
+    // log_softmax sum gradient: d/dx_i (sum_j log_softmax_j) = N/N - softmax_i*N (when summed)
+    // For dim=0 with N classes: dx = ones - softmax * N
+    let x_v = vec![0.0_f32, 1.0, 2.0];
+    let x = Variable::leaf(Tensor::from_vec([3usize], x_v.clone()).unwrap());
+    let s = sum(&log_softmax(&x, 0).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    let dx_v = dx.as_slice::<f32>().unwrap();
+
+    // Reference via finite difference
+    let h = 1e-3_f32;
+    for i in 0..3 {
+        let mut xp = x_v.clone();
+        let mut xm = x_v.clone();
+        xp[i] += h;
+        xm[i] -= h;
+        let xp_v = Variable::new(Tensor::from_vec([3usize], xp).unwrap());
+        let xm_v = Variable::new(Tensor::from_vec([3usize], xm).unwrap());
+        let sp: f32 = log_softmax(&xp_v, 0)
+            .unwrap()
+            .tensor()
+            .as_slice::<f32>()
+            .unwrap()
+            .iter()
+            .sum();
+        let sm: f32 = log_softmax(&xm_v, 0)
+            .unwrap()
+            .tensor()
+            .as_slice::<f32>()
+            .unwrap()
+            .iter()
+            .sum();
+        let fd = (sp - sm) / (2.0 * h);
+        assert!(
+            (dx_v[i] - fd).abs() < 1e-2,
+            "log_softmax_sum'@{} = analytic {}, fd {}",
+            i,
+            dx_v[i],
+            fd
+        );
+    }
 }
