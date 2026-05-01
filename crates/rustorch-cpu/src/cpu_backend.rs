@@ -155,26 +155,260 @@ impl Backend for CpuBackend {
     }
 
     fn eq(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        if lhs.dtype() != rhs.dtype() {
-            return Err(BackendError::DtypeMismatch {
-                op: "eq",
-                lhs: lhs.dtype(),
-                rhs: rhs.dtype(),
-            });
-        }
-        match lhs.dtype() {
-            Dtype::F32 => map_binary::<f32, bool, _>(lhs, rhs, "eq", |a, b| a == b),
-            Dtype::F64 => map_binary::<f64, bool, _>(lhs, rhs, "eq", |a, b| a == b),
-            Dtype::I64 => map_binary::<i64, bool, _>(lhs, rhs, "eq", |a, b| a == b),
-            Dtype::I32 => map_binary::<i32, bool, _>(lhs, rhs, "eq", |a, b| a == b),
-            Dtype::I8 => map_binary::<i8, bool, _>(lhs, rhs, "eq", |a, b| a == b),
-            Dtype::Bool => map_binary::<bool, bool, _>(lhs, rhs, "eq", |a, b| a == b),
+        cmp(lhs, rhs, "eq", CmpKind::Eq)
+    }
+
+    fn ne(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cmp(lhs, rhs, "ne", CmpKind::Ne)
+    }
+
+    fn lt(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cmp(lhs, rhs, "lt", CmpKind::Lt)
+    }
+
+    fn le(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cmp(lhs, rhs, "le", CmpKind::Le)
+    }
+
+    fn gt(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cmp(lhs, rhs, "gt", CmpKind::Gt)
+    }
+
+    fn ge(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cmp(lhs, rhs, "ge", CmpKind::Ge)
+    }
+
+    fn abs(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        match src.dtype() {
+            Dtype::F32 => map_unary_same::<f32, _>(src, "abs", |x| x.abs()),
+            Dtype::F64 => map_unary_same::<f64, _>(src, "abs", |x| x.abs()),
+            Dtype::I64 => map_unary_same::<i64, _>(src, "abs", |x| x.wrapping_abs()),
+            Dtype::I32 => map_unary_same::<i32, _>(src, "abs", |x| x.wrapping_abs()),
             d => Err(BackendError::DtypeMismatch {
-                op: "eq",
+                op: "abs",
                 lhs: d,
                 rhs: d,
             }),
         }
+    }
+
+    fn sqrt(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "sqrt", f32::sqrt, f64::sqrt)
+    }
+
+    fn exp(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "exp", f32::exp, f64::exp)
+    }
+
+    fn log(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "log", f32::ln, f64::ln)
+    }
+
+    fn sin(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "sin", f32::sin, f64::sin)
+    }
+
+    fn cos(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "cos", f32::cos, f64::cos)
+    }
+
+    fn tan(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "tan", f32::tan, f64::tan)
+    }
+
+    fn pow_scalar(&self, src: &Tensor, exponent: f64) -> Result<Tensor, BackendError> {
+        match src.dtype() {
+            Dtype::F32 => {
+                let e = exponent as f32;
+                map_unary_same::<f32, _>(src, "pow_scalar", move |x| x.powf(e))
+            },
+            Dtype::F64 => map_unary_same::<f64, _>(src, "pow_scalar", move |x| x.powf(exponent)),
+            d => Err(BackendError::DtypeMismatch {
+                op: "pow_scalar",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn sigmoid(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(
+            src,
+            "sigmoid",
+            |x| 1.0 / (1.0 + (-x).exp()),
+            |x| 1.0 / (1.0 + (-x).exp()),
+        )
+    }
+
+    fn tanh(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "tanh", f32::tanh, f64::tanh)
+    }
+
+    fn gelu(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        // Approximation tanh — matches PyTorch's `gelu(approximate='tanh')`
+        // which is faster + numerically stable. Exact gelu via erf can be
+        // wired in once we have an erf kernel.
+        const C: f32 = 0.797_884_5_f32; // sqrt(2/pi)
+        const C64: f64 = 0.797_884_560_802_865_f64;
+        unary_float(
+            src,
+            "gelu",
+            |x| 0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh()),
+            |x| 0.5 * x * (1.0 + (C64 * (x + 0.044_715 * x * x * x)).tanh()),
+        )
+    }
+
+    fn leaky_relu(&self, src: &Tensor, slope: f64) -> Result<Tensor, BackendError> {
+        match src.dtype() {
+            Dtype::F32 => {
+                let s = slope as f32;
+                map_unary_same::<f32, _>(
+                    src,
+                    "leaky_relu",
+                    move |x| if x > 0.0 { x } else { s * x },
+                )
+            },
+            Dtype::F64 => {
+                map_unary_same::<f64, _>(
+                    src,
+                    "leaky_relu",
+                    move |x| {
+                        if x > 0.0 {
+                            x
+                        } else {
+                            slope * x
+                        }
+                    },
+                )
+            },
+            d => Err(BackendError::DtypeMismatch {
+                op: "leaky_relu",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn silu(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(
+            src,
+            "silu",
+            |x| x / (1.0 + (-x).exp()),
+            |x| x / (1.0 + (-x).exp()),
+        )
+    }
+
+    fn isnan(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        match src.dtype() {
+            Dtype::F32 => crate::iterator::map_unary::<f32, bool, _>(src, "isnan", |x| x.is_nan()),
+            Dtype::F64 => crate::iterator::map_unary::<f64, bool, _>(src, "isnan", |x| x.is_nan()),
+            d => Err(BackendError::DtypeMismatch {
+                op: "isnan",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn isinf(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        match src.dtype() {
+            Dtype::F32 => {
+                crate::iterator::map_unary::<f32, bool, _>(src, "isinf", |x| x.is_infinite())
+            },
+            Dtype::F64 => {
+                crate::iterator::map_unary::<f64, bool, _>(src, "isinf", |x| x.is_infinite())
+            },
+            d => Err(BackendError::DtypeMismatch {
+                op: "isinf",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn isfinite(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        match src.dtype() {
+            Dtype::F32 => {
+                crate::iterator::map_unary::<f32, bool, _>(src, "isfinite", |x| x.is_finite())
+            },
+            Dtype::F64 => {
+                crate::iterator::map_unary::<f64, bool, _>(src, "isfinite", |x| x.is_finite())
+            },
+            d => Err(BackendError::DtypeMismatch {
+                op: "isfinite",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+}
+
+/// Compare-kinds shared by eq/ne/lt/le/gt/ge.
+#[derive(Debug, Clone, Copy)]
+enum CmpKind {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+fn cmp(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    op_name: &'static str,
+    kind: CmpKind,
+) -> Result<Tensor, BackendError> {
+    if lhs.dtype() != rhs.dtype() {
+        return Err(BackendError::DtypeMismatch {
+            op: op_name,
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        });
+    }
+    macro_rules! dispatch {
+        ($t:ty) => {{
+            match kind {
+                CmpKind::Eq => map_binary::<$t, bool, _>(lhs, rhs, op_name, |a, b| a == b),
+                CmpKind::Ne => map_binary::<$t, bool, _>(lhs, rhs, op_name, |a, b| a != b),
+                CmpKind::Lt => map_binary::<$t, bool, _>(lhs, rhs, op_name, |a, b| a < b),
+                CmpKind::Le => map_binary::<$t, bool, _>(lhs, rhs, op_name, |a, b| a <= b),
+                CmpKind::Gt => map_binary::<$t, bool, _>(lhs, rhs, op_name, |a, b| a > b),
+                CmpKind::Ge => map_binary::<$t, bool, _>(lhs, rhs, op_name, |a, b| a >= b),
+            }
+        }};
+    }
+    match lhs.dtype() {
+        Dtype::F32 => dispatch!(f32),
+        Dtype::F64 => dispatch!(f64),
+        Dtype::I64 => dispatch!(i64),
+        Dtype::I32 => dispatch!(i32),
+        Dtype::I8 => dispatch!(i8),
+        Dtype::Bool => dispatch!(bool),
+        d => Err(BackendError::DtypeMismatch {
+            op: op_name,
+            lhs: d,
+            rhs: d,
+        }),
+    }
+}
+
+/// Helper: dispatch a unary float-only op (f32 + f64 paths).
+fn unary_float(
+    src: &Tensor,
+    op_name: &'static str,
+    f32_fn: impl Fn(f32) -> f32 + Sync + Send,
+    f64_fn: impl Fn(f64) -> f64 + Sync + Send,
+) -> Result<Tensor, BackendError> {
+    match src.dtype() {
+        Dtype::F32 => map_unary_same::<f32, _>(src, op_name, f32_fn),
+        Dtype::F64 => map_unary_same::<f64, _>(src, op_name, f64_fn),
+        d => Err(BackendError::DtypeMismatch {
+            op: op_name,
+            lhs: d,
+            rhs: d,
+        }),
     }
 }
 
@@ -473,5 +707,152 @@ mod tests {
         let a = b().name();
         let bn = cpu_backend().name();
         assert_eq!(a, bn);
+    }
+
+    // -------------------- P1.3 — extra elementary ops --------------------
+
+    #[test]
+    fn abs_f32_and_i64() {
+        let a = Tensor::from_vec([3usize], vec![-1.0_f32, 0.0, 2.0]).unwrap();
+        assert_eq!(
+            b().abs(&a).unwrap().as_slice::<f32>().unwrap(),
+            &[1.0, 0.0, 2.0]
+        );
+        let i = Tensor::from_vec_typed::<i64, _>([3usize], vec![-1_i64, 0, 2]).unwrap();
+        assert_eq!(
+            b().abs(&i).unwrap().as_slice::<i64>().unwrap(),
+            &[1_i64, 0, 2]
+        );
+    }
+
+    #[test]
+    fn sqrt_exp_log() {
+        let a = Tensor::from_vec([4usize], vec![1.0_f32, 4.0, 9.0, 16.0]).unwrap();
+        let r = b().sqrt(&a).unwrap();
+        assert_eq!(r.as_slice::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+        // exp(0) = 1, exp(1) ≈ 2.71828
+        let z = Tensor::from_vec([2usize], vec![0.0_f32, 1.0]).unwrap();
+        let e = b().exp(&z).unwrap().as_slice::<f32>().unwrap().to_vec();
+        assert!((e[0] - 1.0).abs() < 1e-6);
+        assert!((e[1] - core::f32::consts::E).abs() < 1e-5);
+        // log(e) = 1
+        let one = Tensor::from_vec([1usize], vec![core::f32::consts::E]).unwrap();
+        let l = b().log(&one).unwrap().as_slice::<f32>().unwrap().to_vec();
+        assert!((l[0] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn trig_at_zero() {
+        let z = Tensor::from_vec([1usize], vec![0.0_f32]).unwrap();
+        assert_eq!(b().sin(&z).unwrap().as_slice::<f32>().unwrap()[0], 0.0);
+        assert_eq!(b().cos(&z).unwrap().as_slice::<f32>().unwrap()[0], 1.0);
+        assert_eq!(b().tan(&z).unwrap().as_slice::<f32>().unwrap()[0], 0.0);
+    }
+
+    #[test]
+    fn pow_scalar_works() {
+        let a = Tensor::from_vec([3usize], vec![2.0_f32, 3.0, 4.0]).unwrap();
+        let r = b().pow_scalar(&a, 2.0).unwrap();
+        assert_eq!(r.as_slice::<f32>().unwrap(), &[4.0, 9.0, 16.0]);
+    }
+
+    #[test]
+    fn sigmoid_at_zero_is_half() {
+        let z = Tensor::from_vec([1usize], vec![0.0_f32]).unwrap();
+        let r = b().sigmoid(&z).unwrap().as_slice::<f32>().unwrap()[0];
+        assert!((r - 0.5).abs() < 1e-7);
+    }
+
+    #[test]
+    fn tanh_paths() {
+        let z = Tensor::from_vec([3usize], vec![0.0_f32, 1.0, -1.0]).unwrap();
+        let r = b().tanh(&z).unwrap().as_slice::<f32>().unwrap().to_vec();
+        assert!(r[0].abs() < 1e-7);
+        // tanh is odd
+        assert!((r[1] + r[2]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gelu_at_zero_is_zero() {
+        let z = Tensor::from_vec([1usize], vec![0.0_f32]).unwrap();
+        let r = b().gelu(&z).unwrap().as_slice::<f32>().unwrap()[0];
+        assert!(r.abs() < 1e-6);
+    }
+
+    #[test]
+    fn leaky_relu_negative_slope() {
+        let a = Tensor::from_vec([3usize], vec![-1.0_f32, 0.0, 2.0]).unwrap();
+        let r = b().leaky_relu(&a, 0.1).unwrap();
+        let v = r.as_slice::<f32>().unwrap();
+        assert!((v[0] - (-0.1)).abs() < 1e-6);
+        assert_eq!(v[1], 0.0);
+        assert_eq!(v[2], 2.0);
+    }
+
+    #[test]
+    fn silu_at_zero_is_zero() {
+        let z = Tensor::from_vec([1usize], vec![0.0_f32]).unwrap();
+        let r = b().silu(&z).unwrap().as_slice::<f32>().unwrap()[0];
+        assert!(r.abs() < 1e-6);
+    }
+
+    #[test]
+    fn cmp_lt_le_gt_ge() {
+        let a = Tensor::from_vec([3usize], vec![1.0_f32, 2.0, 3.0]).unwrap();
+        let bb = Tensor::from_vec([3usize], vec![2.0_f32, 2.0, 2.0]).unwrap();
+        assert_eq!(
+            b().lt(&a, &bb).unwrap().as_slice::<bool>().unwrap(),
+            &[true, false, false]
+        );
+        assert_eq!(
+            b().le(&a, &bb).unwrap().as_slice::<bool>().unwrap(),
+            &[true, true, false]
+        );
+        assert_eq!(
+            b().gt(&a, &bb).unwrap().as_slice::<bool>().unwrap(),
+            &[false, false, true]
+        );
+        assert_eq!(
+            b().ge(&a, &bb).unwrap().as_slice::<bool>().unwrap(),
+            &[false, true, true]
+        );
+        assert_eq!(
+            b().ne(&a, &bb).unwrap().as_slice::<bool>().unwrap(),
+            &[true, false, true]
+        );
+    }
+
+    #[test]
+    fn isnan_isinf_isfinite() {
+        let t = Tensor::from_vec(
+            [4usize],
+            vec![1.0_f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+        )
+        .unwrap();
+        assert_eq!(
+            b().isnan(&t).unwrap().as_slice::<bool>().unwrap(),
+            &[false, true, false, false]
+        );
+        assert_eq!(
+            b().isinf(&t).unwrap().as_slice::<bool>().unwrap(),
+            &[false, false, true, true]
+        );
+        assert_eq!(
+            b().isfinite(&t).unwrap().as_slice::<bool>().unwrap(),
+            &[true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn unsupported_dtype_returns_err() {
+        let t = Tensor::from_vec_typed::<i64, _>([3usize], vec![1_i64, 2, 3]).unwrap();
+        assert!(matches!(
+            b().sqrt(&t),
+            Err(BackendError::DtypeMismatch { .. })
+        ));
+        assert!(matches!(
+            b().sigmoid(&t),
+            Err(BackendError::DtypeMismatch { .. })
+        ));
     }
 }

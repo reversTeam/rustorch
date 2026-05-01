@@ -59,6 +59,102 @@ pub trait Backend: Send + Sync {
 
     /// Equality (element-wise) → Bool tensor.
     fn eq(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError>;
+
+    // -------------------- P1.3 — extra elementary ops --------------------
+    //
+    // Each extra method has a default Unsupported impl. Backends opt in by
+    // overriding; downstream ops degrade gracefully via `Result<_, BackendError>`.
+
+    /// Element-wise absolute value.
+    fn abs(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("abs", self.name()))
+    }
+    /// Element-wise square root.
+    fn sqrt(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("sqrt", self.name()))
+    }
+    /// Element-wise exponential.
+    fn exp(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("exp", self.name()))
+    }
+    /// Element-wise natural logarithm.
+    fn log(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("log", self.name()))
+    }
+    /// Element-wise sine.
+    fn sin(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("sin", self.name()))
+    }
+    /// Element-wise cosine.
+    fn cos(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("cos", self.name()))
+    }
+    /// Element-wise tangent.
+    fn tan(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("tan", self.name()))
+    }
+    /// Element-wise scalar pow: `out = src^exponent`.
+    fn pow_scalar(&self, _src: &Tensor, _exponent: f64) -> Result<Tensor, BackendError> {
+        Err(unsupported("pow_scalar", self.name()))
+    }
+    /// Sigmoid: `1 / (1 + exp(-x))`.
+    fn sigmoid(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("sigmoid", self.name()))
+    }
+    /// Tanh.
+    fn tanh(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("tanh", self.name()))
+    }
+    /// GELU (exact, using erf).
+    fn gelu(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("gelu", self.name()))
+    }
+    /// LeakyReLU: x if x > 0 else slope*x.
+    fn leaky_relu(&self, _src: &Tensor, _slope: f64) -> Result<Tensor, BackendError> {
+        Err(unsupported("leaky_relu", self.name()))
+    }
+    /// SiLU / Swish: x * sigmoid(x).
+    fn silu(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("silu", self.name()))
+    }
+
+    /// Element-wise not-equal.
+    fn ne(&self, _lhs: &Tensor, _rhs: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("ne", self.name()))
+    }
+    /// Element-wise less-than.
+    fn lt(&self, _lhs: &Tensor, _rhs: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("lt", self.name()))
+    }
+    /// Element-wise less-than-or-equal.
+    fn le(&self, _lhs: &Tensor, _rhs: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("le", self.name()))
+    }
+    /// Element-wise greater-than.
+    fn gt(&self, _lhs: &Tensor, _rhs: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("gt", self.name()))
+    }
+    /// Element-wise greater-than-or-equal.
+    fn ge(&self, _lhs: &Tensor, _rhs: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("ge", self.name()))
+    }
+    /// Bool tensor: which lanes are NaN?
+    fn isnan(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("isnan", self.name()))
+    }
+    /// Bool tensor: which lanes are ±Inf?
+    fn isinf(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("isinf", self.name()))
+    }
+    /// Bool tensor: which lanes are finite (not NaN/Inf)?
+    fn isfinite(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("isfinite", self.name()))
+    }
+}
+
+#[allow(unused)]
+fn unsupported(op: &'static str, device: &'static str) -> BackendError {
+    BackendError::UnsupportedOp { op, device }
 }
 
 #[cfg(test)]
