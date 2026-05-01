@@ -88,6 +88,16 @@ impl Module for ModuleList {
         self.collect_parameters()
     }
 
+    fn named_parameters(&self) -> Vec<(String, Variable)> {
+        let mut out = Vec::new();
+        for (i, m) in self.modules.iter().enumerate() {
+            for (sub_name, v) in m.named_parameters() {
+                out.push((format!("{i}.{sub_name}"), v));
+            }
+        }
+        out
+    }
+
     fn train(&mut self) {
         for m in &mut self.modules {
             m.train();
@@ -166,6 +176,18 @@ impl Module for ModuleDict {
             .filter_map(|k| self.modules.get(k))
             .flat_map(|m| m.parameters())
             .collect()
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Variable)> {
+        let mut out = Vec::new();
+        for k in &self.order {
+            if let Some(m) = self.modules.get(k) {
+                for (sub_name, v) in m.named_parameters() {
+                    out.push((format!("{k}.{sub_name}"), v));
+                }
+            }
+        }
+        out
     }
 
     fn train(&mut self) {

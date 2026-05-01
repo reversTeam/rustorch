@@ -90,4 +90,12 @@ impl Module for Linear {
         }
         params
     }
+
+    fn named_parameters(&self) -> Vec<(String, Variable)> {
+        let mut out = vec![("weight".to_string(), self.weight.clone())];
+        if let Some(b) = &self.bias {
+            out.push(("bias".to_string(), b.clone()));
+        }
+        out
+    }
 }

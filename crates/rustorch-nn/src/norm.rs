@@ -74,6 +74,10 @@ impl Module for RMSNorm {
     fn parameters(&self) -> Vec<Variable> {
         vec![self.gamma.clone()]
     }
+
+    fn named_parameters(&self) -> Vec<(String, Variable)> {
+        vec![("gamma".to_string(), self.gamma.clone())]
+    }
 }
 
 // ------------------------------ LayerNorm ------------------------------
@@ -146,6 +150,13 @@ impl Module for LayerNorm {
 
     fn parameters(&self) -> Vec<Variable> {
         vec![self.gamma.clone(), self.beta.clone()]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Variable)> {
+        vec![
+            ("gamma".to_string(), self.gamma.clone()),
+            ("beta".to_string(), self.beta.clone()),
+        ]
     }
 }
 

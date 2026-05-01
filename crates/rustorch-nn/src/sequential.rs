@@ -63,6 +63,16 @@ impl Module for Sequential {
         params
     }
 
+    fn named_parameters(&self) -> Vec<(String, Variable)> {
+        let mut out = Vec::new();
+        for (i, m) in self.modules.iter().enumerate() {
+            for (sub_name, v) in m.named_parameters() {
+                out.push((format!("{i}.{sub_name}"), v));
+            }
+        }
+        out
+    }
+
     fn train(&mut self) {
         for m in &mut self.modules {
             m.train();

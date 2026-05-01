@@ -21,6 +21,7 @@ pub mod loss;
 pub mod module;
 pub mod norm;
 pub mod sequential;
+pub mod state_dict;
 
 pub use activation::{
     leaky_relu, log_softmax, relu, sigmoid, silu, softmax, tanh, LeakyRelu, LogSoftmax, Relu,
@@ -32,6 +33,7 @@ pub use loss::{Criterion, CrossEntropyLoss, MseLoss};
 pub use module::Module;
 pub use norm::{LayerNorm, RMSNorm};
 pub use sequential::Sequential;
+pub use state_dict::{load_state_dict, state_dict, LoadReport, StateDictError};
 
 /// Crate version reported at runtime.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
