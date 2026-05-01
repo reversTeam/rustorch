@@ -32,6 +32,10 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown -p rustorch-autograd
       - name: Build rustorch-nn for wasm32
         run: cargo build --target wasm32-unknown-unknown -p rustorch-nn
+      - name: Build rustorch-wgpu for wasm32 (browser WebGPU)
+        run: cargo build --target wasm32-unknown-unknown -p rustorch-wgpu
+      - name: Build rustorch-wasm-demo (browser bundle)
+        run: cargo build --target wasm32-unknown-unknown -p rustorch-wasm-demo
 
   headless-test:
     name: wasm-pack test (headless Chrome)

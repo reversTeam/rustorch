@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>rustorch — browser WebGPU demo</title>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0a0b09; color: #ddd; padding: 24px; }
+    h1 { color: #ce422b; }
+    .card { background: #111; border: 1px solid #222; padding: 16px; margin: 12px 0; border-radius: 6px; }
+    .ok { color: #8fcf6f; }
+    .warn { color: #e6b04b; }
+    pre { white-space: pre-wrap; word-break: break-all; max-height: 280px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <h1>rustorch — browser WebGPU demo</h1>
+
+  <div class="card">
+    <h2>Phase 2 deliverable</h2>
+    <p>
+      This page calls into a WASM module compiled from
+      <code>crates/rustorch-wasm-demo</code>. It allocates two
+      F32 tensors of shape <code>[B, K]</code>, runs
+      <code>add → relu → softmax</code> on the browser's WebGPU
+      adapter via the <code>rustorch-wgpu</code> crate, and reads
+      the result back to JS as a <code>Float32Array</code>.
+    </p>
+    <p>
+      Build:
+      <code>wasm-pack build crates/rustorch-wasm-demo --target web</code>
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>WebGPU support</h2>
+    <p id="status">Checking…</p>
+  </div>
+
+  <div class="card">
+    <h2>Result</h2>
+    <pre id="output">(not run yet — click below)</pre>
+    <button id="run">Run forward pass</button>
+  </div>
+
+  <script type="module">
+    import init, { run_demo } from "../pkg/rustorch_wasm_demo.js";
+
+    const status = document.getElementById("status");
+    const output = document.getElementById("output");
+    const button = document.getElementById("run");
+
+    if (!("gpu" in navigator)) {
+      status.innerHTML = '<span class="warn">⚠ WebGPU not available. Use Chrome 120+ with WebGPU enabled.</span>';
+      button.disabled = true;
+    } else {
+      status.innerHTML = '<span class="ok">✓ navigator.gpu present.</span>';
+    }
+
+    button.addEventListener("click", async () => {
+      output.textContent = "Initializing WASM module…";
+      try {
+        await init();
+        output.textContent = "Running add → relu → softmax on the GPU…";
+        const buf = await run_demo(2, 8);
+        output.textContent =
+          "Result (shape [2, 8]):\n" +
+          Array.from(buf)
+            .map((v, i) => `[${i}] ${v.toFixed(6)}`)
+            .join("\n");
+      } catch (err) {
+        output.textContent = "Error: " + (err?.message || err);
+      }
+    });
+  </script>
+</body>
+</html>
