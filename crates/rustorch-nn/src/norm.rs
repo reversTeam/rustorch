@@ -1,13 +1,16 @@
 //! Normalization modules (P1.6).
 //!
-//! v1 ships [`RMSNorm`] (Zhang & Sennrich 2019), the simplest variant
-//! used by Llama, Mistral, T5-derived architectures. LayerNorm /
-//! GroupNorm / BatchNorm follow once their dedicated kernels land
-//! in P1.4.
+//! v1 ships:
+//! - [`RMSNorm`] (Zhang & Sennrich 2019), the simplest variant used by
+//!   Llama, Mistral, T5-derived architectures.
+//! - [`LayerNorm`] (Ba et al. 2016), the workhorse of Transformers.
 //!
-//! `RMSNorm` is built by composing existing autograd ops (mul,
-//! mean_dim, sqrt, div, add) — backward falls out automatically from
-//! the dynamic graph. No hand-coded backward formula required.
+//! Both norms are built by composing existing autograd ops (mul,
+//! mean_dim, sqrt, div, add, sub) — backward falls out automatically
+//! from the dynamic graph. No hand-coded backward formula required.
+//!
+//! GroupNorm / BatchNorm / InstanceNorm follow once their dedicated
+//! kernels land in P1.4 (Welford-stable variance is on the roadmap).
 
 use crate::module::{Module, ModuleError};
 use rustorch_autograd::{ops, Variable};
@@ -70,6 +73,79 @@ impl Module for RMSNorm {
 
     fn parameters(&self) -> Vec<Variable> {
         vec![self.gamma.clone()]
+    }
+}
+
+// ------------------------------ LayerNorm ------------------------------
+
+/// LayerNorm: `y = (x - mean) / sqrt(var + eps) * gamma + beta`.
+///
+/// `gamma` and `beta` are both learnable parameters of shape
+/// `[normalized_size]`, broadcasted across leading dims.
+pub struct LayerNorm {
+    /// Learnable per-channel scale.
+    pub gamma: Variable,
+    /// Learnable per-channel shift.
+    pub beta: Variable,
+    eps: f32,
+    normalized_size: usize,
+}
+
+impl LayerNorm {
+    /// Build with the given last-axis size and default eps = 1e-5.
+    pub fn new(normalized_size: usize) -> Self {
+        Self::with_eps(normalized_size, 1e-5)
+    }
+
+    /// Build with explicit epsilon.
+    pub fn with_eps(normalized_size: usize, eps: f32) -> Self {
+        let gamma = Variable::leaf(
+            Tensor::from_vec([normalized_size], vec![1.0_f32; normalized_size])
+                .expect("gamma shape"),
+        );
+        let beta = Variable::leaf(
+            Tensor::from_vec([normalized_size], vec![0.0_f32; normalized_size])
+                .expect("beta shape"),
+        );
+        LayerNorm {
+            gamma,
+            beta,
+            eps,
+            normalized_size,
+        }
+    }
+
+    /// Last-axis size this norm operates on.
+    pub fn normalized_size(&self) -> usize {
+        self.normalized_size
+    }
+}
+
+impl Module for LayerNorm {
+    fn forward(&self, input: &Variable) -> Result<Variable, ModuleError> {
+        let last_dim = input.tensor().ndim() - 1;
+        // mean
+        let mean = ops::mean_dim(input, &[last_dim])?;
+        // x - mean (broadcast)
+        let centered = ops::sub(input, &mean)?;
+        // (x - mean)²
+        let centered_sq = ops::mul(&centered, &centered)?;
+        // var = mean of centered²
+        let var = ops::mean_dim(&centered_sq, &[last_dim])?;
+        // var + eps
+        let eps_var = Variable::new(Tensor::scalar(self.eps));
+        let var_eps = ops::add(&var, &eps_var)?;
+        // std = sqrt(var + eps)
+        let std = ops::sqrt(&var_eps)?;
+        // normalised = centered / std
+        let normed = ops::div(&centered, &std)?;
+        // * gamma + beta
+        let scaled = ops::mul(&normed, &self.gamma)?;
+        ops::add(&scaled, &self.beta)
+    }
+
+    fn parameters(&self) -> Vec<Variable> {
+        vec![self.gamma.clone(), self.beta.clone()]
     }
 }
 
@@ -156,5 +232,74 @@ mod tests {
         let p = norm.parameters();
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].tensor().shape(), &[8]);
+    }
+
+    // -------------------- LayerNorm --------------------
+
+    #[test]
+    fn layer_norm_zero_input_returns_beta() {
+        // mean=0, var=0 → centered=0, normed=0, y=0*gamma+beta = beta
+        let norm = LayerNorm::with_eps(4, 1e-5);
+        let x = var(vec![1usize, 4], vec![0.0_f32; 4]);
+        let y = norm.forward(&x).unwrap();
+        let y_t = y.tensor();
+        let y_v = y_t.as_slice::<f32>().unwrap();
+        // beta defaults to zeros → y = zeros
+        for &v in y_v {
+            assert!(v.abs() < 1e-5, "expected ~0 (beta=0), got {v}");
+        }
+    }
+
+    #[test]
+    fn layer_norm_centers_and_unit_variance() {
+        // After LayerNorm on a row, the per-row mean ≈ beta and per-row
+        // sample-stddev ≈ gamma (default 1, 0).
+        let norm = LayerNorm::with_eps(4, 0.0);
+        let x = var(vec![1usize, 4], vec![1.0_f32, 2.0, 3.0, 4.0]);
+        let y = norm.forward(&x).unwrap();
+        let y_t = y.tensor();
+        let y_v = y_t.as_slice::<f32>().unwrap();
+        let mean = y_v.iter().sum::<f32>() / y_v.len() as f32;
+        let var = y_v.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / y_v.len() as f32;
+        assert!(mean.abs() < 1e-5, "mean ≈ 0, got {mean}");
+        assert!((var - 1.0).abs() < 1e-4, "var ≈ 1, got {var}");
+    }
+
+    #[test]
+    fn layer_norm_preserves_shape() {
+        let norm = LayerNorm::new(8);
+        let x = var(vec![3usize, 5, 8], vec![0.5_f32; 3 * 5 * 8]);
+        let y = norm.forward(&x).unwrap();
+        assert_eq!(y.tensor().shape(), &[3, 5, 8]);
+    }
+
+    #[test]
+    fn layer_norm_backward_flows_to_gamma_beta_x() {
+        let norm = LayerNorm::new(4);
+        let x = var(
+            vec![2usize, 4],
+            vec![0.5_f32, 1.0, 1.5, 2.0, 0.3, 0.6, 0.9, 1.2],
+        );
+        let y = norm.forward(&x).unwrap();
+        let s = rustorch_autograd::ops::sum(&y).unwrap();
+        backward(&s, None).unwrap();
+        for p in &[&norm.gamma, &norm.beta] {
+            let g = p.grad().unwrap();
+            assert!(
+                g.as_slice::<f32>().unwrap().iter().any(|v| v.abs() > 1e-7),
+                "param should accumulate non-zero grad"
+            );
+        }
+        let xg = x.grad().unwrap();
+        assert!(xg.as_slice::<f32>().unwrap().iter().any(|v| v.abs() > 1e-7));
+    }
+
+    #[test]
+    fn layer_norm_parameters_count() {
+        let norm = LayerNorm::new(8);
+        let p = norm.parameters();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].tensor().shape(), &[8]);
+        assert_eq!(p[1].tensor().shape(), &[8]);
     }
 }
