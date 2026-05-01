@@ -1,12 +1,22 @@
 //! # rustorch-data
 //!
-//! `Dataset` and `IterableDataset` traits + `DataLoader` with workers (rayon)
-//! + `Sampler` impls (Sequential, Random, WeightedRandom, BucketBy, Distributed).
+//! `Dataset` and `IterableDataset` traits + `DataLoader` with batched
+//! iteration + `Sampler` impls (Sequential, Random — others pending).
 //!
-//! Concrete impl lands in P1.8 (DataLoader). Augmentations live in P1.9.
+//! v1 is single-threaded. Workers (`num_workers` via rayon) land in a
+//! follow-up; the iterator API is stable. Augmentations live in P1.9.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
+
+pub mod dataloader;
+pub mod dataset;
+pub mod sampler;
+
+pub use dataloader::{DataLoader, DataLoaderError};
+pub use dataset::{Dataset, DatasetError, IterableDataset, TensorDataset};
+pub use sampler::{RandomSampler, Sampler, SequentialSampler};
 
 /// Crate version reported at runtime.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
