@@ -29,6 +29,7 @@ pub mod iterator;
 pub mod kernels;
 pub mod mock;
 pub mod parallel;
+pub mod pinned;
 pub mod profile;
 pub mod simd;
 
