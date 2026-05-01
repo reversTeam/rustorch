@@ -16,10 +16,12 @@
 #![warn(rust_2018_idioms)]
 
 pub mod adam;
+pub mod lion;
 pub mod scheduler;
 pub mod sgd;
 
 pub use adam::{Adam, AdamW};
+pub use lion::Lion;
 pub use scheduler::{CosineAnnealingLR, ExponentialLR, LinearWarmup, LrScheduler, StepLR};
 pub use sgd::Sgd;
 
