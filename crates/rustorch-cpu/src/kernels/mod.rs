@@ -1,0 +1,5 @@
+//! CPU backend kernels — split per category (shape, reduction, linalg, ...)
+//! to keep each file focused and to give the codegen pipeline a stable
+//! file-name target.
+
+pub mod shape_ops;

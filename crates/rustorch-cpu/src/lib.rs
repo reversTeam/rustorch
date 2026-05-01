@@ -26,6 +26,7 @@ pub mod backend;
 pub mod cpu_backend;
 pub mod error;
 pub mod iterator;
+pub mod kernels;
 pub mod mock;
 pub mod parallel;
 pub mod profile;

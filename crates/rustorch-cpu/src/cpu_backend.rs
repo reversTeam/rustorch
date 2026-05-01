@@ -788,6 +788,46 @@ impl Backend for CpuBackend {
         })
     }
 
+    // -------------------- Shape ops (delegate to kernels::shape_ops) --------------------
+
+    fn cat(&self, tensors: &[&Tensor], dim: usize) -> Result<Tensor, BackendError> {
+        crate::kernels::shape_ops::cat(tensors, dim)
+    }
+
+    fn stack(&self, tensors: &[&Tensor], dim: usize) -> Result<Tensor, BackendError> {
+        crate::kernels::shape_ops::stack(tensors, dim)
+    }
+
+    fn split(
+        &self,
+        src: &Tensor,
+        split_size: usize,
+        dim: usize,
+    ) -> Result<Vec<Tensor>, BackendError> {
+        crate::kernels::shape_ops::split(src, split_size, dim)
+    }
+
+    fn chunk(
+        &self,
+        src: &Tensor,
+        n_chunks: usize,
+        dim: usize,
+    ) -> Result<Vec<Tensor>, BackendError> {
+        crate::kernels::shape_ops::chunk(src, n_chunks, dim)
+    }
+
+    fn repeat(&self, src: &Tensor, repeats: &[usize]) -> Result<Tensor, BackendError> {
+        crate::kernels::shape_ops::repeat(src, repeats)
+    }
+
+    fn flip(&self, src: &Tensor, dims: &[usize]) -> Result<Tensor, BackendError> {
+        crate::kernels::shape_ops::flip(src, dims)
+    }
+
+    fn roll(&self, src: &Tensor, shifts: i64, dim: usize) -> Result<Tensor, BackendError> {
+        crate::kernels::shape_ops::roll(src, shifts, dim)
+    }
+
     fn cast(&self, src: &Tensor, target: Dtype) -> Result<Tensor, BackendError> {
         // Tensor::to_dtype already implements the full 8x8 matrix with
         // saturating semantics: Rust 1.45+ defines `f as i` as

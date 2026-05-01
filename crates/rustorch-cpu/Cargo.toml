@@ -28,6 +28,10 @@ harness = false
 name    = "activation_relu"
 harness = false
 
+[[bench]]
+name    = "shape_ops_cat"
+harness = false
+
 [dependencies]
 rustorch-core = { workspace = true }
 half          = { workspace = true }

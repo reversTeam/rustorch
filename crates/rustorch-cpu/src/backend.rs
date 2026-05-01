@@ -290,6 +290,51 @@ pub trait Backend: Send + Sync {
         Err(unsupported("nonzero", self.name()))
     }
 
+    // -------------------- P1.3 — Shape ops (kernel-side) --------------------
+
+    /// Concatenate `tensors` along `dim`. All tensors must have the
+    /// same dtype and the same shape except along `dim`.
+    fn cat(&self, _tensors: &[&Tensor], _dim: usize) -> Result<Tensor, BackendError> {
+        Err(unsupported("cat", self.name()))
+    }
+    /// Stack `tensors` along a new axis at position `dim`. Inputs must
+    /// all have identical shape and dtype.
+    fn stack(&self, _tensors: &[&Tensor], _dim: usize) -> Result<Tensor, BackendError> {
+        Err(unsupported("stack", self.name()))
+    }
+    /// Split a tensor into chunks of `split_size` along `dim`. Last
+    /// chunk may be smaller if dim size is not divisible.
+    fn split(
+        &self,
+        _src: &Tensor,
+        _split_size: usize,
+        _dim: usize,
+    ) -> Result<Vec<Tensor>, BackendError> {
+        Err(unsupported("split", self.name()))
+    }
+    /// Split into roughly equal `n_chunks` along `dim`.
+    fn chunk(
+        &self,
+        _src: &Tensor,
+        _n_chunks: usize,
+        _dim: usize,
+    ) -> Result<Vec<Tensor>, BackendError> {
+        Err(unsupported("chunk", self.name()))
+    }
+    /// Repeat tensor along given `repeats` count per axis.
+    fn repeat(&self, _src: &Tensor, _repeats: &[usize]) -> Result<Tensor, BackendError> {
+        Err(unsupported("repeat", self.name()))
+    }
+    /// Reverse the tensor along the given `dims`.
+    fn flip(&self, _src: &Tensor, _dims: &[usize]) -> Result<Tensor, BackendError> {
+        Err(unsupported("flip", self.name()))
+    }
+    /// Circular shift along `dim` by `shifts` positions (positive shifts
+    /// values toward higher indices; negative shifts wrap around).
+    fn roll(&self, _src: &Tensor, _shifts: i64, _dim: usize) -> Result<Tensor, BackendError> {
+        Err(unsupported("roll", self.name()))
+    }
+
     /// Convert a tensor from its current dtype to `target` dtype.
     ///
     /// **Saturating** float→int conversions (NaN → 0, +Inf → MAX,
