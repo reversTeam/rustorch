@@ -1178,3 +1178,57 @@ pub fn pow_scalar(src: &Variable, exponent: f64) -> Result<Variable, BackwardErr
     }
     Ok(out_var)
 }
+
+// --------------------------------------------------------------------------
+// mean_dim — d/dx mean(x, dim, keepdim=true) broadcasts grad/N back to x.shape
+// --------------------------------------------------------------------------
+
+struct MeanDimBackward {
+    in_shape: Vec<usize>,
+    n_reduced: usize,
+    edges: [Edge; 1],
+}
+
+impl Node for MeanDimBackward {
+    fn name(&self) -> &'static str {
+        "MeanDimBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // Broadcast grad up to in_shape and divide by N.
+        // We do this by computing `mul(grad, ones_in/N)` — the ones tensor
+        // has the input shape, so the broadcast multiplies grad (with its
+        // size-1 reduced dims) up to the full shape.
+        let inv_n = 1.0_f32 / self.n_reduced as f32;
+        let numel: usize = self.in_shape.iter().product();
+        let scaled_ones =
+            Tensor::from_vec(self.in_shape.clone(), vec![inv_n; numel]).expect("scaled ones");
+        let g = cpu_backend()
+            .mul(grad, &scaled_ones)
+            .expect("mean_dim bw: grad * ones/N");
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `mean(src, dims, keepdim=true)` (autograd-aware; v1 requires keepdim=true).
+pub fn mean_dim(src: &Variable, dims: &[usize]) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .mean_dim(&src.tensor(), dims, true)
+        .map_err(|e| backend_err("mean_dim", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && src.requires_grad {
+        let in_shape = src.tensor().shape().to_vec();
+        // N = product of reduced dim sizes
+        let n_reduced: usize = dims.iter().map(|&d| in_shape[d]).product();
+        let node = std::sync::Arc::new(MeanDimBackward {
+            in_shape,
+            n_reduced,
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}

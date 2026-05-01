@@ -19,6 +19,7 @@ pub mod container;
 pub mod linear;
 pub mod loss;
 pub mod module;
+pub mod norm;
 pub mod sequential;
 
 pub use activation::{
@@ -29,6 +30,7 @@ pub use container::{ModuleDict, ModuleList};
 pub use linear::Linear;
 pub use loss::{Criterion, CrossEntropyLoss, MseLoss};
 pub use module::Module;
+pub use norm::RMSNorm;
 pub use sequential::Sequential;
 
 /// Crate version reported at runtime.
