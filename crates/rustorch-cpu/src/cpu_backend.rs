@@ -503,6 +503,19 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn gelu_exact(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        // gelu_exact(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+        // erf via Abramowitz-Stegun 7.1.26 (max abs error ≤ 1.5e-7).
+        const SQRT_2: f32 = core::f32::consts::SQRT_2;
+        const SQRT_2_F64: f64 = core::f64::consts::SQRT_2;
+        unary_float(
+            src,
+            "gelu_exact",
+            |x| 0.5 * x * (1.0 + erf_f32(x / SQRT_2)),
+            |x| 0.5 * x * (1.0 + erf_f64(x / SQRT_2_F64)),
+        )
+    }
+
     fn hardsigmoid(&self, src: &Tensor) -> Result<Tensor, BackendError> {
         unary_float(
             src,
@@ -510,6 +523,269 @@ impl Backend for CpuBackend {
             |x| ((x + 3.0) / 6.0).clamp(0.0, 1.0),
             |x| ((x + 3.0) / 6.0).clamp(0.0, 1.0),
         )
+    }
+
+    // -------------------- Indexing kernels --------------------
+
+    fn gather(&self, src: &Tensor, dim: usize, idx: &Tensor) -> Result<Tensor, BackendError> {
+        if idx.dtype() != Dtype::I64 {
+            return Err(BackendError::DtypeMismatch {
+                op: "gather",
+                lhs: idx.dtype(),
+                rhs: Dtype::I64,
+            });
+        }
+        if src.ndim() != idx.ndim() {
+            return Err(BackendError::ShapeMismatch {
+                op: "gather",
+                lhs: src.shape().to_vec(),
+                rhs: idx.shape().to_vec(),
+            });
+        }
+        if dim >= src.ndim() {
+            return Err(BackendError::IndexOutOfBounds {
+                op: "gather",
+                index: dim as i64,
+                bound: src.ndim(),
+            });
+        }
+        match src.dtype() {
+            Dtype::F32 => gather_typed::<f32>(src, dim, idx),
+            Dtype::F64 => gather_typed::<f64>(src, dim, idx),
+            Dtype::I64 => gather_typed::<i64>(src, dim, idx),
+            Dtype::I32 => gather_typed::<i32>(src, dim, idx),
+            d => Err(BackendError::DtypeMismatch {
+                op: "gather",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn scatter(
+        &self,
+        dst: &Tensor,
+        dim: usize,
+        idx: &Tensor,
+        src: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        scatter_dispatch(dst, dim, idx, src, "scatter", false)
+    }
+
+    fn scatter_add(
+        &self,
+        dst: &Tensor,
+        dim: usize,
+        idx: &Tensor,
+        src: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        scatter_dispatch(dst, dim, idx, src, "scatter_add", true)
+    }
+
+    fn index_select(
+        &self,
+        src: &Tensor,
+        dim: usize,
+        indices: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        if indices.dtype() != Dtype::I64 {
+            return Err(BackendError::DtypeMismatch {
+                op: "index_select",
+                lhs: indices.dtype(),
+                rhs: Dtype::I64,
+            });
+        }
+        if indices.ndim() != 1 {
+            return Err(BackendError::ShapeMismatch {
+                op: "index_select",
+                lhs: indices.shape().to_vec(),
+                rhs: vec![indices.numel()],
+            });
+        }
+        if dim >= src.ndim() {
+            return Err(BackendError::IndexOutOfBounds {
+                op: "index_select",
+                index: dim as i64,
+                bound: src.ndim(),
+            });
+        }
+        match src.dtype() {
+            Dtype::F32 => index_select_typed::<f32>(src, dim, indices),
+            Dtype::F64 => index_select_typed::<f64>(src, dim, indices),
+            Dtype::I64 => index_select_typed::<i64>(src, dim, indices),
+            Dtype::I32 => index_select_typed::<i32>(src, dim, indices),
+            d => Err(BackendError::DtypeMismatch {
+                op: "index_select",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn masked_select(&self, src: &Tensor, mask: &Tensor) -> Result<Tensor, BackendError> {
+        if mask.dtype() != Dtype::Bool {
+            return Err(BackendError::DtypeMismatch {
+                op: "masked_select",
+                lhs: mask.dtype(),
+                rhs: Dtype::Bool,
+            });
+        }
+        if mask.shape() != src.shape() {
+            return Err(BackendError::ShapeMismatch {
+                op: "masked_select",
+                lhs: src.shape().to_vec(),
+                rhs: mask.shape().to_vec(),
+            });
+        }
+        match src.dtype() {
+            Dtype::F32 => masked_select_typed::<f32>(src, mask),
+            Dtype::F64 => masked_select_typed::<f64>(src, mask),
+            Dtype::I64 => masked_select_typed::<i64>(src, mask),
+            Dtype::I32 => masked_select_typed::<i32>(src, mask),
+            d => Err(BackendError::DtypeMismatch {
+                op: "masked_select",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn masked_fill(&self, src: &Tensor, mask: &Tensor, value: f64) -> Result<Tensor, BackendError> {
+        if mask.dtype() != Dtype::Bool {
+            return Err(BackendError::DtypeMismatch {
+                op: "masked_fill",
+                lhs: mask.dtype(),
+                rhs: Dtype::Bool,
+            });
+        }
+        if mask.shape() != src.shape() {
+            return Err(BackendError::ShapeMismatch {
+                op: "masked_fill",
+                lhs: src.shape().to_vec(),
+                rhs: mask.shape().to_vec(),
+            });
+        }
+        match src.dtype() {
+            Dtype::F32 => masked_fill_typed::<f32>(src, mask, value as f32),
+            Dtype::F64 => masked_fill_typed::<f64>(src, mask, value),
+            Dtype::I64 => masked_fill_typed::<i64>(src, mask, value as i64),
+            Dtype::I32 => masked_fill_typed::<i32>(src, mask, value as i32),
+            d => Err(BackendError::DtypeMismatch {
+                op: "masked_fill",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn r#where(&self, cond: &Tensor, x: &Tensor, y: &Tensor) -> Result<Tensor, BackendError> {
+        if cond.dtype() != Dtype::Bool {
+            return Err(BackendError::DtypeMismatch {
+                op: "where",
+                lhs: cond.dtype(),
+                rhs: Dtype::Bool,
+            });
+        }
+        if x.dtype() != y.dtype() {
+            return Err(BackendError::DtypeMismatch {
+                op: "where",
+                lhs: x.dtype(),
+                rhs: y.dtype(),
+            });
+        }
+        // shapes must broadcast — for v1, require all three to have the same shape.
+        if cond.shape() != x.shape() || x.shape() != y.shape() {
+            return Err(BackendError::ShapeMismatch {
+                op: "where",
+                lhs: x.shape().to_vec(),
+                rhs: y.shape().to_vec(),
+            });
+        }
+        match x.dtype() {
+            Dtype::F32 => where_typed::<f32>(cond, x, y),
+            Dtype::F64 => where_typed::<f64>(cond, x, y),
+            Dtype::I64 => where_typed::<i64>(cond, x, y),
+            Dtype::I32 => where_typed::<i32>(cond, x, y),
+            d => Err(BackendError::DtypeMismatch {
+                op: "where",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn nonzero(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        // Build a [N, ndim] I64 tensor where N is the count of nonzero
+        // elements in src.
+        let ndim = src.ndim();
+        let shape = src.shape().to_vec();
+        let nonzero_coords: Vec<i64>;
+        let walk = |is_nz: &dyn Fn(usize) -> bool| -> Vec<i64> {
+            let mut acc = Vec::new();
+            for linear in 0..src.numel() {
+                if is_nz(linear) {
+                    let mut idx = linear;
+                    let mut coords = vec![0i64; ndim];
+                    for axis in (0..ndim).rev() {
+                        coords[axis] = (idx % shape[axis]) as i64;
+                        idx /= shape[axis];
+                    }
+                    acc.extend_from_slice(&coords);
+                }
+            }
+            acc
+        };
+        match src.dtype() {
+            Dtype::F32 => {
+                let it = src
+                    .iter_elements::<f32>()
+                    .expect("dtype")
+                    .collect::<Vec<f32>>();
+                nonzero_coords = walk(&|i| it[i] != 0.0 && !it[i].is_nan());
+            },
+            Dtype::F64 => {
+                let it = src
+                    .iter_elements::<f64>()
+                    .expect("dtype")
+                    .collect::<Vec<f64>>();
+                nonzero_coords = walk(&|i| it[i] != 0.0 && !it[i].is_nan());
+            },
+            Dtype::I64 => {
+                let it = src
+                    .iter_elements::<i64>()
+                    .expect("dtype")
+                    .collect::<Vec<i64>>();
+                nonzero_coords = walk(&|i| it[i] != 0);
+            },
+            Dtype::I32 => {
+                let it = src
+                    .iter_elements::<i32>()
+                    .expect("dtype")
+                    .collect::<Vec<i32>>();
+                nonzero_coords = walk(&|i| it[i] != 0);
+            },
+            Dtype::Bool => {
+                let it = src
+                    .iter_elements::<bool>()
+                    .expect("dtype")
+                    .collect::<Vec<bool>>();
+                nonzero_coords = walk(&|i| it[i]);
+            },
+            d => {
+                return Err(BackendError::DtypeMismatch {
+                    op: "nonzero",
+                    lhs: d,
+                    rhs: d,
+                })
+            },
+        };
+        let n = nonzero_coords.len() / ndim.max(1);
+        let final_shape = if ndim == 0 { vec![n] } else { vec![n, ndim] };
+        Tensor::from_vec_typed::<i64, _>(final_shape, nonzero_coords).map_err(|_| {
+            BackendError::OutOfMemory {
+                bytes: n * ndim * core::mem::size_of::<i64>(),
+            }
+        })
     }
 
     fn cast(&self, src: &Tensor, target: Dtype) -> Result<Tensor, BackendError> {
@@ -571,6 +847,310 @@ fn cmp(
             rhs: d,
         }),
     }
+}
+
+// -------------------- Indexing kernel helpers --------------------
+
+fn gather_typed<T: rustorch_core::tensor::dtype::Element>(
+    src: &Tensor,
+    dim: usize,
+    idx: &Tensor,
+) -> Result<Tensor, BackendError> {
+    let out_shape = idx.shape().to_vec();
+    let n_out = out_shape.iter().product::<usize>();
+    let src_dim_size = src.shape()[dim];
+    let src_typed = src.iter_elements::<T>().expect("dtype").collect::<Vec<T>>();
+    let idx_typed = idx
+        .iter_elements::<i64>()
+        .expect("idx i64")
+        .collect::<Vec<i64>>();
+
+    let mut out: Vec<T> = Vec::with_capacity(n_out);
+    let src_strides = contiguous_strides(src.shape());
+    for (linear, &i_dim) in idx_typed.iter().enumerate().take(n_out) {
+        let coords = decode_coords(linear, &out_shape);
+        if i_dim < 0 || (i_dim as usize) >= src_dim_size {
+            return Err(BackendError::IndexOutOfBounds {
+                op: "gather",
+                index: i_dim,
+                bound: src_dim_size,
+            });
+        }
+        let mut src_coords = coords.clone();
+        src_coords[dim] = i_dim as usize;
+        let src_linear: usize = src_coords
+            .iter()
+            .zip(src_strides.iter())
+            .map(|(c, s)| c * s)
+            .sum();
+        out.push(src_typed[src_linear]);
+    }
+    Tensor::from_vec_typed::<T, _>(out_shape, out).map_err(|_| BackendError::OutOfMemory {
+        bytes: n_out * core::mem::size_of::<T>(),
+    })
+}
+
+fn scatter_dispatch(
+    dst: &Tensor,
+    dim: usize,
+    idx: &Tensor,
+    src: &Tensor,
+    op_name: &'static str,
+    accumulate: bool,
+) -> Result<Tensor, BackendError> {
+    if idx.dtype() != Dtype::I64 {
+        return Err(BackendError::DtypeMismatch {
+            op: op_name,
+            lhs: idx.dtype(),
+            rhs: Dtype::I64,
+        });
+    }
+    if dst.dtype() != src.dtype() {
+        return Err(BackendError::DtypeMismatch {
+            op: op_name,
+            lhs: dst.dtype(),
+            rhs: src.dtype(),
+        });
+    }
+    if dst.ndim() != idx.ndim() || dst.ndim() != src.ndim() {
+        return Err(BackendError::ShapeMismatch {
+            op: op_name,
+            lhs: dst.shape().to_vec(),
+            rhs: idx.shape().to_vec(),
+        });
+    }
+    if dim >= dst.ndim() {
+        return Err(BackendError::IndexOutOfBounds {
+            op: op_name,
+            index: dim as i64,
+            bound: dst.ndim(),
+        });
+    }
+    if idx.shape() != src.shape() {
+        return Err(BackendError::ShapeMismatch {
+            op: op_name,
+            lhs: idx.shape().to_vec(),
+            rhs: src.shape().to_vec(),
+        });
+    }
+    match dst.dtype() {
+        Dtype::F32 => scatter_typed::<f32>(dst, dim, idx, src, op_name, accumulate, |a, b| a + b),
+        Dtype::F64 => scatter_typed::<f64>(dst, dim, idx, src, op_name, accumulate, |a, b| a + b),
+        Dtype::I64 => scatter_typed::<i64>(dst, dim, idx, src, op_name, accumulate, |a, b| a + b),
+        Dtype::I32 => scatter_typed::<i32>(dst, dim, idx, src, op_name, accumulate, |a, b| a + b),
+        d => Err(BackendError::DtypeMismatch {
+            op: op_name,
+            lhs: d,
+            rhs: d,
+        }),
+    }
+}
+
+fn scatter_typed<T: rustorch_core::tensor::dtype::Element>(
+    dst: &Tensor,
+    dim: usize,
+    idx: &Tensor,
+    src: &Tensor,
+    op_name: &'static str,
+    accumulate: bool,
+    add: impl Fn(T, T) -> T,
+) -> Result<Tensor, BackendError> {
+    let dst_shape = dst.shape().to_vec();
+    let mut dst_typed = dst.iter_elements::<T>().expect("dtype").collect::<Vec<T>>();
+    let idx_typed = idx
+        .iter_elements::<i64>()
+        .expect("idx i64")
+        .collect::<Vec<i64>>();
+    let src_typed = src.iter_elements::<T>().expect("dtype").collect::<Vec<T>>();
+    let dst_strides = contiguous_strides(&dst_shape);
+    let dst_dim_size = dst_shape[dim];
+    for linear in 0..idx.numel() {
+        let coords = decode_coords(linear, idx.shape());
+        let i_dim = idx_typed[linear];
+        if i_dim < 0 || (i_dim as usize) >= dst_dim_size {
+            return Err(BackendError::IndexOutOfBounds {
+                op: op_name,
+                index: i_dim,
+                bound: dst_dim_size,
+            });
+        }
+        let mut dst_coords = coords;
+        dst_coords[dim] = i_dim as usize;
+        let dst_linear: usize = dst_coords
+            .iter()
+            .zip(dst_strides.iter())
+            .map(|(c, s)| c * s)
+            .sum();
+        if accumulate {
+            dst_typed[dst_linear] = add(dst_typed[dst_linear], src_typed[linear]);
+        } else {
+            dst_typed[dst_linear] = src_typed[linear];
+        }
+    }
+    Tensor::from_vec_typed::<T, _>(dst_shape, dst_typed).map_err(|_| BackendError::OutOfMemory {
+        bytes: dst.numel() * core::mem::size_of::<T>(),
+    })
+}
+
+fn index_select_typed<T: rustorch_core::tensor::dtype::Element>(
+    src: &Tensor,
+    dim: usize,
+    indices: &Tensor,
+) -> Result<Tensor, BackendError> {
+    let src_typed = src.iter_elements::<T>().expect("dtype").collect::<Vec<T>>();
+    let idx_vec = indices
+        .iter_elements::<i64>()
+        .expect("idx i64")
+        .collect::<Vec<i64>>();
+    let mut out_shape = src.shape().to_vec();
+    out_shape[dim] = idx_vec.len();
+    let n_out = out_shape.iter().product::<usize>();
+    let src_strides = contiguous_strides(src.shape());
+    let src_dim_size = src.shape()[dim];
+    let mut out: Vec<T> = Vec::with_capacity(n_out);
+    for linear in 0..n_out {
+        let coords = decode_coords(linear, &out_shape);
+        let j = idx_vec[coords[dim]];
+        if j < 0 || (j as usize) >= src_dim_size {
+            return Err(BackendError::IndexOutOfBounds {
+                op: "index_select",
+                index: j,
+                bound: src_dim_size,
+            });
+        }
+        let mut src_coords = coords;
+        src_coords[dim] = j as usize;
+        let src_linear: usize = src_coords
+            .iter()
+            .zip(src_strides.iter())
+            .map(|(c, s)| c * s)
+            .sum();
+        out.push(src_typed[src_linear]);
+    }
+    Tensor::from_vec_typed::<T, _>(out_shape, out).map_err(|_| BackendError::OutOfMemory {
+        bytes: n_out * core::mem::size_of::<T>(),
+    })
+}
+
+fn masked_select_typed<T: rustorch_core::tensor::dtype::Element>(
+    src: &Tensor,
+    mask: &Tensor,
+) -> Result<Tensor, BackendError> {
+    let src_v = src.iter_elements::<T>().expect("dtype").collect::<Vec<T>>();
+    let mask_v = mask
+        .iter_elements::<bool>()
+        .expect("bool")
+        .collect::<Vec<bool>>();
+    let mut out: Vec<T> = Vec::new();
+    for (v, m) in src_v.iter().zip(mask_v.iter()) {
+        if *m {
+            out.push(*v);
+        }
+    }
+    Tensor::from_vec_typed::<T, _>([out.len()], out)
+        .map_err(|_| BackendError::OutOfMemory { bytes: 0 })
+}
+
+fn masked_fill_typed<T: rustorch_core::tensor::dtype::Element>(
+    src: &Tensor,
+    mask: &Tensor,
+    value: T,
+) -> Result<Tensor, BackendError> {
+    let src_v = src.iter_elements::<T>().expect("dtype").collect::<Vec<T>>();
+    let mask_v = mask
+        .iter_elements::<bool>()
+        .expect("bool")
+        .collect::<Vec<bool>>();
+    let out: Vec<T> = src_v
+        .into_iter()
+        .zip(mask_v)
+        .map(|(v, m)| if m { value } else { v })
+        .collect();
+    Tensor::from_vec_typed::<T, _>(src.shape().to_vec(), out).map_err(|_| {
+        BackendError::OutOfMemory {
+            bytes: src.numel() * core::mem::size_of::<T>(),
+        }
+    })
+}
+
+fn where_typed<T: rustorch_core::tensor::dtype::Element>(
+    cond: &Tensor,
+    x: &Tensor,
+    y: &Tensor,
+) -> Result<Tensor, BackendError> {
+    let cond_v = cond
+        .iter_elements::<bool>()
+        .expect("bool")
+        .collect::<Vec<bool>>();
+    let x_v = x.iter_elements::<T>().expect("dtype").collect::<Vec<T>>();
+    let y_v = y.iter_elements::<T>().expect("dtype").collect::<Vec<T>>();
+    let out: Vec<T> = cond_v
+        .iter()
+        .zip(x_v.iter().zip(y_v.iter()))
+        .map(|(&c, (&xi, &yi))| if c { xi } else { yi })
+        .collect();
+    Tensor::from_vec_typed::<T, _>(x.shape().to_vec(), out).map_err(|_| BackendError::OutOfMemory {
+        bytes: x.numel() * core::mem::size_of::<T>(),
+    })
+}
+
+/// Compute row-major contiguous element-strides for a shape.
+fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
+    if shape.is_empty() {
+        return vec![];
+    }
+    let mut s = vec![1usize; shape.len()];
+    for i in (0..shape.len() - 1).rev() {
+        s[i] = s[i + 1] * shape[i + 1];
+    }
+    s
+}
+
+/// Decode a linear index into multi-dim coords (row-major).
+fn decode_coords(linear: usize, shape: &[usize]) -> Vec<usize> {
+    if shape.is_empty() {
+        return vec![];
+    }
+    let mut idx = linear;
+    let mut coords = vec![0usize; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        coords[axis] = idx % shape[axis];
+        idx /= shape[axis];
+    }
+    coords
+}
+
+/// Abramowitz-Stegun 7.1.26 approximation of the error function.
+/// Max absolute error ≤ 1.5e-7 over the whole real line.
+fn erf_f32(x: f32) -> f32 {
+    // erf is odd: erf(-x) = -erf(x).
+    let sign = if x < 0.0 { -1.0_f32 } else { 1.0 };
+    let a = x.abs();
+    // A&S coefficients
+    const P: f32 = 0.327_591_1;
+    const A1: f32 = 0.254_829_6;
+    const A2: f32 = -0.284_496_7;
+    const A3: f32 = 1.421_413_8;
+    const A4: f32 = -1.453_152_1;
+    const A5: f32 = 1.061_405_4;
+    let t = 1.0 / (1.0 + P * a);
+    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-a * a).exp();
+    sign * y
+}
+
+/// Same A&S 7.1.26 in f64 — slightly higher precision (≤ 1.5e-7 still).
+fn erf_f64(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0_f64 } else { 1.0 };
+    let a = x.abs();
+    const P: f64 = 0.327_591_1;
+    const A1: f64 = 0.254_829_592;
+    const A2: f64 = -0.284_496_736;
+    const A3: f64 = 1.421_413_741;
+    const A4: f64 = -1.453_152_027;
+    const A5: f64 = 1.061_405_429;
+    let t = 1.0 / (1.0 + P * a);
+    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-a * a).exp();
+    sign * y
 }
 
 /// Helper: dispatch a unary float-only op (f32 + f64 paths).
@@ -1107,6 +1687,47 @@ mod tests {
     }
 
     // -------------------- P1.3 Activations completion --------------------
+
+    #[test]
+    fn erf_known_values() {
+        // erf(0) = 0, erf(1) ≈ 0.8427, erf(∞) = 1
+        assert!(super::erf_f32(0.0).abs() < 1e-7);
+        assert!((super::erf_f32(1.0) - 0.842_701).abs() < 1e-5);
+        assert!((super::erf_f32(2.0) - 0.995_322).abs() < 1e-5);
+        // odd symmetry
+        for &x in &[0.5_f32, 1.0, 1.5, 2.0, 3.0] {
+            let pos = super::erf_f32(x);
+            let neg = super::erf_f32(-x);
+            assert!((pos + neg).abs() < 1e-6, "erf not odd at {x}");
+        }
+    }
+
+    #[test]
+    fn gelu_exact_at_zero() {
+        let z = Tensor::from_vec([1usize], vec![0.0_f32]).unwrap();
+        let r = b().gelu_exact(&z).unwrap().as_slice::<f32>().unwrap()[0];
+        assert!(r.abs() < 1e-6);
+    }
+
+    #[test]
+    fn gelu_exact_close_to_tanh_approx() {
+        // tanh-approx and erf-exact differ by < 1e-3 over [-3, 3].
+        let xs: Vec<f32> = (-30..=30).map(|i| i as f32 * 0.1).collect();
+        let t = Tensor::from_vec([xs.len()], xs.clone()).unwrap();
+        let approx = b().gelu(&t).unwrap();
+        let exact = b().gelu_exact(&t).unwrap();
+        let av = approx.as_slice::<f32>().unwrap();
+        let ev = exact.as_slice::<f32>().unwrap();
+        for (i, (a, e)) in av.iter().zip(ev.iter()).enumerate() {
+            assert!(
+                (a - e).abs() < 1e-3,
+                "gelu approx/exact diverge at x={}: tanh={}, erf={}",
+                xs[i],
+                a,
+                e
+            );
+        }
+    }
 
     #[test]
     fn elu_negative_scaled_by_alpha() {

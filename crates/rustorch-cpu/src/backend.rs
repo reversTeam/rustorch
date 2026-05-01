@@ -173,9 +173,14 @@ pub trait Backend: Send + Sync {
     fn tanh(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
         Err(unsupported("tanh", self.name()))
     }
-    /// GELU (exact, using erf).
+    /// GELU (tanh approximation, matches `torch.nn.functional.gelu(approximate='tanh')`).
     fn gelu(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
         Err(unsupported("gelu", self.name()))
+    }
+    /// GELU (exact, using erf — matches `torch.nn.functional.gelu(approximate='none')`).
+    /// Uses the Abramowitz-Stegun erf approximation (max abs error ≤ 1.5e-7).
+    fn gelu_exact(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("gelu_exact", self.name()))
     }
     /// LeakyReLU: x if x > 0 else slope*x.
     fn leaky_relu(&self, _src: &Tensor, _slope: f64) -> Result<Tensor, BackendError> {
@@ -217,6 +222,72 @@ pub trait Backend: Send + Sync {
     /// Bool tensor: which lanes are finite (not NaN/Inf)?
     fn isfinite(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
         Err(unsupported("isfinite", self.name()))
+    }
+
+    // -------------------- P1.3 — Indexing ops --------------------
+
+    /// Gather: `out[i_0, …, i_{D-1}] = src[i_0, …, idx[i_0,…,i_{D-1}], …, i_{D-1}]`
+    /// along `dim`. `idx` must be I64 with the same rank as `src`; every
+    /// index must be in `[0, src.shape[dim])`.
+    fn gather(&self, _src: &Tensor, _dim: usize, _idx: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("gather", self.name()))
+    }
+    /// Scatter: `out[i_0, …, idx[…], …] = src[…]` along `dim`. The
+    /// returned tensor is `dst`'s shape; values not addressed by idx
+    /// are copied from `dst`.
+    fn scatter(
+        &self,
+        _dst: &Tensor,
+        _dim: usize,
+        _idx: &Tensor,
+        _src: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("scatter", self.name()))
+    }
+    /// Scatter-add: same as scatter but accumulates instead of
+    /// overwriting (atomic on parallel paths).
+    fn scatter_add(
+        &self,
+        _dst: &Tensor,
+        _dim: usize,
+        _idx: &Tensor,
+        _src: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("scatter_add", self.name()))
+    }
+    /// `index_select(src, dim, indices)` — pick the slices of `src`
+    /// along `dim` matching the (rank-1) `indices` tensor.
+    fn index_select(
+        &self,
+        _src: &Tensor,
+        _dim: usize,
+        _indices: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("index_select", self.name()))
+    }
+    /// `masked_select(src, mask)` — flatten the source into a 1D
+    /// tensor containing every element where `mask` is true.
+    fn masked_select(&self, _src: &Tensor, _mask: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("masked_select", self.name()))
+    }
+    /// `masked_fill(src, mask, value)` — return a copy of `src` with
+    /// `value` written wherever `mask` is true.
+    fn masked_fill(
+        &self,
+        _src: &Tensor,
+        _mask: &Tensor,
+        _value: f64,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("masked_fill", self.name()))
+    }
+    /// `where(cond, x, y)` — element-wise select: `cond ? x : y`.
+    fn r#where(&self, _cond: &Tensor, _x: &Tensor, _y: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("where", self.name()))
+    }
+    /// Indices of nonzero elements (rank-2 I64 tensor of shape
+    /// `[N, ndim]` where `N` is the count of nonzero entries).
+    fn nonzero(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("nonzero", self.name()))
     }
 
     /// Convert a tensor from its current dtype to `target` dtype.
