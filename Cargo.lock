@@ -816,6 +816,7 @@ name = "rustorch-autograd"
 version = "0.0.1"
 dependencies = [
  "rustorch-core",
+ "rustorch-cpu",
  "thiserror",
  "tracing",
 ]

@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 rustorch-core = { workspace = true }
+rustorch-cpu  = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 
