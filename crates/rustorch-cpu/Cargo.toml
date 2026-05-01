@@ -17,6 +17,17 @@ nightly-simd = []
 # Lightweight profiler hooks emitting Chrome trace JSON. Off by default.
 profile      = []
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name    = "math_exp"
+harness = false
+
+[[bench]]
+name    = "activation_relu"
+harness = false
+
 [dependencies]
 rustorch-core = { workspace = true }
 half          = { workspace = true }

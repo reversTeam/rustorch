@@ -97,6 +97,74 @@ pub trait Backend: Send + Sync {
     fn pow_scalar(&self, _src: &Tensor, _exponent: f64) -> Result<Tensor, BackendError> {
         Err(unsupported("pow_scalar", self.name()))
     }
+    /// Element-wise tensor-tensor pow: `out = lhs^rhs` (broadcast).
+    fn pow(&self, _lhs: &Tensor, _rhs: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("pow", self.name()))
+    }
+    /// 1 / sqrt(x).
+    fn rsqrt(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("rsqrt", self.name()))
+    }
+    /// exp(x) - 1, accurate near 0.
+    fn expm1(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("expm1", self.name()))
+    }
+    /// log(1 + x), accurate near 0.
+    fn log1p(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("log1p", self.name()))
+    }
+    /// Base-2 logarithm.
+    fn log2(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("log2", self.name()))
+    }
+    /// Base-10 logarithm.
+    fn log10(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("log10", self.name()))
+    }
+    /// Element-wise asin (radians).
+    fn asin(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("asin", self.name()))
+    }
+    /// Element-wise acos (radians).
+    fn acos(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("acos", self.name()))
+    }
+    /// Element-wise atan (radians).
+    fn atan(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("atan", self.name()))
+    }
+    /// 2-argument atan: `atan2(y, x)`.
+    fn atan2(&self, _y: &Tensor, _x: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("atan2", self.name()))
+    }
+    /// Hyperbolic sine.
+    fn sinh(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("sinh", self.name()))
+    }
+    /// Hyperbolic cosine.
+    fn cosh(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("cosh", self.name()))
+    }
+    /// ELU: `x if x > 0 else alpha * (exp(x) - 1)`.
+    fn elu(&self, _src: &Tensor, _alpha: f64) -> Result<Tensor, BackendError> {
+        Err(unsupported("elu", self.name()))
+    }
+    /// Softplus: `(1/beta) * log(1 + exp(beta * x))`, numerically stable.
+    fn softplus(&self, _src: &Tensor, _beta: f64) -> Result<Tensor, BackendError> {
+        Err(unsupported("softplus", self.name()))
+    }
+    /// HardSwish: `x * relu6(x + 3) / 6`.
+    fn hardswish(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("hardswish", self.name()))
+    }
+    /// HardTanh: clamp(x, min, max).
+    fn hardtanh(&self, _src: &Tensor, _min: f64, _max: f64) -> Result<Tensor, BackendError> {
+        Err(unsupported("hardtanh", self.name()))
+    }
+    /// HardSigmoid: `clamp((x + 3) / 6, 0, 1)`.
+    fn hardsigmoid(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("hardsigmoid", self.name()))
+    }
     /// Sigmoid: `1 / (1 + exp(-x))`.
     fn sigmoid(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
         Err(unsupported("sigmoid", self.name()))

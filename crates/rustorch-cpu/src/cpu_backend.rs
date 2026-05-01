@@ -342,6 +342,176 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn pow(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        if lhs.dtype() != rhs.dtype() {
+            return Err(BackendError::DtypeMismatch {
+                op: "pow",
+                lhs: lhs.dtype(),
+                rhs: rhs.dtype(),
+            });
+        }
+        match lhs.dtype() {
+            Dtype::F32 => map_binary_same::<f32, _>(lhs, rhs, "pow", |a, b| a.powf(b)),
+            Dtype::F64 => map_binary_same::<f64, _>(lhs, rhs, "pow", |a, b| a.powf(b)),
+            d => Err(BackendError::DtypeMismatch {
+                op: "pow",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn rsqrt(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "rsqrt", |x| 1.0 / x.sqrt(), |x| 1.0 / x.sqrt())
+    }
+
+    fn expm1(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "expm1", f32::exp_m1, f64::exp_m1)
+    }
+
+    fn log1p(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "log1p", f32::ln_1p, f64::ln_1p)
+    }
+
+    fn log2(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "log2", f32::log2, f64::log2)
+    }
+
+    fn log10(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "log10", f32::log10, f64::log10)
+    }
+
+    fn asin(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "asin", f32::asin, f64::asin)
+    }
+
+    fn acos(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "acos", f32::acos, f64::acos)
+    }
+
+    fn atan(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "atan", f32::atan, f64::atan)
+    }
+
+    fn atan2(&self, y: &Tensor, x: &Tensor) -> Result<Tensor, BackendError> {
+        if y.dtype() != x.dtype() {
+            return Err(BackendError::DtypeMismatch {
+                op: "atan2",
+                lhs: y.dtype(),
+                rhs: x.dtype(),
+            });
+        }
+        match y.dtype() {
+            Dtype::F32 => map_binary_same::<f32, _>(y, x, "atan2", |a, b| a.atan2(b)),
+            Dtype::F64 => map_binary_same::<f64, _>(y, x, "atan2", |a, b| a.atan2(b)),
+            d => Err(BackendError::DtypeMismatch {
+                op: "atan2",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn sinh(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "sinh", f32::sinh, f64::sinh)
+    }
+
+    fn cosh(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(src, "cosh", f32::cosh, f64::cosh)
+    }
+
+    fn elu(&self, src: &Tensor, alpha: f64) -> Result<Tensor, BackendError> {
+        match src.dtype() {
+            Dtype::F32 => {
+                let a = alpha as f32;
+                map_unary_same::<f32, _>(src, "elu", move |x| {
+                    if x > 0.0 {
+                        x
+                    } else {
+                        a * ((x).exp() - 1.0)
+                    }
+                })
+            },
+            Dtype::F64 => map_unary_same::<f64, _>(src, "elu", move |x| {
+                if x > 0.0 {
+                    x
+                } else {
+                    alpha * (x.exp() - 1.0)
+                }
+            }),
+            d => Err(BackendError::DtypeMismatch {
+                op: "elu",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn softplus(&self, src: &Tensor, beta: f64) -> Result<Tensor, BackendError> {
+        // Numerically stable softplus: when beta*x is large, x ≈ x;
+        // when beta*x is small, log(1 + exp(beta*x)).
+        match src.dtype() {
+            Dtype::F32 => {
+                let beta_f = beta as f32;
+                map_unary_same::<f32, _>(src, "softplus", move |x| {
+                    let bx = beta_f * x;
+                    if bx > 20.0 {
+                        x
+                    } else {
+                        (1.0 + bx.exp()).ln() / beta_f
+                    }
+                })
+            },
+            Dtype::F64 => map_unary_same::<f64, _>(src, "softplus", move |x| {
+                let bx = beta * x;
+                if bx > 20.0 {
+                    x
+                } else {
+                    (1.0 + bx.exp()).ln() / beta
+                }
+            }),
+            d => Err(BackendError::DtypeMismatch {
+                op: "softplus",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn hardswish(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(
+            src,
+            "hardswish",
+            |x| x * ((x + 3.0).clamp(0.0, 6.0)) / 6.0,
+            |x| x * ((x + 3.0).clamp(0.0, 6.0)) / 6.0,
+        )
+    }
+
+    fn hardtanh(&self, src: &Tensor, min: f64, max: f64) -> Result<Tensor, BackendError> {
+        match src.dtype() {
+            Dtype::F32 => {
+                let lo = min as f32;
+                let hi = max as f32;
+                map_unary_same::<f32, _>(src, "hardtanh", move |x| x.clamp(lo, hi))
+            },
+            Dtype::F64 => map_unary_same::<f64, _>(src, "hardtanh", move |x| x.clamp(min, max)),
+            d => Err(BackendError::DtypeMismatch {
+                op: "hardtanh",
+                lhs: d,
+                rhs: d,
+            }),
+        }
+    }
+
+    fn hardsigmoid(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        unary_float(
+            src,
+            "hardsigmoid",
+            |x| ((x + 3.0) / 6.0).clamp(0.0, 1.0),
+            |x| ((x + 3.0) / 6.0).clamp(0.0, 1.0),
+        )
+    }
+
     fn cast(&self, src: &Tensor, target: Dtype) -> Result<Tensor, BackendError> {
         // Tensor::to_dtype already implements the full 8x8 matrix with
         // saturating semantics: Rust 1.45+ defines `f as i` as
@@ -863,5 +1033,249 @@ mod tests {
             b().sigmoid(&t),
             Err(BackendError::DtypeMismatch { .. })
         ));
+    }
+
+    // -------------------- P1.3 Math ops completion --------------------
+
+    #[test]
+    fn pow_tensor_tensor() {
+        let a = Tensor::from_vec([3usize], vec![2.0_f32, 3.0, 4.0]).unwrap();
+        let b_t = Tensor::from_vec([3usize], vec![2.0_f32, 2.0, 2.0]).unwrap();
+        let r = b().pow(&a, &b_t).unwrap();
+        assert_eq!(r.as_slice::<f32>().unwrap(), &[4.0, 9.0, 16.0]);
+    }
+
+    #[test]
+    fn rsqrt_basic() {
+        let a = Tensor::from_vec([3usize], vec![1.0_f32, 4.0, 16.0]).unwrap();
+        let r = b().rsqrt(&a).unwrap();
+        let v = r.as_slice::<f32>().unwrap();
+        assert!((v[0] - 1.0).abs() < 1e-6);
+        assert!((v[1] - 0.5).abs() < 1e-6);
+        assert!((v[2] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn expm1_log1p_round_trip_near_zero() {
+        let a = Tensor::from_vec([3usize], vec![0.0_f32, 1e-7, -1e-7]).unwrap();
+        let e = b().expm1(&a).unwrap();
+        let v = e.as_slice::<f32>().unwrap();
+        assert_eq!(v[0], 0.0);
+        assert!((v[1] - 1e-7).abs() < 1e-13);
+        let inv = b().log1p(&e).unwrap();
+        let w = inv.as_slice::<f32>().unwrap();
+        assert!(w[0].abs() < 1e-7);
+    }
+
+    #[test]
+    fn log2_log10_known_values() {
+        let a = Tensor::from_vec([2usize], vec![8.0_f32, 1000.0]).unwrap();
+        let r2 = b().log2(&a).unwrap().as_slice::<f32>().unwrap().to_vec();
+        let r10 = b().log10(&a).unwrap().as_slice::<f32>().unwrap().to_vec();
+        assert!((r2[0] - 3.0).abs() < 1e-5);
+        assert!((r10[1] - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn asin_acos_atan_known() {
+        let a = Tensor::from_vec([3usize], vec![0.0_f32, 0.5, 1.0]).unwrap();
+        let asin_r = b().asin(&a).unwrap().as_slice::<f32>().unwrap().to_vec();
+        let acos_r = b().acos(&a).unwrap().as_slice::<f32>().unwrap().to_vec();
+        let atan_r = b().atan(&a).unwrap().as_slice::<f32>().unwrap().to_vec();
+        assert!(asin_r[0].abs() < 1e-6);
+        assert!((asin_r[1] - core::f32::consts::FRAC_PI_6).abs() < 1e-5);
+        assert!((asin_r[2] - core::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!((acos_r[0] - core::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!(acos_r[2].abs() < 1e-6);
+        assert!(atan_r[0].abs() < 1e-6);
+        assert!((atan_r[2] - core::f32::consts::FRAC_PI_4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn atan2_y_eq_x_is_pi_over_4() {
+        let y = Tensor::from_vec([1usize], vec![1.0_f32]).unwrap();
+        let x = Tensor::from_vec([1usize], vec![1.0_f32]).unwrap();
+        let r = b().atan2(&y, &x).unwrap().as_slice::<f32>().unwrap()[0];
+        assert!((r - core::f32::consts::FRAC_PI_4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sinh_cosh_at_zero() {
+        let z = Tensor::from_vec([1usize], vec![0.0_f32]).unwrap();
+        assert!(b().sinh(&z).unwrap().as_slice::<f32>().unwrap()[0].abs() < 1e-7);
+        assert!((b().cosh(&z).unwrap().as_slice::<f32>().unwrap()[0] - 1.0).abs() < 1e-7);
+    }
+
+    // -------------------- P1.3 Activations completion --------------------
+
+    #[test]
+    fn elu_negative_scaled_by_alpha() {
+        let a = Tensor::from_vec([3usize], vec![-1.0_f32, 0.0, 1.0]).unwrap();
+        let r = b().elu(&a, 1.0).unwrap();
+        let v = r.as_slice::<f32>().unwrap();
+        assert!((v[0] - (-0.6321)).abs() < 1e-3);
+        assert_eq!(v[1], 0.0);
+        assert_eq!(v[2], 1.0);
+    }
+
+    #[test]
+    fn softplus_at_zero_is_log2() {
+        let z = Tensor::from_vec([1usize], vec![0.0_f32]).unwrap();
+        let r = b().softplus(&z, 1.0).unwrap().as_slice::<f32>().unwrap()[0];
+        assert!((r - core::f32::consts::LN_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn softplus_stable_at_extreme() {
+        let big = Tensor::from_vec([1usize], vec![1e10_f32]).unwrap();
+        let r = b().softplus(&big, 1.0).unwrap().as_slice::<f32>().unwrap()[0];
+        assert!(r.is_finite());
+        assert!((r - 1e10_f32).abs() < 1.0);
+    }
+
+    #[test]
+    fn hardswish_ramp() {
+        let a = Tensor::from_vec([4usize], vec![-3.0_f32, 0.0, 3.0, 6.0]).unwrap();
+        let r = b()
+            .hardswish(&a)
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        assert!(r[0].abs() < 1e-6);
+        assert!(r[1].abs() < 1e-6);
+        assert!((r[2] - 3.0).abs() < 1e-6);
+        assert!((r[3] - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hardtanh_clamps() {
+        let a = Tensor::from_vec([4usize], vec![-2.0_f32, -1.0, 0.0, 2.0]).unwrap();
+        let r = b()
+            .hardtanh(&a, -1.0, 1.0)
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        assert_eq!(r, vec![-1.0_f32, -1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn hardsigmoid_zero_three_neg_three() {
+        let a = Tensor::from_vec([3usize], vec![-3.0_f32, 0.0, 3.0]).unwrap();
+        let r = b()
+            .hardsigmoid(&a)
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        assert!(r[0].abs() < 1e-6);
+        assert!((r[1] - 0.5).abs() < 1e-6);
+        assert!((r[2] - 1.0).abs() < 1e-6);
+    }
+
+    // -------------------- Numerical-stability sanity --------------------
+
+    #[test]
+    fn sigmoid_stable_on_extreme_inputs() {
+        let a = Tensor::from_vec([2usize], vec![-1e10_f32, 1e10]).unwrap();
+        let r = b().sigmoid(&a).unwrap().as_slice::<f32>().unwrap().to_vec();
+        assert_eq!(r[0], 0.0);
+        assert_eq!(r[1], 1.0);
+    }
+
+    // -------------------- Numerical-property tests --------------------
+
+    #[test]
+    fn sin_cos_pythagorean_identity_property() {
+        let mut s: u64 = 0xCAFE1234;
+        let mut data = Vec::with_capacity(50);
+        for _ in 0..50 {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let bits = (s ^ (s >> 32)) as u32;
+            let v = ((bits as f32) / (u32::MAX as f32)) * 2.0 * core::f32::consts::PI
+                - core::f32::consts::PI;
+            data.push(v);
+        }
+        let t = Tensor::from_vec([data.len()], data).unwrap();
+        let s_val = b().sin(&t).unwrap();
+        let c_val = b().cos(&t).unwrap();
+        let s2 = b().mul(&s_val, &s_val).unwrap();
+        let c2 = b().mul(&c_val, &c_val).unwrap();
+        let sum = b().add(&s2, &c2).unwrap();
+        for &v in sum.as_slice::<f32>().unwrap() {
+            assert!((v - 1.0).abs() < 1e-5, "sin²+cos² != 1: {}", v);
+        }
+    }
+
+    // -------------------- Math edge cases (NaN/Inf semantics) --------------------
+
+    #[test]
+    fn log_zero_is_neg_inf() {
+        let z = Tensor::from_vec([1usize], vec![0.0_f32]).unwrap();
+        let r = b().log(&z).unwrap().as_slice::<f32>().unwrap()[0];
+        assert!(
+            r.is_infinite() && r.is_sign_negative(),
+            "log(0) ≠ -Inf: {r}"
+        );
+    }
+
+    #[test]
+    fn log_neg_is_nan() {
+        let n = Tensor::from_vec([1usize], vec![-1.0_f32]).unwrap();
+        assert!(b().log(&n).unwrap().as_slice::<f32>().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn sqrt_neg_is_nan() {
+        let n = Tensor::from_vec([1usize], vec![-1.0_f32]).unwrap();
+        assert!(b().sqrt(&n).unwrap().as_slice::<f32>().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn exp_overflow_is_inf() {
+        let big = Tensor::from_vec([1usize], vec![1000.0_f32]).unwrap();
+        let r = b().exp(&big).unwrap().as_slice::<f32>().unwrap()[0];
+        assert!(r.is_infinite());
+    }
+
+    #[test]
+    fn nan_propagates_through_unary() {
+        let n = Tensor::from_vec([1usize], vec![f32::NAN]).unwrap();
+        for r in [
+            b().sqrt(&n),
+            b().exp(&n),
+            b().log(&n),
+            b().sin(&n),
+            b().cos(&n),
+            b().tan(&n),
+            b().abs(&n),
+            b().sigmoid(&n),
+            b().tanh(&n),
+            b().gelu(&n),
+            b().silu(&n),
+        ] {
+            assert!(r.unwrap().as_slice::<f32>().unwrap()[0].is_nan());
+        }
+    }
+
+    #[test]
+    fn sigmoid_symmetric_property() {
+        let mut s: u64 = 0x00C0_FFEE_BEEF;
+        let mut data = Vec::with_capacity(50);
+        for _ in 0..50 {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let bits = (s ^ (s >> 32)) as u32;
+            let v = ((bits as f32) / (u32::MAX as f32)) * 20.0 - 10.0;
+            data.push(v);
+        }
+        let t = Tensor::from_vec([data.len()], data).unwrap();
+        let neg_t = b().neg(&t).unwrap();
+        let s1 = b().sigmoid(&t).unwrap();
+        let s2 = b().sigmoid(&neg_t).unwrap();
+        let sum = b().add(&s1, &s2).unwrap();
+        for &v in sum.as_slice::<f32>().unwrap() {
+            assert!((v - 1.0).abs() < 1e-6, "sigmoid(x)+sigmoid(-x) != 1: {}", v);
+        }
     }
 }

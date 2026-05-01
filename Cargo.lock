@@ -851,6 +851,7 @@ dependencies = [
 name = "rustorch-cpu"
 version = "0.0.1"
 dependencies = [
+ "criterion",
  "half",
  "num-traits",
  "rayon",
