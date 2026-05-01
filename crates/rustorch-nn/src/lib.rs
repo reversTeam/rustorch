@@ -41,7 +41,7 @@ pub use init::{calculate_fan, init, init_with_seed, FanMode, Init, Nonlinearity}
 pub use linear::Linear;
 pub use loss::{Criterion, CrossEntropyLoss, MseLoss};
 pub use module::Module;
-pub use norm::{LayerNorm, RMSNorm};
+pub use norm::{BatchNorm2d, LayerNorm, RMSNorm};
 pub use sequential::Sequential;
 pub use state_dict::{load_state_dict, state_dict, LoadReport, StateDictError};
 

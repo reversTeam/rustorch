@@ -1507,6 +1507,72 @@ impl Node for Conv2dBackward {
 }
 
 // --------------------------------------------------------------------------
+// batch_norm2d — train mode; running stats handled at the Module level.
+// --------------------------------------------------------------------------
+
+struct BatchNorm2dBackward {
+    input_saved: Tensor,
+    gamma_saved: Tensor,
+    saved_mean: Tensor,
+    saved_var: Tensor,
+    eps: f32,
+    edges: [Edge; 3],
+}
+
+impl Node for BatchNorm2dBackward {
+    fn name(&self) -> &'static str {
+        "BatchNorm2dBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let (dx, dg, db) = rustorch_cpu::kernels::norm::batch_norm2d_backward(
+            grad,
+            &self.input_saved,
+            &self.gamma_saved,
+            &self.saved_mean,
+            &self.saved_var,
+            self.eps,
+        )
+        .expect("bn2d backward");
+        vec![Some(dx), Some(dg), Some(db)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// Autograd-aware BatchNorm2d (train mode). Returns the normalised
+/// output; running-stats updates are handled at the Module layer.
+pub fn batch_norm2d(
+    input: &Variable,
+    gamma: &Variable,
+    beta: &Variable,
+    eps: f32,
+) -> Result<Variable, BackwardError> {
+    let (out, mean, var) = rustorch_cpu::kernels::norm::batch_norm2d_forward(
+        &input.tensor(),
+        &gamma.tensor(),
+        &beta.tensor(),
+        eps,
+    )
+    .map_err(|e| backend_err("batch_norm2d", e))?;
+    let mut out_var = Variable::new(out);
+    let any_grad = input.requires_grad || gamma.requires_grad || beta.requires_grad;
+    if is_grad_enabled() && any_grad {
+        let node = std::sync::Arc::new(BatchNorm2dBackward {
+            input_saved: input.tensor().clone(),
+            gamma_saved: gamma.tensor().clone(),
+            saved_mean: mean,
+            saved_var: var,
+            eps,
+            edges: [input.edge(), gamma.edge(), beta.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
 // maxpool2d — backward scatters grad to argmax positions
 // --------------------------------------------------------------------------
 

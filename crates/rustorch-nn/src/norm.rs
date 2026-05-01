@@ -160,6 +160,112 @@ impl Module for LayerNorm {
     }
 }
 
+// ------------------------------ BatchNorm2d ------------------------------
+
+/// BatchNorm2d (Ioffe & Szegedy 2015). Layout `[N, C, H, W]`.
+/// v1 ships **train mode only** — running stats are not tracked yet
+/// (eval-mode + running mean/var pending).
+pub struct BatchNorm2d {
+    /// Learnable per-channel scale.
+    pub gamma: Variable,
+    /// Learnable per-channel shift.
+    pub beta: Variable,
+    eps: f32,
+    num_features: usize,
+}
+
+impl BatchNorm2d {
+    /// Build with the given `num_features` (channel count) and default
+    /// eps = 1e-5.
+    pub fn new(num_features: usize) -> Self {
+        Self::with_eps(num_features, 1e-5)
+    }
+
+    /// Build with explicit epsilon.
+    pub fn with_eps(num_features: usize, eps: f32) -> Self {
+        let gamma = Variable::leaf(
+            Tensor::from_vec([num_features], vec![1.0_f32; num_features]).expect("gamma shape"),
+        );
+        let beta = Variable::leaf(
+            Tensor::from_vec([num_features], vec![0.0_f32; num_features]).expect("beta shape"),
+        );
+        BatchNorm2d {
+            gamma,
+            beta,
+            eps,
+            num_features,
+        }
+    }
+
+    /// Channel count.
+    pub fn num_features(&self) -> usize {
+        self.num_features
+    }
+}
+
+impl Module for BatchNorm2d {
+    fn forward(&self, input: &Variable) -> Result<Variable, ModuleError> {
+        ops::batch_norm2d(input, &self.gamma, &self.beta, self.eps)
+    }
+
+    fn parameters(&self) -> Vec<Variable> {
+        vec![self.gamma.clone(), self.beta.clone()]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Variable)> {
+        vec![
+            ("gamma".to_string(), self.gamma.clone()),
+            ("beta".to_string(), self.beta.clone()),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod batch_norm_tests {
+    use super::*;
+    use rustorch_autograd::backward;
+
+    #[test]
+    fn batch_norm2d_normalises_per_channel() {
+        let bn = BatchNorm2d::new(2);
+        let x = Variable::new(
+            Tensor::from_vec(
+                [2usize, 2, 2, 2],
+                (0..16).map(|i| i as f32).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let y = bn.forward(&x).unwrap();
+        assert_eq!(y.tensor().shape(), &[2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn batch_norm2d_backward_grads_flow() {
+        let bn = BatchNorm2d::new(2);
+        let x = Variable::leaf(
+            Tensor::from_vec(
+                [2usize, 2, 2, 2],
+                (0..16).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let y = bn.forward(&x).unwrap();
+        let s = rustorch_autograd::ops::sum(&y).unwrap();
+        backward(&s, None).unwrap();
+        assert!(bn.gamma.grad().is_some());
+        assert!(bn.beta.grad().is_some());
+        assert!(x.grad().is_some());
+    }
+
+    #[test]
+    fn batch_norm2d_named_parameters() {
+        let bn = BatchNorm2d::new(8);
+        let np = bn.named_parameters();
+        let names: Vec<String> = np.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, vec!["gamma".to_string(), "beta".to_string()]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
