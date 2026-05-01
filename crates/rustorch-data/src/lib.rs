@@ -18,7 +18,9 @@ pub mod sampler;
 pub use augment::{Augment, AugmentError, HorizontalFlip, Mixup, Normalize, RandomHorizontalFlip};
 pub use dataloader::{DataLoader, DataLoaderError};
 pub use dataset::{Dataset, DatasetError, IterableDataset, TensorDataset};
-pub use sampler::{RandomSampler, Sampler, SequentialSampler};
+pub use sampler::{
+    DistributedSampler, RandomSampler, Sampler, SequentialSampler, WeightedRandomSampler,
+};
 
 /// Crate version reported at runtime.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
