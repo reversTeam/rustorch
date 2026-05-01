@@ -1180,6 +1180,68 @@ pub fn pow_scalar(src: &Variable, exponent: f64) -> Result<Variable, BackwardErr
 }
 
 // --------------------------------------------------------------------------
+// index_select(src, dim=0, idx) — backward via scatter_add along dim 0
+// (specialised for 1-D index tensor over a 2-D `src` of shape [V, D])
+// --------------------------------------------------------------------------
+
+struct IndexSelectBackward {
+    in_shape: Vec<usize>, // src shape (V, D, ...)
+    indices: Tensor,      // 1-D I64 of length K
+    edges: [Edge; 1],
+}
+
+impl Node for IndexSelectBackward {
+    fn name(&self) -> &'static str {
+        "IndexSelectBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // For src shape [V, D...] and idx shape [K], grad has shape
+        // [K, D...]. Backward: src_grad[idx[k]] += grad[k].
+        let v = self.in_shape[0];
+        let row_size: usize = self.in_shape[1..].iter().product();
+        let row_size = row_size.max(1); // 1-D src (D=1) edge case
+        let k = self.indices.numel();
+        let g_data = grad.as_slice::<f32>().expect("f32 grad");
+        let idx_data = self.indices.as_slice::<i64>().expect("i64 idx");
+        let mut src_grad = vec![0.0_f32; v * row_size];
+        for (k_i, &idx_v) in idx_data.iter().enumerate().take(k) {
+            let v_i = idx_v as usize;
+            // Add g_data[k_i * row_size .. (k_i+1) * row_size] to
+            // src_grad[v_i * row_size .. (v_i+1) * row_size]
+            let g_off = k_i * row_size;
+            let s_off = v_i * row_size;
+            for j in 0..row_size {
+                src_grad[s_off + j] += g_data[g_off + j];
+            }
+        }
+        let g_t = Tensor::from_vec(self.in_shape.clone(), src_grad).expect("index_select bw shape");
+        vec![Some(g_t)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `index_select(src, 0, indices)` — gather rows of `src` by 1-D I64
+/// indices (autograd-aware; backward via scatter-add).
+pub fn index_select(src: &Variable, indices: &Tensor) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .index_select(&src.tensor(), 0, indices)
+        .map_err(|e| backend_err("index_select", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(IndexSelectBackward {
+            in_shape: src.tensor().shape().to_vec(),
+            indices: indices.clone(),
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
 // mean_dim — d/dx mean(x, dim, keepdim=true) broadcasts grad/N back to x.shape
 // --------------------------------------------------------------------------
 

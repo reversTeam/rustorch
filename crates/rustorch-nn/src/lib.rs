@@ -16,6 +16,7 @@
 
 pub mod activation;
 pub mod container;
+pub mod embedding;
 pub mod init;
 pub mod linear;
 pub mod loss;
@@ -29,6 +30,7 @@ pub use activation::{
     Sigmoid, Silu, Softmax, Tanh,
 };
 pub use container::{ModuleDict, ModuleList};
+pub use embedding::Embedding;
 pub use init::{calculate_fan, init, init_with_seed, FanMode, Init, Nonlinearity};
 pub use linear::Linear;
 pub use loss::{Criterion, CrossEntropyLoss, MseLoss};
