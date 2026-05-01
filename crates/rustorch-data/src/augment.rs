@@ -222,6 +222,143 @@ impl Augment for Mixup {
     }
 }
 
+// ------------------------------ Resize ------------------------------
+
+/// Resize a `[..., H, W]` image by nearest-neighbour interpolation
+/// (v1). Bilinear and bicubic pending follow-up.
+pub struct Resize {
+    /// Target spatial shape (h, w).
+    pub target: (usize, usize),
+}
+
+impl Resize {
+    /// Build with the target (h, w).
+    pub fn new(target_h: usize, target_w: usize) -> Self {
+        Resize {
+            target: (target_h, target_w),
+        }
+    }
+}
+
+impl Augment for Resize {
+    fn apply(&mut self, x: &Tensor) -> Result<Tensor, AugmentError> {
+        let s = x.shape().to_vec();
+        if s.len() < 2 {
+            return Err(AugmentError::BadRank {
+                expected: 2,
+                got: s.len(),
+            });
+        }
+        let h_in = s[s.len() - 2];
+        let w_in = s[s.len() - 1];
+        let (h_out, w_out) = self.target;
+        // Number of leading batch/channel elements.
+        let leading: usize = s[..s.len() - 2].iter().product::<usize>().max(1);
+        let in_data = x
+            .as_slice::<f32>()
+            .ok_or_else(|| AugmentError::Backend("expected contiguous F32".to_string()))?;
+        let mut out = vec![0.0_f32; leading * h_out * w_out];
+        for n in 0..leading {
+            for i in 0..h_out {
+                for j in 0..w_out {
+                    // Nearest-neighbour
+                    let i_in = ((i as f32 + 0.5) * (h_in as f32) / (h_out as f32)) as usize;
+                    let j_in = ((j as f32 + 0.5) * (w_in as f32) / (w_out as f32)) as usize;
+                    let i_in = i_in.min(h_in - 1);
+                    let j_in = j_in.min(w_in - 1);
+                    let in_idx = (n * h_in + i_in) * w_in + j_in;
+                    let out_idx = (n * h_out + i) * w_out + j;
+                    out[out_idx] = in_data[in_idx];
+                }
+            }
+        }
+        let mut new_shape: Vec<usize> = s[..s.len() - 2].to_vec();
+        new_shape.push(h_out);
+        new_shape.push(w_out);
+        Tensor::from_vec(new_shape, out).map_err(|e| AugmentError::Backend(format!("{e}")))
+    }
+}
+
+// ------------------------------ RandomCrop ------------------------------
+
+/// Random crop. v1 ignores `padding` (no zero-fill); samples a window
+/// inside the input.
+pub struct RandomCrop {
+    /// Target spatial shape (h, w).
+    pub target: (usize, usize),
+    /// Padding (currently unused; kept on the API surface).
+    pub padding: usize,
+    rng: StdRng,
+}
+
+impl RandomCrop {
+    /// Build with target + pre-crop padding (padding is currently ignored).
+    pub fn new(target_h: usize, target_w: usize, padding: usize) -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        RandomCrop {
+            target: (target_h, target_w),
+            padding,
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+    /// Reproducible build with a fixed seed.
+    pub fn with_seed(target_h: usize, target_w: usize, padding: usize, seed: u64) -> Self {
+        RandomCrop {
+            target: (target_h, target_w),
+            padding,
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+}
+
+impl Augment for RandomCrop {
+    fn apply(&mut self, x: &Tensor) -> Result<Tensor, AugmentError> {
+        let s = x.shape().to_vec();
+        if s.len() < 2 {
+            return Err(AugmentError::BadRank {
+                expected: 2,
+                got: s.len(),
+            });
+        }
+        let h_in = s[s.len() - 2];
+        let w_in = s[s.len() - 1];
+        let (h_out, w_out) = self.target;
+        let h_max = h_in.saturating_sub(h_out);
+        let w_max = w_in.saturating_sub(w_out);
+        let off_h = if h_max > 0 {
+            self.rng.gen_range(0..=h_max)
+        } else {
+            0
+        };
+        let off_w = if w_max > 0 {
+            self.rng.gen_range(0..=w_max)
+        } else {
+            0
+        };
+        let leading: usize = s[..s.len() - 2].iter().product::<usize>().max(1);
+        let in_data = x
+            .as_slice::<f32>()
+            .ok_or_else(|| AugmentError::Backend("expected contiguous F32".to_string()))?;
+        let mut out = vec![0.0_f32; leading * h_out * w_out];
+        for n in 0..leading {
+            for i in 0..h_out {
+                for j in 0..w_out {
+                    let in_idx = (n * h_in + off_h + i) * w_in + off_w + j;
+                    let out_idx = (n * h_out + i) * w_out + j;
+                    out[out_idx] = in_data[in_idx];
+                }
+            }
+        }
+        let mut new_shape: Vec<usize> = s[..s.len() - 2].to_vec();
+        new_shape.push(h_out);
+        new_shape.push(w_out);
+        Tensor::from_vec(new_shape, out).map_err(|e| AugmentError::Backend(format!("{e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

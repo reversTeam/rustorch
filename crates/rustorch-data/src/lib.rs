@@ -17,7 +17,10 @@ pub mod dataset;
 pub mod sampler;
 pub mod text;
 
-pub use augment::{Augment, AugmentError, HorizontalFlip, Mixup, Normalize, RandomHorizontalFlip};
+pub use augment::{
+    Augment, AugmentError, HorizontalFlip, Mixup, Normalize, RandomCrop, RandomHorizontalFlip,
+    Resize,
+};
 pub use bundled::{synthetic_cifar10, synthetic_mnist};
 pub use dataloader::{DataLoader, DataLoaderError};
 pub use dataset::{Dataset, DatasetError, IterableDataset, TensorDataset};
