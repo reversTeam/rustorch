@@ -84,6 +84,73 @@ impl Conv2d {
     }
 }
 
+/// 1-D convolution. Layout `[N, C_in, L]`. Implemented as a Conv2d on
+/// `[N, C_in, 1, L]` with kernel `(1, kW)` for v1 — semantically
+/// identical and reuses the existing Conv2d kernels.
+pub struct Conv1d {
+    /// Underlying Conv2d.
+    inner: Conv2d,
+    kernel_size: usize,
+}
+
+impl Conv1d {
+    /// Build a Conv1d.
+    pub fn new(in_channels: usize, out_channels: usize, kernel_size: usize) -> Self {
+        let inner = Conv2d::with_padding(in_channels, out_channels, (1, kernel_size), (0, 0));
+        Conv1d { inner, kernel_size }
+    }
+
+    /// Build with explicit padding.
+    pub fn with_padding(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        padding: usize,
+    ) -> Self {
+        let inner = Conv2d::with_padding(in_channels, out_channels, (1, kernel_size), (0, padding));
+        Conv1d { inner, kernel_size }
+    }
+
+    /// Disable bias.
+    #[must_use]
+    pub fn no_bias(mut self) -> Self {
+        self.inner = self.inner.no_bias();
+        self
+    }
+
+    /// Kernel size.
+    pub fn kernel_size(&self) -> usize {
+        self.kernel_size
+    }
+}
+
+impl Module for Conv1d {
+    fn forward(&self, input: &Variable) -> Result<Variable, ModuleError> {
+        // Reshape [N, C, L] → [N, C, 1, L], conv, then reshape back.
+        let s = input.tensor().shape().to_vec();
+        if s.len() != 3 {
+            return Err(rustorch_autograd::BackwardError::Backend {
+                op: "conv1d",
+                message: format!("expected rank-3 input [N, C, L], got {s:?}"),
+            });
+        }
+        let (n, c, l) = (s[0], s[1], s[2]);
+        let x_4d = ops::reshape(input, vec![n, c, 1, l])?;
+        let y_4d = self.inner.forward(&x_4d)?;
+        let s2 = y_4d.tensor().shape().to_vec();
+        let (n2, c2, _, l2) = (s2[0], s2[1], s2[2], s2[3]);
+        ops::reshape(&y_4d, vec![n2, c2, l2])
+    }
+
+    fn parameters(&self) -> Vec<Variable> {
+        self.inner.parameters()
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Variable)> {
+        self.inner.named_parameters()
+    }
+}
+
 /// 2-D max-pooling layer (stateless, no parameters).
 pub struct MaxPool2d {
     kernel_size: (usize, usize),

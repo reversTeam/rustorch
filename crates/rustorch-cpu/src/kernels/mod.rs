@@ -3,6 +3,8 @@
 //! file-name target.
 
 pub mod conv;
+pub mod ctc;
+pub mod einsum;
 pub mod linalg;
 pub mod loss;
 pub mod norm;

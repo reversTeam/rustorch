@@ -34,11 +34,11 @@ pub use activation::{
 };
 pub use attention::{scaled_dot_product_attention, SingleHeadAttention};
 pub use container::{ModuleDict, ModuleList};
-pub use conv::{Conv2d, MaxPool2d};
+pub use conv::{Conv1d, Conv2d, MaxPool2d};
 pub use embedding::Embedding;
 pub use hooks::{HookHandle, HookedModule};
 pub use init::{calculate_fan, init, init_with_seed, FanMode, Init, Nonlinearity};
-pub use linear::Linear;
+pub use linear::{Bilinear, Linear};
 pub use loss::{Criterion, CrossEntropyLoss, MseLoss};
 pub use module::Module;
 pub use norm::{BatchNorm2d, LayerNorm, RMSNorm};
