@@ -11,11 +11,13 @@
 #![warn(rust_2018_idioms)]
 
 pub mod augment;
+pub mod bundled;
 pub mod dataloader;
 pub mod dataset;
 pub mod sampler;
 
 pub use augment::{Augment, AugmentError, HorizontalFlip, Mixup, Normalize, RandomHorizontalFlip};
+pub use bundled::{synthetic_cifar10, synthetic_mnist};
 pub use dataloader::{DataLoader, DataLoaderError};
 pub use dataset::{Dataset, DatasetError, IterableDataset, TensorDataset};
 pub use sampler::{
