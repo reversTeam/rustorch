@@ -1,0 +1,7 @@
+[toolchain]
+# Pin to stable channel for portability across rustup / homebrew installs.
+# MSRV is also enforced via rust-version = "1.78" in workspace Cargo.toml.
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

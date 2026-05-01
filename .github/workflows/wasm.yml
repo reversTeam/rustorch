@@ -1,0 +1,55 @@
+name: WASM
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: cargo build --target wasm32-unknown-unknown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - name: Build rustorch-core for wasm32
+        run: cargo build --target wasm32-unknown-unknown -p rustorch-core
+      - name: Build rustorch-autograd for wasm32
+        run: cargo build --target wasm32-unknown-unknown -p rustorch-autograd
+      - name: Build rustorch-nn for wasm32
+        run: cargo build --target wasm32-unknown-unknown -p rustorch-nn
+
+  headless-test:
+    name: wasm-pack test (headless Chrome)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm-test
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+      - name: Run headless tests for rustorch-core
+        # Phase 2 will add wasm-bindgen-test invocations; for Phase 0 we just
+        # confirm the build target is wired correctly.
+        run: cargo build --target wasm32-unknown-unknown -p rustorch-core

@@ -1,0 +1,32 @@
+# Per-target rustflags (portable, committed to VCS).
+#
+# Note for macOS contributors: if `cargo build --target wasm32-unknown-unknown`
+# fails with "can't find crate for `core`", your shell PATH is picking up
+# Homebrew's cargo (`/opt/homebrew/bin/cargo`) which shadows the rustup one.
+# Fix:  prepend `$HOME/.cargo/bin` to PATH so rustup's shims win,
+#       OR  invoke explicitly: `~/.cargo/bin/cargo build ...`
+#       OR  set RUSTC env var to your rustup stable rustc binary.
+# The Linux / Windows rustup defaults do not have this issue.
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
+
+# Native dev profile: enable target-cpu=native for tight matmul loops
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+# Convenience aliases — invoke as `cargo <alias>`
+[alias]
+fmt-check    = "fmt --all -- --check"
+lint         = "clippy --workspace --all-targets --all-features -- -D warnings"
+lint-fix     = "clippy --workspace --all-targets --fix --allow-dirty --allow-staged"
+test-all     = "test --workspace --all-features"
+test-no-default = "test --workspace --no-default-features"
+ci-check     = "check --workspace --all-targets --all-features"
+docs         = "doc --workspace --no-deps --all-features"
+deny         = "deny --workspace check"
+cov          = "llvm-cov --workspace --lcov --output-path lcov.info"
+wasm         = "build --target wasm32-unknown-unknown -p rustorch-core"

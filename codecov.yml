@@ -1,0 +1,90 @@
+# Codecov configuration for rustorch.
+# Docs: https://docs.codecov.com/docs/codecovyml-reference
+
+codecov:
+  require_ci_to_pass: true
+  notify:
+    wait_for_ci: true
+
+# Coverage targets
+coverage:
+  precision: 2
+  round: down
+  range: "85...95"
+
+  status:
+    project:
+      default:
+        target: 95%       # workspace-wide target
+        threshold: 1%      # tolerance for noise
+        if_ci_failed: error
+        only_pulls: false
+      core:
+        target: 95%
+        paths:
+          - "crates/rustorch-core/"
+          - "crates/rustorch-autograd/"
+      kernels:
+        target: 95%
+        paths:
+          - "crates/rustorch-cpu/"
+      nn:
+        target: 95%
+        paths:
+          - "crates/rustorch-nn/"
+          - "crates/rustorch-optim/"
+      data:
+        target: 95%
+        paths:
+          - "crates/rustorch-data/"
+          - "crates/rustorch-serde/"
+    patch:
+      default:
+        target: 90%        # new code must be at least 90% covered
+        threshold: 0%
+        only_pulls: true
+
+  # Default ignored files = generated code, test helpers, examples
+  ignore:
+    - "**/build.rs"
+    - "**/target/"
+    - "**/tests/"
+    - "**/benches/"
+    - "**/examples/"
+    - "crates/rustorch-codegen/"  # build-time-only crate, exempt
+    - "crates/rustorch-derive/"   # proc-macro crate, no runtime cov
+
+# Comment on pull requests
+comment:
+  layout: "header, diff, flags, components, files"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+  show_carryforward_flags: false
+  show_critical_paths: true
+
+# Components — file-pattern groupings shown in the PR comment
+component_management:
+  individual_components:
+    - component_id: core
+      name: core
+      paths:
+        - "crates/rustorch-core/**"
+        - "crates/rustorch-autograd/**"
+    - component_id: cpu
+      name: cpu-backend
+      paths:
+        - "crates/rustorch-cpu/**"
+    - component_id: nn
+      name: nn-modules
+      paths:
+        - "crates/rustorch-nn/**"
+        - "crates/rustorch-optim/**"
+    - component_id: data
+      name: data-pipeline
+      paths:
+        - "crates/rustorch-data/**"
+        - "crates/rustorch-serde/**"
+
+# Slack/email notifications: configured at the org level, not here.

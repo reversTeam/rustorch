@@ -1,0 +1,22 @@
+[package]
+name = "rustorch-codegen"
+description = "build.rs codegen helpers for rustorch (parses ops.yaml -> Rust source)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde       = { workspace = true }
+serde_yaml  = { workspace = true }
+quote       = { workspace = true }
+proc-macro2 = { workspace = true }
+heck        = { workspace = true }
+thiserror   = { workspace = true }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

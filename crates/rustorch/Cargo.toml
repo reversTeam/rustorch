@@ -1,0 +1,44 @@
+[package]
+name = "rustorch"
+description = "Pure Rust port of PyTorch — Tensor library + autograd + nn + optim + multi-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Default features mirror the user-facing doc v0.7.2 (cuda / bf16 / fp16 / safetensors enabled by default).
+# Explicit feature stubs are declared even when their backing crates are not yet implemented,
+# so that the public Cargo surface is stable from day one.
+[features]
+default = ["bf16", "fp16", "safetensors"]
+bf16        = []
+fp16        = []
+safetensors = []
+serde       = ["rustorch-core/serde"]
+derive      = ["rustorch-nn/derive"]
+# Phase-2.5+ backends — feature-gated, no-op until the underlying crate ships
+cuda        = []
+rocm        = []
+mkl         = []
+accelerate  = []
+mlir        = []
+
+[dependencies]
+rustorch-core     = { workspace = true }
+rustorch-cpu      = { workspace = true }
+rustorch-autograd = { workspace = true }
+rustorch-nn       = { workspace = true }
+rustorch-optim    = { workspace = true }
+rustorch-data     = { workspace = true }
+rustorch-serde    = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

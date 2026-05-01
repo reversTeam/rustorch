@@ -1,0 +1,97 @@
+# cargo-deny configuration for rustorch.
+#
+# CI invokes:    cargo deny check
+# Local fix:     cargo deny check --hide-inclusion-graph
+#
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Use all available targets to catch transitive deps from cfg-gated code paths.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Vulnerability advisories (RustSec)
+# ---------------------------------------------------------------------------
+[advisories]
+db-path = "$CARGO_HOME/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Newer schema removes individual `vulnerability/unmaintained/...` keys —
+# everything that's not "ignore"-d here counts as an error.
+ignore = [
+    # Document each ignored advisory with rationale + expiry.
+    # Format:
+    # { id = "RUSTSEC-2024-XXXX", reason = "...", expiration = "2026-12-31" },
+]
+
+# ---------------------------------------------------------------------------
+# License whitelist
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+]
+confidence-threshold = 0.93
+
+# Some old crates have non-SPDX license expressions; resolve them by hand.
+[[licenses.exceptions]]
+name = "ring"
+allow = ["ISC", "MIT", "OpenSSL"]
+
+[[licenses.clarify]]
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ---------------------------------------------------------------------------
+# Source whitelist — accept only crates.io and rustorch's own GitHub
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = ["rustorch"]
+
+# ---------------------------------------------------------------------------
+# Banned crates — encourage Rust-native alternatives where they exist
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = [
+    # openssl-sys: prefer rustls. We use HTTPS clients for dataset fetch
+    # (P1.8 bundled datasets) and W&B/MLflow sinks (P2.5) — rustls works there.
+    { name = "openssl", reason = "Prefer rustls in this workspace" },
+    { name = "openssl-sys", reason = "Prefer rustls in this workspace" },
+]
+
+# Skip duplicate-version warnings for crates known to legitimately have
+# multiple versions in the dependency tree (e.g., during transitive upgrades).
+skip = [
+    # Add entries here as the dep graph evolves.
+    # { name = "syn", version = "1.0" },
+]
+
+# Skip a transitive subtree from multi-version checks.
+skip-tree = [
+    # ndarray ecosystem sometimes has version skew with downstream;
+    # uncomment if a real conflict shows up.
+    # { name = "ndarray" },
+]

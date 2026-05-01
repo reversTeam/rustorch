@@ -1,0 +1,25 @@
+# clippy configuration for rustorch.
+#
+# CI invokes:
+#   cargo clippy --workspace --all-targets --all-features -- -D warnings
+#
+# This file tunes thresholds; lint allow/deny lives in `#![deny(...)]` /
+# `#![allow(...)]` at the crate root level.
+
+# Functions can be moderately complex — ML kernels often unavoidable.
+# Default is 25 which is too aggressive for hand-tuned numerical code.
+cognitive-complexity-threshold = 30
+
+# Numerical code legitimately uses many f32/f64 literals.
+too-many-arguments-threshold = 8
+type-complexity-threshold = 250
+
+# Documentation-only items: skip needless-doctest-main since we do test docs.
+doc-valid-idents = [
+    "PyTorch", "rustorch", "WebGPU", "WGSL", "WASM", "GPU", "CPU",
+    "CUDA", "ROCm", "MLIR", "LLVM", "ONNX", "BERT", "GPT", "GPT-2",
+    "ResNet", "ViT", "MLP", "RNN", "LSTM", "GRU", "AdamW", "SGD",
+    "MNIST", "CIFAR-10", "CIFAR-100", "ImageNet", "WikiText",
+    "LibriSpeech", "Coco2017", "ADE20k", "HuggingFace", "TanStack",
+    "TensorBoard", "MLflow", "W&B",
+]

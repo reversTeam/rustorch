@@ -1,0 +1,37 @@
+# Cargo
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+/.idea
+/.vscode
+*.iml
+.DS_Store
+
+# Per-developer overrides
+/.cargo/config.local.toml
+
+# Coverage
+/coverage
+*.profraw
+*.profdata
+lcov.info
+
+# Generated docs
+/target/doc
+
+# Build outputs
+/dist
+/pkg
+
+# Profiling
+/trace.json
+/perf.data*
+flamegraph.svg
+
+# Datasets cache (local)
+/.cache
+
+# Reference clones (huge, not part of workspace)
+/pytorch

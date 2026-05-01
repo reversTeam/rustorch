@@ -1,0 +1,19 @@
+[package]
+name = "rustorch-autograd"
+description = "Tape-based reverse-mode autograd engine for rustorch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rustorch-core = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

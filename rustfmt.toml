@@ -1,0 +1,23 @@
+# rustfmt configuration for rustorch — STABLE channel only.
+# Nightly-only options live in rustfmt.nightly.toml and are picked up by
+#   cargo +nightly fmt --config-path rustfmt.nightly.toml
+
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"
+edition = "2021"
+
+# Use field init shorthand: `Foo { x }` instead of `Foo { x: x }`
+use_field_init_shorthand = true
+
+# Use try shorthand: `?` instead of `try!()`
+use_try_shorthand = true
+
+# Trailing comma in match blocks
+match_block_trailing_comma = true
+
+# Reorder imports + modules alphabetically
+reorder_imports = true
+reorder_modules = true

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# rustorch pre-commit hook
+# Runs cargo fmt --check and cargo clippy on staged Rust files.
+# Bypass with `git commit --no-verify` if absolutely necessary (warned).
+
+set -euo pipefail
+
+# Collect staged Rust files (Added, Copied, Modified, Renamed)
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' || true)
+
+if [ -z "${STAGED_RS}" ]; then
+    # Nothing Rust to check; let other hooks (commit-msg) take over
+    exit 0
+fi
+
+START=$(date +%s)
+echo "rustorch pre-commit: checking $(echo "${STAGED_RS}" | wc -l | tr -d ' ') Rust file(s)"
+
+# 1. rustfmt --check on staged files only
+if ! echo "${STAGED_RS}" | xargs cargo fmt -- --check 2>/dev/null; then
+    echo
+    echo "  rustfmt check failed."
+    echo "  Fix:    cargo fmt --all"
+    echo "  Bypass: git commit --no-verify   (NOT recommended)"
+    exit 1
+fi
+
+# 2. clippy on the whole workspace, but only when Rust files actually changed.
+#    --no-deps avoids re-checking transitive deps; uses cached metadata.
+if ! cargo clippy --workspace --all-targets --all-features -- -D warnings >/dev/null 2>&1; then
+    echo
+    echo "  clippy reported warnings (treated as errors)."
+    echo "  Run for details:  cargo clippy --workspace --all-targets --all-features"
+    echo "  Auto-fix where possible:  cargo clippy --workspace --all-targets --fix"
+    exit 1
+fi
+
+ELAPSED=$(( $(date +%s) - START ))
+echo "rustorch pre-commit: OK (${ELAPSED}s)"
+exit 0

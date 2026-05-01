@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# rustorch commit-msg hook
+# Validates Conventional Commits 1.0.0 format.
+
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+COMMIT_MSG=$(head -n 1 "${COMMIT_MSG_FILE}")
+
+# Allow merge commits + revert commits without further validation
+if echo "${COMMIT_MSG}" | grep -qE '^(Merge|Revert)'; then
+    exit 0
+fi
+
+# Allow fixup/squash commits during interactive rebase
+if echo "${COMMIT_MSG}" | grep -qE '^(fixup|squash)!'; then
+    exit 0
+fi
+
+# Conventional Commits regex:
+#   <type>(<scope>)!: <subject>
+#   <type>: <subject>
+PATTERN='^(feat|fix|refactor|perf|test|docs|build|chore|revert|style|ci)(\([a-z0-9_/-]+\))?!?: .{3,}$'
+
+if ! echo "${COMMIT_MSG}" | grep -qE "${PATTERN}"; then
+    cat <<EOF
+
+  Commit message does not follow Conventional Commits format.
+
+  Got:      ${COMMIT_MSG}
+
+  Expected: <type>(<scope>): <subject>
+
+  Types:    feat, fix, refactor, perf, test, docs, build, chore, revert, style, ci
+  Scopes:   tensor, autograd, nn, optim, cpu, wgpu, cuda, data, serde,
+            derive, cli, console, serve, docs, rfc, ...
+
+  Examples:
+    feat(autograd): implement create_graph for higher-order gradients
+    fix(cpu): handle empty matmul shape without panicking
+    docs(rfc): add RFC-0002 tensor design
+
+  See CONTRIBUTING.md for full conventions.
+  Bypass: git commit --no-verify   (NOT recommended)
+
+EOF
+    exit 1
+fi
+
+exit 0
