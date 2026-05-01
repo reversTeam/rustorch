@@ -888,6 +888,7 @@ dependencies = [
  "num-traits",
  "rustorch-autograd",
  "rustorch-core",
+ "rustorch-cpu",
  "rustorch-derive",
  "thiserror",
 ]
@@ -900,6 +901,7 @@ dependencies = [
  "num-traits",
  "rustorch-autograd",
  "rustorch-core",
+ "rustorch-cpu",
  "thiserror",
 ]
 
