@@ -42,6 +42,13 @@ pub fn pinned<S: Into<Vec<usize>>>(shape: S, dtype: Dtype) -> Tensor {
     }
 }
 
+/// Async H2D / D2H transfer stub — on CPU, this is a no-op clone.
+/// On CUDA targets it will dispatch to `cudaMemcpyAsync`. The API is
+/// kept stable so call sites are portable.
+pub fn to_async(src: &Tensor) -> Tensor {
+    src.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
