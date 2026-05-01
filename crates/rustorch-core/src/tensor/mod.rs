@@ -21,5 +21,13 @@
 //! integrated piece-by-piece.
 
 pub mod dtype;
+pub mod layout;
+pub mod shape;
+pub mod storage;
+pub mod version;
 
 pub use dtype::{Dtype, Element};
+pub use layout::{Layout, LayoutError};
+pub use shape::{BroadcastError, Shape};
+pub use storage::{Storage, StorageError};
+pub use version::{VersionCounter, VersionSnapshot};
