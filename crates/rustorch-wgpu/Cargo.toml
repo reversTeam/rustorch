@@ -1,0 +1,29 @@
+[package]
+name = "rustorch-wgpu"
+description = "wgpu (WebGPU/Vulkan/Metal/DX12) backend for rustorch — cross-platform GPU + WASM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+# Enable tests that actually require a GPU adapter to be present.
+# Off by default so plain `cargo test` works in CI without GPU.
+gpu-tests = []
+
+[dependencies]
+rustorch-core = { workspace = true }
+rustorch-cpu  = { workspace = true }
+wgpu          = { workspace = true }
+pollster      = { workspace = true }
+bytemuck      = { workspace = true }
+thiserror     = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -26,6 +26,7 @@ members = [
     "crates/rustorch-data",
     "crates/rustorch-serde",
     "crates/rustorch-codegen",
+    "crates/rustorch-wgpu",
 ]
 exclude = [
     "pytorch", # reference clone of upstream PyTorch (read-only)
@@ -57,6 +58,7 @@ rustorch-derive    = { version = "0.0.1", path = "crates/rustorch-derive" }
 rustorch-data      = { version = "0.0.1", path = "crates/rustorch-data" }
 rustorch-serde     = { version = "0.0.1", path = "crates/rustorch-serde" }
 rustorch-codegen   = { version = "0.0.1", path = "crates/rustorch-codegen" }
+rustorch-wgpu      = { version = "0.0.1", path = "crates/rustorch-wgpu" }
 
 # Numerics & types
 half        = "2.4"   # f16 / bf16
@@ -100,6 +102,10 @@ ndarray     = "0.16"
 # so versions are pinned but only pulled in by crates that actually need them.
 wasm-bindgen = "0.2"
 js-sys       = "0.3"
+
+# GPU backend (Phase 2)
+wgpu         = { version = "22.1", default-features = false, features = ["wgsl"] }
+pollster     = "0.3"
 
 # Dev-only — benchmarks, property tests, concurrent-correctness tests.
 # Members reference these through `[dev-dependencies] x = { workspace = true }`.
