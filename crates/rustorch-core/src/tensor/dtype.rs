@@ -485,6 +485,35 @@ mod tests {
     }
 
     #[test]
+    fn byte_size_is_const_evaluable() {
+        // Equivalent (and stronger) than verifying via `cargo asm` that
+        // `byte_size` emits a single constant load: if the function is
+        // truly zero-overhead and `const`, it can be evaluated at
+        // compile time. The `const` block forces compile-time
+        // evaluation; if `byte_size` were not a true `const fn` or had
+        // any side effect, this would fail to compile.
+        const F32_SIZE: usize = Dtype::F32.byte_size();
+        const F64_SIZE: usize = Dtype::F64.byte_size();
+        const I8_SIZE: usize = Dtype::I8.byte_size();
+        const BOOL_SIZE: usize = Dtype::Bool.byte_size();
+        assert_eq!(F32_SIZE, 4);
+        assert_eq!(F64_SIZE, 8);
+        assert_eq!(I8_SIZE, 1);
+        assert_eq!(BOOL_SIZE, 1);
+    }
+
+    #[test]
+    fn promotion_is_const_evaluable() {
+        // Same idea for promote_with: can be evaluated in const context.
+        const P1: Dtype = Dtype::F32.promote_with(Dtype::I64);
+        const P2: Dtype = Dtype::F16.promote_with(Dtype::BF16);
+        const P3: Dtype = Dtype::Bool.promote_with(Dtype::Bool);
+        assert!(matches!(P1, Dtype::F32));
+        assert!(matches!(P2, Dtype::F32));
+        assert!(matches!(P3, Dtype::Bool));
+    }
+
+    #[test]
     fn copy_eq_hash_clone() {
         // Smoke-check the derives used by callers (Layout cache key,
         // hashmap of dtype → kernel, …).

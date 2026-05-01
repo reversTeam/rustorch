@@ -434,4 +434,39 @@ mod tests {
         let b = a.clone();
         assert_eq!(a, b);
     }
+
+    // ---------------------- proptest property tests ----------------------
+    //
+    // P1.1 task `Layout struct` step #4 — proptest invariants.
+
+    use proptest::prelude::*;
+
+    fn arb_dim() -> impl Strategy<Value = Vec<usize>> {
+        proptest::collection::vec(1usize..=8, 1..=4)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        #[test]
+        fn proptest_contiguous_strides_match_independent_recompute(shape in arb_dim()) {
+            let l = Layout::contiguous(shape.clone(), Dtype::F32);
+            // Independent reference: walk shape inner-to-outer.
+            let mut expected = vec![1isize; shape.len()];
+            for i in (0..shape.len().saturating_sub(1)).rev() {
+                expected[i] = expected[i + 1] * shape[i + 1] as isize;
+            }
+            prop_assert_eq!(l.strides(), expected.as_slice());
+            prop_assert_eq!(l.numel(), shape.iter().product::<usize>());
+            prop_assert!(l.is_contiguous());
+        }
+
+        #[test]
+        fn proptest_byte_size_invariant(shape in arb_dim()) {
+            for d in [Dtype::F32, Dtype::F64, Dtype::I64, Dtype::I8, Dtype::Bool] {
+                let l = Layout::contiguous(shape.clone(), d);
+                prop_assert_eq!(l.byte_size(), l.numel() * d.byte_size());
+            }
+        }
+    }
 }

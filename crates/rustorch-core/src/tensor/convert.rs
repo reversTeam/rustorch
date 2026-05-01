@@ -320,6 +320,62 @@ pub fn tensor_from_storage(storage: Storage, layout: Layout) -> Tensor {
 }
 
 // --------------------------------------------------------------------------
+// ndarray interop — feature-gated (P1.1 task `Conversions` step #4)
+// --------------------------------------------------------------------------
+
+/// `ndarray` interop helpers, gated behind the `ndarray` feature flag.
+#[cfg(feature = "ndarray")]
+pub mod ndarray_interop {
+    use super::Tensor;
+    use crate::tensor::dtype::{Dtype, Element};
+    use ndarray::{Array, ArrayD, ArrayView, ArrayViewD, IxDyn};
+
+    /// Borrow the tensor as an `ndarray::ArrayViewD<T>`. Returns `None`
+    /// if the tensor is non-contiguous, has non-zero offset, or `T`
+    /// does not match the tensor's dtype.
+    ///
+    /// # Examples
+    /// ```
+    /// use rustorch_core::Tensor;
+    /// use rustorch_core::tensor::convert::ndarray_interop::as_array_view;
+    /// let t = Tensor::from_vec([2usize, 3], vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    /// let view = as_array_view::<f32>(&t).unwrap();
+    /// assert_eq!(view.shape(), &[2, 3]);
+    /// assert_eq!(view.sum(), 21.0);
+    /// ```
+    pub fn as_array_view<'a, T: Element>(t: &'a Tensor) -> Option<ArrayViewD<'a, T>> {
+        let slice = t.as_slice::<T>()?;
+        let shape = IxDyn(t.shape());
+        ArrayView::from_shape(shape, slice).ok()
+    }
+
+    /// Build a [`Tensor`] from an owned `ndarray::ArrayD<T>`. Always
+    /// allocates a fresh aligned buffer (we cannot reuse ndarray's
+    /// allocation because alignment guarantees differ).
+    pub fn from_ndarray<T: Element>(a: ArrayD<T>) -> Tensor {
+        let shape: Vec<usize> = a.shape().to_vec();
+        // ndarray may have non-standard memory order; collapse to row-major
+        // contiguous via `to_owned()` followed by `into_raw_vec()`.
+        let contiguous: Array<T, IxDyn> = a
+            .as_standard_layout()
+            .into_owned()
+            .into_dimensionality()
+            .expect("dim convertible to dyn");
+        let (data, _offset) = contiguous.into_raw_vec_and_offset();
+        Tensor::from_vec_typed::<T, _>(shape, data).expect("shape numel == vec len by construction")
+    }
+
+    /// Convenience: build a [`Tensor`] from an `ArrayView` (copies).
+    pub fn from_array_view<T: Element>(view: ArrayViewD<'_, T>) -> Tensor {
+        let _ = Dtype::F32; // silence unused warning if no other Dtype use
+        from_ndarray(view.to_owned())
+    }
+}
+
+#[cfg(feature = "ndarray")]
+pub use ndarray_interop::{as_array_view, from_array_view, from_ndarray};
+
+// --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------
 
@@ -488,5 +544,75 @@ mod tests {
         let s = e.to_string();
         assert!(s.contains("f32"));
         assert!(s.contains("i8"));
+    }
+
+    // ---------------------- ndarray interop tests ----------------------
+
+    #[cfg(feature = "ndarray")]
+    mod ndarray_tests {
+        use super::*;
+        use ndarray::Array2;
+
+        #[test]
+        fn array_view_round_trip_f32() {
+            let t = Tensor::from_vec([2usize, 3], vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+            let view = ndarray_interop::as_array_view::<f32>(&t).unwrap();
+            assert_eq!(view.shape(), &[2, 3]);
+            assert_eq!(view.iter().copied().sum::<f32>(), 21.0);
+        }
+
+        #[test]
+        fn array_view_returns_none_on_non_contiguous() {
+            let t = Tensor::from_vec([2usize, 3], vec![1.0_f32; 6]).unwrap();
+            let tr = t.transpose(0, 1).unwrap();
+            assert!(ndarray_interop::as_array_view::<f32>(&tr).is_none());
+        }
+
+        #[test]
+        fn array_view_returns_none_on_dtype_mismatch() {
+            let t = Tensor::from_vec([3usize], vec![1.0_f32; 3]).unwrap();
+            assert!(ndarray_interop::as_array_view::<i32>(&t).is_none());
+        }
+
+        #[test]
+        fn from_ndarray_owned_round_trip() {
+            let a = Array2::<f32>::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap()
+                .into_dyn();
+            let t = ndarray_interop::from_ndarray(a);
+            assert_eq!(t.shape(), &[2, 3]);
+            assert_eq!(
+                t.as_slice::<f32>().unwrap(),
+                &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            );
+        }
+
+        #[test]
+        fn from_ndarray_handles_transposed_input() {
+            // A column-major view → from_ndarray must convert to row-major.
+            let a =
+                Array2::<f32>::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+            let trans = a.t().to_owned().into_dyn();
+            let t = ndarray_interop::from_ndarray(trans);
+            assert_eq!(t.shape(), &[3, 2]);
+            // Original a in row-major: [[1,2,3],[4,5,6]]; transpose gives
+            // [[1,4],[2,5],[3,6]] → flat [1,4,2,5,3,6]
+            assert_eq!(
+                t.as_slice::<f32>().unwrap(),
+                &[1.0_f32, 4.0, 2.0, 5.0, 3.0, 6.0]
+            );
+        }
+
+        #[test]
+        fn from_array_view_copies() {
+            let a = Array2::<f32>::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0])
+                .unwrap()
+                .into_dyn();
+            let v = a.view();
+            let t = ndarray_interop::from_array_view(v);
+            // Original still usable
+            assert_eq!(a.sum(), 10.0);
+            assert_eq!(t.as_slice::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+        }
     }
 }

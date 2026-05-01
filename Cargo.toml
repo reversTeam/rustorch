@@ -88,11 +88,24 @@ proc-macro2 = "1.0"
 # Build-time YAML parsing (rustorch-codegen, build.rs)
 heck        = "0.5"   # case conversions in codegen
 
+# Portable SIMD (P1.2 task `SIMD abstraction` — wide is stable, fewer features
+# than pulp but no nightly required).
+wide        = "0.7"
+
+# n-dimensional array interop (P1.1 task `Conversions` — feature-gated).
+ndarray     = "0.16"
+
 # WASM targets (no rayon, no fork)
 # These are guarded with #[cfg(target_arch = "wasm32")]; declared at workspace level
 # so versions are pinned but only pulled in by crates that actually need them.
 wasm-bindgen = "0.2"
 js-sys       = "0.3"
+
+# Dev-only — benchmarks, property tests, concurrent-correctness tests.
+# Members reference these through `[dev-dependencies] x = { workspace = true }`.
+criterion   = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+proptest    = "1.5"
+loom        = "0.7"
 
 [profile.release]
 opt-level = 3

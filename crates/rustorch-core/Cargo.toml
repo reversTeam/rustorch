@@ -15,7 +15,14 @@ doctest = true
 
 [features]
 default = []
-serde = ["dep:serde"]
+serde   = ["dep:serde"]
+# n-dimensional array interop — view + from_ndarray helpers behind a feature
+# flag so users don't pay for the ndarray dep when they don't need it.
+ndarray = ["dep:ndarray"]
+# loom feature replaces std::sync atomics with loom shims — used only by the
+# storage/version concurrent-model tests to verify Arc/Atomic correctness
+# under all interleavings.
+loom    = ["dep:loom"]
 
 [dependencies]
 half       = { workspace = true }
@@ -23,6 +30,36 @@ num-traits = { workspace = true }
 bytemuck   = { workspace = true }
 thiserror  = { workspace = true }
 serde      = { workspace = true, optional = true }
+ndarray    = { workspace = true, optional = true }
+loom       = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest  = { workspace = true }
+
+[[bench]]
+name    = "tensor_new"
+harness = false
+
+[[bench]]
+name    = "shape_broadcast"
+harness = false
+
+[[bench]]
+name    = "layout_contiguous"
+harness = false
+
+[[bench]]
+name    = "storage_alloc"
+harness = false
+
+[[bench]]
+name    = "version_bump"
+harness = false
+
+[[bench]]
+name    = "view_transpose"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

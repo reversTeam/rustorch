@@ -618,4 +618,85 @@ mod tests {
         assert!(e.to_string().contains("6"));
         assert!(e.to_string().contains("7"));
     }
+
+    // ---------------------- proptest property tests ----------------------
+    //
+    // P1.1 task `View operations` step #4 — proptest involution and
+    // inverse identity over 200+ random tensor shapes.
+
+    use proptest::prelude::*;
+
+    fn arb_2d() -> impl Strategy<Value = (usize, usize)> {
+        (1usize..=6, 1usize..=6)
+    }
+
+    fn arb_3d() -> impl Strategy<Value = (usize, usize, usize)> {
+        (1usize..=4, 1usize..=4, 1usize..=4)
+    }
+
+    fn arb_perm_3() -> impl Strategy<Value = [usize; 3]> {
+        prop_oneof![
+            Just([0, 1, 2]),
+            Just([0, 2, 1]),
+            Just([1, 0, 2]),
+            Just([1, 2, 0]),
+            Just([2, 0, 1]),
+            Just([2, 1, 0]),
+        ]
+    }
+
+    fn invert_perm(p: [usize; 3]) -> [usize; 3] {
+        let mut inv = [0usize; 3];
+        for (i, &pi) in p.iter().enumerate() {
+            inv[pi] = i;
+        }
+        inv
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        #[test]
+        fn proptest_transpose_involution_2d((m, n) in arb_2d()) {
+            let t = Tensor::zeros([m, n]);
+            let t2 = t.transpose(0, 1).unwrap().transpose(0, 1).unwrap();
+            prop_assert_eq!(t2.shape(), t.shape());
+            prop_assert_eq!(t2.strides(), t.strides());
+        }
+
+        #[test]
+        fn proptest_permute_inverse_identity_3d(
+            (a, b, c) in arb_3d(),
+            p in arb_perm_3(),
+        ) {
+            let t = Tensor::zeros([a, b, c]);
+            let permuted = t.permute(&p).unwrap();
+            let inv = invert_perm(p);
+            let back = permuted.permute(&inv).unwrap();
+            prop_assert_eq!(back.shape(), t.shape());
+            prop_assert_eq!(back.strides(), t.strides());
+        }
+
+        #[test]
+        fn proptest_view_round_trip_preserves_data((m, n) in arb_2d()) {
+            // Build [m,n] with predictable f32 contents, view to [m*n], reshape back.
+            let numel = m * n;
+            let data: Vec<f32> = (0..numel).map(|i| i as f32).collect();
+            let t = Tensor::from_vec([m, n], data.clone()).unwrap();
+            let flat = t.view([numel]).unwrap();
+            let back = flat.view([m, n]).unwrap();
+            prop_assert_eq!(back.as_slice::<f32>().unwrap(), data.as_slice());
+        }
+
+        #[test]
+        fn proptest_squeeze_unsqueeze_round_trip((m, n) in arb_2d()) {
+            // unsqueeze + squeeze on the same axis is the identity.
+            let t = Tensor::zeros([m, n]);
+            for axis in 0..=2 {
+                let u = t.unsqueeze(axis).unwrap();
+                let s = u.squeeze(axis).unwrap();
+                prop_assert_eq!(s.shape(), t.shape());
+            }
+        }
+    }
 }

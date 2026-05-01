@@ -511,4 +511,77 @@ mod tests {
         assert_eq!(s.ndim(), 10);
         assert_eq!(s.numel(), (1..=10).product::<usize>());
     }
+
+    // ---------------------- proptest property tests ----------------------
+    //
+    // P1.1 task `Shape newtype + broadcasting helpers` step #4 — proptest
+    // cross-check against an independent NumPy-rules reimplementation.
+
+    use proptest::prelude::*;
+
+    /// Strategy: dim shapes with rank 0..=4, sizes 1..=5.
+    fn arb_shape() -> impl Strategy<Value = Vec<usize>> {
+        proptest::collection::vec(1usize..=5, 0..=4)
+    }
+
+    /// Reference broadcasting (independent of `Shape::broadcast_with`).
+    fn reference_broadcast(a: &[usize], b: &[usize]) -> Result<Vec<usize>, ()> {
+        let n = a.len().max(b.len());
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let l = a.len().checked_sub(1 + i).map(|j| a[j]).unwrap_or(1);
+            let r = b.len().checked_sub(1 + i).map(|j| b[j]).unwrap_or(1);
+            match (l, r) {
+                (a, b) if a == b => out.push(a),
+                (1, b) => out.push(b),
+                (a, 1) => out.push(a),
+                _ => return Err(()),
+            }
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        #[test]
+        fn proptest_broadcast_matches_reference(a in arb_shape(), b in arb_shape()) {
+            let lhs = Shape::from(a.clone());
+            let rhs = Shape::from(b.clone());
+            let got = lhs.broadcast_with(&rhs);
+            let expected = reference_broadcast(&a, &b);
+            match (got, expected) {
+                (Ok(s), Ok(v)) => prop_assert_eq!(s.into_vec(), v),
+                (Err(_), Err(())) => {},
+                (Ok(s), Err(())) => prop_assert!(false, "ours OK ({:?}) but reference says incompatible", s),
+                (Err(e), Ok(v)) => prop_assert!(false, "ours errored ({:?}) but reference produced {:?}", e, v),
+            }
+        }
+
+        #[test]
+        fn proptest_broadcast_commutative(a in arb_shape(), b in arb_shape()) {
+            let lhs = Shape::from(a);
+            let rhs = Shape::from(b);
+            // a.broadcast(b) and b.broadcast(a) must agree (Ok or Err).
+            match (lhs.broadcast_with(&rhs), rhs.broadcast_with(&lhs)) {
+                (Ok(p), Ok(q)) => prop_assert_eq!(p, q),
+                (Err(_), Err(_)) => {},
+                _ => prop_assert!(false, "broadcast not commutative"),
+            }
+        }
+
+        #[test]
+        fn proptest_numel_is_product(a in arb_shape()) {
+            let s = Shape::from(a.clone());
+            let expected: usize = if a.is_empty() { 1 } else { a.iter().product() };
+            prop_assert_eq!(s.numel(), expected);
+        }
+
+        #[test]
+        fn proptest_self_broadcast_is_self(a in arb_shape()) {
+            let s = Shape::from(a.clone());
+            prop_assert_eq!(s.broadcast_with(&s).unwrap(), Shape::from(a));
+        }
+    }
 }
