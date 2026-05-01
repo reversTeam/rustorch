@@ -27,8 +27,8 @@ pub mod sequential;
 pub mod state_dict;
 
 pub use activation::{
-    leaky_relu, log_softmax, relu, sigmoid, silu, softmax, tanh, LeakyRelu, LogSoftmax, Relu,
-    Sigmoid, Silu, Softmax, Tanh,
+    leaky_relu, log_softmax, mish, relu, sigmoid, silu, softmax, tanh, LeakyRelu, LogSoftmax, Mish,
+    Relu, Sigmoid, Silu, Softmax, Tanh,
 };
 pub use attention::{scaled_dot_product_attention, SingleHeadAttention};
 pub use container::{ModuleDict, ModuleList};

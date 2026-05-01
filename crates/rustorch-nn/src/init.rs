@@ -75,6 +75,13 @@ pub enum Init {
         /// Distribution standard deviation.
         std: f32,
     },
+    /// Truncated Normal: like `Normal { mean: 0, std }` but reject any
+    /// sample outside `[-2*std, 2*std]` and resample. Common for
+    /// transformer init (`std = 0.02` style).
+    TruncNormal {
+        /// Standard deviation; rejection bound is ±2σ.
+        std: f32,
+    },
     /// Xavier/Glorot uniform: bound = sqrt(6 / (fan_in + fan_out)).
     XavierUniform,
     /// Xavier/Glorot normal: std = sqrt(2 / (fan_in + fan_out)).
@@ -131,6 +138,23 @@ pub fn init_with_seed(init: Init, shape: &[usize], seed: u64) -> Tensor {
         Init::Normal { mean, std } => (0..numel)
             .map(|_| sample_normal(&mut rng, mean, std))
             .collect(),
+        Init::TruncNormal { std } => {
+            let bound = 2.0 * std;
+            (0..numel)
+                .map(|_| {
+                    // Resample until |v| < bound. Each draw has ~95.4% acceptance
+                    // probability, so this terminates very quickly.
+                    let mut v;
+                    loop {
+                        v = sample_normal(&mut rng, 0.0, std);
+                        if v.abs() < bound {
+                            break;
+                        }
+                    }
+                    v
+                })
+                .collect()
+        },
         Init::XavierUniform => {
             let (fan_in, fan_out) = calculate_fan(shape);
             let bound = (6.0_f32 / (fan_in + fan_out) as f32).sqrt();
@@ -309,5 +333,29 @@ mod tests {
             1234,
         );
         assert_eq!(a.as_slice::<f32>().unwrap(), b.as_slice::<f32>().unwrap());
+    }
+
+    #[test]
+    fn trunc_normal_clamped_within_two_sigma() {
+        // For std=0.02, samples must be in [-0.04, 0.04].
+        let t = init_with_seed(Init::TruncNormal { std: 0.02 }, &[10_000], 99);
+        let v = t.as_slice::<f32>().unwrap();
+        let bound = 2.0 * 0.02;
+        for &x in v {
+            assert!(x.abs() < bound, "got {x}, bound {bound}");
+        }
+    }
+
+    #[test]
+    fn trunc_normal_stats_close_to_normal() {
+        // Truncated at ±2σ keeps ~95% of the mass; std should still be
+        // close to the parent (~0.94 * std actually, but the test is
+        // generous).
+        let t = init_with_seed(Init::TruncNormal { std: 1.0 }, &[10_000], 7);
+        let v = t.as_slice::<f32>().unwrap();
+        let (m, s) = empirical_mean_std(v);
+        assert!(m.abs() < 0.1, "mean ≈ 0, got {m}");
+        // Truncated std is slightly smaller than parent — accept 0.7..1.0
+        assert!(s > 0.7 && s < 1.0, "std in [0.7, 1.0], got {s}");
     }
 }
