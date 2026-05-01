@@ -12,8 +12,11 @@
 //! AdamW: same update with **decoupled** weight decay applied directly
 //! on the parameter (not via the gradient).
 
+use crate::state_dict::{flatten_buffers, unflatten_buffers, OptimMeta};
 use crate::{write_param_data, Optimizer};
 use rustorch_autograd::Variable;
+use rustorch_core::tensor::tensor_impl::Tensor;
+use std::collections::BTreeMap;
 
 /// Adam optimiser with bias correction.
 pub struct Adam {
@@ -69,6 +72,50 @@ impl Adam {
     /// Borrow the parameter list (read-only).
     pub fn parameters(&self) -> &[Variable] {
         &self.params
+    }
+
+    /// Serialise per-parameter `m` / `v` buffers as a tensor map keyed
+    /// by `"m.{i}"` / `"v.{i}"`. Hyperparameters (lr, betas, eps,
+    /// weight_decay, step_t) are returned separately via [`Self::meta`].
+    pub fn state_dict(&self) -> BTreeMap<String, Tensor> {
+        let mut out = BTreeMap::new();
+        flatten_buffers(&mut out, "m", &self.m);
+        flatten_buffers(&mut out, "v", &self.v);
+        out
+    }
+
+    /// Restore `m` / `v` buffers from a tensor map. The number of
+    /// parameters must match the optimizer's `params.len()`.
+    pub fn load_state_dict(&mut self, sd: &BTreeMap<String, Tensor>) {
+        self.m = unflatten_buffers(sd, "m", self.params.len());
+        self.v = unflatten_buffers(sd, "v", self.params.len());
+    }
+
+    /// Hyperparameters / step counter snapshot.
+    pub fn meta(&self) -> OptimMeta {
+        OptimMeta {
+            lr: self.lr,
+            step_t: self.step_t,
+            betas: Some(self.betas),
+            eps: Some(self.eps),
+            weight_decay: Some(self.weight_decay),
+            ..OptimMeta::default()
+        }
+    }
+
+    /// Restore from an [`OptimMeta`] snapshot.
+    pub fn load_meta(&mut self, meta: &OptimMeta) {
+        self.lr = meta.lr;
+        self.step_t = meta.step_t;
+        if let Some(b) = meta.betas {
+            self.betas = b;
+        }
+        if let Some(e) = meta.eps {
+            self.eps = e;
+        }
+        if let Some(wd) = meta.weight_decay {
+            self.weight_decay = wd;
+        }
     }
 }
 

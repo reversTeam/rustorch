@@ -3,8 +3,11 @@
 //! Supports vanilla SGD, momentum (Polyak), Nesterov accelerated
 //! gradient, and L2 weight decay (decoupled from the gradient).
 
+use crate::state_dict::{flatten_buffers, unflatten_buffers, OptimMeta};
 use crate::{write_param_data, Optimizer};
 use rustorch_autograd::Variable;
+use rustorch_core::tensor::tensor_impl::Tensor;
+use std::collections::BTreeMap;
 
 /// SGD optimiser with optional momentum + Nesterov + weight decay.
 pub struct Sgd {
@@ -57,6 +60,41 @@ impl Sgd {
     /// Borrow the parameter list (read-only).
     pub fn parameters(&self) -> &[Variable] {
         &self.params
+    }
+
+    /// Serialise per-parameter velocity buffers (only present if
+    /// `momentum > 0` and at least one step has run). Keyed by
+    /// `"velocity.{i}"`.
+    pub fn state_dict(&self) -> BTreeMap<String, Tensor> {
+        let mut out = BTreeMap::new();
+        flatten_buffers(&mut out, "velocity", &self.velocity);
+        out
+    }
+
+    /// Restore velocity buffers from a tensor map.
+    pub fn load_state_dict(&mut self, sd: &BTreeMap<String, Tensor>) {
+        self.velocity = unflatten_buffers(sd, "velocity", self.params.len());
+    }
+
+    /// Hyperparameter snapshot.
+    pub fn meta(&self) -> OptimMeta {
+        OptimMeta {
+            lr: self.lr,
+            momentum: Some(self.momentum),
+            weight_decay: Some(self.weight_decay),
+            ..OptimMeta::default()
+        }
+    }
+
+    /// Restore from [`OptimMeta`].
+    pub fn load_meta(&mut self, meta: &OptimMeta) {
+        self.lr = meta.lr;
+        if let Some(m) = meta.momentum {
+            self.momentum = m;
+        }
+        if let Some(wd) = meta.weight_decay {
+            self.weight_decay = wd;
+        }
     }
 }
 

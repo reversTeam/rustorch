@@ -22,6 +22,7 @@ pub mod nadam;
 pub mod rmsprop;
 pub mod scheduler;
 pub mod sgd;
+pub mod state_dict;
 
 pub use adagrad::Adagrad;
 pub use adam::{Adam, AdamW};
@@ -30,6 +31,7 @@ pub use nadam::NAdam;
 pub use rmsprop::RMSprop;
 pub use scheduler::{CosineAnnealingLR, ExponentialLR, LinearWarmup, LrScheduler, StepLR};
 pub use sgd::Sgd;
+pub use state_dict::OptimMeta;
 
 use rustorch_autograd::Variable;
 use rustorch_core::tensor::tensor_impl::Tensor;
