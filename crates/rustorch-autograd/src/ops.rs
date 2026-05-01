@@ -893,3 +893,288 @@ pub fn log_softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError
     }
     Ok(out_var)
 }
+
+// --------------------------------------------------------------------------
+// div — d/dx (x/y) = 1/y;  d/dy (x/y) = -x/y²
+// --------------------------------------------------------------------------
+
+struct DivBackward {
+    lhs_saved: Tensor,
+    rhs_saved: Tensor,
+    edges: [Edge; 2],
+}
+
+impl Node for DivBackward {
+    fn name(&self) -> &'static str {
+        "DivBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let g_lhs = cpu_backend()
+            .div(grad, &self.rhs_saved)
+            .expect("div bw: g/rhs");
+        // dy = -x/y² * grad = -lhs * grad / (rhs*rhs)
+        let rhs_sq = cpu_backend()
+            .mul(&self.rhs_saved, &self.rhs_saved)
+            .expect("div bw: rhs²");
+        let lhs_grad = cpu_backend()
+            .mul(&self.lhs_saved, grad)
+            .expect("div bw: x*g");
+        let div_term = cpu_backend()
+            .div(&lhs_grad, &rhs_sq)
+            .expect("div bw: x*g/rhs²");
+        let g_rhs = cpu_backend().neg(&div_term).expect("div bw: neg");
+        vec![Some(g_lhs), Some(g_rhs)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `lhs / rhs` (autograd-aware).
+pub fn div(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .div(&lhs.tensor(), &rhs.tensor())
+        .map_err(|e| backend_err("div", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
+        let node = std::sync::Arc::new(DivBackward {
+            lhs_saved: lhs.tensor().clone(),
+            rhs_saved: rhs.tensor().clone(),
+            edges: [lhs.edge(), rhs.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// exp — d/dx exp(x) = exp(x)  (use saved output)
+// --------------------------------------------------------------------------
+
+struct ExpBackward {
+    saved_out: Tensor,
+    edges: [Edge; 1],
+}
+
+impl Node for ExpBackward {
+    fn name(&self) -> &'static str {
+        "ExpBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let g = cpu_backend()
+            .mul(grad, &self.saved_out)
+            .expect("exp bw: grad*out");
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `exp(src)` (autograd-aware).
+pub fn exp(src: &Variable) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .exp(&src.tensor())
+        .map_err(|e| backend_err("exp", e))?;
+    let mut out_var = Variable::new(out.clone());
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(ExpBackward {
+            saved_out: out,
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// log — d/dx log(x) = 1/x
+// --------------------------------------------------------------------------
+
+struct LogBackward {
+    saved_input: Tensor,
+    edges: [Edge; 1],
+}
+
+impl Node for LogBackward {
+    fn name(&self) -> &'static str {
+        "LogBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let g = cpu_backend()
+            .div(grad, &self.saved_input)
+            .expect("log bw: grad/x");
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `log(src)` (natural log, autograd-aware).
+pub fn log(src: &Variable) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .log(&src.tensor())
+        .map_err(|e| backend_err("log", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(LogBackward {
+            saved_input: src.tensor().clone(),
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// sqrt — d/dx sqrt(x) = 1 / (2 * sqrt(x)) = 0.5 / out
+// --------------------------------------------------------------------------
+
+struct SqrtBackward {
+    saved_out: Tensor,
+    edges: [Edge; 1],
+}
+
+impl Node for SqrtBackward {
+    fn name(&self) -> &'static str {
+        "SqrtBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // grad / (2 * out)
+        let two_out = {
+            let two = Tensor::scalar(2.0);
+            cpu_backend()
+                .mul(&two, &self.saved_out)
+                .expect("sqrt bw: 2*out")
+        };
+        let g = cpu_backend()
+            .div(grad, &two_out)
+            .expect("sqrt bw: grad/(2*out)");
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `sqrt(src)` (autograd-aware).
+pub fn sqrt(src: &Variable) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .sqrt(&src.tensor())
+        .map_err(|e| backend_err("sqrt", e))?;
+    let mut out_var = Variable::new(out.clone());
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(SqrtBackward {
+            saved_out: out,
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// abs — d/dx |x| = sign(x); zero at x=0 by convention
+// --------------------------------------------------------------------------
+
+struct AbsBackward {
+    saved_input: Tensor,
+    edges: [Edge; 1],
+}
+
+impl Node for AbsBackward {
+    fn name(&self) -> &'static str {
+        "AbsBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let x = self.saved_input.as_slice::<f32>().expect("f32");
+        let g = grad.as_slice::<f32>().expect("f32");
+        let mut out = Vec::with_capacity(x.len());
+        for i in 0..x.len() {
+            let s = if x[i] > 0.0 {
+                1.0_f32
+            } else if x[i] < 0.0 {
+                -1.0_f32
+            } else {
+                0.0_f32
+            };
+            out.push(g[i] * s);
+        }
+        let g_t = Tensor::from_vec(self.saved_input.shape().to_vec(), out).expect("abs bw shape");
+        vec![Some(g_t)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `abs(src)` (autograd-aware).
+pub fn abs(src: &Variable) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .abs(&src.tensor())
+        .map_err(|e| backend_err("abs", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(AbsBackward {
+            saved_input: src.tensor().clone(),
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// pow_scalar — d/dx x^n = n * x^(n-1)
+// --------------------------------------------------------------------------
+
+struct PowScalarBackward {
+    saved_input: Tensor,
+    exponent: f64,
+    edges: [Edge; 1],
+}
+
+impl Node for PowScalarBackward {
+    fn name(&self) -> &'static str {
+        "PowScalarBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // n * x^(n-1) * grad
+        let xn1 = cpu_backend()
+            .pow_scalar(&self.saved_input, self.exponent - 1.0)
+            .expect("pow bw: x^(n-1)");
+        let n = Tensor::scalar(self.exponent as f32);
+        let scaled = cpu_backend().mul(&n, &xn1).expect("pow bw: n*x^(n-1)");
+        let g = cpu_backend()
+            .mul(grad, &scaled)
+            .expect("pow bw: grad*scaled");
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `src.pow(exponent)` (scalar exponent, autograd-aware).
+pub fn pow_scalar(src: &Variable, exponent: f64) -> Result<Variable, BackwardError> {
+    let out = cpu_backend()
+        .pow_scalar(&src.tensor(), exponent)
+        .map_err(|e| backend_err("pow_scalar", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(PowScalarBackward {
+            saved_input: src.tensor().clone(),
+            exponent,
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}

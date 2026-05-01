@@ -6,8 +6,8 @@
 //! - chain-rule properties
 
 use rustorch_autograd::ops::{
-    add, cross_entropy, leaky_relu, log_softmax, matmul, mean, mse_loss, mul, neg, relu, sigmoid,
-    silu, softmax, sub, sum, tanh,
+    abs, add, cross_entropy, div, exp, leaky_relu, log, log_softmax, matmul, mean, mse_loss, mul,
+    neg, pow_scalar, relu, sigmoid, silu, softmax, sqrt, sub, sum, tanh,
 };
 use rustorch_autograd::{backward, no_grad, with_grad, Variable};
 use rustorch_core::tensor::tensor_impl::Tensor;
@@ -485,6 +485,95 @@ fn log_softmax_finite_difference() {
             i,
             dx_v[i],
             fd
+        );
+    }
+}
+
+// -------------------- math ops: div, exp, log, sqrt, abs, pow_scalar --------------------
+
+#[test]
+fn div_backward_quotient_rule() {
+    // y = x / k (k constant) → dy/dx = 1/k
+    let x = Variable::leaf(Tensor::from_vec([3], vec![3.0_f32, 6.0, 9.0]).unwrap());
+    let k = Variable::new(Tensor::from_vec([3], vec![3.0_f32, 3.0, 3.0]).unwrap());
+    let s = sum(&div(&x, &k).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    let dx_v = dx.as_slice::<f32>().unwrap();
+    for &v in dx_v {
+        assert!((v - 1.0 / 3.0).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn exp_backward_equals_output() {
+    // d/dx exp(x).sum() = exp(x); sum kicks in 1·exp grad on each lane
+    let x = Variable::leaf(Tensor::from_vec([3], vec![0.0_f32, 1.0, 2.0]).unwrap());
+    let s = sum(&exp(&x).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    let dx_v = dx.as_slice::<f32>().unwrap();
+    let expected = [1.0_f32, std::f32::consts::E, std::f32::consts::E.powi(2)];
+    for (got, e) in dx_v.iter().zip(expected.iter()) {
+        assert!((got - e).abs() < 1e-3, "exp'@x = {got}, expected {e}");
+    }
+}
+
+#[test]
+fn log_backward_is_reciprocal() {
+    let x = Variable::leaf(Tensor::from_vec([3], vec![1.0_f32, 2.0, 4.0]).unwrap());
+    let s = sum(&log(&x).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    let dx_v = dx.as_slice::<f32>().unwrap();
+    for (got, x_v) in dx_v.iter().zip(&[1.0_f32, 2.0, 4.0]) {
+        let expected = 1.0 / x_v;
+        assert!(
+            (got - expected).abs() < 1e-5,
+            "log'@{x_v} = {got}, expected {expected}"
+        );
+    }
+}
+
+#[test]
+fn sqrt_backward_half_over_sqrt_x() {
+    // d/dx sqrt(x).sum() = 1/(2*sqrt(x))
+    let x = Variable::leaf(Tensor::from_vec([3], vec![1.0_f32, 4.0, 9.0]).unwrap());
+    let s = sum(&sqrt(&x).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    let dx_v = dx.as_slice::<f32>().unwrap();
+    for (got, x_v) in dx_v.iter().zip(&[1.0_f32, 4.0, 9.0]) {
+        let expected = 0.5_f32 / x_v.sqrt();
+        assert!(
+            (got - expected).abs() < 1e-5,
+            "sqrt'@{x_v} = {got}, expected {expected}"
+        );
+    }
+}
+
+#[test]
+fn abs_backward_sign_function() {
+    let x = Variable::leaf(Tensor::from_vec([4], vec![3.0_f32, -2.0, 0.0, 5.0]).unwrap());
+    let s = sum(&abs(&x).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    assert_eq!(dx.as_slice::<f32>().unwrap(), &[1.0_f32, -1.0, 0.0, 1.0]);
+}
+
+#[test]
+fn pow_scalar_backward_x_to_3() {
+    // y = x^3 → dy/dx = 3*x²
+    let x = Variable::leaf(Tensor::from_vec([3], vec![1.0_f32, 2.0, 3.0]).unwrap());
+    let s = sum(&pow_scalar(&x, 3.0).unwrap()).unwrap();
+    backward(&s, None).unwrap();
+    let dx = x.grad().unwrap();
+    let dx_v = dx.as_slice::<f32>().unwrap();
+    for (got, x_v) in dx_v.iter().zip(&[1.0_f32, 2.0, 3.0]) {
+        let expected = 3.0 * x_v * x_v;
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "x³'@{x_v} = {got}, expected {expected}"
         );
     }
 }
