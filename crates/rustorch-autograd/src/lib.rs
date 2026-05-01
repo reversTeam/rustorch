@@ -18,6 +18,7 @@ pub mod anomaly;
 pub mod backward;
 pub mod checkpoint;
 pub mod custom_function;
+pub mod higher_order;
 pub mod node;
 pub mod ops;
 pub mod tape;
@@ -29,6 +30,7 @@ pub use anomaly::{
 pub use backward::{backward, BackwardError};
 pub use checkpoint::checkpoint;
 pub use custom_function::{apply_custom, BwdCtx, CustomFunction, FwdCtx};
+pub use higher_order::grad;
 pub use node::{Edge, Node};
 pub use tape::{is_grad_enabled, no_grad, with_grad, NoGradGuard, WithGradGuard};
 pub use variable::Variable;
