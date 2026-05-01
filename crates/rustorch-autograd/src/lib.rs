@@ -16,6 +16,7 @@
 
 pub mod anomaly;
 pub mod backward;
+pub mod custom_function;
 pub mod node;
 pub mod ops;
 pub mod tape;
@@ -25,6 +26,7 @@ pub use anomaly::{
     check_or_panic, first_bad_value, is_detect_anomaly, set_detect_anomaly, DetectAnomalyGuard,
 };
 pub use backward::{backward, BackwardError};
+pub use custom_function::{apply_custom, BwdCtx, CustomFunction, FwdCtx};
 pub use node::{Edge, Node};
 pub use tape::{is_grad_enabled, no_grad, with_grad, NoGradGuard, WithGradGuard};
 pub use variable::Variable;
