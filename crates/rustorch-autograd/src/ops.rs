@@ -57,7 +57,7 @@ impl Node for AddBackward {
 /// `lhs + rhs` (autograd-aware).
 pub fn add(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .add(&lhs.tensor, &rhs.tensor)
+        .add(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("add", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
@@ -94,7 +94,7 @@ impl Node for SubBackward {
 /// `lhs - rhs`.
 pub fn sub(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .sub(&lhs.tensor, &rhs.tensor)
+        .sub(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("sub", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
@@ -138,13 +138,13 @@ impl Node for MulBackward {
 /// `lhs * rhs`.
 pub fn mul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .mul(&lhs.tensor, &rhs.tensor)
+        .mul(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("mul", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
         let node = std::sync::Arc::new(MulBackward {
-            lhs_saved: lhs.tensor.clone(),
-            rhs_saved: rhs.tensor.clone(),
+            lhs_saved: lhs.tensor().clone(),
+            rhs_saved: rhs.tensor().clone(),
             edges: [lhs.edge(), rhs.edge()],
         });
         out.grad_fn = Some(node);
@@ -176,7 +176,7 @@ impl Node for NegBackward {
 /// `-src`.
 pub fn neg(src: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .neg(&src.tensor)
+        .neg(&src.tensor())
         .map_err(|e| backend_err("neg", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
@@ -218,15 +218,15 @@ impl Node for MatMulBackward {
 /// `lhs @ rhs` (rank-2 matmul).
 pub fn matmul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .matmul(&lhs.tensor, &rhs.tensor)
+        .matmul(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("matmul", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
         // matmul backward needs the contiguous transposes; clone the
         // inputs to keep them alive for backward.
         let node = std::sync::Arc::new(MatMulBackward {
-            lhs_saved: lhs.tensor.clone(),
-            rhs_saved: rhs.tensor.clone(),
+            lhs_saved: lhs.tensor().clone(),
+            rhs_saved: rhs.tensor().clone(),
             edges: [lhs.edge(), rhs.edge()],
         });
         out.grad_fn = Some(node);
@@ -266,12 +266,12 @@ impl Node for ReluBackward {
 /// `relu(src)`.
 pub fn relu(src: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .relu(&src.tensor)
+        .relu(&src.tensor())
         .map_err(|e| backend_err("relu", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(ReluBackward {
-            saved: src.tensor.clone(),
+            saved: src.tensor().clone(),
             edges: [src.edge()],
         });
         out.grad_fn = Some(node);
@@ -313,7 +313,7 @@ impl Node for SigmoidBackward {
 /// `sigmoid(src)`.
 pub fn sigmoid(src: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .sigmoid(&src.tensor)
+        .sigmoid(&src.tensor())
         .map_err(|e| backend_err("sigmoid", e))?;
     let mut out_var = Variable::new(out.clone());
     if is_grad_enabled() && src.requires_grad {
@@ -359,7 +359,7 @@ impl Node for TanhBackward {
 /// `tanh(src)`.
 pub fn tanh(src: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .tanh(&src.tensor)
+        .tanh(&src.tensor())
         .map_err(|e| backend_err("tanh", e))?;
     let mut out_var = Variable::new(out.clone());
     if is_grad_enabled() && src.requires_grad {
@@ -406,12 +406,12 @@ impl Node for SumBackward {
 /// Full-tensor sum.
 pub fn sum(src: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .sum(&src.tensor)
+        .sum(&src.tensor())
         .map_err(|e| backend_err("sum", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(SumBackward {
-            in_shape: src.tensor.shape().to_vec(),
+            in_shape: src.tensor().shape().to_vec(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -448,13 +448,13 @@ impl Node for MeanBackward {
 /// Full-tensor mean.
 pub fn mean(src: &Variable) -> Result<Variable, BackwardError> {
     let out = cpu_backend()
-        .mean(&src.tensor)
+        .mean(&src.tensor())
         .map_err(|e| backend_err("mean", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(MeanBackward {
-            in_shape: src.tensor.shape().to_vec(),
-            n: src.tensor.numel(),
+            in_shape: src.tensor().shape().to_vec(),
+            n: src.tensor().numel(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -519,24 +519,104 @@ pub fn cross_entropy(
 ) -> Result<Variable, BackwardError> {
     // Forward: cross_entropy via the backend (= log_softmax + nll).
     let loss = cpu_backend()
-        .cross_entropy(&input.tensor, &target.tensor, reduction)
+        .cross_entropy(&input.tensor(), &target.tensor(), reduction)
         .map_err(|e| backend_err("cross_entropy", e))?;
     let mut out_var = Variable::new(loss);
     if is_grad_enabled() && input.requires_grad {
         // For backward we save the softmax (not log_softmax) so that
         // grad = (softmax - one_hot(target)) / N.
         let softmax = cpu_backend()
-            .softmax(&input.tensor, 1)
+            .softmax(&input.tensor(), 1)
             .map_err(|e| backend_err("cross_entropy:softmax", e))?;
-        let n_samples = input.tensor.shape()[0];
-        let n_classes = input.tensor.shape()[1];
+        let n_samples = input.tensor().shape()[0];
+        let n_classes = input.tensor().shape()[1];
         let node = std::sync::Arc::new(CrossEntropyBackward {
             softmax_saved: softmax,
-            target: target.tensor.clone(),
+            target: target.tensor().clone(),
             n_samples,
             n_classes,
             reduction,
             edges: [input.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// add_bias — y = x + bias (with bias broadcast across batch).
+// d/dx = grad ; d/dbias = sum(grad, dim=0).
+// --------------------------------------------------------------------------
+
+struct AddBiasBackward {
+    /// Original bias shape (e.g. [out_features]) — used to sum the
+    /// upstream grad back to that shape.
+    bias_shape: Vec<usize>,
+    edges: [Edge; 2],
+}
+
+impl Node for AddBiasBackward {
+    fn name(&self) -> &'static str {
+        "AddBiasBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // d/dx: grad passes through unchanged.
+        // d/dbias: sum over the batch axis (axis 0) to collapse [B, …]
+        // back to bias_shape.
+        let g_bias = cpu_backend()
+            .sum_dim(grad, &[0], false)
+            .expect("sum_dim across batch for bias grad");
+        // sum_dim of [B, out] over dim 0 → [out] — exactly bias_shape.
+        let _ = &self.bias_shape;
+        vec![Some(grad.clone()), Some(g_bias)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// `x + bias` where `bias.shape == x.shape[1..]` (broadcast across batch).
+pub fn add_bias(x: &Variable, bias: &Variable) -> Result<Variable, BackwardError> {
+    let x_t = x.tensor();
+    let bias_t = bias.tensor();
+    if x_t.ndim() != 2 || bias_t.ndim() != 1 {
+        return Err(BackwardError::Backend {
+            op: "add_bias",
+            message: format!(
+                "expected x: rank-2, bias: rank-1; got {:?} and {:?}",
+                x_t.shape(),
+                bias_t.shape()
+            ),
+        });
+    }
+    let batch = x_t.shape()[0];
+    let n_out = x_t.shape()[1];
+    if bias_t.shape() != [n_out] {
+        return Err(BackwardError::Backend {
+            op: "add_bias",
+            message: format!(
+                "bias shape {:?} does not match x.shape[1] = {}",
+                bias_t.shape(),
+                n_out
+            ),
+        });
+    }
+    // Forward: broadcast bias along axis 0.
+    let bias_buf: &[f32] = bias_t.as_slice::<f32>().expect("f32");
+    let mut wide = Vec::with_capacity(batch * n_out);
+    for _ in 0..batch {
+        wide.extend_from_slice(bias_buf);
+    }
+    let bias_wide = Tensor::from_vec([batch, n_out], wide).expect("bias broadcast shape");
+    let out = cpu_backend()
+        .add(&x_t, &bias_wide)
+        .map_err(|e| backend_err("add_bias", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && (x.requires_grad || bias.requires_grad) {
+        let node = std::sync::Arc::new(AddBiasBackward {
+            bias_shape: bias_t.shape().to_vec(),
+            edges: [x.edge(), bias.edge()],
         });
         out_var.grad_fn = Some(node);
         out_var.requires_grad = true;
@@ -584,16 +664,16 @@ pub fn mse_loss(
     reduction: Reduction,
 ) -> Result<Variable, BackwardError> {
     let loss = cpu_backend()
-        .mse_loss(&input.tensor, &target.tensor, reduction)
+        .mse_loss(&input.tensor(), &target.tensor(), reduction)
         .map_err(|e| backend_err("mse_loss", e))?;
     let mut out_var = Variable::new(loss);
     if is_grad_enabled() && (input.requires_grad || target.requires_grad) {
         let diff = cpu_backend()
-            .sub(&input.tensor, &target.tensor)
+            .sub(&input.tensor(), &target.tensor())
             .map_err(|e| backend_err("mse_loss:sub", e))?;
         let node = std::sync::Arc::new(MseBackward {
             diff,
-            n: input.tensor.numel(),
+            n: input.tensor().numel(),
             reduction,
             edges: [input.edge(), target.edge()],
         });

@@ -1,12 +1,21 @@
 //! `Variable` — the user-facing autograd-aware tensor wrapper.
 //!
 //! Composes:
-//! - the underlying [`Tensor`] (the actual data + layout)
+//! - `data: Arc<Mutex<Tensor>>` — the underlying tensor, **shared
+//!   mutable** so the optimiser and the model see the same parameter
+//!   updates after a `step()`. Tensor is cheap to clone (Arc bump on
+//!   storage), so `tensor()` returns a fresh clone of the current
+//!   contents on every call.
 //! - an optional `grad_fn`: the backward node that produced this
 //!   variable (None for leaves)
-//! - a shared `grad` slot (Arc<Mutex<Option<Tensor>>>) where
+//! - a shared `grad` slot (`Arc<Mutex<Option<Tensor>>>`) where
 //!   `backward()` accumulates the gradient
 //! - a `requires_grad` flag
+//!
+//! `Clone` shares the data slot — a parameter cloned into the
+//! optimiser's parameter list aliases the model's copy, so an
+//! optimiser-side `set_data(new_tensor)` is observed by the model on
+//! the next forward pass.
 
 use crate::node::{Edge, Node};
 use rustorch_core::tensor::tensor_impl::Tensor;
@@ -15,8 +24,9 @@ use std::sync::{Arc, Mutex};
 /// Autograd-aware tensor wrapper.
 #[derive(Clone)]
 pub struct Variable {
-    /// Underlying tensor.
-    pub tensor: Tensor,
+    /// Shared mutable tensor data. The wrapping `Arc<Mutex<...>>`
+    /// supports the model+optimiser parameter-update flow.
+    pub data: Arc<Mutex<Tensor>>,
     /// Backward node — present iff this variable was produced by an
     /// op on at least one variable with `requires_grad`.
     pub grad_fn: Option<Arc<dyn Node>>,
@@ -32,18 +42,17 @@ impl Variable {
     /// defaults to `false`.
     pub fn new(tensor: Tensor) -> Self {
         Variable {
-            tensor,
+            data: Arc::new(Mutex::new(tensor)),
             grad_fn: None,
             grad: Arc::new(Mutex::new(None)),
             requires_grad: false,
         }
     }
 
-    /// Build a leaf variable that participates in autograd. Equivalent
-    /// to `Variable::new(t).requires_grad(true)`.
+    /// Build a leaf variable that participates in autograd.
     pub fn leaf(tensor: Tensor) -> Self {
         Variable {
-            tensor,
+            data: Arc::new(Mutex::new(tensor)),
             grad_fn: None,
             grad: Arc::new(Mutex::new(None)),
             requires_grad: true,
@@ -57,10 +66,24 @@ impl Variable {
         self
     }
 
-    /// Borrow the underlying tensor.
+    /// Read the current tensor data. Returns a fresh `Tensor` clone
+    /// (cheap — Arc bump on storage). Used by ops to get the value
+    /// at forward time, even after the optimiser has mutated the
+    /// shared data slot.
     #[inline]
-    pub fn tensor(&self) -> &Tensor {
-        &self.tensor
+    pub fn tensor(&self) -> Tensor {
+        self.data.lock().unwrap().clone()
+    }
+
+    /// Alias for [`Variable::tensor`] kept for legacy callers.
+    pub fn data_snapshot(&self) -> Tensor {
+        self.tensor()
+    }
+
+    /// Replace the shared `data` with a new tensor. Used by optimisers
+    /// after computing the parameter update.
+    pub fn set_data(&self, new: Tensor) {
+        *self.data.lock().unwrap() = new;
     }
 
     /// Read the accumulated gradient (returns `None` until
@@ -69,17 +92,17 @@ impl Variable {
         self.grad.lock().unwrap().clone()
     }
 
-    /// Reset the accumulated gradient to `None`. Mirrors PyTorch's
-    /// `optimizer.zero_grad(set_to_none=True)`.
+    /// Reset the accumulated gradient to `None`.
     pub fn zero_grad(&self) {
         *self.grad.lock().unwrap() = None;
     }
 
-    /// Return a *detached* copy — same data, no grad_fn, requires_grad
-    /// false. The detach breaks the autograd graph at this point.
+    /// Return a *detached* copy — same data snapshot, no grad_fn,
+    /// requires_grad false. Detach breaks the autograd graph.
     pub fn detach(&self) -> Variable {
+        let snapshot = self.tensor();
         Variable {
-            tensor: self.tensor.clone(),
+            data: Arc::new(Mutex::new(snapshot)),
             grad_fn: None,
             grad: Arc::new(Mutex::new(None)),
             requires_grad: false,
@@ -102,9 +125,10 @@ impl Variable {
 
 impl core::fmt::Debug for Variable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let t = self.tensor();
         f.debug_struct("Variable")
-            .field("shape", &self.tensor.shape())
-            .field("dtype", &self.tensor.dtype())
+            .field("shape", &t.shape())
+            .field("dtype", &t.dtype())
             .field("requires_grad", &self.requires_grad)
             .field("has_grad_fn", &self.grad_fn.is_some())
             .finish()

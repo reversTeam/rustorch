@@ -50,7 +50,7 @@ pub fn backward(output: &Variable, initial_grad: Option<Tensor>) -> Result<(), B
     // Default gradient: ones of the same shape and dtype as the output.
     let grad = match initial_grad {
         Some(g) => g,
-        None => crate::ones_like(&output.tensor),
+        None => crate::ones_like(&output.tensor()),
     };
 
     // Build topological order via DFS (so that when we iterate in

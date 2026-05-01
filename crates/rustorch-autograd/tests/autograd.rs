@@ -316,7 +316,7 @@ fn mlp_one_step_descends_loss() {
     let h1 = relu(&matmul(&x, &w1).unwrap()).unwrap();
     let logits = matmul(&h1, &w2).unwrap();
     let loss = cross_entropy(&logits, &target, Reduction::Mean).unwrap();
-    let initial_loss = loss.tensor.as_slice::<f32>().unwrap()[0];
+    let initial_loss = loss.tensor().as_slice::<f32>().unwrap()[0];
 
     // Backward.
     backward(&loss, None).unwrap();
@@ -324,16 +324,16 @@ fn mlp_one_step_descends_loss() {
     // SGD step on w1, w2 (manual: w -= lr * w.grad).
     let g1 = w1.grad().unwrap();
     let g2 = w2.grad().unwrap();
-    let w1_data: Vec<f32> = w1
-        .tensor
+    let w1_t = w1.tensor();
+    let w1_data: Vec<f32> = w1_t
         .as_slice::<f32>()
         .unwrap()
         .iter()
         .zip(g1.as_slice::<f32>().unwrap())
         .map(|(w, g)| w - lr * g)
         .collect();
-    let w2_data: Vec<f32> = w2
-        .tensor
+    let w2_t = w2.tensor();
+    let w2_data: Vec<f32> = w2_t
         .as_slice::<f32>()
         .unwrap()
         .iter()
@@ -347,7 +347,7 @@ fn mlp_one_step_descends_loss() {
     let h1n = relu(&matmul(&x, &w1_new).unwrap()).unwrap();
     let logits_n = matmul(&h1n, &w2_new).unwrap();
     let loss_n = cross_entropy(&logits_n, &target, Reduction::Mean).unwrap();
-    let new_loss = loss_n.tensor.as_slice::<f32>().unwrap()[0];
+    let new_loss = loss_n.tensor().as_slice::<f32>().unwrap()[0];
 
     assert!(
         new_loss < initial_loss,
