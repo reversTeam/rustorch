@@ -172,6 +172,14 @@ impl Optimizer for Adam {
             param.zero_grad();
         }
     }
+
+    fn lr(&self) -> f32 {
+        self.lr
+    }
+
+    fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
 }
 
 impl Optimizer for AdamW {
@@ -180,5 +188,11 @@ impl Optimizer for AdamW {
     }
     fn zero_grad(&mut self) {
         self.0.zero_grad();
+    }
+    fn lr(&self) -> f32 {
+        self.0.lr()
+    }
+    fn set_lr(&mut self, lr: f32) {
+        self.0.set_lr(lr);
     }
 }
