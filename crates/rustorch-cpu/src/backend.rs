@@ -290,6 +290,133 @@ pub trait Backend: Send + Sync {
         Err(unsupported("nonzero", self.name()))
     }
 
+    // -------------------- P1.4 — Reductions with dim --------------------
+
+    /// Reduce-sum along `dims`. If `keepdim` is true, every reduced axis
+    /// is kept as size 1 (else removed).
+    fn sum_dim(
+        &self,
+        _src: &Tensor,
+        _dims: &[usize],
+        _keepdim: bool,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("sum_dim", self.name()))
+    }
+    /// Reduce-mean along `dims`.
+    fn mean_dim(
+        &self,
+        _src: &Tensor,
+        _dims: &[usize],
+        _keepdim: bool,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("mean_dim", self.name()))
+    }
+    /// Reduce-max along `dims` (single axis at a time for argmax).
+    fn max_dim(&self, _src: &Tensor, _dim: usize, _keepdim: bool) -> Result<Tensor, BackendError> {
+        Err(unsupported("max_dim", self.name()))
+    }
+    /// Reduce-min along `dim`.
+    fn min_dim(&self, _src: &Tensor, _dim: usize, _keepdim: bool) -> Result<Tensor, BackendError> {
+        Err(unsupported("min_dim", self.name()))
+    }
+    /// Argmax — index (I64) of the maximum element along `dim`.
+    fn argmax(&self, _src: &Tensor, _dim: usize, _keepdim: bool) -> Result<Tensor, BackendError> {
+        Err(unsupported("argmax", self.name()))
+    }
+    /// Argmin — index (I64) of the minimum element along `dim`.
+    fn argmin(&self, _src: &Tensor, _dim: usize, _keepdim: bool) -> Result<Tensor, BackendError> {
+        Err(unsupported("argmin", self.name()))
+    }
+    /// Variance along `dim` (Welford one-pass).
+    fn var_dim(
+        &self,
+        _src: &Tensor,
+        _dim: usize,
+        _unbiased: bool,
+        _keepdim: bool,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("var_dim", self.name()))
+    }
+    /// All-reduce ops (full-tensor) — full sum / mean already exist; here
+    /// we add prod, full max, full min, all/any over Bool, cumsum, cumprod.
+    fn prod(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("prod", self.name()))
+    }
+    /// Full-tensor max → scalar.
+    fn max(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("max", self.name()))
+    }
+    /// Full-tensor min → scalar.
+    fn min(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("min", self.name()))
+    }
+    /// True iff every element is true (Bool tensor).
+    fn all(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("all", self.name()))
+    }
+    /// True iff any element is true.
+    fn any(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("any", self.name()))
+    }
+    /// Cumulative sum along `dim`.
+    fn cumsum(&self, _src: &Tensor, _dim: usize) -> Result<Tensor, BackendError> {
+        Err(unsupported("cumsum", self.name()))
+    }
+    /// Cumulative product along `dim`.
+    fn cumprod(&self, _src: &Tensor, _dim: usize) -> Result<Tensor, BackendError> {
+        Err(unsupported("cumprod", self.name()))
+    }
+
+    // -------------------- P1.4 — Softmax / log_softmax --------------------
+
+    /// Numerically stable softmax along `dim` (uses max-subtraction + log-sum-exp).
+    fn softmax(&self, _src: &Tensor, _dim: usize) -> Result<Tensor, BackendError> {
+        Err(unsupported("softmax", self.name()))
+    }
+    /// Numerically stable log_softmax along `dim`.
+    fn log_softmax(&self, _src: &Tensor, _dim: usize) -> Result<Tensor, BackendError> {
+        Err(unsupported("log_softmax", self.name()))
+    }
+
+    // -------------------- P1.4 — Loss functions --------------------
+
+    /// Mean Squared Error: `((x - y)^2).reduce(reduction)`.
+    fn mse_loss(
+        &self,
+        _input: &Tensor,
+        _target: &Tensor,
+        _reduction: Reduction,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("mse_loss", self.name()))
+    }
+    /// Cross-entropy = log_softmax(input) → NLL with class targets (I64).
+    fn cross_entropy(
+        &self,
+        _input: &Tensor,
+        _target: &Tensor,
+        _reduction: Reduction,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("cross_entropy", self.name()))
+    }
+    /// Negative Log Likelihood loss against pre-computed log-probabilities.
+    fn nll_loss(
+        &self,
+        _log_probs: &Tensor,
+        _target: &Tensor,
+        _reduction: Reduction,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("nll_loss", self.name()))
+    }
+    /// Binary cross-entropy with logits (numerically stable).
+    fn bce_with_logits(
+        &self,
+        _input: &Tensor,
+        _target: &Tensor,
+        _reduction: Reduction,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("bce_with_logits", self.name()))
+    }
+
     // -------------------- P1.3 — Shape ops (kernel-side) --------------------
 
     /// Concatenate `tensors` along `dim`. All tensors must have the
@@ -352,6 +479,17 @@ pub trait Backend: Send + Sync {
 #[allow(unused)]
 fn unsupported(op: &'static str, device: &'static str) -> BackendError {
     BackendError::UnsupportedOp { op, device }
+}
+
+/// Reduction mode for loss functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reduction {
+    /// Reduce by mean.
+    Mean,
+    /// Reduce by sum.
+    Sum,
+    /// No reduction — keep per-sample values.
+    None,
 }
 
 #[cfg(test)]

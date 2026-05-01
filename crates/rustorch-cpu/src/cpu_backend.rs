@@ -788,6 +788,106 @@ impl Backend for CpuBackend {
         })
     }
 
+    // -------------------- Reductions (P1.4) --------------------
+
+    fn sum_dim(&self, src: &Tensor, dims: &[usize], keepdim: bool) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::sum_dim(src, dims, keepdim)
+    }
+    fn mean_dim(
+        &self,
+        src: &Tensor,
+        dims: &[usize],
+        keepdim: bool,
+    ) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::mean_dim(src, dims, keepdim)
+    }
+    fn max_dim(&self, src: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::max_dim(src, dim, keepdim)
+    }
+    fn min_dim(&self, src: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::min_dim(src, dim, keepdim)
+    }
+    fn argmax(&self, src: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::argmax(src, dim, keepdim)
+    }
+    fn argmin(&self, src: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::argmin(src, dim, keepdim)
+    }
+    fn var_dim(
+        &self,
+        src: &Tensor,
+        dim: usize,
+        unbiased: bool,
+        keepdim: bool,
+    ) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::var_dim(src, dim, unbiased, keepdim)
+    }
+    fn prod(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::prod(src)
+    }
+    fn max(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::max(src)
+    }
+    fn min(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::min(src)
+    }
+    fn all(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::all(src)
+    }
+    fn any(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::any(src)
+    }
+    fn cumsum(&self, src: &Tensor, dim: usize) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::cumsum(src, dim)
+    }
+    fn cumprod(&self, src: &Tensor, dim: usize) -> Result<Tensor, BackendError> {
+        crate::kernels::reduction::cumprod(src, dim)
+    }
+
+    // -------------------- Softmax (P1.4) --------------------
+
+    fn softmax(&self, src: &Tensor, dim: usize) -> Result<Tensor, BackendError> {
+        crate::kernels::softmax::softmax(src, dim)
+    }
+    fn log_softmax(&self, src: &Tensor, dim: usize) -> Result<Tensor, BackendError> {
+        crate::kernels::softmax::log_softmax(src, dim)
+    }
+
+    // -------------------- Loss functions (P1.4) --------------------
+
+    fn mse_loss(
+        &self,
+        input: &Tensor,
+        target: &Tensor,
+        reduction: crate::backend::Reduction,
+    ) -> Result<Tensor, BackendError> {
+        crate::kernels::loss::mse_loss(input, target, reduction)
+    }
+    fn cross_entropy(
+        &self,
+        input: &Tensor,
+        target: &Tensor,
+        reduction: crate::backend::Reduction,
+    ) -> Result<Tensor, BackendError> {
+        crate::kernels::loss::cross_entropy(input, target, reduction)
+    }
+    fn nll_loss(
+        &self,
+        log_probs: &Tensor,
+        target: &Tensor,
+        reduction: crate::backend::Reduction,
+    ) -> Result<Tensor, BackendError> {
+        crate::kernels::loss::nll_loss(log_probs, target, reduction)
+    }
+    fn bce_with_logits(
+        &self,
+        input: &Tensor,
+        target: &Tensor,
+        reduction: crate::backend::Reduction,
+    ) -> Result<Tensor, BackendError> {
+        crate::kernels::loss::bce_with_logits(input, target, reduction)
+    }
+
     // -------------------- Shape ops (delegate to kernels::shape_ops) --------------------
 
     fn cat(&self, tensors: &[&Tensor], dim: usize) -> Result<Tensor, BackendError> {
