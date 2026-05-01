@@ -15,6 +15,7 @@ pub mod bundled;
 pub mod dataloader;
 pub mod dataset;
 pub mod sampler;
+pub mod text;
 
 pub use augment::{Augment, AugmentError, HorizontalFlip, Mixup, Normalize, RandomHorizontalFlip};
 pub use bundled::{synthetic_cifar10, synthetic_mnist};
@@ -23,6 +24,7 @@ pub use dataset::{Dataset, DatasetError, IterableDataset, TensorDataset};
 pub use sampler::{
     DistributedSampler, RandomSampler, Sampler, SequentialSampler, WeightedRandomSampler,
 };
+pub use text::{Pad, Truncate, WhitespaceTokenizer};
 
 /// Crate version reported at runtime.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
