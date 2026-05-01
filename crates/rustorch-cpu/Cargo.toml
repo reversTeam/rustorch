@@ -14,6 +14,8 @@ categories.workspace = true
 default = []
 # SIMD via portable_simd is nightly-only; the stable path uses scalar + auto-vectorization
 nightly-simd = []
+# Lightweight profiler hooks emitting Chrome trace JSON. Off by default.
+profile      = []
 
 [dependencies]
 rustorch-core = { workspace = true }
