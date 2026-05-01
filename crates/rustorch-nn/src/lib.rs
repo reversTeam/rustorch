@@ -15,6 +15,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod activation;
+pub mod container;
 pub mod linear;
 pub mod loss;
 pub mod module;
@@ -24,6 +25,7 @@ pub use activation::{
     leaky_relu, log_softmax, relu, sigmoid, silu, softmax, tanh, LeakyRelu, LogSoftmax, Relu,
     Sigmoid, Silu, Softmax, Tanh,
 };
+pub use container::{ModuleDict, ModuleList};
 pub use linear::Linear;
 pub use loss::{Criterion, CrossEntropyLoss, MseLoss};
 pub use module::Module;
