@@ -1442,8 +1442,113 @@ impl Node for ReshapeBackward {
     }
 }
 
-/// Reshape `src` to the given shape. Requires `numel(src) == numel(shape)`.
-/// Only contiguous F32 tensors are supported in v1.
+// --------------------------------------------------------------------------
+// conv2d — stride=1, configurable padding, no dilation/groups
+// Backward via dedicated cpu kernels (grad_input + grad_weight).
+// --------------------------------------------------------------------------
+
+struct Conv2dBackward {
+    input_saved: Tensor,
+    weight_saved: Tensor,
+    pad_h: usize,
+    pad_w: usize,
+    has_bias: bool,
+    edges: Vec<Edge>,
+}
+
+impl Node for Conv2dBackward {
+    fn name(&self) -> &'static str {
+        "Conv2dBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let din = rustorch_cpu::kernels::conv::conv2d_grad_input(
+            grad,
+            &self.weight_saved,
+            self.input_saved.shape(),
+            self.pad_h,
+            self.pad_w,
+        )
+        .expect("conv2d grad_input");
+        let dw = rustorch_cpu::kernels::conv::conv2d_grad_weight(
+            &self.input_saved,
+            grad,
+            self.weight_saved.shape(),
+            self.pad_h,
+            self.pad_w,
+        )
+        .expect("conv2d grad_weight");
+        let mut grads: Vec<Option<Tensor>> = vec![Some(din), Some(dw)];
+        if self.has_bias {
+            // Bias grad: sum over batch + spatial dims, leaving [C_out].
+            let g_data = grad.as_slice::<f32>().expect("f32 grad");
+            let n = grad.shape()[0];
+            let c_out = grad.shape()[1];
+            let h_out = grad.shape()[2];
+            let w_out = grad.shape()[3];
+            let mut db = vec![0.0_f32; c_out];
+            for ni in 0..n {
+                for (co, db_co) in db.iter_mut().enumerate() {
+                    for hi in 0..h_out {
+                        for wi in 0..w_out {
+                            let idx = ((ni * c_out + co) * h_out + hi) * w_out + wi;
+                            *db_co += g_data[idx];
+                        }
+                    }
+                }
+            }
+            let db_t = Tensor::from_vec([c_out], db).expect("bias grad");
+            grads.push(Some(db_t));
+        }
+        grads
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// Autograd-aware conv2d (stride=1, configurable padding).
+pub fn conv2d(
+    input: &Variable,
+    weight: &Variable,
+    bias: Option<&Variable>,
+    pad_h: usize,
+    pad_w: usize,
+) -> Result<Variable, BackwardError> {
+    let bias_t = bias.map(|b| b.tensor());
+    let bias_ref = bias_t.as_ref();
+    let out = rustorch_cpu::kernels::conv::conv2d_forward(
+        &input.tensor(),
+        &weight.tensor(),
+        bias_ref,
+        pad_h,
+        pad_w,
+    )
+    .map_err(|e| backend_err("conv2d", e))?;
+    let mut out_var = Variable::new(out);
+    let any_grad = input.requires_grad
+        || weight.requires_grad
+        || bias.map(|b| b.requires_grad).unwrap_or(false);
+    if is_grad_enabled() && any_grad {
+        let mut edges = vec![input.edge(), weight.edge()];
+        if let Some(b) = bias {
+            edges.push(b.edge());
+        }
+        let node = std::sync::Arc::new(Conv2dBackward {
+            input_saved: input.tensor().clone(),
+            weight_saved: weight.tensor().clone(),
+            pad_h,
+            pad_w,
+            has_bias: bias.is_some(),
+            edges,
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+/// Reshape `src` to the given shape (autograd-aware view; F32-only).
+/// Requires `numel(src) == numel(shape)`.
 pub fn reshape(src: &Variable, shape: Vec<usize>) -> Result<Variable, BackwardError> {
     let src_t = src.tensor();
     let numel: usize = shape.iter().product();
