@@ -22,15 +22,21 @@ pub mod backend;
 pub mod cache;
 pub mod elementwise;
 pub mod error;
+pub mod layernorm;
 pub mod matmul;
+pub mod reduce;
 pub mod shaders;
+pub mod softmax;
 pub mod storage;
 pub mod transfer;
 
 pub use backend::WgpuBackend;
 pub use elementwise::{dispatch_binary, dispatch_unary};
 pub use error::WgpuError;
+pub use layernorm::layernorm_rows;
 pub use matmul::matmul;
+pub use reduce::{reduce_rows, ReduceKind};
+pub use softmax::softmax_rows;
 pub use storage::WgpuStorage;
 pub use transfer::{to_cpu, to_gpu};
 
