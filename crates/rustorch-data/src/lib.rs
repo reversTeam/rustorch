@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod audio;
 pub mod augment;
 pub mod bundled;
 pub mod dataloader;
@@ -17,6 +18,7 @@ pub mod dataset;
 pub mod sampler;
 pub mod text;
 
+pub use audio::{Resample, SpecAugment, Spectrogram};
 pub use augment::{
     Augment, AugmentError, HorizontalFlip, Mixup, Normalize, RandomCrop, RandomHorizontalFlip,
     Resize,
