@@ -15,13 +15,19 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod adagrad;
 pub mod adam;
 pub mod lion;
+pub mod nadam;
+pub mod rmsprop;
 pub mod scheduler;
 pub mod sgd;
 
+pub use adagrad::Adagrad;
 pub use adam::{Adam, AdamW};
 pub use lion::Lion;
+pub use nadam::NAdam;
+pub use rmsprop::RMSprop;
 pub use scheduler::{CosineAnnealingLR, ExponentialLR, LinearWarmup, LrScheduler, StepLR};
 pub use sgd::Sgd;
 
