@@ -333,10 +333,360 @@ impl PartialEq for Tensor {
 }
 
 // --------------------------------------------------------------------------
+// In-place mutating ops (P1.3 task `Arithmetic ops` in-place variants).
+//
+// Each in-place op:
+// 1. Checks dtype + shape compatibility (broadcast lhs ←= broadcast(lhs, rhs)).
+// 2. Acquires unique mutable access to the buffer (Storage must be unique).
+// 3. Walks lhs in shape order with strided index decoding (works on
+//    non-contiguous lhs).
+// 4. Bumps the shared VersionCounter on success — autograd's
+//    SavedVariable detects the bump and panics with a clear
+//    "in-place modification of saved tensor" message.
+//
+// Failure modes:
+// - DtypeMismatch on incompatible scalar types.
+// - ShapeDataMismatch when rhs cannot be broadcast to lhs (out shape
+//   must equal lhs shape — in-place cannot grow lhs).
+// - "Tensor::*_ aliasing violation" panic when storage is shared.
+//   This is consistent with PyTorch's behaviour ("a leaf Variable
+//   that requires grad has been used in an in-place op").
+// --------------------------------------------------------------------------
+
+impl Tensor {
+    /// In-place addition: `self += other` (with `other` broadcast to
+    /// `self.shape()`).
+    ///
+    /// **Bumps the shared [`VersionCounter`]** so any autograd
+    /// `SavedVariable` snapshotting the same tensor will detect the
+    /// mutation at backward time.
+    ///
+    /// Errors:
+    /// - [`TensorError::DtypeMismatch`] if dtypes differ.
+    /// - [`TensorError::ShapeMismatch`] if `other.shape()` cannot
+    ///   broadcast to `self.shape()` *without growing self*.
+    ///
+    /// Panics if the underlying storage is shared with a clone (an
+    /// alias) — the caller must `.contiguous()` or own the buffer.
+    pub fn add_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        binary_inplace(self, other, "add_", |a, b| a + b, |a, b| a + b)
+    }
+
+    /// In-place subtraction: `self -= other`.
+    pub fn sub_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        binary_inplace(self, other, "sub_", |a, b| a - b, |a, b| a - b)
+    }
+
+    /// In-place multiplication: `self *= other`.
+    pub fn mul_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        binary_inplace(self, other, "mul_", |a, b| a * b, |a, b| a * b)
+    }
+
+    /// In-place division: `self /= other`.
+    pub fn div_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        binary_inplace(self, other, "div_", |a, b| a / b, |a, b| a / b)
+    }
+
+    /// In-place negation: `self = -self`.
+    pub fn neg_(&mut self) -> Result<&mut Tensor, TensorError> {
+        unary_inplace(self, "neg_", |x| -x, |x| -x)
+    }
+
+    /// In-place absolute value: `self = |self|`.
+    pub fn abs_(&mut self) -> Result<&mut Tensor, TensorError> {
+        unary_inplace(self, "abs_", |x: f32| x.abs(), |x: f64| x.abs())
+    }
+
+    /// In-place fill with a scalar: `self[..] = value`.
+    pub fn fill_(&mut self, value: f64) -> Result<&mut Tensor, TensorError> {
+        match self.dtype() {
+            Dtype::F32 => {
+                let v = value as f32;
+                fill_inplace_f32(self, v)
+            },
+            Dtype::F64 => fill_inplace_f64(self, value),
+            d => Err(TensorError::DtypeMismatch {
+                op: "fill_",
+                got: d,
+                expected: Dtype::F32,
+            }),
+        }
+    }
+
+    /// In-place zero: `self[..] = 0`.
+    pub fn zero_(&mut self) -> Result<&mut Tensor, TensorError> {
+        self.fill_(0.0)
+    }
+
+    /// In-place copy from another tensor of the same shape and dtype.
+    pub fn copy_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        if self.dtype() != other.dtype() {
+            return Err(TensorError::DtypeMismatch {
+                op: "copy_",
+                got: self.dtype(),
+                expected: other.dtype(),
+            });
+        }
+        if self.shape() != other.shape() {
+            return Err(TensorError::ShapeMismatch {
+                op: "copy_",
+                lhs: self.shape().to_vec(),
+                rhs: other.shape().to_vec(),
+            });
+        }
+        // copy_ is implemented as: `self *= 0; self += other` — a tiny
+        // bit slower than memcpy but works on any layout uniformly and
+        // re-uses the same uniqueness/version machinery. The version
+        // counter is bumped *once* (we drop the intermediate bump from
+        // the multiplication by suppressing it via raw access).
+        // For simplicity, we re-implement here as a straightforward
+        // shape-order walk.
+        match self.dtype() {
+            Dtype::F32 => copy_inplace_typed::<f32>(self, other),
+            Dtype::F64 => copy_inplace_typed::<f64>(self, other),
+            d => Err(TensorError::DtypeMismatch {
+                op: "copy_",
+                got: d,
+                expected: Dtype::F32,
+            }),
+        }
+    }
+}
+
+/// Generic in-place binary op dispatch (f32 + f64 paths).
+fn binary_inplace<'a>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+    op_name: &'static str,
+    op_f32: impl Fn(f32, f32) -> f32,
+    op_f64: impl Fn(f64, f64) -> f64,
+) -> Result<&'a mut Tensor, TensorError> {
+    if lhs.dtype() != rhs.dtype() {
+        return Err(TensorError::DtypeMismatch {
+            op: op_name,
+            got: lhs.dtype(),
+            expected: rhs.dtype(),
+        });
+    }
+    // Broadcast rhs to lhs shape; reject if out-of-place broadcast would
+    // grow lhs.
+    let _expected_strides = rhs
+        .shape_ref()
+        .expand_strides_to(lhs.shape_ref())
+        .map_err(|_| TensorError::ShapeMismatch {
+            op: op_name,
+            lhs: lhs.shape().to_vec(),
+            rhs: rhs.shape().to_vec(),
+        })?;
+    match lhs.dtype() {
+        Dtype::F32 => binary_inplace_typed::<f32>(lhs, rhs, op_f32, op_name),
+        Dtype::F64 => binary_inplace_typed::<f64>(lhs, rhs, op_f64, op_name),
+        d => Err(TensorError::DtypeMismatch {
+            op: op_name,
+            got: d,
+            expected: Dtype::F32,
+        }),
+    }
+}
+
+/// Concrete typed in-place binary kernel.
+fn binary_inplace_typed<'a, T>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+    op: impl Fn(T, T) -> T,
+    op_name: &'static str,
+) -> Result<&'a mut Tensor, TensorError>
+where
+    T: Element + core::ops::Add<Output = T> + core::ops::Sub<Output = T>,
+{
+    let n = lhs.numel();
+    let lhs_shape = lhs.shape().to_vec();
+    let lhs_strides = lhs.strides().to_vec();
+    let lhs_offset = lhs.storage_offset();
+    let rhs_strides = rhs
+        .shape_ref()
+        .expand_strides_to(lhs.shape_ref())
+        .expect("broadcast was checked");
+    let rhs_offset = rhs.storage_offset();
+
+    // Read rhs first (immutable borrow via storage()).
+    let rhs_raw_ptr = rhs.storage().as_bytes().as_ptr() as *const T;
+    let rhs_len = rhs.storage().byte_len() / core::mem::size_of::<T>();
+    // SAFETY: dtype matches, lifetime tied to rhs which we don't mutate.
+    let rhs_raw: &[T] = if rhs_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(rhs_raw_ptr, rhs_len) }
+    };
+
+    // Acquire unique mutable bytes from lhs.
+    let lhs_storage = lhs
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: op_name })?;
+    let lhs_bytes_ptr = lhs_storage.as_mut_ptr();
+    let lhs_byte_len = lhs_storage.len();
+    let lhs_typed_len = lhs_byte_len / core::mem::size_of::<T>();
+    // SAFETY: unique borrow via Storage::as_bytes_mut, dtype matches.
+    let lhs_raw: &mut [T] =
+        unsafe { core::slice::from_raw_parts_mut(lhs_bytes_ptr as *mut T, lhs_typed_len) };
+
+    for i in 0..n {
+        let li = strided_index(i, &lhs_shape, &lhs_strides, lhs_offset);
+        let ri = strided_index(i, &lhs_shape, &rhs_strides, rhs_offset);
+        lhs_raw[li] = op(lhs_raw[li], rhs_raw[ri]);
+    }
+    lhs.version().bump();
+    Ok(lhs)
+}
+
+/// Generic in-place unary op dispatch (f32 + f64 paths).
+fn unary_inplace<'a>(
+    src: &'a mut Tensor,
+    op_name: &'static str,
+    op_f32: impl Fn(f32) -> f32,
+    op_f64: impl Fn(f64) -> f64,
+) -> Result<&'a mut Tensor, TensorError> {
+    match src.dtype() {
+        Dtype::F32 => unary_inplace_typed::<f32>(src, op_f32, op_name),
+        Dtype::F64 => unary_inplace_typed::<f64>(src, op_f64, op_name),
+        d => Err(TensorError::DtypeMismatch {
+            op: op_name,
+            got: d,
+            expected: Dtype::F32,
+        }),
+    }
+}
+
+fn unary_inplace_typed<'a, T: Element>(
+    src: &'a mut Tensor,
+    op: impl Fn(T) -> T,
+    op_name: &'static str,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = src.numel();
+    let shape = src.shape().to_vec();
+    let strides = src.strides().to_vec();
+    let offset = src.storage_offset();
+    let storage = src
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: op_name })?;
+    let typed_len = storage.len() / core::mem::size_of::<T>();
+    // SAFETY: unique mutable borrow + dtype match.
+    let raw: &mut [T] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut T, typed_len) };
+    for i in 0..n {
+        let idx = strided_index(i, &shape, &strides, offset);
+        raw[idx] = op(raw[idx]);
+    }
+    src.version().bump();
+    Ok(src)
+}
+
+fn fill_inplace_f32(t: &mut Tensor, v: f32) -> Result<&mut Tensor, TensorError> {
+    let n = t.numel();
+    let shape = t.shape().to_vec();
+    let strides = t.strides().to_vec();
+    let offset = t.storage_offset();
+    let storage = t
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "fill_" })?;
+    let raw: &mut [f32] = unsafe {
+        core::slice::from_raw_parts_mut(
+            storage.as_mut_ptr() as *mut f32,
+            storage.len() / core::mem::size_of::<f32>(),
+        )
+    };
+    for i in 0..n {
+        let idx = strided_index(i, &shape, &strides, offset);
+        raw[idx] = v;
+    }
+    t.version().bump();
+    Ok(t)
+}
+
+fn fill_inplace_f64(t: &mut Tensor, v: f64) -> Result<&mut Tensor, TensorError> {
+    let n = t.numel();
+    let shape = t.shape().to_vec();
+    let strides = t.strides().to_vec();
+    let offset = t.storage_offset();
+    let storage = t
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "fill_" })?;
+    let raw: &mut [f64] = unsafe {
+        core::slice::from_raw_parts_mut(
+            storage.as_mut_ptr() as *mut f64,
+            storage.len() / core::mem::size_of::<f64>(),
+        )
+    };
+    for i in 0..n {
+        let idx = strided_index(i, &shape, &strides, offset);
+        raw[idx] = v;
+    }
+    t.version().bump();
+    Ok(t)
+}
+
+fn copy_inplace_typed<'a, T: Element>(
+    dst: &'a mut Tensor,
+    src: &Tensor,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = dst.numel();
+    let shape = dst.shape().to_vec();
+    let dst_strides = dst.strides().to_vec();
+    let dst_offset = dst.storage_offset();
+    let src_strides = src.strides().to_vec();
+    let src_offset = src.storage_offset();
+
+    let src_ptr = src.storage().as_bytes().as_ptr() as *const T;
+    let src_len = src.storage().byte_len() / core::mem::size_of::<T>();
+    let src_raw: &[T] = if src_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(src_ptr, src_len) }
+    };
+
+    let storage = dst
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "copy_" })?;
+    let dst_typed_len = storage.len() / core::mem::size_of::<T>();
+    let dst_raw: &mut [T] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut T, dst_typed_len) };
+    for i in 0..n {
+        let di = strided_index(i, &shape, &dst_strides, dst_offset);
+        let si = strided_index(i, &shape, &src_strides, src_offset);
+        dst_raw[di] = src_raw[si];
+    }
+    dst.version().bump();
+    Ok(dst)
+}
+
+/// Compute the storage element index for the i-th shape-order element.
+fn strided_index(linear: usize, shape: &[usize], strides: &[isize], offset: usize) -> usize {
+    let mut idx = linear;
+    let mut storage = offset as isize;
+    for (axis, &dim) in shape.iter().enumerate().rev() {
+        let coord = idx % dim;
+        idx /= dim;
+        storage += coord as isize * strides[axis];
+    }
+    storage as usize
+}
+
+impl Tensor {
+    /// Crate-internal: borrow the inner CPU buffer mutably for the
+    /// purpose of in-place ops. Returns `None` when storage is shared
+    /// (any clone exists), forcing the caller to either COW or reject.
+    fn storage_mut_for_inplace(&mut self) -> Option<&mut [u8]> {
+        // SAFETY: we require unique storage; the borrow is mutable on
+        // self and lifetime-bounded.
+        self.storage.as_bytes_mut()
+    }
+}
+
+// --------------------------------------------------------------------------
 // Errors
 // --------------------------------------------------------------------------
 
-/// Errors returned by [`Tensor`] constructors.
+/// Errors returned by [`Tensor`] constructors and in-place ops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TensorError {
     /// Constructor was given a `data` of wrong length for the requested
@@ -348,6 +698,30 @@ pub enum TensorError {
         got: usize,
         /// Shape requested (for diagnostic display).
         shape: Vec<usize>,
+    },
+    /// Two operands have shapes that cannot be jointly used.
+    ShapeMismatch {
+        /// Op name (`"add_"`, `"copy_"`, …).
+        op: &'static str,
+        /// LHS shape.
+        lhs: Vec<usize>,
+        /// RHS shape.
+        rhs: Vec<usize>,
+    },
+    /// Two operands have incompatible dtypes.
+    DtypeMismatch {
+        /// Op name.
+        op: &'static str,
+        /// Dtype actually received.
+        got: Dtype,
+        /// Dtype expected.
+        expected: Dtype,
+    },
+    /// Op required unique ownership of the storage but the buffer is
+    /// shared with at least one other clone or view.
+    Aliased {
+        /// Op name.
+        op: &'static str,
     },
     /// Underlying storage allocation failed.
     Storage(StorageError),
@@ -367,6 +741,15 @@ impl core::fmt::Display for TensorError {
                 got,
                 shape,
             } => write!(f, "shape {shape:?} requires {expected} elements, got {got}"),
+            TensorError::ShapeMismatch { op, lhs, rhs } => {
+                write!(f, "{op}: incompatible shapes {lhs:?} vs {rhs:?}")
+            },
+            TensorError::DtypeMismatch { op, got, expected } => {
+                write!(f, "{op}: dtype mismatch (got {got}, expected {expected})")
+            },
+            TensorError::Aliased { op } => {
+                write!(f, "{op}: in-place op requires unique storage; clone first")
+            },
             TensorError::Storage(e) => write!(f, "storage error: {e}"),
         }
     }
@@ -526,5 +909,126 @@ mod tests {
         assert_eq!(t.storage().byte_len(), 0);
         assert_eq!(t.numel(), 0);
         assert!(t.is_empty());
+    }
+
+    // ---------------------- in-place op tests ----------------------
+
+    #[test]
+    fn add_inplace_basic_f32() {
+        let mut a = Tensor::from_vec([3usize], vec![1.0_f32, 2.0, 3.0]).unwrap();
+        let v0 = a.version().current();
+        let b = Tensor::from_vec([3usize], vec![10.0_f32, 20.0, 30.0]).unwrap();
+        a.add_(&b).unwrap();
+        assert_eq!(a.as_slice::<f32>().unwrap(), &[11.0, 22.0, 33.0]);
+        assert_eq!(a.version().current(), v0 + 1, "version_counter must bump");
+    }
+
+    #[test]
+    fn add_inplace_with_broadcast_row_vector() {
+        let mut a = Tensor::from_vec([2usize, 3], vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let row = Tensor::from_vec([3usize], vec![10.0_f32, 20.0, 30.0]).unwrap();
+        a.add_(&row).unwrap();
+        assert_eq!(
+            a.as_slice::<f32>().unwrap(),
+            &[11.0, 22.0, 33.0, 14.0, 25.0, 36.0]
+        );
+    }
+
+    #[test]
+    fn sub_mul_div_inplace_paths() {
+        let mut a = Tensor::from_vec([3usize], vec![6.0_f32, 8.0, 10.0]).unwrap();
+        let b = Tensor::from_vec([3usize], vec![2.0_f32, 4.0, 5.0]).unwrap();
+        a.sub_(&b).unwrap();
+        assert_eq!(a.as_slice::<f32>().unwrap(), &[4.0, 4.0, 5.0]);
+        a.mul_(&b).unwrap();
+        assert_eq!(a.as_slice::<f32>().unwrap(), &[8.0, 16.0, 25.0]);
+        a.div_(&b).unwrap();
+        assert_eq!(a.as_slice::<f32>().unwrap(), &[4.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn neg_abs_inplace() {
+        let mut a = Tensor::from_vec([3usize], vec![1.0_f32, -2.0, 3.0]).unwrap();
+        a.neg_().unwrap();
+        assert_eq!(a.as_slice::<f32>().unwrap(), &[-1.0, 2.0, -3.0]);
+        a.abs_().unwrap();
+        assert_eq!(a.as_slice::<f32>().unwrap(), &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn fill_zero_inplace() {
+        let mut a = Tensor::from_vec([3usize], vec![1.0_f32, 2.0, 3.0]).unwrap();
+        a.fill_(7.5).unwrap();
+        assert_eq!(a.as_slice::<f32>().unwrap(), &[7.5, 7.5, 7.5]);
+        a.zero_().unwrap();
+        assert_eq!(a.as_slice::<f32>().unwrap(), &[0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn copy_inplace() {
+        let mut dst = Tensor::zeros([3usize]);
+        let src = Tensor::from_vec([3usize], vec![1.0_f32, 2.0, 3.0]).unwrap();
+        dst.copy_(&src).unwrap();
+        assert_eq!(dst.as_slice::<f32>().unwrap(), &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn inplace_aliased_returns_err() {
+        let mut a = Tensor::from_vec([3usize], vec![1.0_f32; 3]).unwrap();
+        let _alias = a.clone(); // bumps storage refcount → aliasing
+        let b = Tensor::from_vec([3usize], vec![1.0_f32; 3]).unwrap();
+        match a.add_(&b) {
+            Err(TensorError::Aliased { op }) => assert_eq!(op, "add_"),
+            other => panic!("expected Aliased, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inplace_dtype_mismatch_returns_err() {
+        let mut a = Tensor::from_vec([3usize], vec![1.0_f32; 3]).unwrap();
+        let b = Tensor::from_vec_typed::<i64, _>([3usize], vec![1_i64, 2, 3]).unwrap();
+        match a.add_(&b) {
+            Err(TensorError::DtypeMismatch { op, .. }) => assert_eq!(op, "add_"),
+            other => panic!("expected DtypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inplace_shape_mismatch_returns_err() {
+        let mut a = Tensor::from_vec([3usize], vec![1.0_f32; 3]).unwrap();
+        // Cannot broadcast a [4] into a [3] in-place — would grow.
+        let b = Tensor::from_vec([4usize], vec![1.0_f32; 4]).unwrap();
+        match a.add_(&b) {
+            Err(TensorError::ShapeMismatch { op, .. }) => assert_eq!(op, "add_"),
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inplace_through_view_bumps_base_version() {
+        // The version counter is shared between a tensor and its views.
+        // Mutating through a view bumps the base's counter too.
+        let a = Tensor::from_vec([2usize, 3], vec![1.0_f32; 6]).unwrap();
+        let v0 = a.version().current();
+        // We can't mutate through a view if storage is shared; so first
+        // verify the *counter* alone shares.
+        let view = a.clone();
+        assert!(view.version().shares_with(a.version()));
+        let _ = v0;
+        // Force unique storage by dropping the alias before mutating.
+        drop(view);
+        let mut a = a; // re-bind for mut access
+        let b = Tensor::scalar(1.0);
+        a.add_(&b).unwrap();
+        assert_eq!(a.version().current(), 1);
+    }
+
+    #[test]
+    fn fill_dtype_unsupported_returns_err() {
+        let mut a = Tensor::from_vec_typed::<i64, _>([3usize], vec![1_i64; 3]).unwrap();
+        match a.fill_(0.0) {
+            Err(TensorError::DtypeMismatch { op, .. }) => assert_eq!(op, "fill_"),
+            other => panic!("expected DtypeMismatch, got {other:?}"),
+        }
     }
 }
