@@ -20,14 +20,20 @@
 //! `rustorch_core`. The submodules below ship in parallel and are
 //! integrated piece-by-piece.
 
+pub mod convert;
 pub mod dtype;
 pub mod layout;
 pub mod shape;
 pub mod storage;
+pub mod tensor_impl;
 pub mod version;
+pub mod view;
 
+pub use convert::{tensor_from_storage, ConvertError, ShapeIter};
 pub use dtype::{Dtype, Element};
 pub use layout::{Layout, LayoutError};
 pub use shape::{BroadcastError, Shape};
 pub use storage::{Storage, StorageError};
+pub use tensor_impl::{Tensor, TensorError};
 pub use version::{VersionCounter, VersionSnapshot};
+pub use view::ViewError;

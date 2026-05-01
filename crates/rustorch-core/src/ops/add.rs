@@ -16,20 +16,20 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     // Case 1: identical shapes
     if sa == sb {
         let out: Vec<f32> = da.iter().zip(db.iter()).map(|(x, y)| x + y).collect();
-        return Tensor::from_vec(sa.to_vec(), out);
+        return Tensor::from_vec(sa.to_vec(), out).map_err(Into::into);
     }
 
     // Case 2a: a is scalar
     if sa.is_empty() {
         let s = da[0];
         let out: Vec<f32> = db.iter().map(|y| y + s).collect();
-        return Tensor::from_vec(sb.to_vec(), out);
+        return Tensor::from_vec(sb.to_vec(), out).map_err(Into::into);
     }
     // Case 2b: b is scalar
     if sb.is_empty() {
         let s = db[0];
         let out: Vec<f32> = da.iter().map(|x| x + s).collect();
-        return Tensor::from_vec(sa.to_vec(), out);
+        return Tensor::from_vec(sa.to_vec(), out).map_err(Into::into);
     }
 
     // Case 3a: row vector [N] + matrix [M, N]
@@ -42,7 +42,7 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
                 out.push(db[i * n + j] + da[j]);
             }
         }
-        return Tensor::from_vec(vec![m, n], out);
+        return Tensor::from_vec(vec![m, n], out).map_err(Into::into);
     }
     // Case 3b: matrix [M, N] + row vector [N]
     if sb.len() == 1 && sa.len() == 2 && sb[0] == sa[1] {
@@ -54,7 +54,7 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
                 out.push(da[i * n + j] + db[j]);
             }
         }
-        return Tensor::from_vec(vec![m, n], out);
+        return Tensor::from_vec(vec![m, n], out).map_err(Into::into);
     }
 
     Err(Error::ShapeMismatch {

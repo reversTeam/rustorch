@@ -41,7 +41,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             out[i * n + j] = sum;
         }
     }
-    Tensor::from_vec(vec![m, n], out)
+    Tensor::from_vec(vec![m, n], out).map_err(Into::into)
 }
 
 #[cfg(test)]

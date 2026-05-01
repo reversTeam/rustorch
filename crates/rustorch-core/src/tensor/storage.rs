@@ -128,6 +128,12 @@ impl Storage {
     /// byte length must be divisible by `size_of::<T>()`.
     pub unsafe fn as_slice<T: Copy + 'static>(&self) -> &[T] {
         let bytes = self.as_bytes();
+        if bytes.is_empty() {
+            // Empty storage uses a dangling u8 sentinel that is NOT
+            // guaranteed to be aligned for arbitrary T. Return a typed
+            // empty slice via the static fallback.
+            return &[];
+        }
         let n = bytes.len() / core::mem::size_of::<T>();
         // SAFETY: caller asserted that the bytes are a valid `[T]`.
         slice::from_raw_parts(bytes.as_ptr() as *const T, n)
