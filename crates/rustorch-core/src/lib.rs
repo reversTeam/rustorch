@@ -17,6 +17,7 @@
 
 mod format;
 pub mod ops;
+pub mod tensor;
 
 use std::fmt;
 
