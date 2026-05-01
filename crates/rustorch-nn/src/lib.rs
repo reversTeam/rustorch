@@ -18,6 +18,7 @@ pub mod activation;
 pub mod attention;
 pub mod container;
 pub mod embedding;
+pub mod hooks;
 pub mod init;
 pub mod linear;
 pub mod loss;
@@ -33,6 +34,7 @@ pub use activation::{
 pub use attention::{scaled_dot_product_attention, SingleHeadAttention};
 pub use container::{ModuleDict, ModuleList};
 pub use embedding::Embedding;
+pub use hooks::{HookHandle, HookedModule};
 pub use init::{calculate_fan, init, init_with_seed, FanMode, Init, Nonlinearity};
 pub use linear::Linear;
 pub use loss::{Criterion, CrossEntropyLoss, MseLoss};
