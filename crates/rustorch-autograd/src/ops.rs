@@ -1242,6 +1242,144 @@ pub fn index_select(src: &Variable, indices: &Tensor) -> Result<Variable, Backwa
 }
 
 // --------------------------------------------------------------------------
+// bmm — batched matmul: [B, M, K] @ [B, K, N] = [B, M, N]
+// Backward: dA[bi] = grad[bi] @ B[bi].T;  dB[bi] = A[bi].T @ grad[bi]
+// --------------------------------------------------------------------------
+
+fn bmm_forward(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackwardError> {
+    let l_shape = lhs.shape();
+    let r_shape = rhs.shape();
+    if l_shape.len() != 3 || r_shape.len() != 3 {
+        return Err(BackwardError::Backend {
+            op: "bmm",
+            message: format!("bmm needs rank-3 inputs, got {l_shape:?} @ {r_shape:?}"),
+        });
+    }
+    let (b, m, k1) = (l_shape[0], l_shape[1], l_shape[2]);
+    let (b2, k2, n) = (r_shape[0], r_shape[1], r_shape[2]);
+    if b != b2 || k1 != k2 {
+        return Err(BackwardError::Backend {
+            op: "bmm",
+            message: format!("shape mismatch: {l_shape:?} @ {r_shape:?}"),
+        });
+    }
+    let l_data = lhs
+        .as_slice::<f32>()
+        .ok_or_else(|| BackwardError::Backend {
+            op: "bmm",
+            message: "lhs must be contiguous F32".to_string(),
+        })?;
+    let r_data = rhs
+        .as_slice::<f32>()
+        .ok_or_else(|| BackwardError::Backend {
+            op: "bmm",
+            message: "rhs must be contiguous F32".to_string(),
+        })?;
+    let k = k1;
+    let mut out = vec![0.0_f32; b * m * n];
+    for bi in 0..b {
+        let l_off = bi * m * k;
+        let r_off = bi * k * n;
+        let o_off = bi * m * n;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0_f32;
+                for kk in 0..k {
+                    acc += l_data[l_off + i * k + kk] * r_data[r_off + kk * n + j];
+                }
+                out[o_off + i * n + j] = acc;
+            }
+        }
+    }
+    Tensor::from_vec([b, m, n], out).map_err(|e| BackwardError::Backend {
+        op: "bmm",
+        message: format!("output build: {e}"),
+    })
+}
+
+struct BmmBackward {
+    lhs_saved: Tensor,
+    rhs_saved: Tensor,
+    edges: [Edge; 2],
+}
+
+fn bmm_grad_inputs(grad: &Tensor, lhs: &Tensor, rhs: &Tensor) -> (Tensor, Tensor) {
+    // dA[bi] = grad[bi] @ B[bi].T  → shape [B, M, K]
+    // dB[bi] = A[bi].T @ grad[bi]  → shape [B, K, N]
+    let l_shape = lhs.shape();
+    let r_shape = rhs.shape();
+    let b = l_shape[0];
+    let m = l_shape[1];
+    let k = l_shape[2];
+    let n = r_shape[2];
+    let g = grad.as_slice::<f32>().expect("f32 grad");
+    let l = lhs.as_slice::<f32>().expect("f32 lhs");
+    let r = rhs.as_slice::<f32>().expect("f32 rhs");
+
+    let mut da = vec![0.0_f32; b * m * k];
+    let mut db = vec![0.0_f32; b * k * n];
+
+    for bi in 0..b {
+        let g_off = bi * m * n;
+        let l_off = bi * m * k;
+        let r_off = bi * k * n;
+        // dA[bi] = grad[bi] @ B[bi].T: shape [M, K]
+        for i in 0..m {
+            for kk in 0..k {
+                let mut acc = 0.0_f32;
+                for j in 0..n {
+                    acc += g[g_off + i * n + j] * r[r_off + kk * n + j];
+                }
+                da[l_off + i * k + kk] = acc;
+            }
+        }
+        // dB[bi] = A[bi].T @ grad[bi]: shape [K, N]
+        for kk in 0..k {
+            for j in 0..n {
+                let mut acc = 0.0_f32;
+                for i in 0..m {
+                    acc += l[l_off + i * k + kk] * g[g_off + i * n + j];
+                }
+                db[r_off + kk * n + j] = acc;
+            }
+        }
+    }
+
+    let da_t = Tensor::from_vec([b, m, k], da).expect("dA build");
+    let db_t = Tensor::from_vec([b, k, n], db).expect("dB build");
+    (da_t, db_t)
+}
+
+impl Node for BmmBackward {
+    fn name(&self) -> &'static str {
+        "BmmBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let (da, db) = bmm_grad_inputs(grad, &self.lhs_saved, &self.rhs_saved);
+        vec![Some(da), Some(db)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// Batched matmul `[B, M, K] @ [B, K, N] = [B, M, N]` (autograd-aware).
+pub fn bmm(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
+    let out = bmm_forward(&lhs.tensor(), &rhs.tensor())?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
+        let node = std::sync::Arc::new(BmmBackward {
+            lhs_saved: lhs.tensor().clone(),
+            rhs_saved: rhs.tensor().clone(),
+            edges: [lhs.edge(), rhs.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
 // mean_dim — d/dx mean(x, dim, keepdim=true) broadcasts grad/N back to x.shape
 // --------------------------------------------------------------------------
 

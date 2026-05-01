@@ -6,8 +6,8 @@
 //! - chain-rule properties
 
 use rustorch_autograd::ops::{
-    abs, add, cross_entropy, div, exp, leaky_relu, log, log_softmax, matmul, mean, mse_loss, mul,
-    neg, pow_scalar, relu, sigmoid, silu, softmax, sqrt, sub, sum, tanh,
+    abs, add, bmm, cross_entropy, div, exp, leaky_relu, log, log_softmax, matmul, mean, mse_loss,
+    mul, neg, pow_scalar, relu, sigmoid, silu, softmax, sqrt, sub, sum, tanh,
 };
 use rustorch_autograd::{backward, no_grad, with_grad, Variable};
 use rustorch_core::tensor::tensor_impl::Tensor;
@@ -576,4 +576,53 @@ fn pow_scalar_backward_x_to_3() {
             "x³'@{x_v} = {got}, expected {expected}"
         );
     }
+}
+
+// -------------------- bmm (batched matmul) --------------------
+
+#[test]
+fn bmm_forward_matches_per_batch_matmul() {
+    // B=2, M=2, K=3, N=2
+    let a = Variable::new(
+        Tensor::from_vec(
+            [2usize, 2, 3],
+            vec![
+                1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
+        )
+        .unwrap(),
+    );
+    let b = Variable::new(
+        Tensor::from_vec(
+            [2usize, 3, 2],
+            vec![
+                1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0,
+            ],
+        )
+        .unwrap(),
+    );
+    let c = bmm(&a, &b).unwrap();
+    assert_eq!(c.tensor().shape(), &[2, 2, 2]);
+    // batch 0: A[0]= [[1,2,3],[4,5,6]] @ [[1,0],[0,1],[1,0]] = [[1+3, 2], [4+6, 5]] = [[4,2],[10,5]]
+    // batch 1: A[1]= [[7,8,9],[10,11,12]] @ [[0,1],[1,0],[0,1]] = [[8, 7+9],[11, 10+12]] = [[8,16],[11,22]]
+    let expected = vec![4.0_f32, 2.0, 10.0, 5.0, 8.0, 16.0, 11.0, 22.0];
+    assert_eq!(c.tensor().as_slice::<f32>().unwrap(), expected.as_slice());
+}
+
+#[test]
+fn bmm_backward_propagates_to_both_inputs() {
+    // Simple bmm with sum loss
+    let a = Variable::leaf(Tensor::from_vec([1usize, 2, 2], vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
+    let b = Variable::leaf(Tensor::from_vec([1usize, 2, 2], vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
+    let c = bmm(&a, &b).unwrap();
+    let s = sum(&c).unwrap();
+    backward(&s, None).unwrap();
+    // d/dA sum(A @ B) = grad @ B.T = ones[2,2] @ [[1,3],[2,4]] = [[3,7],[3,7]]
+    let da = a.grad().unwrap();
+    assert_eq!(da.shape(), &[1, 2, 2]);
+    assert_eq!(da.as_slice::<f32>().unwrap(), &[3.0_f32, 7.0, 3.0, 7.0]);
+    // d/dB sum(A @ B) = A.T @ grad = [[1,3],[2,4]] @ ones[2,2] = [[4,4],[6,6]]
+    let db = b.grad().unwrap();
+    assert_eq!(db.shape(), &[1, 2, 2]);
+    assert_eq!(db.as_slice::<f32>().unwrap(), &[4.0_f32, 4.0, 6.0, 6.0]);
 }
