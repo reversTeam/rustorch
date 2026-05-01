@@ -83,6 +83,48 @@ impl Criterion for CrossEntropyLoss {
     }
 }
 
+// ------------------------------ CTCLoss ------------------------------
+
+/// CTC loss wrapper around the cpu kernel. v1 is **forward only** —
+/// returns a Variable that does NOT track gradient. Useful for
+/// metric reporting; differentiable training requires the alpha-beta
+/// backward (pending follow-up).
+pub struct CTCLoss {
+    reduction: Reduction,
+    /// Per-sample input lengths.
+    pub input_lens: Vec<i64>,
+    /// Per-sample target lengths.
+    pub target_lens: Vec<i64>,
+}
+
+impl CTCLoss {
+    /// Build with input + target lengths (len = batch size) and reduction.
+    pub fn new(input_lens: Vec<i64>, target_lens: Vec<i64>, reduction: Reduction) -> Self {
+        CTCLoss {
+            reduction,
+            input_lens,
+            target_lens,
+        }
+    }
+}
+
+impl Criterion for CTCLoss {
+    fn forward(&self, log_probs: &Variable, targets: &Variable) -> Result<Variable, ModuleError> {
+        let loss = rustorch_cpu::kernels::ctc::ctc_loss_forward(
+            &log_probs.tensor(),
+            &targets.tensor(),
+            &self.input_lens,
+            &self.target_lens,
+            self.reduction,
+        )
+        .map_err(|e| rustorch_autograd::BackwardError::Backend {
+            op: "ctc_loss",
+            message: e.to_string(),
+        })?;
+        Ok(Variable::new(loss))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

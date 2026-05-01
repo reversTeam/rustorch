@@ -25,6 +25,7 @@ pub mod linear;
 pub mod loss;
 pub mod module;
 pub mod norm;
+pub mod rnn;
 pub mod sequential;
 pub mod state_dict;
 
@@ -39,9 +40,10 @@ pub use embedding::Embedding;
 pub use hooks::{HookHandle, HookedModule};
 pub use init::{calculate_fan, init, init_with_seed, FanMode, Init, Nonlinearity};
 pub use linear::{Bilinear, Linear};
-pub use loss::{Criterion, CrossEntropyLoss, MseLoss};
-pub use module::Module;
+pub use loss::{CTCLoss, Criterion, CrossEntropyLoss, MseLoss};
+pub use module::{Buffer, Module, Parameter};
 pub use norm::{BatchNorm2d, LayerNorm, RMSNorm};
+pub use rnn::{LstmCell, RnnCell};
 pub use sequential::Sequential;
 pub use state_dict::{load_state_dict, state_dict, LoadReport, StateDictError};
 

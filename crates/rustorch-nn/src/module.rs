@@ -16,6 +16,16 @@ use rustorch_autograd::{BackwardError, Variable};
 /// Errors returned by [`Module::forward`].
 pub type ModuleError = BackwardError;
 
+/// Trainable parameter newtype — alias for [`Variable`] in v1.
+/// Distinguishes parameters from arbitrary tensors at the type level
+/// for documentation and future static enforcement.
+pub type Parameter = Variable;
+
+/// Non-trainable buffer newtype — alias for [`Variable`] in v1.
+/// Used by Modules that need to track running statistics (e.g.
+/// BatchNorm) without making them learnable parameters.
+pub type Buffer = Variable;
+
 /// Common trait for every neural-network module.
 pub trait Module: Send + Sync {
     /// Compute the forward pass.
