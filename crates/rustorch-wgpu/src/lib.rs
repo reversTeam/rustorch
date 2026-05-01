@@ -20,6 +20,7 @@
 
 pub mod backend;
 pub mod cache;
+pub mod conv;
 pub mod elementwise;
 pub mod error;
 pub mod layernorm;
@@ -31,6 +32,7 @@ pub mod storage;
 pub mod transfer;
 
 pub use backend::WgpuBackend;
+pub use conv::{conv2d_forward, transpose_weight, Conv2dCfg};
 pub use elementwise::{dispatch_binary, dispatch_unary};
 pub use error::WgpuError;
 pub use layernorm::layernorm_rows;
