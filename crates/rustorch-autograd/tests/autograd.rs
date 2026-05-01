@@ -626,3 +626,33 @@ fn bmm_backward_propagates_to_both_inputs() {
     assert_eq!(db.shape(), &[1, 2, 2]);
     assert_eq!(db.as_slice::<f32>().unwrap(), &[4.0_f32, 4.0, 6.0, 6.0]);
 }
+
+// -------------------- reshape --------------------
+
+#[test]
+fn reshape_preserves_data_and_grad() {
+    use rustorch_autograd::ops::reshape;
+    let x = Variable::leaf(
+        Tensor::from_vec([2usize, 3], vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+    );
+    let y = reshape(&x, vec![3, 2]).unwrap();
+    assert_eq!(y.tensor().shape(), &[3, 2]);
+    let s = sum(&y).unwrap();
+    backward(&s, None).unwrap();
+    let g = x.grad().unwrap();
+    assert_eq!(g.shape(), &[2, 3]);
+    assert_eq!(g.as_slice::<f32>().unwrap(), &[1.0_f32; 6]);
+}
+
+#[test]
+fn reshape_chain_preserves_gradient_flow() {
+    use rustorch_autograd::ops::reshape;
+    // y = reshape(x*x, [4]); s = sum(y); ds/dx = 2x
+    let x = Variable::leaf(Tensor::from_vec([2usize, 2], vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
+    let xsq = mul(&x, &x).unwrap();
+    let y = reshape(&xsq, vec![4]).unwrap();
+    let s = sum(&y).unwrap();
+    backward(&s, None).unwrap();
+    let g = x.grad().unwrap();
+    assert_eq!(g.as_slice::<f32>().unwrap(), &[2.0_f32, 4.0, 6.0, 8.0]);
+}

@@ -1415,6 +1415,70 @@ pub fn transpose(src: &Variable, d0: usize, d1: usize) -> Result<Variable, Backw
     Ok(out_var)
 }
 
+// --------------------------------------------------------------------------
+// reshape — view-only op; backward reshapes the gradient to in_shape.
+// (Requires the input to be contiguous; non-contiguous inputs need an
+// explicit `.contiguous()` first. Same constraint PyTorch's `view` has.)
+// --------------------------------------------------------------------------
+
+struct ReshapeBackward {
+    in_shape: Vec<usize>,
+    edges: [Edge; 1],
+}
+
+impl Node for ReshapeBackward {
+    fn name(&self) -> &'static str {
+        "ReshapeBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        // Reshape grad back to input shape. Since reshape is a view op
+        // we materialise the bytes via from_vec.
+        let data = grad.as_slice::<f32>().expect("f32 grad").to_vec();
+        let g = Tensor::from_vec(self.in_shape.clone(), data).expect("reshape bw shape");
+        vec![Some(g)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// Reshape `src` to the given shape. Requires `numel(src) == numel(shape)`.
+/// Only contiguous F32 tensors are supported in v1.
+pub fn reshape(src: &Variable, shape: Vec<usize>) -> Result<Variable, BackwardError> {
+    let src_t = src.tensor();
+    let numel: usize = shape.iter().product();
+    if numel != src_t.numel() {
+        return Err(BackwardError::Backend {
+            op: "reshape",
+            message: format!(
+                "shape {:?} has {numel} elements, src has {} elements",
+                shape,
+                src_t.numel()
+            ),
+        });
+    }
+    let data = src_t
+        .as_slice::<f32>()
+        .ok_or_else(|| BackwardError::Backend {
+            op: "reshape",
+            message: "expected contiguous F32".to_string(),
+        })?;
+    let out = Tensor::from_vec(shape, data.to_vec()).map_err(|e| BackwardError::Backend {
+        op: "reshape",
+        message: format!("{e}"),
+    })?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && src.requires_grad {
+        let node = std::sync::Arc::new(ReshapeBackward {
+            in_shape: src_t.shape().to_vec(),
+            edges: [src.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
 /// Batched matmul `[B, M, K] @ [B, K, N] = [B, M, N]` (autograd-aware).
 pub fn bmm(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
     let out = bmm_forward(&lhs.tensor(), &rhs.tensor())?;
