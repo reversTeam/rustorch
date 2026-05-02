@@ -70,6 +70,16 @@ impl Slot {
         self.tenants.push(id);
         self.intervals.push(iv);
     }
+
+    /// Append an aliased tenant — used by the in-place layer to
+    /// register an output that shares storage with an already-placed
+    /// input. The slot's `bytes`/`align` are NOT recomputed because
+    /// the merged interval was already accounted for during FFD.
+    /// The intervals list is not extended either — `fits()` is never
+    /// called after `plan_with_inplace` returns.
+    pub(crate) fn push_aliased_tenant(&mut self, id: TensorId) {
+        self.tenants.push(id);
+    }
 }
 
 /// Final memory-plan output.

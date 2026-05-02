@@ -27,9 +27,13 @@
 #![warn(rust_2018_idioms)]
 
 pub mod allocator;
+pub mod inplace;
 pub mod lifetime;
 
 pub use allocator::{plan, plan_with_budget, PlanError, PlanResult, Slot};
+pub use inplace::{
+    evaluate_hint, plan_with_inplace, InPlaceBlockers, InPlaceDecision, InPlaceHint,
+};
 pub use lifetime::{Interval, LifetimeError, LifetimeTable, TensorId};
 
 /// Crate version reported at runtime.
