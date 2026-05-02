@@ -38,6 +38,7 @@ members = [
     "crates/rustorch-rpc-internal",
     "crates/rustorch-attention",
     "crates/rustorch-quant",
+    "crates/rustorch-fusion",
 ]
 exclude = [
     "pytorch", # reference clone of upstream PyTorch (read-only)
@@ -73,6 +74,7 @@ rustorch-wgpu      = { version = "0.0.1", path = "crates/rustorch-wgpu" }
 rustorch-planner   = { version = "0.0.1", path = "crates/rustorch-planner" }
 rustorch-attention = { version = "0.0.1", path = "crates/rustorch-attention" }
 rustorch-quant     = { version = "0.0.1", path = "crates/rustorch-quant" }
+rustorch-fusion    = { version = "0.0.1", path = "crates/rustorch-fusion" }
 
 # Numerics & types
 half        = "2.4"   # f16 / bf16

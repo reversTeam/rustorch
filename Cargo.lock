@@ -2931,6 +2931,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-fusion"
+version = "0.0.1"
+dependencies = [
+ "criterion",
+ "proptest",
+]
+
+[[package]]
 name = "rustorch-log"
 version = "0.0.1"
 dependencies = [

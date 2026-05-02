@@ -1,0 +1,25 @@
+[package]
+name = "rustorch-fusion"
+description = "Eager-mode op fusion for rustorch — DAG pattern matcher + library of hand-fused kernels (matmul+bias+activation, layernorm+linear, residual add+mul, elementwise epilogue chains)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest  = { workspace = true }
+
+[[bench]]
+name    = "fused_matmul_bench"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
