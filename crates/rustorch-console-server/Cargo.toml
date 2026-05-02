@@ -1,0 +1,60 @@
+[package]
+name = "rustorch-console-server"
+description = "Backend HTTP/JSON-RPC + SSE pour la Console rustorch — alimente le frontend Next.js (P3) et la CLI (P2.1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "rustorch-console"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP + async
+axum       = { version = "0.7", features = ["json", "macros"] }
+tokio      = { version = "1.40", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tower      = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# Serialization
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+# Persistence
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
+
+# Async streams (for SSE)
+async-stream = "0.3"
+futures      = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Time + identifiers
+chrono = { version = "0.4", features = ["serde"] }
+ulid   = { version = "1.1", features = ["serde"] }
+
+# Errors + tracing
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI flags
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# OpenAPI — utoipa 5+ emits OpenAPI 3.1 (4.x emits 3.0).
+utoipa            = { version = "5", features = ["axum_extras", "chrono"] }
+utoipa-swagger-ui = { version = "8", features = ["axum"] }
+
+[dev-dependencies]
+reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tempfile   = "3.10"
+tokio      = { version = "1.40", features = ["macros", "rt-multi-thread", "test-util"] }
+eventsource-stream = "0.2"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
