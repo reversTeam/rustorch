@@ -16,10 +16,12 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod cpu_backward;
 pub mod cpu_forward;
 pub mod mask;
 pub mod online_softmax;
 
+pub use cpu_backward::flash_backward;
 pub use cpu_forward::{
     flash_forward, flash_forward_masked, naive_forward, naive_forward_masked, AttentionError,
     AttentionShape,
