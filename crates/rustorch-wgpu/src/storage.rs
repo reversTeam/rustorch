@@ -178,6 +178,84 @@ mod gpu_pool_tests {
     }
 
     #[test]
+    fn pooled_storage_send_and_sync() {
+        // Compile-time assertion: the Storage type can cross thread
+        // boundaries. If WgpuStorage stops being Send + Sync, this
+        // test fails to compile.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WgpuStorage>();
+    }
+
+    #[test]
+    fn pooled_storage_zero_numel_drop_is_safe() {
+        // numel = 0 → buffer size clamps to 4 (wgpu min).  Drop
+        // should not panic; pool counts the slot exactly once.
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let pool = BufferPool::default();
+        let s = WgpuStorage::allocate_pooled(&backend.device, &pool, 0, Dtype::F32).unwrap();
+        drop(s);
+        // Zero-sized allocation still hits the pool once with the
+        // 4-byte minimum bucket.
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn pooled_storage_threaded_clone_is_safe() {
+        // Spawn N threads, each clones the same storage, increments,
+        // and drops. After all threads, the storage's refcount is back
+        // to one and dropping it returns the buffer to the pool.
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let pool = BufferPool::default();
+        let storage = WgpuStorage::allocate_pooled(&backend.device, &pool, 64, Dtype::F32).unwrap();
+        let storage = StdArc::new(storage);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = storage.clone();
+                thread::spawn(move || {
+                    let _local = (*s).clone();
+                    // _local drops here — but the original Arc-wrapped
+                    // copy is still alive in the parent.
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Outer Arc still alive — buffer not returned to pool yet.
+        assert!(pool.is_empty());
+        // try_unwrap returns Err if there are other strong refs;
+        // here we know we're the unique holder so unwrap to the inner
+        // value via map_err to side-step the missing Debug impl on
+        // WgpuStorage.
+        let inner = StdArc::try_unwrap(storage).map_err(|_| ()).unwrap();
+        drop(inner);
+        // Now the underlying PooledBuffer is dropped → pool gains 1.
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn pool_max_bytes_zero_disables_pooling() {
+        use crate::cache::PoolPolicy;
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let pool = BufferPool::default();
+        // Cap to zero → every release must evict.
+        pool.set_policy(PoolPolicy {
+            max_bytes: 0,
+            max_per_bucket: 64,
+        });
+        let s = WgpuStorage::allocate_pooled(&backend.device, &pool, 64, Dtype::F32).unwrap();
+        drop(s);
+        // Pool stays empty because max_bytes=0.
+        assert!(pool.is_empty());
+        let m = pool.metrics();
+        assert!(m.evictions >= 1);
+    }
+
+    #[test]
     fn pool_metrics_count_hits_after_recycling() {
         let backend = WgpuBackend::new_blocking().expect("init wgpu");
         let pool = BufferPool::default();

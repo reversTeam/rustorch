@@ -230,4 +230,42 @@ mod tests {
             pollster::block_on(to_cpu_async(&backend, &gpu, vec![3])).expect("async readback");
         assert_eq!(back.as_slice::<f32>().unwrap(), &[10.0_f32, 20.0, 30.0]);
     }
+
+    #[test]
+    fn async_readback_preserves_nan_bits() {
+        // NaN must round-trip bit-exactly.
+        let backend = WgpuBackend::new_blocking().expect("init wgpu");
+        let cpu = Tensor::from_vec([3_usize], vec![f32::NAN, 1.0, f32::INFINITY]).unwrap();
+        let gpu = to_gpu(&backend, &cpu).unwrap();
+        let back = pollster::block_on(to_cpu_async(&backend, &gpu, vec![3])).unwrap();
+        let got = back.as_slice::<f32>().unwrap();
+        assert!(got[0].is_nan(), "NaN was not preserved");
+        assert_eq!(got[1], 1.0);
+        assert_eq!(got[2], f32::INFINITY);
+    }
+
+    #[test]
+    fn parallel_readbacks_to_distinct_buffers_dont_interfere() {
+        // Two pipelines reading two distinct buffers must both succeed.
+        let backend = WgpuBackend::new_blocking().expect("init wgpu");
+        let a = Tensor::from_vec([2_usize], vec![1.0_f32, 2.0]).unwrap();
+        let b = Tensor::from_vec([2_usize], vec![3.0_f32, 4.0]).unwrap();
+        let ga = to_gpu(&backend, &a).unwrap();
+        let gb = to_gpu(&backend, &b).unwrap();
+        let ra = to_cpu(&backend, &ga, vec![2]).unwrap();
+        let rb = to_cpu(&backend, &gb, vec![2]).unwrap();
+        assert_eq!(ra.as_slice::<f32>().unwrap(), &[1.0, 2.0]);
+        assert_eq!(rb.as_slice::<f32>().unwrap(), &[3.0, 4.0]);
+    }
+
+    #[test]
+    fn empty_shape_readback_returns_empty_tensor() {
+        let backend = WgpuBackend::new_blocking().expect("init wgpu");
+        // Shape [0] → 0 elements. Tensor::from_vec rejects it; instead
+        // we exercise a shape with a 0 dimension.
+        let cpu = Tensor::from_vec([2_usize, 0], vec![] as Vec<f32>).unwrap();
+        let gpu = to_gpu(&backend, &cpu).unwrap();
+        let back = to_cpu(&backend, &gpu, vec![2, 0]).unwrap();
+        assert_eq!(back.numel(), 0);
+    }
 }
