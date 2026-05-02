@@ -1467,6 +1467,7 @@ dependencies = [
  "console_error_panic_hook",
  "js-sys",
  "rustorch-core",
+ "rustorch-serde",
  "rustorch-wgpu",
  "wasm-bindgen",
  "wasm-bindgen-futures",

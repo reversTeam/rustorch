@@ -13,6 +13,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rustorch-core  = { workspace = true }
 rustorch-wgpu  = { workspace = true }
+rustorch-serde = { workspace = true }
+
+[features]
+default = []
+# Enable safetensors-loader GPU tests on a host with a real adapter.
+gpu-tests = ["rustorch-wgpu/gpu-tests"]
 
 # Browser bindings — only pulled in when the wasm target is selected.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -23,6 +29,3 @@ js-sys              = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
-
-[features]
-default = []

@@ -16,6 +16,10 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod gpt_block;
+pub mod model_loader;
+pub mod resnet_block;
+
 #[cfg(target_arch = "wasm32")]
 mod web {
     use rustorch_core::tensor::dtype::Dtype;

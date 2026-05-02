@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>rustorch — ResNet block (WebGPU demo)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: ui-monospace, Menlo, monospace; background: #0a0b09; color: #e0e0e0; padding: 24px; max-width: 960px; margin: 0 auto; }
+    h1 { color: #ce422b; }
+    .card { background: #14140f; border: 1px solid #2a2a26; padding: 16px 18px; margin: 14px 0; border-radius: 8px; }
+    button { background: #ce422b; color: white; border: none; padding: 10px 18px; border-radius: 4px; font: inherit; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    pre { background: #0a0a08; padding: 10px; border-radius: 4px; font-size: 0.85em; max-height: 280px; overflow-y: auto; }
+    label { color: #aaa; margin-right: 8px; }
+    input[type="number"] { background: #0a0a08; color: #e0e0e0; border: 1px solid #2a2a26; padding: 4px 8px; border-radius: 3px; font: inherit; width: 80px; margin-right: 16px; }
+    .ok { color: #8fcf6f; }
+    .warn { color: #e6b04b; }
+    .err { color: #e87b6f; }
+  </style>
+</head>
+<body>
+  <h1>ResNet block — WebGPU demo</h1>
+  <p>
+    Runs a single basic ResNet block on a synthetic <code>[1, C_in, H, W]</code>
+    F32 input. Uses random (deterministic, seeded) weights. Returns the
+    <code>[1, C_out, H, W]</code> output as a Float32Array. Real ResNet-18
+    inference with HuggingFace weights lands in a follow-up via
+    <code>load_safetensors_to_js</code>.
+  </p>
+
+  <div class="card">
+    <h2>Adapter</h2>
+    <p id="status">checking…</p>
+  </div>
+
+  <div class="card">
+    <h2>Run</h2>
+    <p>
+      <label>C_in <input id="ci" type="number" value="3" min="1" max="64" /></label>
+      <label>C_out <input id="co" type="number" value="8" min="1" max="64" /></label>
+      <label>H <input id="h" type="number" value="16" min="1" max="64" /></label>
+      <label>W <input id="w" type="number" value="16" min="1" max="64" /></label>
+      <button id="run">Run block</button>
+    </p>
+    <pre id="output">(not run yet)</pre>
+  </div>
+
+  <script type="module">
+    import init, { run_resnet_block_js } from "../pkg/rustorch_wasm_demo.js";
+    const $ = (id) => document.getElementById(id);
+
+    if (!("gpu" in navigator)) {
+      $("status").innerHTML = '<span class="warn">⚠ WebGPU not available. Use Chrome 120+.</span>';
+      $("run").disabled = true;
+    } else {
+      $("status").innerHTML = '<span class="ok">✓ navigator.gpu present.</span>';
+    }
+
+    let initialized = false;
+    async function ensureInit() { if (!initialized) { await init(); initialized = true; } }
+
+    $("run").addEventListener("click", async () => {
+      const out = $("output");
+      out.textContent = "Initializing WASM…";
+      try {
+        await ensureInit();
+        const ci = parseInt($("ci").value);
+        const co = parseInt($("co").value);
+        const h  = parseInt($("h").value);
+        const w  = parseInt($("w").value);
+        // Deterministic input.
+        const inp = new Float32Array(ci * h * w);
+        for (let i = 0; i < inp.length; i++) inp[i] = (Math.sin(i * 0.013) * 0.5);
+        out.textContent = `Running ResNet block on [1, ${ci}, ${h}, ${w}]…`;
+        const t0 = performance.now();
+        const result = await run_resnet_block_js(inp, ci, co, h, w);
+        const dt = performance.now() - t0;
+        out.textContent =
+          `Output [1, ${co}, ${h}, ${w}], total ${result.length} F32 values\n` +
+          `Total time: ${dt.toFixed(2)} ms\n\n` +
+          `First 16 values:\n` +
+          Array.from(result).slice(0, 16).map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
+      } catch (err) {
+        out.innerHTML = `<span class="err">Error: ${err?.message || err}</span>`;
+      }
+    });
+  </script>
+</body>
+</html>
