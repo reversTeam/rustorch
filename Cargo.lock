@@ -1442,6 +1442,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-planner"
+version = "0.0.1"
+dependencies = [
+ "rustorch-core",
+]
+
+[[package]]
 name = "rustorch-serde"
 version = "0.0.1"
 dependencies = [

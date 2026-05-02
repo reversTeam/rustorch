@@ -28,6 +28,7 @@ members = [
     "crates/rustorch-codegen",
     "crates/rustorch-wgpu",
     "crates/rustorch-wasm-demo",
+    "crates/rustorch-planner",
 ]
 exclude = [
     "pytorch", # reference clone of upstream PyTorch (read-only)
@@ -60,6 +61,7 @@ rustorch-data      = { version = "0.0.1", path = "crates/rustorch-data" }
 rustorch-serde     = { version = "0.0.1", path = "crates/rustorch-serde" }
 rustorch-codegen   = { version = "0.0.1", path = "crates/rustorch-codegen" }
 rustorch-wgpu      = { version = "0.0.1", path = "crates/rustorch-wgpu" }
+rustorch-planner   = { version = "0.0.1", path = "crates/rustorch-planner" }
 
 # Numerics & types
 half        = "2.4"   # f16 / bf16
