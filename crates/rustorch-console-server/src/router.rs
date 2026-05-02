@@ -4,7 +4,7 @@
 //! depending on a binary build.
 
 use crate::auth::{require_bearer, AuthConfig};
-use crate::handlers::{catalog, cluster, me, runs, sse_routes};
+use crate::handlers::{activity, builder, catalog, cluster, deploy, fs, me, runs, sse_routes};
 use crate::openapi::ApiDoc;
 use crate::state::AppState;
 use axum::{middleware, routing::get, Json, Router};
@@ -23,6 +23,10 @@ pub fn build(state: AppState, auth: AuthConfig) -> Router {
         .merge(cluster::routes())
         .merge(catalog::routes())
         .merge(runs::routes())
+        .merge(fs::routes())
+        .merge(builder::routes())
+        .merge(deploy::routes())
+        .merge(activity::routes())
         .merge(sse_routes::routes())
         .with_state(state);
 

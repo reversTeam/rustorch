@@ -5,7 +5,7 @@
 
 use crate::cluster::GpuSample;
 use crate::db;
-use crate::handlers::{catalog, cluster, me, runs};
+use crate::handlers::{activity, builder, catalog, cluster, deploy, fs, me, runs};
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -39,6 +39,17 @@ use utoipa::OpenApi;
         runs::save_checkpoint,
         runs::artifacts,
         runs::system,
+        fs::tree,
+        fs::read_file,
+        fs::write_file,
+        fs::problems,
+        fs::run_cargo,
+        builder::get_current,
+        builder::put_current,
+        builder::presets,
+        deploy::deploy,
+        deploy::register_dataset,
+        activity::list,
     ),
     components(schemas(
         me::MeResponse,
@@ -66,6 +77,18 @@ use utoipa::OpenApi;
         db::MetricPoint,
         db::Checkpoint,
         db::ActivityEvent,
+        fs::TreeEntry,
+        fs::FileResponse,
+        fs::WriteBody,
+        fs::Problem,
+        fs::RunBody,
+        fs::RunSpawnResponse,
+        builder::GraphDoc,
+        builder::PresetEntry,
+        deploy::DeployBody,
+        deploy::DeployResponse,
+        deploy::RegisterDatasetBody,
+        deploy::RegisterDatasetResponse,
     )),
     tags(
         (name = "me",       description = "Identity & workspace metadata"),

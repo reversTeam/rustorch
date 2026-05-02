@@ -815,6 +815,212 @@ async fn cluster_tick_task_streams_via_sse() {
     assert!(state.hub.ring_len(TICK_TOPIC) >= 1);
 }
 
+// ---- HTTP step 4 — FS / Builder / Deploy / Activity ---------------------
+
+#[tokio::test]
+async fn fs_read_write_roundtrip_and_traversal_blocked() {
+    use rustorch_console_server::cluster::MockClusterProvider;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = db::connect(":memory:").await.unwrap();
+    let state = AppState::new(pool, Hub::new(), Arc::new(MockClusterProvider::new()))
+        .with_workspace(tmp.path().to_path_buf());
+    let app = router::build(state, AuthConfig::default());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = reqwest::Client::new();
+    // Write a file inside the sandbox.
+    let resp = client
+        .put(format!("http://{addr}/fs/file?path=src/hello.rs"))
+        .json(&json!({"content": "fn main() {}"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // Read it back.
+    let v: serde_json::Value = reqwest::get(format!("http://{addr}/fs/file?path=src/hello.rs"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["content"], "fn main() {}");
+    // List the tree — at least our new file shows up.
+    let tree: Vec<serde_json::Value> = reqwest::get(format!("http://{addr}/fs/tree"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(tree.iter().any(|e| e["path"] == "src/hello.rs"));
+    // Traversal is rejected with 400.
+    let resp = reqwest::get(format!("http://{addr}/fs/file?path=../../etc/passwd"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn fs_problems_returns_empty_array() {
+    let (addr, _) = spawn(AuthConfig::default()).await;
+    let v: Vec<serde_json::Value> = reqwest::get(format!("http://{addr}/fs/problems"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(v.is_empty());
+}
+
+#[tokio::test]
+async fn builder_graph_roundtrip_persists_to_db() {
+    let (addr, _) = spawn(AuthConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    // First GET on an empty DB returns the default empty graph.
+    let v: serde_json::Value = client
+        .get(format!("http://{addr}/graph/current"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(v["nodes"].as_array().unwrap().is_empty());
+
+    // Save a non-trivial doc.
+    let doc = json!({
+        "nodes": [{"id": "n1", "kind": "Linear"}],
+        "edges": [],
+        "meta": {"title": "hello"},
+    });
+    client
+        .put(format!("http://{addr}/graph/current"))
+        .json(&doc)
+        .send()
+        .await
+        .unwrap();
+
+    // Get it back — should round-trip.
+    let v: serde_json::Value = client
+        .get(format!("http://{addr}/graph/current"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["nodes"][0]["id"], "n1");
+    assert_eq!(v["meta"]["title"], "hello");
+}
+
+#[tokio::test]
+async fn builder_presets_lists_known_models() {
+    let (addr, _) = spawn(AuthConfig::default()).await;
+    let v: Vec<serde_json::Value> = reqwest::get(format!("http://{addr}/graph/presets"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = v.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"resnet50"));
+    assert!(names.contains(&"gpt2-small"));
+}
+
+#[tokio::test]
+async fn deploy_validates_url_scheme_and_logs_activity() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let run_id = seed_run(&state).await;
+    let client = reqwest::Client::new();
+
+    // Bad URL scheme is rejected.
+    let resp = client
+        .post(format!("http://{addr}/deploy"))
+        .json(&json!({
+            "run_id": run_id,
+            "checkpoint": "best.safetensors",
+            "target_url": "ftp://nope",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // Happy path.
+    let resp = client
+        .post(format!("http://{addr}/deploy"))
+        .json(&json!({
+            "run_id": run_id,
+            "checkpoint": "best.safetensors",
+            "target_url": "https://api.example.com",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["status"], "queued");
+
+    // Activity feed picks up the request.
+    let act: Vec<serde_json::Value> = reqwest::get(format!("http://{addr}/activity"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(act
+        .iter()
+        .any(|a| a["kind"] == "deploy_requested" && a["run_id"] == run_id));
+}
+
+#[tokio::test]
+async fn datasets_post_validates_required_fields() {
+    let (addr, _) = spawn(AuthConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{addr}/datasets"))
+        .json(&json!({"name": "", "url": "https://x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let resp = client
+        .post(format!("http://{addr}/datasets"))
+        .json(&json!({"name": "newset", "url": "s3://bucket/path"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+}
+
+#[tokio::test]
+async fn activity_feed_returns_ordered_recent_events() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+
+    // Seed three activity rows directly.
+    for k in ["one", "two", "three"] {
+        db::insert_activity(&state.db, k, None, json!({}))
+            .await
+            .unwrap();
+    }
+
+    let v: Vec<serde_json::Value> = reqwest::get(format!("http://{addr}/activity?limit=10"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v.len(), 3);
+    // Newest first.
+    assert_eq!(v[0]["kind"], "three");
+    assert_eq!(v[2]["kind"], "one");
+}
+
 #[tokio::test]
 async fn checkpoint_against_missing_run_is_404() {
     let (_addr, state) = spawn(AuthConfig::default()).await;
