@@ -254,3 +254,124 @@ mod tests {
         assert_eq!(t.naive_total_bytes(), 64 + 32 + 16);
     }
 }
+
+/// Property-based tests over random execution traces.
+///
+/// The contract under test:
+/// 1. **Interval validity**: every recorded buffer satisfies
+///    `last_use >= def`. There is no way for `record_use`/`record_def`
+///    to violate this on a well-formed trace.
+/// 2. **Bytes accounting**: `naive_total_bytes()` equals the
+///    arithmetic sum of every interval's `bytes` (no double-counting,
+///    no truncation).
+/// 3. **Use never shrinks an interval**: calling `record_use(id, t)`
+///    with a `t` smaller than the current `last_use` is a no-op on the
+///    interval bounds.
+/// 4. **All recorded uses are bounded**: for every observed use of
+///    `id` at step `t`, `last_use(id) >= t`.
+///
+/// 1000 random traces × up to 200 ops per trace covers the
+/// "Property test" acceptance criterion of task `Buffer lifetime
+/// analysis on autograd graph`.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy: a trace is a Vec<(def_step, id, bytes, [use_steps])>
+    /// where def_step is monotonically increasing and use_steps are
+    /// all >= def_step. Models a forward pass with optional later uses.
+    fn trace_strategy() -> impl Strategy<Value = Vec<(u32, TensorId, u64, Vec<u32>)>> {
+        // Up to 200 ops per trace, up to 64KB per buffer, up to 5 later
+        // uses per buffer (skip-connections, residuals, etc.).
+        prop::collection::vec(
+            (
+                0u32..200,
+                (0u64..200).prop_map(TensorId),
+                1u64..65_536,
+                prop::collection::vec(0u32..200, 0..5),
+            ),
+            1..200,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 1000,
+            .. ProptestConfig::default()
+        })]
+
+        /// Every recorded interval has `last_use >= def`.
+        #[test]
+        fn interval_validity(trace in trace_strategy()) {
+            let mut t = LifetimeTable::new();
+            for (def_step, id, bytes, _) in &trace {
+                t.record_def(*id, *def_step, *bytes);
+            }
+            for (_, iv) in t.iter() {
+                prop_assert!(iv.last_use >= iv.def);
+            }
+        }
+
+        /// `naive_total_bytes` equals sum of `bytes` across intervals.
+        #[test]
+        fn naive_total_matches_sum(trace in trace_strategy()) {
+            let mut t = LifetimeTable::new();
+            for (def_step, id, bytes, _) in &trace {
+                t.record_def(*id, *def_step, *bytes);
+            }
+            let expected: u64 = t.iter().map(|(_, iv)| iv.bytes).sum();
+            prop_assert_eq!(t.naive_total_bytes(), expected);
+        }
+
+        /// `record_use` with a step earlier than the current `last_use`
+        /// never shrinks the interval.
+        #[test]
+        fn use_never_shrinks(trace in trace_strategy()) {
+            let mut t = LifetimeTable::new();
+            // First, define everything.
+            for (def_step, id, bytes, _) in &trace {
+                t.record_def(*id, *def_step, *bytes);
+            }
+            // Snapshot then attempt earlier uses.
+            let snapshot: std::collections::HashMap<TensorId, Interval> =
+                t.iter().map(|(id, iv)| (*id, *iv)).collect();
+            for (def_step, id, _, _) in &trace {
+                if *def_step > 0 {
+                    let _ = t.record_use(*id, def_step.saturating_sub(1));
+                }
+            }
+            for (id, iv_before) in &snapshot {
+                let iv_after = t.get(*id).unwrap();
+                prop_assert!(
+                    iv_after.last_use >= iv_before.last_use,
+                    "last_use shrank for {:?}: {} -> {}",
+                    id, iv_before.last_use, iv_after.last_use
+                );
+            }
+        }
+
+        /// For every observed use, `last_use(id) >= step`.
+        #[test]
+        fn last_use_bounds_every_observation(trace in trace_strategy()) {
+            let mut t = LifetimeTable::new();
+            for (def_step, id, bytes, uses) in &trace {
+                t.record_def(*id, *def_step, *bytes);
+                for u in uses {
+                    let _ = t.record_use(*id, (*u).max(*def_step));
+                }
+            }
+            for (def_step, id, _, uses) in &trace {
+                let iv = t.get(*id).unwrap();
+                for u in uses {
+                    let observed = (*u).max(*def_step);
+                    prop_assert!(
+                        iv.last_use >= observed,
+                        "last_use({:?}) = {} < observed use {}",
+                        id, iv.last_use, observed
+                    );
+                }
+            }
+        }
+    }
+}

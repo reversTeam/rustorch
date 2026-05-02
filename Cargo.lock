@@ -2965,6 +2965,9 @@ dependencies = [
 name = "rustorch-planner"
 version = "0.0.1"
 dependencies = [
+ "criterion",
+ "proptest",
+ "rand 0.8.6",
  "rustorch-core",
 ]
 

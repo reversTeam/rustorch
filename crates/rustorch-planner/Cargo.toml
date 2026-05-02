@@ -13,6 +13,15 @@ categories.workspace = true
 [dependencies]
 rustorch-core = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+proptest  = { workspace = true }
+rand      = { workspace = true }
+
+[[bench]]
+name    = "lifetime_bench"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
