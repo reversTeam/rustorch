@@ -24,4 +24,19 @@ pub enum WgpuError {
     /// Generic shape error during a wgpu operation.
     #[error("shape mismatch: {0}")]
     ShapeMismatch(String),
+
+    /// GPU is out of memory and even after evicting the pool the
+    /// allocation could not be satisfied.
+    ///
+    /// The string carries a one-line snapshot of the pool's metrics at
+    /// the moment of failure (bytes pooled, bytes allocated cumulative)
+    /// so users can wire it into their telemetry without depending on
+    /// the [`crate::cache::PoolMetricsSnapshot`] type directly.
+    #[error("GPU out of memory: requested {requested} bytes, {snapshot}")]
+    OutOfMemory {
+        /// Bytes requested by the failing allocation.
+        requested: u64,
+        /// One-line snapshot of pool metrics at failure time.
+        snapshot: String,
+    },
 }

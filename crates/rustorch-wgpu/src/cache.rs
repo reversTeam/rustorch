@@ -252,6 +252,81 @@ impl BufferPool {
         self.inner.metrics.snapshot()
     }
 
+    /// Drop **all** buffers currently held in the pool. Each evicted
+    /// buffer is counted in `metrics.evictions`. Used by the
+    /// evict-and-retry path of [`BufferPool::try_acquire`] when the
+    /// device is OOM. Returns the number of buffers evicted.
+    pub fn evict_all(&self) -> usize {
+        let mut guard = self.inner.bins.lock().expect("pool lock");
+        let mut evicted = 0_usize;
+        for (bucket, bin) in guard.iter_mut() {
+            evicted += bin.len();
+            self.inner
+                .metrics
+                .bytes_pooled
+                .fetch_sub((*bucket) * bin.len() as u64, Ordering::Relaxed);
+            self.inner
+                .metrics
+                .evictions
+                .fetch_add(bin.len() as u64, Ordering::Relaxed);
+            bin.clear();
+        }
+        evicted
+    }
+
+    /// Acquire a buffer with explicit OOM handling. On failure: drop
+    /// every pooled buffer (releasing GPU memory back to the driver)
+    /// and retry once. If that still fails, returns
+    /// [`crate::error::WgpuError::OutOfMemory`] with a metric snapshot
+    /// suitable for telemetry.
+    pub fn try_acquire(
+        &self,
+        device: &wgpu::Device,
+        size: u64,
+        usage: wgpu::BufferUsages,
+    ) -> Result<wgpu::Buffer, crate::error::WgpuError> {
+        // First attempt: normal acquire under a captured error scope so
+        // an OOM raises a wgpu validation error we can intercept rather
+        // than going to the device's uncaptured error handler (which by
+        // default panics in `RustyError`).
+        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let buf = self.acquire(device, size, usage);
+        let err = pollster::block_on(device.pop_error_scope());
+        if err.is_none() {
+            return Ok(buf);
+        }
+        // First attempt OOM'd. Drop the buffer the device returned (it
+        // may be in an invalid state per wgpu's contract), then evict
+        // and retry once.
+        drop(buf);
+        let evicted = self.evict_all();
+        // If we evicted nothing, retrying won't free anything new.
+        if evicted == 0 {
+            let snap = self.metrics();
+            return Err(crate::error::WgpuError::OutOfMemory {
+                requested: size,
+                snapshot: format!(
+                    "pool empty (bytes_alloc={}, hits={}, misses={})",
+                    snap.bytes_allocated, snap.hits, snap.misses
+                ),
+            });
+        }
+        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let buf2 = self.acquire(device, size, usage);
+        let err2 = pollster::block_on(device.pop_error_scope());
+        if err2.is_none() {
+            return Ok(buf2);
+        }
+        let snap = self.metrics();
+        Err(crate::error::WgpuError::OutOfMemory {
+            requested: size,
+            snapshot: format!(
+                "after evicting {} buffers: bytes_alloc={}, evictions={}, misses={}",
+                evicted, snap.bytes_allocated, snap.evictions, snap.misses
+            ),
+        })
+    }
+
     /// Acquire a buffer wrapped in a [`crate::pooled::PooledBuffer`]
     /// that will return itself to this pool when dropped.
     ///

@@ -148,6 +148,36 @@ mod gpu_pool_tests {
     }
 
     #[test]
+    fn evict_all_clears_pool_and_decrements_pooled_bytes() {
+        let backend = WgpuBackend::new_blocking().expect("init wgpu");
+        let pool = BufferPool::default();
+        let s = WgpuStorage::allocate_pooled(&backend.device, &pool, 64, Dtype::F32).unwrap();
+        drop(s);
+        assert_eq!(pool.len(), 1);
+        let evicted = pool.evict_all();
+        assert_eq!(evicted, 1);
+        assert!(pool.is_empty());
+        let m = pool.metrics();
+        assert_eq!(m.bytes_pooled, 0);
+        assert!(m.evictions >= 1);
+    }
+
+    #[test]
+    fn try_acquire_succeeds_for_normal_allocation() {
+        let backend = WgpuBackend::new_blocking().expect("init wgpu");
+        let pool = BufferPool::default();
+        // 4 KiB tensor — well within any GPU's budget.
+        let buf = pool
+            .try_acquire(
+                &backend.device,
+                4096,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            )
+            .expect("normal allocation must succeed");
+        assert!(buf.size() >= 4096);
+    }
+
+    #[test]
     fn pool_metrics_count_hits_after_recycling() {
         let backend = WgpuBackend::new_blocking().expect("init wgpu");
         let pool = BufferPool::default();
