@@ -1,0 +1,47 @@
+name: wgpu-windows
+
+# Dedicated Windows job using the WARP software DX12 adapter so wgpu
+# tests run reproducibly on every PR. WARP ships with Windows 10/11
+# and is automatically picked up by wgpu when no hardware GPU is
+# present on the runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: wgpu-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  WGPU_BACKEND: dx12
+
+jobs:
+  dx12-tests:
+    name: cargo test --features gpu-tests (WARP)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wgpu-windows
+
+      - name: Build rustorch-wgpu with gpu-tests feature
+        run: cargo build -p rustorch-wgpu --tests --features gpu-tests
+
+      - name: Run rustorch-wgpu GPU tests on WARP
+        # WARP is software-only and slow; allow extra time per test.
+        run: cargo test -p rustorch-wgpu --features gpu-tests
+        env:
+          RUST_TEST_TIME_UNIT: 60000,180000
+
+      - name: Run cross-backend parity tests (WARP)
+        run: cargo test -p rustorch-wgpu --features gpu-tests --test parity

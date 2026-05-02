@@ -1,0 +1,45 @@
+name: wgpu-macos
+
+# Dedicated macOS-arm64 job that runs the rustorch-wgpu GPU test
+# suite under the system Metal backend. Apple Silicon runners
+# (`macos-latest` is now M-series) expose a real Metal adapter so we
+# get genuine kernel coverage, not a software fallback like Lavapipe
+# or WARP.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: wgpu-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  WGPU_BACKEND: metal
+
+jobs:
+  metal-tests:
+    name: cargo test --features gpu-tests (Metal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wgpu-macos
+
+      - name: Build rustorch-wgpu with gpu-tests feature
+        run: cargo build -p rustorch-wgpu --tests --features gpu-tests
+
+      - name: Run rustorch-wgpu GPU tests on Metal
+        run: cargo test -p rustorch-wgpu --features gpu-tests
+
+      - name: Run cross-backend parity tests (Metal)
+        run: cargo test -p rustorch-wgpu --features gpu-tests --test parity

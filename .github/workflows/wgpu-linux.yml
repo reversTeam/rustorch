@@ -1,0 +1,61 @@
+name: wgpu-linux
+
+# Dedicated Linux job that boots a deterministic software Vulkan
+# adapter (Mesa Lavapipe) and runs the rustorch-wgpu GPU test suite
+# end-to-end (i.e. with the `gpu-tests` feature). The default `ci.yml`
+# only runs CPU-side tests because GitHub-hosted ubuntu-latest runners
+# do not expose any GPU adapter by default.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: wgpu-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  # Force wgpu onto the Vulkan backend; Lavapipe registers itself as
+  # the default Vulkan ICD when `mesa-vulkan-drivers` is installed.
+  WGPU_BACKEND: vulkan
+
+jobs:
+  vulkan-tests:
+    name: cargo test --features gpu-tests (Lavapipe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wgpu-linux
+
+      - name: Install Mesa software Vulkan (Lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1
+          # Sanity check — `vulkaninfo` should list at least one device.
+          vulkaninfo --summary | head -40
+
+      - name: Build rustorch-wgpu with gpu-tests feature
+        run: cargo build -p rustorch-wgpu --tests --features gpu-tests
+
+      - name: Run rustorch-wgpu GPU tests
+        # Lavapipe is fast enough for our fixtures but slower than a
+        # real GPU; bump the per-test timeout a bit.
+        run: cargo test -p rustorch-wgpu --features gpu-tests
+        env:
+          RUST_TEST_TIME_UNIT: 60000,120000
+
+      - name: Run cross-backend parity tests (Lavapipe baseline)
+        run: cargo test -p rustorch-wgpu --features gpu-tests --test parity
+
+      - name: Cargo bench compile-only
+        run: cargo build -p rustorch-wgpu --release --examples

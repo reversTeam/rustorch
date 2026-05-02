@@ -1,0 +1,38 @@
+name: wgpu-bench
+
+# Compile-only bench check on every PR. Full benchmark runs (with
+# regression gating) require a real GPU runner with stable timings,
+# which GitHub-hosted runners do NOT provide. This job catches:
+# - benches that fail to compile after a refactor
+# - new bench files that aren't wired into Cargo.toml
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: wgpu-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  bench-compile:
+    name: cargo bench --no-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wgpu-bench
+      - name: Compile examples (bench harnesses)
+        run: cargo build -p rustorch-wgpu --release --examples
+      # When dedicated benches land under crates/rustorch-wgpu/benches/
+      # add `cargo bench --no-run` here. For now the `examples/bench_*`
+      # binaries are the de-facto benches.
