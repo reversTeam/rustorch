@@ -31,6 +31,7 @@ pub mod mock;
 pub mod parallel;
 pub mod pinned;
 pub mod profile;
+pub mod quant;
 pub mod simd;
 
 pub use backend::Backend;
