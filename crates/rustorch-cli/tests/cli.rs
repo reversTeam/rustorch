@@ -159,3 +159,28 @@ fn run_log_format_json_emits_json() {
         .code(2)
         .stdout(predicate::str::contains("\"event\":\"error\""));
 }
+
+#[test]
+fn man_page_helper_renders_all_subcommands() {
+    // The `rustorch-man` helper binary writes a `.1` file per
+    // sub-command. We point it at a temp dir and assert every
+    // expected file ended up there.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().to_str().unwrap();
+    Command::cargo_bin("rustorch-man")
+        .expect("man helper built")
+        .arg(target)
+        .assert()
+        .success();
+    for name in [
+        "rustorch.1",
+        "rustorch-run.1",
+        "rustorch-sweep.1",
+        "rustorch-check.1",
+        "rustorch-deploy.1",
+        "rustorch-fork.1",
+    ] {
+        let p = dir.path().join(name);
+        assert!(p.exists(), "missing man-page: {name}");
+    }
+}

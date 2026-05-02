@@ -14,8 +14,17 @@ categories.workspace = true
 name = "rustorch"
 path = "src/main.rs"
 
+# Standalone helper binary that emits the man-pages into a target dir.
+# Built on demand: `cargo run -p rustorch-cli --bin rustorch-man -- target/man`.
+[[bin]]
+name = "rustorch-man"
+path = "src/bin/man.rs"
+required-features = []
+
 [dependencies]
 clap        = { version = "4.5", features = ["derive", "env"] }
+clap_mangen = "0.2"
+ctrlc       = { version = "3.4", features = ["termination"] }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 toml        = "0.8"
