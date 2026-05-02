@@ -4,7 +4,7 @@
 //! handler is a one-liner change.
 
 use crate::db;
-use crate::handlers::{cluster, me, runs};
+use crate::handlers::{catalog, cluster, me, runs};
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -19,6 +19,9 @@ use utoipa::OpenApi;
         me::workspace,
         cluster::gpus,
         cluster::health,
+        catalog::list_models,
+        catalog::list_datasets,
+        catalog::get_dataset,
         runs::list,
         runs::get_one,
         runs::create,
@@ -26,22 +29,44 @@ use utoipa::OpenApi;
         runs::pause,
         runs::resume,
         runs::stop,
+        runs::curves,
+        runs::hparams,
+        runs::code,
+        runs::log,
+        runs::checkpoints,
+        runs::artifacts,
+        runs::system,
     ),
     components(schemas(
         me::MeResponse,
         me::WorkspaceResponse,
         cluster::GpuSample,
         cluster::ClusterHealth,
+        catalog::ModelEntry,
+        catalog::DatasetSummary,
+        catalog::DatasetDetail,
         runs::ListResponse,
         runs::CreateBody,
+        runs::CurvesResponse,
+        runs::HparamsResponse,
+        runs::CodeResponse,
+        runs::LogLine,
+        runs::LogResponse,
+        runs::ArtifactEntry,
+        runs::SystemSample,
+        runs::SystemResponse,
         db::Run,
         db::RunSummary,
         db::RunStatus,
+        db::MetricPoint,
+        db::Checkpoint,
+        db::ActivityEvent,
     )),
     tags(
-        (name = "me",      description = "Identity & workspace metadata"),
-        (name = "cluster", description = "Cluster topology + GPU samples"),
-        (name = "runs",    description = "Run lifecycle + listing"),
+        (name = "me",       description = "Identity & workspace metadata"),
+        (name = "cluster",  description = "Cluster topology + GPU samples"),
+        (name = "catalog",  description = "Model & dataset registry"),
+        (name = "runs",     description = "Run lifecycle + read-only views"),
     )
 )]
 pub struct ApiDoc;

@@ -162,6 +162,207 @@ pub async fn stop(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
     .await
 }
 
+// ---- read-only views (curves / hparams / code / log / checkpoints / artifacts / system) -----
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CurvesResponse {
+    /// Distinct metric names available for this run (`loss`, `val_acc`, `lr`, …).
+    pub names: Vec<String>,
+    pub points: Vec<db::MetricPoint>,
+}
+
+#[utoipa::path(get, path = "/runs/{id}/curves", responses((status = 200, body = CurvesResponse)))]
+pub async fn curves(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<CurvesResponse>> {
+    // 404 early if the run is missing.
+    let _ = db::get_run(&s.db, &id).await?;
+    let points = db::list_metrics(&s.db, &id).await?;
+    let mut names: Vec<String> = points.iter().map(|p| p.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    Ok(Json(CurvesResponse { names, points }))
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct HparamsResponse {
+    pub run_id: String,
+    pub cfg: serde_json::Value,
+}
+
+#[utoipa::path(get, path = "/runs/{id}/hparams", responses((status = 200, body = HparamsResponse)))]
+pub async fn hparams(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<HparamsResponse>> {
+    let run = db::get_run(&s.db, &id).await?;
+    let cfg: serde_json::Value = serde_json::from_str(&run.cfg_json).unwrap_or_default();
+    Ok(Json(HparamsResponse {
+        run_id: run.id,
+        cfg,
+    }))
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CodeResponse {
+    pub run_id: String,
+    /// Source `.rs` content of the training entry point. Until the
+    /// runner uploads it (P2.8), this is a placeholder pulled from
+    /// `cfg.code` if present, otherwise an empty string.
+    pub source: String,
+    /// Optional commit SHA the runner was at when the run started.
+    pub commit_sha: Option<String>,
+}
+
+#[utoipa::path(get, path = "/runs/{id}/code", responses((status = 200, body = CodeResponse)))]
+pub async fn code(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<CodeResponse>> {
+    let run = db::get_run(&s.db, &id).await?;
+    let cfg: serde_json::Value = serde_json::from_str(&run.cfg_json).unwrap_or_default();
+    let source = cfg
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("// no source recorded yet (runner upload lands in P2.8)\n")
+        .to_string();
+    let commit_sha = cfg
+        .get("commit_sha")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok(Json(CodeResponse {
+        run_id: run.id,
+        source,
+        commit_sha,
+    }))
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+pub struct LogQuery {
+    /// How many last lines to return. Capped at 10_000.
+    pub tail: Option<i64>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct LogLine {
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub level: &'static str,
+    pub msg: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct LogResponse {
+    pub run_id: String,
+    pub lines: Vec<LogLine>,
+}
+
+#[utoipa::path(
+    get, path = "/runs/{id}/log",
+    params(LogQuery),
+    responses((status = 200, body = LogResponse))
+)]
+pub async fn log(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(_q): Query<LogQuery>,
+) -> ApiResult<Json<LogResponse>> {
+    // The actual log table lands with the gRPC ingest layer (P2.8 /
+    // P2.5). For now we synthesize a minimal placeholder so the UI
+    // can render something deterministic during development.
+    let run = db::get_run(&s.db, &id).await?;
+    let lines = vec![LogLine {
+        ts: run.created_at,
+        level: "info",
+        msg: format!("run {} created (status: {:?})", run.id, run.status),
+    }];
+    Ok(Json(LogResponse {
+        run_id: run.id,
+        lines,
+    }))
+}
+
+#[utoipa::path(
+    get, path = "/runs/{id}/checkpoints",
+    responses((status = 200, body = [db::Checkpoint]))
+)]
+pub async fn checkpoints(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<db::Checkpoint>>> {
+    let _ = db::get_run(&s.db, &id).await?;
+    let cps = db::list_checkpoints(&s.db, &id).await?;
+    Ok(Json(cps))
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ArtifactEntry {
+    pub kind: &'static str,
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[utoipa::path(
+    get, path = "/runs/{id}/artifacts",
+    responses((status = 200, body = [ArtifactEntry]))
+)]
+pub async fn artifacts(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<ArtifactEntry>>> {
+    // Artifacts arrive via the runner gRPC stream (P2.8). Until then
+    // we materialize the run's checkpoints as `kind: "checkpoint"`
+    // artifacts so the UI has something to render.
+    let _ = db::get_run(&s.db, &id).await?;
+    let cps = db::list_checkpoints(&s.db, &id).await?;
+    let items: Vec<ArtifactEntry> = cps
+        .into_iter()
+        .map(|c| ArtifactEntry {
+            kind: "checkpoint",
+            path: c.path,
+            bytes: 0,
+        })
+        .collect();
+    Ok(Json(items))
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct SystemSample {
+    pub gpu_id: u32,
+    pub util: u32,
+    pub vram_used_mb: u32,
+    pub temp_c: u32,
+    pub power_w: u32,
+    pub throughput_samples_per_s: f64,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct SystemResponse {
+    pub run_id: String,
+    pub samples: Vec<SystemSample>,
+}
+
+#[utoipa::path(get, path = "/runs/{id}/system", responses((status = 200, body = SystemResponse)))]
+pub async fn system(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<SystemResponse>> {
+    // Mock samples — real per-GPU / throughput data flows through
+    // the gRPC `GpuTelemetry` event in P2.8.
+    let run = db::get_run(&s.db, &id).await?;
+    Ok(Json(SystemResponse {
+        run_id: run.id,
+        samples: vec![SystemSample {
+            gpu_id: 0,
+            util: 0,
+            vram_used_mb: 256,
+            temp_c: 38,
+            power_w: 60,
+            throughput_samples_per_s: 0.0,
+        }],
+    }))
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/runs", get(list).post(create))
@@ -170,4 +371,11 @@ pub fn routes() -> Router<AppState> {
         .route("/runs/:id/pause", post(pause))
         .route("/runs/:id/resume", post(resume))
         .route("/runs/:id/stop", post(stop))
+        .route("/runs/:id/curves", get(curves))
+        .route("/runs/:id/hparams", get(hparams))
+        .route("/runs/:id/code", get(code))
+        .route("/runs/:id/log", get(log))
+        .route("/runs/:id/checkpoints", get(checkpoints))
+        .route("/runs/:id/artifacts", get(artifacts))
+        .route("/runs/:id/system", get(system))
 }

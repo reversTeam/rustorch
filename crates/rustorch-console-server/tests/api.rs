@@ -2,7 +2,13 @@
 //! `127.0.0.1:0`. Each test starts its own server with an in-memory
 //! SQLite DB so they're fully isolated and parallel-safe.
 
-use rustorch_console_server::{auth::AuthConfig, db, router, sse::Hub, state::AppState};
+use rustorch_console_server::{
+    auth::AuthConfig,
+    db::{self, NewCheckpoint},
+    router,
+    sse::Hub,
+    state::AppState,
+};
 use serde_json::json;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -300,4 +306,253 @@ async fn sse_runs_changed_emits_lifecycle_event() {
     let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(v["id"], id);
     assert_eq!(v["status"], "queued");
+}
+
+// ---- catalog --------------------------------------------------------
+
+#[tokio::test]
+async fn catalog_lists_models_and_datasets() {
+    let (addr, _) = spawn(AuthConfig::default()).await;
+
+    let models: Vec<serde_json::Value> = reqwest::get(format!("http://{addr}/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = models.iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"resnet50"));
+    assert!(names.contains(&"gpt2-small"));
+
+    let datasets: Vec<serde_json::Value> = reqwest::get(format!("http://{addr}/datasets"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = datasets
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"mnist"));
+    assert!(names.contains(&"cifar10"));
+}
+
+#[tokio::test]
+async fn catalog_dataset_detail_or_404() {
+    let (addr, _) = spawn(AuthConfig::default()).await;
+
+    let v: serde_json::Value = reqwest::get(format!("http://{addr}/datasets/mnist"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["name"], "mnist");
+    assert!(v["splits"].as_array().unwrap().len() >= 2);
+
+    let resp = reqwest::get(format!("http://{addr}/datasets/missing-one"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "NOT_FOUND");
+}
+
+// ---- /runs/:id read-only views ------------------------------------
+
+/// Create a run via the lib (faster than HTTP) so each test has a
+/// known id to query.
+async fn seed_run(state: &AppState) -> String {
+    let r = db::insert_run(
+        &state.db,
+        db::NewRun {
+            title: Some("seed".into()),
+            cfg_json: serde_json::json!({"lr": 1e-3, "code": "fn main() {}", "commit_sha": "abc123"}),
+            sweep_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    r.id
+}
+
+#[tokio::test]
+async fn runs_curves_returns_metrics_grouped_by_name() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let run_id = seed_run(&state).await;
+
+    // Insert a few sample points across two metric names.
+    for step in 0..3 {
+        db::insert_metric(&state.db, &run_id, step, "loss", 1.0 - 0.1 * step as f64)
+            .await
+            .unwrap();
+        db::insert_metric(&state.db, &run_id, step, "lr", 1e-3)
+            .await
+            .unwrap();
+    }
+
+    let v: serde_json::Value = reqwest::get(format!("http://{addr}/runs/{run_id}/curves"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = v["names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["loss", "lr"]);
+    assert_eq!(v["points"].as_array().unwrap().len(), 6);
+
+    // Missing run → 404.
+    let resp = reqwest::get(format!("http://{addr}/runs/missing/curves"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn runs_hparams_echoes_cfg() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let run_id = seed_run(&state).await;
+
+    let v: serde_json::Value = reqwest::get(format!("http://{addr}/runs/{run_id}/hparams"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["run_id"], run_id);
+    assert_eq!(v["cfg"]["lr"], 1e-3);
+}
+
+#[tokio::test]
+async fn runs_code_returns_recorded_source() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let run_id = seed_run(&state).await;
+
+    let v: serde_json::Value = reqwest::get(format!("http://{addr}/runs/{run_id}/code"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["source"], "fn main() {}");
+    assert_eq!(v["commit_sha"], "abc123");
+}
+
+#[tokio::test]
+async fn runs_log_returns_placeholder_lines() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let run_id = seed_run(&state).await;
+
+    let v: serde_json::Value = reqwest::get(format!("http://{addr}/runs/{run_id}/log?tail=50"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["run_id"], run_id);
+    let lines = v["lines"].as_array().unwrap();
+    assert!(!lines.is_empty());
+    assert_eq!(lines[0]["level"], "info");
+}
+
+#[tokio::test]
+async fn runs_checkpoints_lists_in_step_desc() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let run_id = seed_run(&state).await;
+
+    for step in [0, 5, 10] {
+        db::insert_checkpoint(
+            &state.db,
+            NewCheckpoint {
+                run_id: run_id.clone(),
+                path: format!("ckpt-{step}.safetensors"),
+                step,
+                metrics: serde_json::json!({"val_acc": 0.5 + 0.05 * step as f64}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let arr: Vec<serde_json::Value> =
+        reqwest::get(format!("http://{addr}/runs/{run_id}/checkpoints"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(arr.len(), 3);
+    // Sorted by step DESC — newest first.
+    assert_eq!(arr[0]["step"], 10);
+    assert_eq!(arr[2]["step"], 0);
+    assert!(arr[0]["metrics"]["val_acc"].as_f64().unwrap() > 0.9);
+}
+
+#[tokio::test]
+async fn runs_artifacts_mirror_checkpoints() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let run_id = seed_run(&state).await;
+
+    db::insert_checkpoint(
+        &state.db,
+        NewCheckpoint {
+            run_id: run_id.clone(),
+            path: "best.safetensors".into(),
+            step: 1,
+            metrics: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    let arr: Vec<serde_json::Value> =
+        reqwest::get(format!("http://{addr}/runs/{run_id}/artifacts"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["kind"], "checkpoint");
+    assert_eq!(arr[0]["path"], "best.safetensors");
+}
+
+#[tokio::test]
+async fn runs_system_returns_mock_samples() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let run_id = seed_run(&state).await;
+
+    let v: serde_json::Value = reqwest::get(format!("http://{addr}/runs/{run_id}/system"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["run_id"], run_id);
+    assert!(!v["samples"].as_array().unwrap().is_empty());
+    assert_eq!(v["samples"][0]["gpu_id"], 0);
+}
+
+#[tokio::test]
+async fn checkpoint_against_missing_run_is_404() {
+    let (_addr, state) = spawn(AuthConfig::default()).await;
+    let err = db::insert_checkpoint(
+        &state.db,
+        NewCheckpoint {
+            run_id: "no-such-run".into(),
+            path: "p".into(),
+            step: 0,
+            metrics: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap_err();
+    let s = format!("{err:?}");
+    assert!(s.contains("NotFound"), "expected NotFound, got {s}");
 }

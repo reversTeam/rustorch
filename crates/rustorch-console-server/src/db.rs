@@ -248,6 +248,175 @@ pub async fn count_runs(pool: &SqlitePool, status: Option<RunStatus>) -> ApiResu
     Ok(n.0)
 }
 
+// ---- metrics --------------------------------------------------------
+
+/// One scalar metric sample. Many `MetricPoint`s grouped by `name`
+/// form a curve on the Run detail Charts tab.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct MetricPoint {
+    pub step: i64,
+    pub name: String,
+    pub value: f64,
+    pub ts: DateTime<Utc>,
+}
+
+/// Insert a metric row. The PRIMARY KEY (run_id, step, name) is
+/// enforced by the schema — same step+name twice is a no-op via
+/// `INSERT OR REPLACE` so the runner can retry safely.
+pub async fn insert_metric(
+    pool: &SqlitePool,
+    run_id: &str,
+    step: i64,
+    name: &str,
+    value: f64,
+) -> ApiResult<MetricPoint> {
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT OR REPLACE INTO metrics (run_id, step, name, value, ts)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(run_id)
+    .bind(step)
+    .bind(name)
+    .bind(value)
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(MetricPoint {
+        step,
+        name: name.to_string(),
+        value,
+        ts: now,
+    })
+}
+
+/// Fetch every metric sample for a run, ordered by (name, step). The
+/// frontend groups by `name` to build per-curve series.
+pub async fn list_metrics(pool: &SqlitePool, run_id: &str) -> ApiResult<Vec<MetricPoint>> {
+    let rows: Vec<MetricPointRow> = sqlx::query_as(
+        "SELECT step, name, value, ts FROM metrics
+         WHERE run_id = ? ORDER BY name, step",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(MetricPoint::try_from).collect()
+}
+
+// ---- checkpoints ----------------------------------------------------
+
+/// One persisted .safetensors snapshot. `metrics_json` is whatever
+/// the runner wanted to remember at save time (val_acc, loss, …).
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct Checkpoint {
+    pub id: String,
+    pub run_id: String,
+    pub path: String,
+    pub step: i64,
+    pub metrics: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewCheckpoint {
+    pub run_id: String,
+    pub path: String,
+    pub step: i64,
+    pub metrics: serde_json::Value,
+}
+
+pub async fn insert_checkpoint(pool: &SqlitePool, new: NewCheckpoint) -> ApiResult<Checkpoint> {
+    // Make sure the parent run exists — surfaces a clean 404 instead
+    // of an obscure FK violation when the runner sends a bogus id.
+    let _ = get_run(pool, &new.run_id).await?;
+
+    let id = ulid::Ulid::new().to_string();
+    let now = Utc::now();
+    let metrics_str = serde_json::to_string(&new.metrics)?;
+
+    sqlx::query(
+        "INSERT INTO checkpoints (id, run_id, path, step, metrics_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&new.run_id)
+    .bind(&new.path)
+    .bind(new.step)
+    .bind(&metrics_str)
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?;
+
+    Ok(Checkpoint {
+        id,
+        run_id: new.run_id,
+        path: new.path,
+        step: new.step,
+        metrics: new.metrics,
+        created_at: now,
+    })
+}
+
+pub async fn list_checkpoints(pool: &SqlitePool, run_id: &str) -> ApiResult<Vec<Checkpoint>> {
+    let rows: Vec<CheckpointRow> = sqlx::query_as(
+        "SELECT id, run_id, path, step, metrics_json, created_at
+         FROM checkpoints WHERE run_id = ? ORDER BY step DESC",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(Checkpoint::try_from).collect()
+}
+
+// ---- activity --------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ActivityEvent {
+    pub id: i64,
+    pub kind: String,
+    pub run_id: Option<String>,
+    pub payload: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn insert_activity(
+    pool: &SqlitePool,
+    kind: &str,
+    run_id: Option<&str>,
+    payload: serde_json::Value,
+) -> ApiResult<ActivityEvent> {
+    let now = Utc::now();
+    let payload_str = serde_json::to_string(&payload)?;
+    let res = sqlx::query(
+        "INSERT INTO activity (kind, run_id, payload_json, created_at)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(kind)
+    .bind(run_id)
+    .bind(&payload_str)
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(ActivityEvent {
+        id: res.last_insert_rowid(),
+        kind: kind.to_string(),
+        run_id: run_id.map(str::to_string),
+        payload,
+        created_at: now,
+    })
+}
+
+pub async fn list_activity(pool: &SqlitePool, limit: i64) -> ApiResult<Vec<ActivityEvent>> {
+    let rows: Vec<ActivityRow> = sqlx::query_as(
+        "SELECT id, kind, run_id, payload_json, created_at
+         FROM activity ORDER BY id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(ActivityEvent::try_from).collect()
+}
+
 // ---- private row types -------------------------------------------------
 
 #[derive(sqlx::FromRow)]
@@ -304,6 +473,82 @@ fn parse_ts(s: &str) -> ApiResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| ApiError::Internal(format!("ts parse: {e}")))
+}
+
+#[derive(sqlx::FromRow)]
+struct MetricPointRow {
+    step: i64,
+    name: String,
+    value: f64,
+    ts: String,
+}
+
+impl TryFrom<MetricPointRow> for MetricPoint {
+    type Error = ApiError;
+    fn try_from(r: MetricPointRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            step: r.step,
+            name: r.name,
+            value: r.value,
+            ts: parse_ts(&r.ts)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct CheckpointRow {
+    id: String,
+    run_id: String,
+    path: String,
+    step: i64,
+    metrics_json: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<CheckpointRow> for Checkpoint {
+    type Error = ApiError;
+    fn try_from(r: CheckpointRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: r.id,
+            run_id: r.run_id,
+            path: r.path,
+            step: r.step,
+            metrics: r
+                .metrics_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!({})),
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ActivityRow {
+    id: i64,
+    kind: String,
+    run_id: Option<String>,
+    payload_json: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<ActivityRow> for ActivityEvent {
+    type Error = ApiError;
+    fn try_from(r: ActivityRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: r.id,
+            kind: r.kind,
+            run_id: r.run_id,
+            payload: r
+                .payload_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!({})),
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
 }
 
 #[cfg(test)]

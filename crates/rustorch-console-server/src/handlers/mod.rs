@@ -2,6 +2,7 @@
 //! sections. Each module exposes a small `routes()` builder so the
 //! top-level `router::build()` only does composition.
 
+pub mod catalog;
 pub mod cluster;
 pub mod me;
 pub mod runs;
