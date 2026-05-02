@@ -20,6 +20,10 @@ proptest  = { workspace = true }
 name    = "observer_bench"
 harness = false
 
+[[bench]]
+name    = "gemm_int8_bench"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

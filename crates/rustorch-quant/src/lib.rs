@@ -20,10 +20,12 @@
 #![warn(rust_2018_idioms)]
 
 pub mod dtype;
+pub mod gemm_int8;
 pub mod observer;
 pub mod qops;
 
 pub use dtype::QParams;
+pub use gemm_int8::{gemm_f32_reference, gemm_int8_scalar, GemmError};
 pub use observer::{HistogramObserver, MinMaxObserver, ObserverError, PerChannelMinMaxObserver};
 pub use qops::{dequantize, quantize, QError};
 
