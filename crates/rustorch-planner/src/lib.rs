@@ -29,12 +29,14 @@
 pub mod allocator;
 pub mod inplace;
 pub mod lifetime;
+pub mod reorder;
 
 pub use allocator::{plan, plan_with_budget, PlanError, PlanResult, Slot};
 pub use inplace::{
     evaluate_hint, plan_with_inplace, InPlaceBlockers, InPlaceDecision, InPlaceHint,
 };
 pub use lifetime::{Interval, LifetimeError, LifetimeTable, TensorId};
+pub use reorder::{plan_with_reorder, reorder, OpDag, OpId, OpNode, ReorderError};
 
 /// Crate version reported at runtime.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

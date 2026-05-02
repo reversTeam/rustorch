@@ -30,6 +30,10 @@ harness = false
 name    = "inplace_bench"
 harness = false
 
+[[bench]]
+name    = "reorder_bench"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
