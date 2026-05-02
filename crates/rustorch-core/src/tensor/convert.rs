@@ -172,6 +172,38 @@ fn copy_to_contiguous<T: Element>(src: &Tensor) -> Tensor {
 // --------------------------------------------------------------------------
 
 impl Tensor {
+    /// Convert to bfloat16. Convenience wrapper over [`Tensor::to_dtype`].
+    ///
+    /// ```
+    /// # use rustorch_core::Tensor;
+    /// # use rustorch_core::tensor::Dtype;
+    /// let t = Tensor::from_vec([3usize], vec![1.5_f32, 2.5, 3.5]).unwrap();
+    /// let b = t.to_bf16();
+    /// assert_eq!(b.dtype(), Dtype::BF16);
+    /// ```
+    #[inline]
+    pub fn to_bf16(&self) -> Tensor {
+        self.to_dtype(Dtype::BF16)
+    }
+
+    /// Convert to half (IEEE 754 binary16). Convenience wrapper over
+    /// [`Tensor::to_dtype`].
+    #[inline]
+    pub fn to_f16(&self) -> Tensor {
+        self.to_dtype(Dtype::F16)
+    }
+
+    /// Convert to single-precision float. Convenience wrapper over
+    /// [`Tensor::to_dtype`].
+    ///
+    /// Useful as the closing step of the
+    /// `bf16-forward → backward-in-bf16 → f32-master-update` pattern
+    /// (cf. mixed-precision autocast in `rustorch-autograd`).
+    #[inline]
+    pub fn to_f32(&self) -> Tensor {
+        self.to_dtype(Dtype::F32)
+    }
+
     /// Convert the tensor to a different element dtype, allocating a
     /// new buffer. No-op (cheap clone) if `target == self.dtype()`.
     ///

@@ -93,6 +93,21 @@ impl Backend for CpuBackend {
         match lhs.dtype() {
             Dtype::F32 => matmul_naive::<f32>(lhs, rhs, m, k1, n),
             Dtype::F64 => matmul_naive::<f64>(lhs, rhs, m, k1, n),
+            // bf16/f16 do not implement Add/Mul natively, so we accumulate
+            // through f32 and cast the final result back. Matches the
+            // numerics of GPU bf16 matmul (which accumulates in f32).
+            Dtype::BF16 => {
+                let lhs_f = lhs.to_dtype(Dtype::F32);
+                let rhs_f = rhs.to_dtype(Dtype::F32);
+                let out_f = matmul_naive::<f32>(&lhs_f, &rhs_f, m, k1, n)?;
+                Ok(out_f.to_dtype(Dtype::BF16))
+            },
+            Dtype::F16 => {
+                let lhs_f = lhs.to_dtype(Dtype::F32);
+                let rhs_f = rhs.to_dtype(Dtype::F32);
+                let out_f = matmul_naive::<f32>(&lhs_f, &rhs_f, m, k1, n)?;
+                Ok(out_f.to_dtype(Dtype::F16))
+            },
             d => Err(BackendError::DtypeMismatch {
                 op: "matmul",
                 lhs: d,
@@ -1353,6 +1368,48 @@ fn dispatch_binary(
         (Dtype::I32, BinaryKind::Div) => {
             map_binary_same::<i32, _>(lhs, rhs, op_name, |a, b| a.checked_div(b).unwrap_or(0))
         },
+        // BF16 / F16 — accumulate via f32 since `half::bf16` does not
+        // implement `Add` directly. Element-wise: cast → op → cast back.
+        (Dtype::BF16, BinaryKind::Add) => {
+            map_binary_same::<half::bf16, _>(lhs, rhs, op_name, |a, b| {
+                half::bf16::from_f32(a.to_f32() + b.to_f32())
+            })
+        },
+        (Dtype::BF16, BinaryKind::Sub) => {
+            map_binary_same::<half::bf16, _>(lhs, rhs, op_name, |a, b| {
+                half::bf16::from_f32(a.to_f32() - b.to_f32())
+            })
+        },
+        (Dtype::BF16, BinaryKind::Mul) => {
+            map_binary_same::<half::bf16, _>(lhs, rhs, op_name, |a, b| {
+                half::bf16::from_f32(a.to_f32() * b.to_f32())
+            })
+        },
+        (Dtype::BF16, BinaryKind::Div) => {
+            map_binary_same::<half::bf16, _>(lhs, rhs, op_name, |a, b| {
+                half::bf16::from_f32(a.to_f32() / b.to_f32())
+            })
+        },
+        (Dtype::F16, BinaryKind::Add) => {
+            map_binary_same::<half::f16, _>(lhs, rhs, op_name, |a, b| {
+                half::f16::from_f32(a.to_f32() + b.to_f32())
+            })
+        },
+        (Dtype::F16, BinaryKind::Sub) => {
+            map_binary_same::<half::f16, _>(lhs, rhs, op_name, |a, b| {
+                half::f16::from_f32(a.to_f32() - b.to_f32())
+            })
+        },
+        (Dtype::F16, BinaryKind::Mul) => {
+            map_binary_same::<half::f16, _>(lhs, rhs, op_name, |a, b| {
+                half::f16::from_f32(a.to_f32() * b.to_f32())
+            })
+        },
+        (Dtype::F16, BinaryKind::Div) => {
+            map_binary_same::<half::f16, _>(lhs, rhs, op_name, |a, b| {
+                half::f16::from_f32(a.to_f32() / b.to_f32())
+            })
+        },
         (d, _) => Err(BackendError::DtypeMismatch {
             op: op_name,
             lhs: d,
@@ -2038,5 +2095,87 @@ mod tests {
         for &v in sum.as_slice::<f32>().unwrap() {
             assert!((v - 1.0).abs() < 1e-6, "sigmoid(x)+sigmoid(-x) != 1: {}", v);
         }
+    }
+
+    // ----- mixed-precision parity (P3.1) ---------------------------------
+
+    /// Build an `[m, k]` tensor in `dtype` from a Vec<f32> source.
+    fn mk(shape: [usize; 2], data: Vec<f32>, dtype: Dtype) -> Tensor {
+        let t = Tensor::from_vec(shape.to_vec(), data).unwrap();
+        t.to_dtype(dtype)
+    }
+
+    fn cmp_via_f32(actual: &Tensor, expected: &Tensor, tol: f32) {
+        let af = actual.to_dtype(Dtype::F32);
+        let ef = expected.to_dtype(Dtype::F32);
+        let av = af.as_slice::<f32>().unwrap();
+        let ev = ef.as_slice::<f32>().unwrap();
+        for (a, e) in av.iter().zip(ev) {
+            let scale = e.abs().max(1.0);
+            assert!(
+                (a - e).abs() / scale < tol,
+                "mismatch a={} e={} (rel tol {})",
+                a,
+                e,
+                tol
+            );
+        }
+    }
+
+    #[test]
+    fn add_bf16_parity_with_f32() {
+        let a32 = mk([2, 3], vec![0.5, 1.0, -1.5, 2.5, 3.0, -4.5], Dtype::F32);
+        let b32 = mk([2, 3], vec![0.25, -0.5, 0.75, -1.25, 2.0, 1.5], Dtype::F32);
+        let a16 = a32.to_bf16();
+        let b16 = b32.to_bf16();
+        let r32 = b().add(&a32, &b32).unwrap();
+        let r16 = b().add(&a16, &b16).unwrap();
+        // bf16 has ~3 decimal digits of precision — 5e-3 relative tol.
+        cmp_via_f32(&r16, &r32, 5e-3);
+        assert_eq!(r16.dtype(), Dtype::BF16);
+    }
+
+    #[test]
+    fn mul_bf16_parity_with_f32() {
+        let a32 = mk(
+            [4_usize, 4],
+            (1..=16).map(|i| i as f32 * 0.1).collect(),
+            Dtype::F32,
+        );
+        let b32 = mk(
+            [4_usize, 4],
+            (1..=16).map(|i| i as f32 * 0.05).collect(),
+            Dtype::F32,
+        );
+        let a16 = a32.to_bf16();
+        let b16 = b32.to_bf16();
+        let r32 = b().mul(&a32, &b32).unwrap();
+        let r16 = b().mul(&a16, &b16).unwrap();
+        // bf16 mul rounds twice (each operand → 7-bit mantissa, then
+        // product → 7-bit mantissa). 1.2e-2 covers worst-case rounding.
+        cmp_via_f32(&r16, &r32, 1.2e-2);
+    }
+
+    #[test]
+    fn matmul_bf16_parity_with_f32() {
+        let a32 = mk(
+            [4, 5],
+            (0..20).map(|i| i as f32 * 0.1).collect(),
+            Dtype::F32,
+        );
+        let b32 = mk(
+            [5, 3],
+            (0..15).map(|i| (i as f32 - 7.0) * 0.05).collect(),
+            Dtype::F32,
+        );
+        let a16 = a32.to_bf16();
+        let b16 = b32.to_bf16();
+        let r32 = b().matmul(&a32, &b32).unwrap();
+        let r16 = b().matmul(&a16, &b16).unwrap();
+        // bf16 inputs cast to f32 → exact-ish computation → cast back.
+        // Precision is dominated by the input round-trip.
+        cmp_via_f32(&r16, &r32, 1e-2);
+        assert_eq!(r16.shape(), [4, 3]);
+        assert_eq!(r16.dtype(), Dtype::BF16);
     }
 }

@@ -12,6 +12,7 @@
 //! Helper [`ModuleError`] wraps autograd errors uniformly.
 
 use rustorch_autograd::{BackwardError, Variable};
+use rustorch_core::tensor::dtype::Dtype;
 
 /// Errors returned by [`Module::forward`].
 pub type ModuleError = BackwardError;
@@ -59,4 +60,87 @@ pub trait Module: Send + Sync {
 
     /// Switch to eval mode.
     fn eval(&mut self) {}
+
+    /// Cast every parameter to the requested dtype **in place**.
+    ///
+    /// Walks `parameters()` and rebuilds each Variable's stored
+    /// [`rustorch_core::Tensor`] via [`Tensor::to_dtype`]. Buffers
+    /// (e.g. BatchNorm running stats) are *not* touched by default;
+    /// composite modules with non-trainable Variables should override.
+    ///
+    /// Used by mixed-precision recipes:
+    /// ```ignore
+    /// model.to_dtype(Dtype::BF16);
+    /// // forward / backward now run in bf16; the optimiser may keep
+    /// // f32 master weights via a separate copy if desired.
+    /// ```
+    fn to_dtype(&mut self, target: Dtype) {
+        for p in self.parameters() {
+            let cur = p.tensor();
+            if cur.dtype() != target {
+                p.set_data(cur.to_dtype(target));
+            }
+        }
+    }
+
+    /// Convenience: cast every parameter to bf16 in place.
+    #[inline]
+    fn to_bf16(&mut self) {
+        self.to_dtype(Dtype::BF16);
+    }
+
+    /// Convenience: cast every parameter to f16 in place.
+    #[inline]
+    fn to_f16(&mut self) {
+        self.to_dtype(Dtype::F16);
+    }
+
+    /// Convenience: cast every parameter back to f32 in place.
+    #[inline]
+    fn to_f32(&mut self) {
+        self.to_dtype(Dtype::F32);
+    }
+}
+
+#[cfg(test)]
+mod cast_tests {
+    use super::*;
+    use crate::Linear;
+
+    #[test]
+    fn linear_to_bf16_round_trip() {
+        let mut layer = Linear::new(4, 3);
+        // All params start in f32.
+        for p in layer.parameters() {
+            assert_eq!(p.tensor().dtype(), Dtype::F32);
+        }
+        layer.to_bf16();
+        for p in layer.parameters() {
+            assert_eq!(p.tensor().dtype(), Dtype::BF16);
+        }
+        // Round-trip back to f32.
+        layer.to_f32();
+        for p in layer.parameters() {
+            assert_eq!(p.tensor().dtype(), Dtype::F32);
+        }
+    }
+
+    #[test]
+    fn to_dtype_is_noop_when_already_target() {
+        let mut layer = Linear::new(2, 2);
+        // Snapshot the storage pointer-equivalent (we use the data
+        // values themselves) before and after a same-dtype cast.
+        let before: Vec<Vec<f32>> = layer
+            .parameters()
+            .iter()
+            .map(|p| p.tensor().as_slice::<f32>().unwrap().to_vec())
+            .collect();
+        layer.to_dtype(Dtype::F32);
+        let after: Vec<Vec<f32>> = layer
+            .parameters()
+            .iter()
+            .map(|p| p.tensor().as_slice::<f32>().unwrap().to_vec())
+            .collect();
+        assert_eq!(before, after);
+    }
 }

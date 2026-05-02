@@ -15,6 +15,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod anomaly;
+pub mod autocast;
 pub mod backward;
 pub mod checkpoint;
 pub mod custom_function;
@@ -27,6 +28,7 @@ pub mod variable;
 pub use anomaly::{
     check_or_panic, first_bad_value, is_detect_anomaly, set_detect_anomaly, DetectAnomalyGuard,
 };
+pub use autocast::{autocast, current_dtype as autocast_dtype, no_autocast, AutocastDtype};
 pub use backward::{backward, BackwardError};
 pub use checkpoint::checkpoint;
 pub use custom_function::{apply_custom, BwdCtx, CustomFunction, FwdCtx};
