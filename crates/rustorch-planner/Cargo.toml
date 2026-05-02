@@ -22,6 +22,10 @@ rand      = { workspace = true }
 name    = "lifetime_bench"
 harness = false
 
+[[bench]]
+name    = "allocator_bench"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

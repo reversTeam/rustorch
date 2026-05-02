@@ -29,8 +29,8 @@
 pub mod allocator;
 pub mod lifetime;
 
-pub use allocator::{plan, PlanResult, Slot};
-pub use lifetime::{Interval, LifetimeTable, TensorId};
+pub use allocator::{plan, plan_with_budget, PlanError, PlanResult, Slot};
+pub use lifetime::{Interval, LifetimeError, LifetimeTable, TensorId};
 
 /// Crate version reported at runtime.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

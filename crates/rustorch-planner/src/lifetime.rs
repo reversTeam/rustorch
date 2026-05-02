@@ -33,6 +33,18 @@ pub struct Interval {
     /// Tensor's payload size in bytes — passed straight to the
     /// allocator's slot-sizing logic.
     pub bytes: u64,
+    /// Required byte alignment for the tensor's storage. Defaults to
+    /// `1` (byte alignment) when registered via [`LifetimeTable::record_def`];
+    /// callers that need stricter alignment (e.g. SIMD: 16, cache
+    /// line: 64, GPU coalescing: 256) should use
+    /// [`LifetimeTable::record_def_with_align`].
+    ///
+    /// The allocator promotes a slot's effective alignment to
+    /// `max(align)` over its tenants and rounds the slot's byte size
+    /// up to that boundary so the runtime can place the slot at any
+    /// `slot.align`-aligned offset and have every tenant satisfy its
+    /// own alignment.
+    pub align: u32,
 }
 
 impl Interval {
@@ -66,10 +78,26 @@ impl LifetimeTable {
         Self::default()
     }
 
-    /// Mark `id` as produced at `step` with payload `bytes`.
+    /// Mark `id` as produced at `step` with payload `bytes`. Equivalent
+    /// to [`LifetimeTable::record_def_with_align`] with `align = 1`.
     /// Initialises `last_use = step` so a tensor that is never read
     /// has duration 1.
     pub fn record_def(&mut self, id: TensorId, step: u32, bytes: u64) {
+        self.record_def_with_align(id, step, bytes, 1);
+    }
+
+    /// Mark `id` as produced at `step` with payload `bytes` and a
+    /// required alignment of `align` bytes. Common values:
+    /// - `1`  — no alignment requirement (byte-aligned)
+    /// - `16` — SSE / NEON SIMD load
+    /// - `64` — typical cache line
+    /// - `256` — GPU memory-transaction coalescing
+    ///
+    /// On re-definition, the recorded alignment is promoted to the
+    /// `max` of the observed values — the planner must satisfy every
+    /// observation, so the strictest alignment wins.
+    pub fn record_def_with_align(&mut self, id: TensorId, step: u32, bytes: u64, align: u32) {
+        let align = align.max(1);
         self.intervals
             .entry(id)
             .and_modify(|iv| {
@@ -80,11 +108,13 @@ impl LifetimeTable {
                 iv.def = iv.def.min(step);
                 iv.last_use = iv.last_use.max(step);
                 iv.bytes = iv.bytes.max(bytes);
+                iv.align = iv.align.max(align);
             })
             .or_insert(Interval {
                 def: step,
                 last_use: step,
                 bytes,
+                align,
             });
     }
 
@@ -162,6 +192,7 @@ mod tests {
             def: 3,
             last_use: 7,
             bytes: 0,
+            align: 1,
         };
         assert_eq!(iv.duration(), 5);
     }
@@ -172,6 +203,7 @@ mod tests {
             def: 4,
             last_use: 4,
             bytes: 16,
+            align: 1,
         };
         assert_eq!(iv.duration(), 1);
     }
@@ -182,11 +214,13 @@ mod tests {
             def: 0,
             last_use: 5,
             bytes: 0,
+            align: 1,
         };
         let b = Interval {
             def: 4,
             last_use: 8,
             bytes: 0,
+            align: 1,
         };
         assert!(a.overlaps(&b));
         assert!(b.overlaps(&a));
@@ -198,11 +232,13 @@ mod tests {
             def: 0,
             last_use: 3,
             bytes: 0,
+            align: 1,
         };
         let b = Interval {
             def: 4,
             last_use: 7,
             bytes: 0,
+            align: 1,
         };
         assert!(!a.overlaps(&b));
         assert!(!b.overlaps(&a));
@@ -215,11 +251,13 @@ mod tests {
             def: 0,
             last_use: 3,
             bytes: 0,
+            align: 1,
         };
         let b = Interval {
             def: 3,
             last_use: 5,
             bytes: 0,
+            align: 1,
         };
         assert!(a.overlaps(&b));
     }
