@@ -24,6 +24,12 @@ pollster      = { workspace = true }
 bytemuck      = { workspace = true }
 thiserror     = { workspace = true }
 
+# Used by the CPU baselines in `examples/bench_*` only. Native-only
+# (rayon does not target wasm32). Pulled in unconditionally because
+# the examples opt into it; the library itself does not depend on it.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rayon = { workspace = true }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

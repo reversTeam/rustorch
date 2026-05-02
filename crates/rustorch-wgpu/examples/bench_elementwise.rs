@@ -54,10 +54,7 @@ fn main() {
     let backend = WgpuBackend::new_blocking().expect("init wgpu");
     println!("Elementwise add: a + b");
     println!("---------------------------------------------------");
-    // NOTE: 4M+ elements with workgroup_size=64 → 65536 groups, just above
-    // the 65535 hard limit on dispatch_workgroups per dim. A 2D dispatch
-    // (gid.x + gid.y * stride) would lift this; tracked for follow-up.
-    for &n in &[1_024, 16_384, 262_144, 1_048_576, 2_097_152] {
+    for &n in &[1_024, 16_384, 262_144, 1_048_576, 4_194_304, 16_777_216] {
         bench_one(&backend, n, 10);
     }
 }

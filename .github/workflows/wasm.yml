@@ -53,7 +53,5 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
-      - name: Run headless tests for rustorch-core
-        # Phase 2 will add wasm-bindgen-test invocations; for Phase 0 we just
-        # confirm the build target is wired correctly.
-        run: cargo build --target wasm32-unknown-unknown -p rustorch-core
+      - name: Smoke-test rustorch-wasm-demo in headless Chrome
+        run: wasm-pack test --headless --chrome crates/rustorch-wasm-demo

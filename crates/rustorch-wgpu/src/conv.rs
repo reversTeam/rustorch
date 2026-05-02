@@ -30,7 +30,11 @@ fn im2col_wgsl() -> String {
 @group(0) @binding(3) var<uniform> params: array<vec4<u32>, 4>;
 
 @compute @workgroup_size({BLOCK})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+fn main(
+    @builtin(workgroup_id)         wgid: vec3<u32>,
+    @builtin(local_invocation_id)  lid:  vec3<u32>,
+    @builtin(num_workgroups)       nwg:  vec3<u32>,
+) {{
     let n_   = params[0].x;
     let c    = params[0].y;
     let h    = params[0].z;
@@ -45,7 +49,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let wout = params[2].w;
     let total = params[3].x; // = N * Hout * Wout * (C * kH * kW)
 
-    let idx = gid.x;
+    let idx = (wgid.y * nwg.x + wgid.x) * {BLOCK}u + lid.x;
     if (idx >= total) {{ return; }}
 
     // out has shape [N*Hout*Wout, C*kH*kW] in row-major.
@@ -207,7 +211,8 @@ fn dispatch_im2col(
         cpass.set_pipeline(&pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
         let groups = (total as u32).div_ceil(BLOCK).max(1);
-        cpass.dispatch_workgroups(groups, 1, 1);
+        let (gx, gy) = crate::elementwise::split_dispatch(groups);
+        cpass.dispatch_workgroups(gx, gy, 1);
     }
     backend.queue.submit(Some(encoder.finish()));
     Ok(out)
@@ -224,14 +229,18 @@ fn permute_nhwc_to_nchw_wgsl() -> String {
 @group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
 
 @compute @workgroup_size({BLOCK})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    // meta = [N, Spatial(=Hout*Wout), Cout, Total]
+fn main(
+    @builtin(workgroup_id)         wgid: vec3<u32>,
+    @builtin(local_invocation_id)  lid:  vec3<u32>,
+    @builtin(num_workgroups)       nwg:  vec3<u32>,
+) {{
+    // params = [N, Spatial(=Hout*Wout), Cout, Total]
     let n_     = params[0].x;
     let spatial = params[0].y;
     let cout   = params[0].z;
     let total  = params[0].w;
 
-    let idx = gid.x;
+    let idx = (wgid.y * nwg.x + wgid.x) * {BLOCK}u + lid.x;
     if (idx >= total) {{ return; }}
 
     // input layout : [N*Spatial, Cout]   (row-major)
@@ -331,7 +340,8 @@ fn dispatch_permute(
         cpass.set_pipeline(&pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
         let groups = (total as u32).div_ceil(BLOCK).max(1);
-        cpass.dispatch_workgroups(groups, 1, 1);
+        let (gx, gy) = crate::elementwise::split_dispatch(groups);
+        cpass.dispatch_workgroups(gx, gy, 1);
     }
     backend.queue.submit(Some(encoder.finish()));
     Ok(out)

@@ -11,6 +11,11 @@
 //! Workgroup size is 64 (`@workgroup_size(64)`), tunable in a later
 //! slice.
 
+// Element-wise kernels use a 2D dispatch to lift the 65535-per-dim cap
+// on `dispatch_workgroups`. The flat element index is recomputed from
+// `(wgid.x, wgid.y, lid.x)` using the `num_workgroups` builtin so the
+// host doesn't have to embed the dispatch width into the uniform.
+
 /// Binary kernel template — `<OP>` is one of `+`, `-`, `*`, `/`.
 fn binary_template(op: &str) -> String {
     format!(
@@ -21,8 +26,12 @@ fn binary_template(op: &str) -> String {
 @group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+fn main(
+    @builtin(workgroup_id)         wgid: vec3<u32>,
+    @builtin(local_invocation_id)  lid:  vec3<u32>,
+    @builtin(num_workgroups)       nwg:  vec3<u32>,
+) {{
+    let i = (wgid.y * nwg.x + wgid.x) * 64u + lid.x;
     let n = params[0].x;
     if (i >= n) {{ return; }}
     out[i] = lhs[i] {op} rhs[i];
@@ -40,8 +49,12 @@ fn unary_template(expr: &str) -> String {
 @group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+fn main(
+    @builtin(workgroup_id)         wgid: vec3<u32>,
+    @builtin(local_invocation_id)  lid:  vec3<u32>,
+    @builtin(num_workgroups)       nwg:  vec3<u32>,
+) {{
+    let i = (wgid.y * nwg.x + wgid.x) * 64u + lid.x;
     let n = params[0].x;
     if (i >= n) {{ return; }}
     let x = inp[i];

@@ -16,6 +16,22 @@ use rustorch_core::tensor::dtype::Dtype;
 use std::sync::Arc;
 
 const WORKGROUP_SIZE: u32 = 64;
+const MAX_DIM: u32 = 65535;
+
+/// Compute a 2D dispatch grid that covers `n_groups` workgroups while
+/// respecting the per-dimension cap of [`MAX_DIM`]. Returns `(x, y)`.
+///
+/// Used by elementwise / im2col / permute kernels — the WGSL side
+/// recomputes the flat index as `(wgid.y * nwg.x + wgid.x) * WG + lid.x`.
+pub(crate) fn split_dispatch(n_groups: u32) -> (u32, u32) {
+    if n_groups <= MAX_DIM {
+        (n_groups.max(1), 1)
+    } else {
+        // Roughly square split: x = MAX_DIM, y = ceil(n_groups / MAX_DIM).
+        let y = n_groups.div_ceil(MAX_DIM);
+        (MAX_DIM, y)
+    }
+}
 
 fn build_pipeline(
     backend: &WgpuBackend,
@@ -124,7 +140,8 @@ pub fn dispatch_binary(
         cpass.set_pipeline(&pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
         let groups = (lhs.numel as u32).div_ceil(WORKGROUP_SIZE).max(1);
-        cpass.dispatch_workgroups(groups, 1, 1);
+        let (gx, gy) = split_dispatch(groups);
+        cpass.dispatch_workgroups(gx, gy, 1);
     }
     backend.queue.submit(Some(encoder.finish()));
     Ok(out)
@@ -176,10 +193,35 @@ pub fn dispatch_unary(
         cpass.set_pipeline(&pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
         let groups = (inp.numel as u32).div_ceil(WORKGROUP_SIZE).max(1);
-        cpass.dispatch_workgroups(groups, 1, 1);
+        let (gx, gy) = split_dispatch(groups);
+        cpass.dispatch_workgroups(gx, gy, 1);
     }
     backend.queue.submit(Some(encoder.finish()));
     Ok(out)
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::split_dispatch;
+
+    #[test]
+    fn split_dispatch_below_cap_stays_1d() {
+        assert_eq!(split_dispatch(1), (1, 1));
+        assert_eq!(split_dispatch(64), (64, 1));
+        assert_eq!(split_dispatch(65_535), (65_535, 1));
+    }
+
+    #[test]
+    fn split_dispatch_above_cap_goes_2d() {
+        // n_groups just above the cap → y=2.
+        assert_eq!(split_dispatch(65_536), (65_535, 2));
+        // 4× the cap → y=4 (262_140 covered, then we trim n inside the kernel).
+        assert_eq!(split_dispatch(262_140), (65_535, 4));
+        // Worst case the bench triggered.
+        let (gx, gy) = split_dispatch((4_194_304_u32).div_ceil(64));
+        assert!(gx <= 65_535 && gy <= 65_535);
+        assert!(gx as u64 * gy as u64 * 64 >= 4_194_304);
+    }
 }
 
 #[cfg(all(test, feature = "gpu-tests"))]
@@ -271,6 +313,26 @@ mod tests {
         let cpu: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
         for (g, c) in gpu.iter().zip(&cpu) {
             assert!((g - c).abs() < 1e-5, "mismatch: gpu {g} vs cpu {c}");
+        }
+    }
+
+    #[test]
+    fn add_above_65535_workgroup_cap() {
+        // 5M elements → 5_000_000 / 64 ≈ 78_125 workgroups: above the
+        // 65535 single-dim cap on dispatch_workgroups. Regression test
+        // for the 2D dispatch fix.
+        let n = 5_000_000;
+        let a: Vec<f32> = (0..n).map(|i| (i as f32) * 1e-4).collect();
+        let b: Vec<f32> = vec![1.0_f32; n];
+        let gpu = run_binary("add", &a, &b);
+        // Spot-check a few positions instead of the whole vector.
+        for &idx in &[0_usize, 1, 65_535 * 64, 65_536 * 64, n - 1] {
+            assert!(
+                (gpu[idx] - (a[idx] + 1.0)).abs() < 1e-5,
+                "mismatch at idx={idx}: gpu={} expected={}",
+                gpu[idx],
+                a[idx] + 1.0
+            );
         }
     }
 }
