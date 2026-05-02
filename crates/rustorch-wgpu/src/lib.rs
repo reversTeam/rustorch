@@ -33,10 +33,12 @@ pub mod mapped_upload;
 pub mod matmul;
 pub mod pooled;
 pub mod reduce;
+pub mod registry;
 pub mod shaders;
 pub mod softmax;
 pub mod staging;
 pub mod storage;
+pub mod template;
 pub mod transfer;
 pub mod transpose;
 
@@ -55,9 +57,11 @@ pub use layernorm::{layernorm_rows, layernorm_welford_rows, rmsnorm_rows};
 pub use mapped_upload::upload_mapped_at_creation;
 pub use matmul::{matmul, matmul_with_transposes};
 pub use reduce::{reduce_rows, ReduceKind};
+pub use registry::{KernelRegistry, OpId};
 pub use softmax::{log_softmax_axis, log_softmax_rows, softmax_axis, softmax_rows};
 pub use staging::StagingRing;
 pub use storage::WgpuStorage;
+pub use template::{validate_all_kernels, validate_wgsl};
 pub use transfer::{to_cpu, to_cpu_async, to_gpu};
 pub use transpose::transpose2d;
 
