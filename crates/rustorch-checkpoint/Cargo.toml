@@ -1,0 +1,22 @@
+[package]
+name = "rustorch-checkpoint"
+description = "Gradient checkpointing for rustorch — thin facade over rustorch-autograd::checkpoint with additional integration tests for nesting, RNG state preservation, and 24-layer transformer end-to-end validation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rustorch-autograd = { workspace = true }
+rustorch-core = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
