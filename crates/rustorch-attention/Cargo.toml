@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+rayon = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -18,6 +19,10 @@ proptest  = { workspace = true }
 
 [[bench]]
 name    = "online_softmax_bench"
+harness = false
+
+[[bench]]
+name    = "flash_forward_bench"
 harness = false
 
 [package.metadata.docs.rs]

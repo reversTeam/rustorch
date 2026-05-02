@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 552c43b2725ead67c9fbed1c27dc48cc914b65b886cdaaf7a6e6e5c0e369cae2 # shrinks to shape = AttentionShape { batch: 1, heads: 1, seq: 1, dim: 4, br: 16, bc: 16 }

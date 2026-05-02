@@ -16,8 +16,10 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod cpu_forward;
 pub mod online_softmax;
 
+pub use cpu_forward::{flash_forward, naive_forward, AttentionError, AttentionShape};
 pub use online_softmax::{combine_tiles, online_softmax_full, OnlineSoftmaxState};
 
 /// Crate version reported at runtime.
