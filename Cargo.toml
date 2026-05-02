@@ -36,6 +36,7 @@ members = [
     "crates/rustorch-profile",
     "crates/rustorch-serve",
     "crates/rustorch-rpc-internal",
+    "crates/rustorch-attention",
 ]
 exclude = [
     "pytorch", # reference clone of upstream PyTorch (read-only)
@@ -69,6 +70,7 @@ rustorch-serde     = { version = "0.0.1", path = "crates/rustorch-serde" }
 rustorch-codegen   = { version = "0.0.1", path = "crates/rustorch-codegen" }
 rustorch-wgpu      = { version = "0.0.1", path = "crates/rustorch-wgpu" }
 rustorch-planner   = { version = "0.0.1", path = "crates/rustorch-planner" }
+rustorch-attention = { version = "0.0.1", path = "crates/rustorch-attention" }
 
 # Numerics & types
 half        = "2.4"   # f16 / bf16

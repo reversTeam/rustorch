@@ -1,0 +1,25 @@
+[package]
+name = "rustorch-attention"
+description = "Tiled Flash Attention (forward + backward) for rustorch — pure Rust CPU implementation with online softmax (Welford-style max+sum aggregation), causal/padding masks, and dropout. Mathematically equivalent to naive attention to 1e-4."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest  = { workspace = true }
+
+[[bench]]
+name    = "online_softmax_bench"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

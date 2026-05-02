@@ -2806,6 +2806,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-attention"
+version = "0.0.1"
+dependencies = [
+ "criterion",
+ "proptest",
+]
+
+[[package]]
 name = "rustorch-autograd"
 version = "0.0.1"
 dependencies = [
