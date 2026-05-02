@@ -25,7 +25,8 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 
-# Persistence
+# Persistence — Postgres driver is opt-in via the `postgres` feature
+# so the default build stays SQLite-only.
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
 
 # Async streams (for SSE)
@@ -57,12 +58,22 @@ nvml-wrapper = { version = "0.10", optional = true }
 [features]
 default = []
 nvml = ["dep:nvml-wrapper"]
+# Pulls the Postgres driver into the sqlx pool. The actual swap from
+# SQLite-flavoured queries to PG-flavoured ones is left for a follow-
+# up — today this just means `cargo build --features postgres`
+# compiles a binary with both drivers linked.
+postgres = ["sqlx/postgres"]
 
 [dev-dependencies]
 reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tempfile   = "3.10"
 tokio      = { version = "1.40", features = ["macros", "rt-multi-thread", "test-util"] }
 eventsource-stream = "0.2"
+criterion  = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[[bench]]
+name    = "list_runs"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

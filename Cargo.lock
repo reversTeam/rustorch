@@ -2850,6 +2850,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "criterion",
  "eventsource-stream",
  "futures",
  "nvml-wrapper",
