@@ -1,0 +1,21 @@
+[package]
+name = "rustorch-amp"
+description = "Mixed precision (bf16 / fp16) for rustorch — Autocast scope guard, op promotion list, GradScaler (fp16 only), scalar bf16/fp16 matmul kernels with f32 accumulator. Decoupled from autograd; integration via custom-Function API in a follow-up."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+half = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
