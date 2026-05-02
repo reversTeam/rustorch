@@ -1,0 +1,29 @@
+[package]
+name = "rustorch-serve"
+description = "Inference / serving runtime — HTTP /predict + dynamic batching (P2.6)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+axum       = { version = "0.7", features = ["json"] }
+tokio      = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tower      = "0.5"
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio   = { version = "1.40", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

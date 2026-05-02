@@ -1,0 +1,30 @@
+[package]
+name = "rustorch-rpc-internal"
+description = "Internal RPC layer between the Console backend and Runners (P2.8). Today: in-process registry + bidirectional event channel; gRPC arrives behind feature flag once protoc is on the toolchain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing     = { workspace = true }
+parking_lot = "0.12"
+ulid        = { version = "1.1", features = ["serde"] }
+
+[features]
+default = []
+# When `tonic` and `protoc` are available on the build host, enabling
+# this feature compiles the gRPC server/client from the .proto file.
+grpc = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

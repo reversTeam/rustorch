@@ -1,0 +1,29 @@
+[package]
+name = "rustorch-log"
+description = "Multi-sink logging + metrics for rustorch (P2.5) — Console SSE, stdout JSON, file, W&B / MLflow / TensorBoard adapters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+chrono      = { version = "0.4", features = ["serde"] }
+tracing     = { workspace = true }
+parking_lot = "0.12"
+
+[features]
+default = []
+# Pulls in HTTP-based sinks (W&B + MLflow). Keeps the default crate
+# small and stays dep-light when only the local sinks are needed.
+http = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

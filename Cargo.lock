@@ -2921,6 +2921,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-log"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "rustorch-nn"
 version = "0.0.1"
 dependencies = [
@@ -2954,6 +2966,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-profile"
+version = "0.0.1"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rustorch-rpc-internal"
+version = "0.0.1"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "rustorch-serde"
 version = "0.0.1"
 dependencies = [
@@ -2963,6 +2997,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rustorch-serve"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

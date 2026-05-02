@@ -1,0 +1,116 @@
+// Wire schema for the Console ↔ Runner bidirectional stream.
+// Generated stubs land via tonic-build when feature `grpc` is on.
+syntax = "proto3";
+
+package rustorch.rpc.runner;
+
+service RunnerControl {
+  // Console registers a runner at boot, receives a RunnerId.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Bidirectional stream — runner pushes events, console pushes
+  // commands.
+  rpc Session(stream RunnerEvent) returns (stream ControlCommand);
+
+  // Heartbeat for liveness detection (zombie runner cleanup).
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message RegisterRequest {
+  string run_id = 1;
+  uint32 gpu_count = 2;
+  string runner_version = 3;
+}
+
+message RegisterResponse {
+  string runner_id = 1;
+  // Server-assigned token to authenticate the upcoming Session call.
+  string session_token = 2;
+}
+
+message HeartbeatRequest {
+  string runner_id = 1;
+}
+
+message HeartbeatResponse {
+  // Console clock — runner uses it for skew detection.
+  int64 server_ts_ms = 1;
+}
+
+message RunnerEvent {
+  oneof event {
+    Metric metric = 1;
+    LogLine log = 2;
+    StatusUpdate status = 3;
+    CheckpointSaved checkpoint = 4;
+    GpuTelemetry gpu = 5;
+    RunnerError error = 6;
+  }
+}
+
+message Metric {
+  int64 step = 1;
+  string name = 2;
+  double value = 3;
+}
+
+message LogLine {
+  // Unix epoch ms.
+  int64 ts_ms = 1;
+  string level = 2;
+  string msg = 3;
+}
+
+enum RunnerState {
+  STARTING = 0;
+  RUNNING = 1;
+  PAUSED = 2;
+  FINISHED = 3;
+  FAILED = 4;
+}
+
+message StatusUpdate {
+  RunnerState state = 1;
+  string message = 2;
+}
+
+message CheckpointSaved {
+  string path = 1;
+  int64 step = 2;
+  string metrics_json = 3;
+}
+
+message GpuTelemetry {
+  uint32 gpu_id = 1;
+  uint32 util = 2;
+  uint32 vram_used_mb = 3;
+  uint32 temp_c = 4;
+  uint32 power_w = 5;
+}
+
+message RunnerError {
+  string code = 1;
+  string message = 2;
+  string traceback = 3;
+}
+
+message ControlCommand {
+  oneof command {
+    Pause pause = 1;
+    Resume resume = 2;
+    Stop stop = 3;
+    Interrupt interrupt = 4;
+    SaveCheckpoint save_checkpoint = 5;
+    UpdateConfig update_config = 6;
+  }
+}
+
+message Pause {}
+message Resume {}
+message Stop {}
+message Interrupt {}
+message SaveCheckpoint {}
+message UpdateConfig {
+  // Free-form JSON merged into the runner's TrainCfg.
+  string overrides_json = 1;
+}
