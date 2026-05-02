@@ -37,7 +37,7 @@ pub fn to_gpu(backend: &WgpuBackend, t: &Tensor) -> Result<WgpuStorage, WgpuErro
         .queue
         .submit(std::iter::empty::<wgpu::CommandBuffer>());
     Ok(WgpuStorage {
-        buffer: Arc::new(buffer),
+        buffer: Arc::new(crate::pooled::PooledBuffer::standalone(buffer)),
         dtype: Dtype::F32,
         numel: data.len(),
     })

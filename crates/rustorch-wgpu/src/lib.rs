@@ -25,6 +25,7 @@ pub mod elementwise;
 pub mod error;
 pub mod layernorm;
 pub mod matmul;
+pub mod pooled;
 pub mod reduce;
 pub mod shaders;
 pub mod softmax;
