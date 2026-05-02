@@ -105,7 +105,14 @@ wasm-bindgen = "0.2"
 js-sys       = "0.3"
 
 # GPU backend (Phase 2)
-wgpu         = { version = "22.1", default-features = false, features = ["wgsl"] }
+# Native backends are gated per-target so wasm32 builds don't pull them in.
+# - macOS / iOS    → metal
+# - Linux / Android → vulkan
+# - Windows         → dx12 + vulkan (vulkan as fallback)
+# - wasm32          → webgpu (added implicitly by wgpu when target_family=wasm)
+# `default` already includes wgsl + metal + dx12 + webgpu. We add
+# `vulkan-portability` so Linux runners pick up the Vulkan backend too.
+wgpu         = { version = "22.1", features = ["vulkan-portability"] }
 pollster     = "0.3"
 
 # Dev-only — benchmarks, property tests, concurrent-correctness tests.

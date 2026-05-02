@@ -24,7 +24,7 @@ fn matmul_tiled_wgsl() -> String {
 @group(0) @binding(0) var<storage, read>  lhs: array<f32>;
 @group(0) @binding(1) var<storage, read>  rhs: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> meta: array<vec4<u32>, 1>;
+@group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
 
 var<workgroup> a_tile: array<array<f32, {TILE}u>, {TILE}u>;
 var<workgroup> b_tile: array<array<f32, {TILE}u>, {TILE}u>;
@@ -35,9 +35,9 @@ fn main(
     @builtin(local_invocation_id)  lid: vec3<u32>,
     @builtin(workgroup_id)         wgid: vec3<u32>,
 ) {{
-    let m = meta[0].x;
-    let k = meta[0].y;
-    let n = meta[0].z;
+    let m = params[0].x;
+    let k = params[0].y;
+    let n = params[0].z;
 
     let row = wgid.y * {TILE}u + lid.y;   // 0..M
     let col = wgid.x * {TILE}u + lid.x;   // 0..N
@@ -128,7 +128,7 @@ pub fn matmul(
     let out = WgpuStorage::allocate(&backend.device, m * n, Dtype::F32)?;
 
     // meta = [M, K, N, _]
-    let meta_data = [m as u32, k as u32, n as u32, 0_u32];
+    let params_data = [m as u32, k as u32, n as u32, 0_u32];
     let meta = backend.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("matmul-meta"),
         size: 16,
@@ -137,7 +137,7 @@ pub fn matmul(
     });
     backend
         .queue
-        .write_buffer(&meta, 0, bytemuck::cast_slice(&meta_data));
+        .write_buffer(&meta, 0, bytemuck::cast_slice(&params_data));
 
     let bind_group_layout = pipeline.get_bind_group_layout(0);
     let bind_group = backend

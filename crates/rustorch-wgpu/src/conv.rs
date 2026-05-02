@@ -27,23 +27,23 @@ fn im2col_wgsl() -> String {
         r#"
 @group(0) @binding(0) var<storage, read>  inp: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> meta: array<vec4<u32>, 4>;
+@group(0) @binding(3) var<uniform> params: array<vec4<u32>, 4>;
 
 @compute @workgroup_size({BLOCK})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let n_   = meta[0].x;
-    let c    = meta[0].y;
-    let h    = meta[0].z;
-    let w    = meta[0].w;
-    let kh   = meta[1].x;
-    let kw   = meta[1].y;
-    let sh_  = meta[1].z;
-    let sw   = meta[1].w;
-    let ph   = meta[2].x;
-    let pw   = meta[2].y;
-    let hout = meta[2].z;
-    let wout = meta[2].w;
-    let total = meta[3].x; // = N * Hout * Wout * (C * kH * kW)
+    let n_   = params[0].x;
+    let c    = params[0].y;
+    let h    = params[0].z;
+    let w    = params[0].w;
+    let kh   = params[1].x;
+    let kw   = params[1].y;
+    let sh_  = params[1].z;
+    let sw   = params[1].w;
+    let ph   = params[2].x;
+    let pw   = params[2].y;
+    let hout = params[2].z;
+    let wout = params[2].w;
+    let total = params[3].x; // = N * Hout * Wout * (C * kH * kW)
 
     let idx = gid.x;
     if (idx >= total) {{ return; }}
@@ -144,7 +144,7 @@ fn dispatch_im2col(
         .cache
         .get_or_insert_with(key, || build_im2col_pipeline(backend));
 
-    let meta_data: [u32; 16] = [
+    let params_data: [u32; 16] = [
         n as u32,
         c as u32,
         h as u32,
@@ -170,7 +170,7 @@ fn dispatch_im2col(
     });
     backend
         .queue
-        .write_buffer(&meta, 0, bytemuck::cast_slice(&meta_data));
+        .write_buffer(&meta, 0, bytemuck::cast_slice(&params_data));
 
     let bind_group_layout = pipeline.get_bind_group_layout(0);
     let bind_group = backend
@@ -221,15 +221,15 @@ fn permute_nhwc_to_nchw_wgsl() -> String {
         r#"
 @group(0) @binding(0) var<storage, read>  inp: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> meta: array<vec4<u32>, 1>;
+@group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
 
 @compute @workgroup_size({BLOCK})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     // meta = [N, Spatial(=Hout*Wout), Cout, Total]
-    let n_     = meta[0].x;
-    let spatial = meta[0].y;
-    let cout   = meta[0].z;
-    let total  = meta[0].w;
+    let n_     = params[0].x;
+    let spatial = params[0].y;
+    let cout   = params[0].z;
+    let total  = params[0].w;
 
     let idx = gid.x;
     if (idx >= total) {{ return; }}
@@ -285,7 +285,7 @@ fn dispatch_permute(
     let pipeline = backend
         .cache
         .get_or_insert_with(key, || build_permute_pipeline(backend));
-    let meta_data: [u32; 4] = [n as u32, spatial as u32, cout as u32, total as u32];
+    let params_data: [u32; 4] = [n as u32, spatial as u32, cout as u32, total as u32];
     let meta = backend.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("permute-meta"),
         size: 16,
@@ -294,7 +294,7 @@ fn dispatch_permute(
     });
     backend
         .queue
-        .write_buffer(&meta, 0, bytemuck::cast_slice(&meta_data));
+        .write_buffer(&meta, 0, bytemuck::cast_slice(&params_data));
 
     let bind_group_layout = pipeline.get_bind_group_layout(0);
     let bind_group = backend

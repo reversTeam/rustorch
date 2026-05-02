@@ -18,12 +18,12 @@ fn binary_template(op: &str) -> String {
 @group(0) @binding(0) var<storage, read> lhs: array<f32>;
 @group(0) @binding(1) var<storage, read> rhs: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> meta: array<vec4<u32>, 1>;
+@group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let i = gid.x;
-    let n = meta[0].x;
+    let n = params[0].x;
     if (i >= n) {{ return; }}
     out[i] = lhs[i] {op} rhs[i];
 }}
@@ -37,12 +37,12 @@ fn unary_template(expr: &str) -> String {
         r#"
 @group(0) @binding(0) var<storage, read> inp: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> meta: array<vec4<u32>, 1>;
+@group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let i = gid.x;
-    let n = meta[0].x;
+    let n = params[0].x;
     if (i >= n) {{ return; }}
     let x = inp[i];
     out[i] = {expr};

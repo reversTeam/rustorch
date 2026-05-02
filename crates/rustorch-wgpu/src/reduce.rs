@@ -65,7 +65,7 @@ fn reduce_wgsl(kind: ReduceKind) -> String {
         r#"
 @group(0) @binding(0) var<storage, read>  inp: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> meta: array<vec4<u32>, 1>;
+@group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
 
 var<workgroup> shared_buf: array<f32, {BLOCK}u>;
 
@@ -74,8 +74,8 @@ fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id)        wgid: vec3<u32>,
 ) {{
-    let b = meta[0].x;
-    let k = meta[0].y;
+    let b = params[0].x;
+    let k = params[0].y;
     let row = wgid.x;
     if (row >= b) {{ return; }}
 
@@ -163,7 +163,7 @@ pub fn reduce_rows(
         .get_or_insert_with(key, || build_pipeline(backend, kind));
 
     let out = WgpuStorage::allocate(&backend.device, b, Dtype::F32)?;
-    let meta_data = [b as u32, k as u32, 0_u32, 0_u32];
+    let params_data = [b as u32, k as u32, 0_u32, 0_u32];
     let meta = backend.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("reduce-meta"),
         size: 16,
@@ -172,7 +172,7 @@ pub fn reduce_rows(
     });
     backend
         .queue
-        .write_buffer(&meta, 0, bytemuck::cast_slice(&meta_data));
+        .write_buffer(&meta, 0, bytemuck::cast_slice(&params_data));
 
     let bind_group_layout = pipeline.get_bind_group_layout(0);
     let bind_group = backend
