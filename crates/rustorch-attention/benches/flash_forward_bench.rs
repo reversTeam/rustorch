@@ -7,7 +7,9 @@
 //! of bc × dim ≈ 16 KB.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rustorch_attention::{flash_forward, naive_forward, AttentionShape};
+use rustorch_attention::{
+    flash_forward, flash_forward_masked, naive_forward, AttentionShape, Mask,
+};
 
 fn fixture(n_elements: usize, seed: u32) -> Vec<f32> {
     let mut s = seed.wrapping_mul(2654435761);
@@ -64,10 +66,32 @@ fn bench_flash_n1024_b2_h4(c: &mut Criterion) {
     });
 }
 
+fn bench_flash_causal_n2048(c: &mut Criterion) {
+    // Causal mask overhead probe — acceptance: masked Flash within
+    // 1.05× of unmasked.
+    let shape = AttentionShape::new(1, 1, 2048, 64);
+    let (q, k, v, mut out) = buffers(&shape);
+    c.bench_function("flash_forward_causal_b1_h1_n2048_d64", |b| {
+        b.iter(|| {
+            flash_forward_masked(
+                black_box(&shape),
+                &q,
+                &k,
+                &v,
+                black_box(&Mask::Causal),
+                &mut out,
+            )
+            .unwrap();
+            black_box(&out);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_flash_n2048,
     bench_naive_n2048,
-    bench_flash_n1024_b2_h4
+    bench_flash_n1024_b2_h4,
+    bench_flash_causal_n2048
 );
 criterion_main!(benches);

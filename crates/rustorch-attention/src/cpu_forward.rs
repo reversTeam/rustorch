@@ -39,6 +39,7 @@
 // pattern crate-locally.
 #![allow(clippy::needless_range_loop)]
 
+use crate::mask::{Mask, MaskError};
 use crate::online_softmax::OnlineSoftmaxState;
 use rayon::prelude::*;
 
@@ -107,6 +108,14 @@ pub enum AttentionError {
     },
     /// `dim == 0` makes the scaling factor `1/sqrt(0)` undefined.
     ZeroDim,
+    /// Mask validation failed (e.g. padding mask length mismatch).
+    Mask(MaskError),
+}
+
+impl From<MaskError> for AttentionError {
+    fn from(e: MaskError) -> Self {
+        AttentionError::Mask(e)
+    }
 }
 
 impl core::fmt::Display for AttentionError {
@@ -121,6 +130,7 @@ impl core::fmt::Display for AttentionError {
                 write!(f, "output buffer has {got} elements, expected {expected}")
             },
             AttentionError::ZeroDim => write!(f, "dim must be > 0"),
+            AttentionError::Mask(e) => write!(f, "mask error: {e}"),
         }
     }
 }
@@ -160,13 +170,7 @@ fn validate(
 /// Compute scaled attention `O = softmax(QK^T * scale) V` using the
 /// tiled Flash forward kernel. Output is written in-place to `out`.
 ///
-/// `scale` defaults to `1/sqrt(dim)`; this is set INSIDE the kernel
-/// (exactly once per score) to avoid hot-loop sqrt and to ensure
-/// numerical equivalence with naive attention modulo summation order.
-///
-/// The outer loops over `(batch, head, query-tile)` are parallelised
-/// via `rayon`; output bit-equivalence with the single-thread
-/// path is verified by `parallel_matches_serial` below.
+/// Equivalent to [`flash_forward_masked`] with `Mask::None`.
 pub fn flash_forward(
     shape: &AttentionShape,
     q: &[f32],
@@ -174,7 +178,27 @@ pub fn flash_forward(
     v: &[f32],
     out: &mut [f32],
 ) -> Result<(), AttentionError> {
+    flash_forward_masked(shape, q, k, v, &Mask::None, out)
+}
+
+/// Compute masked scaled attention `O = softmax((QK^T + mask) * scale) V`.
+///
+/// `scale` is `1/sqrt(dim)` and is applied INSIDE the kernel exactly
+/// once per score. Masked positions become `-inf` BEFORE the online
+/// softmax sees them, so they contribute zero (cleanly via
+/// `exp(-inf - finite) = 0`) without any NaN risk.
+///
+/// The outer loops over `(batch, head)` are parallelised via `rayon`.
+pub fn flash_forward_masked(
+    shape: &AttentionShape,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    mask: &Mask<'_>,
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
     validate(shape, q, k, v, out)?;
+    mask.validate(shape.seq)?;
     if shape.seq == 0 {
         // Empty seq → output is already correctly-sized empty.
         return Ok(());
@@ -221,7 +245,14 @@ pub fn flash_forward(
                             for d in 0..dim {
                                 s += q_row[d] * k_row[d];
                             }
-                            scores.push(s * scale);
+                            // Apply mask BEFORE scale → masked entries
+                            // become -inf cleanly, exp(-inf) = 0.
+                            let score = if mask.is_masked(qi_row, kk) {
+                                f32::NEG_INFINITY
+                            } else {
+                                s * scale
+                            };
+                            scores.push(score);
                         }
 
                         let m_new_tile = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -285,7 +316,21 @@ pub fn naive_forward(
     v: &[f32],
     out: &mut [f32],
 ) -> Result<(), AttentionError> {
+    naive_forward_masked(shape, q, k, v, &Mask::None, out)
+}
+
+/// Naive reference attention with optional masking. Used by tests
+/// to verify masked Flash forward equivalence.
+pub fn naive_forward_masked(
+    shape: &AttentionShape,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    mask: &Mask<'_>,
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
     validate(shape, q, k, v, out)?;
+    mask.validate(shape.seq)?;
     let scale = 1.0 / (shape.dim as f32).sqrt();
     let (s_b, s_h, s_n) = shape.strides();
     for b in 0..shape.batch {
@@ -295,6 +340,10 @@ pub fn naive_forward(
             let mut scores = vec![0.0f32; shape.seq * shape.seq];
             for i in 0..shape.seq {
                 for j in 0..shape.seq {
+                    if mask.is_masked(i, j) {
+                        scores[i * shape.seq + j] = f32::NEG_INFINITY;
+                        continue;
+                    }
                     let mut s = 0.0f32;
                     for d in 0..shape.dim {
                         s += q[base + i * s_n + d] * k[base + j * s_n + d];
@@ -499,6 +548,91 @@ mod tests {
         flash_forward(&shape, &q, &k, &v, &mut o_flash).unwrap();
         naive_forward(&shape, &q, &k, &v, &mut o_naive).unwrap();
         assert_close_buffers(&o_flash, &o_naive, 1e-4, "parallel vs naive");
+    }
+
+    // --- Masked-path tests ---------------------------------------
+
+    #[test]
+    fn causal_flash_matches_causal_naive() {
+        let shape = AttentionShape::new(1, 2, 64, 32);
+        let (q, k, v, mut o_flash) = shape_buffers(&shape);
+        let mut o_naive = vec![0.0f32; shape.buffer_len()];
+        flash_forward_masked(&shape, &q, &k, &v, &Mask::Causal, &mut o_flash).unwrap();
+        naive_forward_masked(&shape, &q, &k, &v, &Mask::Causal, &mut o_naive).unwrap();
+        assert_close_buffers(&o_flash, &o_naive, 1e-4, "causal masked");
+    }
+
+    #[test]
+    fn padding_flash_matches_padding_naive() {
+        let shape = AttentionShape::new(1, 1, 8, 4);
+        let (q, k, v, mut o_flash) = shape_buffers(&shape);
+        let mut o_naive = vec![0.0f32; shape.buffer_len()];
+        let keep = [true, false, true, true, false, true, false, true];
+        let mask = Mask::Padding(&keep);
+        flash_forward_masked(&shape, &q, &k, &v, &mask, &mut o_flash).unwrap();
+        naive_forward_masked(&shape, &q, &k, &v, &mask, &mut o_naive).unwrap();
+        assert_close_buffers(&o_flash, &o_naive, 1e-4, "padding masked");
+    }
+
+    #[test]
+    fn causal_first_query_only_attends_to_self() {
+        // For a causal mask, q[0] can only attend to k[0] → output
+        // is exactly v[0] (single-element softmax = 1.0).
+        let shape = AttentionShape::new(1, 1, 4, 8);
+        let q = vec![1.0f32; shape.buffer_len()];
+        let k = vec![1.0f32; shape.buffer_len()];
+        // V row 0 = [10, 20, 30, ...]; row 1+ = something else.
+        let mut v = vec![0.0f32; shape.buffer_len()];
+        for d in 0..8 {
+            v[d] = 10.0 * (d + 1) as f32;
+            v[8 + d] = -99.0; // row 1
+            v[16 + d] = 99.0; // row 2
+        }
+        let mut out = vec![0.0f32; shape.buffer_len()];
+        flash_forward_masked(&shape, &q, &k, &v, &Mask::Causal, &mut out).unwrap();
+        // q[0] sees only k[0] → out[0..8] = v[0..8].
+        for d in 0..8 {
+            assert!(
+                close(out[d], v[d], 1e-6),
+                "out[{d}]={} vs v[{d}]={}",
+                out[d],
+                v[d]
+            );
+        }
+    }
+
+    #[test]
+    fn padding_mask_excludes_padded_positions_exactly() {
+        // 4 keys; keep = [true, false, false, true]. q[0] attends to
+        // k[0] and k[3] only. With q=k=ones, scores at 0 and 3 are
+        // both equal → output averages v[0] and v[3].
+        let shape = AttentionShape::new(1, 1, 4, 4);
+        let q = vec![1.0f32; shape.buffer_len()];
+        let k = vec![1.0f32; shape.buffer_len()];
+        let v: Vec<f32> = vec![
+            10.0, 0.0, 0.0, 0.0, 99.0, 0.0, 0.0, 0.0, -99.0, 0.0, 0.0, 0.0, 30.0, 0.0, 0.0, 0.0,
+        ];
+        let keep = [true, false, false, true];
+        let mut out = vec![0.0f32; shape.buffer_len()];
+        flash_forward_masked(&shape, &q, &k, &v, &Mask::Padding(&keep), &mut out).unwrap();
+        // out[0] = (v[0][0] + v[3][0]) / 2 = (10 + 30) / 2 = 20.
+        assert!(close(out[0], 20.0, 1e-5));
+    }
+
+    #[test]
+    fn padding_mask_length_mismatch_returns_error() {
+        let shape = AttentionShape::new(1, 1, 4, 4);
+        let (q, k, v, mut out) = shape_buffers(&shape);
+        let keep = [true; 3]; // wrong length
+        let err =
+            flash_forward_masked(&shape, &q, &k, &v, &Mask::Padding(&keep), &mut out).unwrap_err();
+        assert!(matches!(
+            err,
+            AttentionError::Mask(MaskError::PaddingLengthMismatch {
+                expected: 4,
+                got: 3
+            })
+        ));
     }
 
     #[test]

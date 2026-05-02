@@ -17,9 +17,14 @@
 #![warn(rust_2018_idioms)]
 
 pub mod cpu_forward;
+pub mod mask;
 pub mod online_softmax;
 
-pub use cpu_forward::{flash_forward, naive_forward, AttentionError, AttentionShape};
+pub use cpu_forward::{
+    flash_forward, flash_forward_masked, naive_forward, naive_forward_masked, AttentionError,
+    AttentionShape,
+};
+pub use mask::{Mask, MaskError};
 pub use online_softmax::{combine_tiles, online_softmax_full, OnlineSoftmaxState};
 
 /// Crate version reported at runtime.
