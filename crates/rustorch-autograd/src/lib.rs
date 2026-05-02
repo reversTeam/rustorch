@@ -30,7 +30,9 @@ pub use anomaly::{
 };
 pub use autocast::{autocast, current_dtype as autocast_dtype, no_autocast, AutocastDtype};
 pub use backward::{backward, BackwardError};
-pub use checkpoint::checkpoint;
+pub use checkpoint::{
+    checkpoint, checkpoint_n, gradient_checkpointing_count, reset_gradient_checkpointing_count,
+};
 pub use custom_function::{apply_custom, BwdCtx, CustomFunction, FwdCtx};
 pub use higher_order::grad;
 pub use node::{Edge, Node};
