@@ -18,6 +18,7 @@
 
 pub mod cpu_backward;
 pub mod cpu_forward;
+pub mod gpu_wgsl;
 pub mod mask;
 pub mod online_softmax;
 

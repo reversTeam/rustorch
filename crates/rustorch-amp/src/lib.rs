@@ -31,11 +31,16 @@ pub mod autocast;
 pub mod bf16_kernels;
 pub mod dtypes;
 pub mod grad_scaler;
+pub mod model_cast;
 
 pub use autocast::{autocast, autocast_force_fp32, current_dtype, AutocastGuard, Mixed, OpKind};
 pub use bf16_kernels::{matmul_bf16_with_f32_accum, matmul_fp16_with_f32_accum};
 pub use dtypes::{f32_to_bf16, f32_to_fp16};
 pub use grad_scaler::{GradScaler, ScalerStep};
+pub use model_cast::{
+    f32_param_bytes, low_prec_param_bytes, parameters_from_bf16, parameters_from_fp16,
+    parameters_to_bf16, parameters_to_fp16,
+};
 
 /// Crate version reported at runtime.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

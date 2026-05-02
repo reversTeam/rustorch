@@ -21,6 +21,7 @@
 
 pub mod dtype;
 pub mod gemm_int8;
+pub mod gpu_int8;
 pub mod observer;
 pub mod qmodules;
 pub mod qops;
