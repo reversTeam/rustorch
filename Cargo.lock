@@ -2990,6 +2990,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-quant"
+version = "0.0.1"
+dependencies = [
+ "criterion",
+ "proptest",
+]
+
+[[package]]
 name = "rustorch-rpc-internal"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,25 @@
+[package]
+name = "rustorch-quant"
+description = "Int8 dynamic quantization for rustorch — observers (MinMax + Histogram), per-tensor and per-channel quant params, quantize/dequantize ops with HALF_TO_EVEN rounding. Foundation for QuantLinear / QuantConv2d (later tasks)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest  = { workspace = true }
+
+[[bench]]
+name    = "observer_bench"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
