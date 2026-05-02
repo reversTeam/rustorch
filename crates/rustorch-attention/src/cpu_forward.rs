@@ -684,11 +684,13 @@ mod proptests {
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 100,
+            cases: 200,
             .. ProptestConfig::default()
         })]
 
         /// Flash forward matches naive within 1e-3 over random shapes.
+        /// 200 cases — meets the Phase 3 e7656812 acceptance step
+        /// "Add 200-case proptest sampling random (B, H, N, D)".
         #[test]
         fn flash_matches_naive_random_shapes(shape in shape_strategy()) {
             let n = shape.buffer_len();

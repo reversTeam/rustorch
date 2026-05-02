@@ -25,6 +25,10 @@ harness = false
 name    = "flash_forward_bench"
 harness = false
 
+[[bench]]
+name    = "long_seq_bench"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
