@@ -31,6 +31,7 @@ members = [
     "crates/rustorch-planner",
     "crates/rustorch-cli",
     "crates/rustorch-console-server",
+    "crates/rustorch-sweep",
 ]
 exclude = [
     "pytorch", # reference clone of upstream PyTorch (read-only)

@@ -815,6 +815,106 @@ async fn cluster_tick_task_streams_via_sse() {
     assert!(state.hub.ring_len(TICK_TOPIC) >= 1);
 }
 
+// ---- Sweeps (P2.3) ---------------------------------------------------
+
+#[tokio::test]
+async fn sweeps_grid_creates_persists_and_retrieves() {
+    let (addr, _) = spawn(AuthConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    // Create a 3x2 grid sweep.
+    let resp = client
+        .post(format!("http://{addr}/sweeps"))
+        .json(&json!({
+            "strategy": "grid",
+            "axes": [
+                {"name": "lr",    "values": [1e-4, 3e-4, 1e-3]},
+                {"name": "batch", "values": [64, 128]}
+            ],
+            "base_cfg": {"optim": "adamw"},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(v["trials"].as_array().unwrap().len(), 6);
+
+    // List shows the sweep.
+    let list: Vec<serde_json::Value> = reqwest::get(format!("http://{addr}/sweeps"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.iter().any(|s| s["id"] == id));
+
+    // Get-one replans and returns the same number of trials.
+    let one: serde_json::Value = reqwest::get(format!("http://{addr}/sweeps/{id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["trials"].as_array().unwrap().len(), 6);
+    assert_eq!(one["status"], "pending");
+
+    // Cancel flips status.
+    let resp = client
+        .post(format!("http://{addr}/sweeps/{id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let c: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(c["status"], "cancelled");
+}
+
+#[tokio::test]
+async fn sweeps_random_with_seed_is_reproducible() {
+    let (addr, _) = spawn(AuthConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let body = json!({
+        "strategy": "random",
+        "config": {"trials": 3, "seed": 42},
+        "axes": [{"name": "lr", "values": [1e-4, 3e-4, 1e-3, 1e-2]}],
+        "base_cfg": {},
+    });
+    let r1: serde_json::Value = client
+        .post(format!("http://{addr}/sweeps"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let r2: serde_json::Value = client
+        .post(format!("http://{addr}/sweeps"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let axes1: Vec<&serde_json::Value> = r1["trials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| &t["axes"])
+        .collect();
+    let axes2: Vec<&serde_json::Value> = r2["trials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| &t["axes"])
+        .collect();
+    assert_eq!(axes1, axes2, "same seed → same trials");
+}
+
 // ---- HTTP step 4 — FS / Builder / Deploy / Activity ---------------------
 
 #[tokio::test]

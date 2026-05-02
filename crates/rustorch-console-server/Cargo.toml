@@ -15,6 +15,9 @@ name = "rustorch-console"
 path = "src/main.rs"
 
 [dependencies]
+# Internal crates
+rustorch-sweep = { path = "../rustorch-sweep" }
+
 # HTTP + async
 axum       = { version = "0.7", features = ["json", "macros"] }
 tokio      = { version = "1.40", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "process", "io-util", "fs"] }

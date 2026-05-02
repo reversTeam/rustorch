@@ -2855,6 +2855,7 @@ dependencies = [
  "futures",
  "nvml-wrapper",
  "reqwest",
+ "rustorch-sweep",
  "serde",
  "serde_json",
  "sqlx",
@@ -2962,6 +2963,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rustorch-sweep"
+version = "0.0.1"
+dependencies = [
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "ulid",
+ "utoipa",
 ]
 
 [[package]]

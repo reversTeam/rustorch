@@ -11,3 +11,4 @@ pub mod fs;
 pub mod me;
 pub mod runs;
 pub mod sse_routes;
+pub mod sweeps;
