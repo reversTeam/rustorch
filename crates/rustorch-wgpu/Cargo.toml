@@ -28,7 +28,13 @@ thiserror     = { workspace = true }
 # (rayon does not target wasm32). Pulled in unconditionally because
 # the examples opt into it; the library itself does not depend on it.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-rayon = { workspace = true }
+rayon     = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "dispatch"
+harness = false
+required-features = ["gpu-tests"]
 
 [package.metadata.docs.rs]
 all-features = true

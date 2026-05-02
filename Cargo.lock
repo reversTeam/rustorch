@@ -1478,6 +1478,7 @@ name = "rustorch-wgpu"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "criterion",
  "pollster",
  "rayon",
  "rustorch-core",

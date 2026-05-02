@@ -33,6 +33,33 @@ jobs:
           key: wgpu-bench
       - name: Compile examples (bench harnesses)
         run: cargo build -p rustorch-wgpu --release --examples
-      # When dedicated benches land under crates/rustorch-wgpu/benches/
-      # add `cargo bench --no-run` here. For now the `examples/bench_*`
-      # binaries are the de-facto benches.
+      - name: Compile criterion bench (dispatch.rs) without running
+        # The bench needs a Vulkan adapter for some assertions —
+        # we only verify it compiles here. The full timing run lives
+        # on a self-hosted GPU runner (TODO: wire up alert-on-regression
+        # via github-action-benchmark when the runner lands).
+        run: cargo bench -p rustorch-wgpu --features gpu-tests --no-run
+
+  # Sketch of the regression-tracking job. Disabled by default
+  # because GitHub-hosted runners have no stable GPU. Activate
+  # when a self-hosted GPU runner is wired up — at that point flip
+  # `if: false` to `if: github.event_name == 'pull_request'`.
+  bench-track:
+    name: criterion (regression tracking, disabled)
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run criterion benches
+        run: cargo bench -p rustorch-wgpu --features gpu-tests -- --output-format bencher | tee bench.txt
+      - name: Store + alert on regression
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: cargo
+          output-file-path: bench.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: false
+          alert-threshold: '110%'
+          comment-on-alert: true
+          fail-on-alert: true
