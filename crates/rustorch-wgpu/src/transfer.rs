@@ -268,4 +268,48 @@ mod tests {
         let back = to_cpu(&backend, &gpu, vec![2, 0]).unwrap();
         assert_eq!(back.numel(), 0);
     }
+
+    /// Property-style sweep: a battery of randomly-generated tensors
+    /// must round-trip bit-exact through `to_gpu → to_cpu`. We use a
+    /// xorshift-style PRNG (deterministic for reproducibility) instead
+    /// of pulling in `proptest` as a dep.
+    #[test]
+    fn random_round_trip_property_sweep() {
+        let backend = WgpuBackend::new_blocking().expect("init wgpu");
+        let mut s: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        for trial in 0..32_usize {
+            // Random length in [1, 1024].
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let n = (s % 1024) as usize + 1;
+            // Random F32 values via bit reinterpret.
+            let data: Vec<f32> = (0..n)
+                .map(|i| {
+                    let bits = s.wrapping_mul(0x9E37_79B9).wrapping_add(i as u64) as u32;
+                    f32::from_bits(bits & 0x7FFF_FFFF) // clear sign for finite-ish values
+                })
+                .filter(|x| x.is_finite())
+                .collect();
+            if data.is_empty() {
+                continue;
+            }
+            let n = data.len();
+            let cpu = Tensor::from_vec([n], data.clone()).unwrap();
+            let gpu = to_gpu(&backend, &cpu).unwrap();
+            let back = to_cpu(&backend, &gpu, vec![n]).unwrap();
+            let raw = back.as_slice::<f32>().unwrap();
+            // Bit-exact equality via to_bits comparison.
+            for (a, b) in raw.iter().zip(&data) {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "trial {} mismatch at byte: {:?} vs {:?}",
+                    trial,
+                    a,
+                    b
+                );
+            }
+        }
+    }
 }

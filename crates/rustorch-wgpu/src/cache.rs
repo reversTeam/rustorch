@@ -118,8 +118,14 @@ impl Default for PoolPolicy {
     fn default() -> Self {
         // 1 GiB total cap, 32 buffers per bucket — generous defaults
         // that work for laptop-sized models without hoarding forever.
+        // Honours the `WGPU_POOL_MAX` env var (interpreted as bytes)
+        // so users can tune at process-start without recompiling.
+        let max_bytes = std::env::var("WGPU_POOL_MAX")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1 << 30);
         PoolPolicy {
-            max_bytes: 1 << 30,
+            max_bytes,
             max_per_bucket: 32,
         }
     }

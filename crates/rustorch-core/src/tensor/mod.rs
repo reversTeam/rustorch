@@ -21,6 +21,7 @@
 //! integrated piece-by-piece.
 
 pub mod convert;
+pub mod device;
 pub mod dtype;
 pub mod layout;
 pub mod shape;
@@ -30,6 +31,7 @@ pub mod version;
 pub mod view;
 
 pub use convert::{tensor_from_storage, ConvertError, ShapeIter};
+pub use device::Device;
 pub use dtype::{Dtype, Element};
 pub use layout::{Layout, LayoutError};
 pub use shape::{BroadcastError, Shape};

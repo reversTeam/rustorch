@@ -39,4 +39,42 @@ pub enum WgpuError {
         /// One-line snapshot of pool metrics at failure time.
         snapshot: String,
     },
+
+    /// WGSL shader failed to compile. The diagnostic carries the
+    /// driver / naga error message verbatim so callers can surface it
+    /// to logs / users without losing source-line info.
+    #[error("WGSL shader compile error in `{label}`: {message}")]
+    ShaderCompile {
+        /// Human-readable kernel label (e.g. `"matmul"`, `"softmax"`).
+        label: String,
+        /// Raw error text from the validator / driver.
+        message: String,
+    },
+
+    /// Caller asked for a zero-byte allocation. wgpu requires every
+    /// buffer to have non-zero size; rustorch surfaces this as a
+    /// distinct variant rather than silently padding to 4 bytes so
+    /// the upstream bug is visible.
+    #[error("zero-size allocation request ({context})")]
+    ZeroSize {
+        /// Where the zero-size request originated (op name / label).
+        context: String,
+    },
+
+    /// The wgpu device entered the lost state — typically because the
+    /// driver crashed or a long-running compute hit a watchdog timer.
+    /// Recovery requires re-creating the [`crate::WgpuBackend`] from
+    /// scratch.
+    #[error("wgpu device lost: {reason}")]
+    DeviceLost {
+        /// Reason reported by the driver, if any.
+        reason: String,
+    },
+
+    /// A wgpu validation error was captured (uncaptured-error scope).
+    /// Means the runtime spotted a bind-group / shader / encoder
+    /// problem after the dispatch was already submitted; usually a
+    /// rustorch bug, surface to the user.
+    #[error("wgpu validation error: {0}")]
+    Validation(String),
 }
