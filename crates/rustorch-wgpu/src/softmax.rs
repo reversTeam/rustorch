@@ -3,10 +3,15 @@
 //! Computes `softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))` along
 //! the last axis of an `[B, K]` matrix. One workgroup per row.
 //!
-//! v1: 1-pass numerically stable softmax. Each workgroup:
+//! Numerically stable 3-phase implementation. Each workgroup:
 //!   1. Cooperatively finds row max.
 //!   2. Computes exp(x_i - max), accumulates into row sum.
 //!   3. Writes exp / sum to output.
+//!
+//! For ops along an arbitrary axis, see [`softmax_axis`] /
+//! [`log_softmax_axis`] which transpose-roundtrip the input so the
+//! requested axis becomes the last one before dispatching the
+//! row-wise kernel.
 
 use crate::backend::WgpuBackend;
 use crate::cache::PipelineKey;
@@ -367,6 +372,75 @@ pub fn softmax_rows(
     Ok(out)
 }
 
+/// Generic-axis softmax for 2D inputs `[d0, d1]`.
+///
+/// `axis = 0` softmaxes over rows of each column; `axis = 1` (or `-1`)
+/// is the standard row-wise softmax. Internally:
+/// - axis=1 → direct dispatch on [d0, d1].
+/// - axis=0 → transpose to [d1, d0], softmax_rows, transpose back.
+///
+/// Returns the result tensor with the **same shape** as the input.
+pub fn softmax_axis(
+    backend: &WgpuBackend,
+    inp: &WgpuStorage,
+    d0: usize,
+    d1: usize,
+    axis: usize,
+) -> Result<WgpuStorage, WgpuError> {
+    use crate::transpose::transpose2d;
+    if inp.numel != d0 * d1 {
+        return Err(WgpuError::ShapeMismatch(format!(
+            "softmax_axis: numel {} != d0*d1 {}",
+            inp.numel,
+            d0 * d1
+        )));
+    }
+    match axis {
+        1 => softmax_rows(backend, inp, d0, d1),
+        0 => {
+            // Transpose [d0, d1] → [d1, d0], softmax along last (now d0),
+            // transpose back to [d0, d1].
+            let xt = transpose2d(backend, inp, d0, d1)?;
+            let yt = softmax_rows(backend, &xt, d1, d0)?;
+            transpose2d(backend, &yt, d1, d0)
+        },
+        _ => Err(WgpuError::ShapeMismatch(format!(
+            "softmax_axis: axis {} out of range for 2D input",
+            axis
+        ))),
+    }
+}
+
+/// Generic-axis log-softmax. Same convention as [`softmax_axis`].
+pub fn log_softmax_axis(
+    backend: &WgpuBackend,
+    inp: &WgpuStorage,
+    d0: usize,
+    d1: usize,
+    axis: usize,
+) -> Result<WgpuStorage, WgpuError> {
+    use crate::transpose::transpose2d;
+    if inp.numel != d0 * d1 {
+        return Err(WgpuError::ShapeMismatch(format!(
+            "log_softmax_axis: numel {} != d0*d1 {}",
+            inp.numel,
+            d0 * d1
+        )));
+    }
+    match axis {
+        1 => log_softmax_rows(backend, inp, d0, d1),
+        0 => {
+            let xt = transpose2d(backend, inp, d0, d1)?;
+            let yt = log_softmax_rows(backend, &xt, d1, d0)?;
+            transpose2d(backend, &yt, d1, d0)
+        },
+        _ => Err(WgpuError::ShapeMismatch(format!(
+            "log_softmax_axis: axis {} out of range for 2D input",
+            axis
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +533,72 @@ mod gpu_tests {
         for (a, b) in g.iter().zip(&c) {
             assert!((a - b).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn softmax_axis_zero_normalizes_columns() {
+        let backend = WgpuBackend::new_blocking().expect("init");
+        // [3, 2] tensor — softmax(axis=0) means each column sums to 1.
+        let data = vec![1.0_f32, 4.0, 2.0, 5.0, 3.0, 6.0];
+        let t = Tensor::from_vec([3_usize, 2], data.clone()).unwrap();
+        let g = to_gpu(&backend, &t).unwrap();
+        let r = softmax_axis(&backend, &g, 3, 2, 0).unwrap();
+        let c = to_cpu(&backend, &r, vec![3, 2]).unwrap();
+        let raw = c.as_slice::<f32>().unwrap();
+        // Column 0 sum = raw[0] + raw[2] + raw[4]; Column 1 = raw[1] + raw[3] + raw[5].
+        let col0: f32 = raw[0] + raw[2] + raw[4];
+        let col1: f32 = raw[1] + raw[3] + raw[5];
+        assert!((col0 - 1.0).abs() < 1e-5, "col0 = {col0}");
+        assert!((col1 - 1.0).abs() < 1e-5, "col1 = {col1}");
+    }
+
+    #[test]
+    fn softmax_axis_one_matches_softmax_rows() {
+        // axis=1 should produce exactly the same output as softmax_rows.
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let data = vec![1.0_f32, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0];
+        let t = Tensor::from_vec([2_usize, 4], data.clone()).unwrap();
+        let g = to_gpu(&backend, &t).unwrap();
+        let r_axis = softmax_axis(&backend, &g, 2, 4, 1).unwrap();
+        let r_rows = softmax_rows(&backend, &g, 2, 4).unwrap();
+        let c_axis = to_cpu(&backend, &r_axis, vec![2, 4]).unwrap();
+        let c_rows = to_cpu(&backend, &r_rows, vec![2, 4]).unwrap();
+        for (a, b) in c_axis
+            .as_slice::<f32>()
+            .unwrap()
+            .iter()
+            .zip(c_rows.as_slice::<f32>().unwrap())
+        {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn log_softmax_axis_zero_columns_log_sum_to_zero() {
+        // log_softmax along axis 0 → log(sum(exp(out, axis=0))) = 0.
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let data = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let t = Tensor::from_vec([3_usize, 2], data).unwrap();
+        let g = to_gpu(&backend, &t).unwrap();
+        let r = log_softmax_axis(&backend, &g, 3, 2, 0).unwrap();
+        let c = to_cpu(&backend, &r, vec![3, 2]).unwrap();
+        let raw = c.as_slice::<f32>().unwrap();
+        // Column-wise log-sum-exp must be 0.
+        for col in 0..2 {
+            let lse = (raw[col].exp() + raw[col + 2].exp() + raw[col + 4].exp()).ln();
+            assert!(lse.abs() < 1e-5, "col {col}: lse = {lse}");
+        }
+    }
+
+    #[test]
+    fn softmax_axis_rejects_invalid_axis() {
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let t = Tensor::from_vec([2_usize, 2], vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap();
+        let g = to_gpu(&backend, &t).unwrap();
+        let err = match softmax_axis(&backend, &g, 2, 2, 5) {
+            Ok(_) => panic!("axis=5 should have been rejected"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("axis 5"));
     }
 }
