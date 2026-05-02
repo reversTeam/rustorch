@@ -1,11 +1,10 @@
-//! Row-wise reductions on the GPU.
+//! Row-wise argmax / argmin on the GPU.
 //!
-//! Treats the input as a `[B, K]` matrix and produces a `[B]` output:
-//! one workgroup per row, threads cooperate via workgroup-shared
-//! memory to reduce K elements down to a single scalar.
-//!
-//! v1 supports `sum`, `mean`, `max`. Backwards (e.g. `softmax`) is
-//! built on top in [`softmax`](crate::softmax).
+//! Treats the input as a `[B, K]` matrix and produces a `[B]` u32
+//! output: the index in `0..K` of the row's maximum (or minimum).
+//! One workgroup per row, threads cooperate via two workgroup-shared
+//! arrays (value + index) for the reduction. Stable: ties resolve to
+//! the first (lowest index) occurrence, mirroring `torch.argmax`.
 
 use crate::backend::WgpuBackend;
 use crate::cache::PipelineKey;
@@ -15,64 +14,49 @@ use rustorch_core::tensor::dtype::Dtype;
 
 const BLOCK: u32 = 256;
 
-/// Reduction kind.
+/// Direction of the argmax-style reduction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ReduceKind {
-    /// Sum along the row.
-    Sum,
-    /// Arithmetic mean along the row.
-    Mean,
-    /// Maximum along the row.
+pub enum ArgKind {
+    /// Index of the maximum value (ties → lowest index).
     Max,
-    /// Minimum along the row.
+    /// Index of the minimum value (ties → lowest index).
     Min,
 }
 
-impl ReduceKind {
+impl ArgKind {
     fn op_name(self) -> &'static str {
         match self {
-            ReduceKind::Sum => "reduce_sum",
-            ReduceKind::Mean => "reduce_mean",
-            ReduceKind::Max => "reduce_max",
-            ReduceKind::Min => "reduce_min",
+            ArgKind::Max => "argmax",
+            ArgKind::Min => "argmin",
         }
     }
-
-    fn init_value(self) -> &'static str {
+    fn init(self) -> &'static str {
         match self {
-            ReduceKind::Sum | ReduceKind::Mean => "0.0",
-            ReduceKind::Max => "-3.4e38",
-            ReduceKind::Min => "3.4e38",
+            ArgKind::Max => "-3.4e38",
+            ArgKind::Min => "3.4e38",
         }
     }
-
-    fn combine(self) -> &'static str {
+    /// WGSL expression: replaces (acc, idx) with (v, i) iff `cond`.
+    fn cond(self) -> &'static str {
+        // "first occurrence wins" => strict comparison.
         match self {
-            ReduceKind::Sum | ReduceKind::Mean => "a + b",
-            ReduceKind::Max => "max(a, b)",
-            ReduceKind::Min => "min(a, b)",
-        }
-    }
-
-    fn finalize(self) -> &'static str {
-        match self {
-            ReduceKind::Mean => "acc / f32(k)",
-            _ => "acc",
+            ArgKind::Max => "v > acc",
+            ArgKind::Min => "v < acc",
         }
     }
 }
 
-fn reduce_wgsl(kind: ReduceKind) -> String {
-    let init = kind.init_value();
-    let combine = kind.combine();
-    let finalize = kind.finalize();
+fn argmax_wgsl(kind: ArgKind) -> String {
+    let init = kind.init();
+    let cond = kind.cond();
     format!(
         r#"
 @group(0) @binding(0) var<storage, read>  inp: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<u32>;
 @group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
 
-var<workgroup> shared_buf: array<f32, {BLOCK}u>;
+var<workgroup> shared_val: array<f32, {BLOCK}u>;
+var<workgroup> shared_idx: array<u32, {BLOCK}u>;
 
 @compute @workgroup_size({BLOCK})
 fn main(
@@ -85,47 +69,63 @@ fn main(
     if (row >= b) {{ return; }}
 
     var acc: f32 = {init};
+    var idx: u32 = 0u;
     var i: u32 = lid.x;
     loop {{
         if (i >= k) {{ break; }}
         let v = inp[row * k + i];
-        let a = acc; let b_ = v;
-        acc = {combine};
+        if ({cond}) {{
+            acc = v;
+            idx = i;
+        }}
         i = i + {BLOCK}u;
     }}
-    shared_buf[lid.x] = acc;
+    shared_val[lid.x] = acc;
+    shared_idx[lid.x] = idx;
     workgroupBarrier();
 
     var stride: u32 = {BLOCK}u / 2u;
     loop {{
         if (stride == 0u) {{ break; }}
         if (lid.x < stride) {{
-            let a = shared_buf[lid.x]; let b_ = shared_buf[lid.x + stride];
-            shared_buf[lid.x] = {combine};
+            let other_v = shared_val[lid.x + stride];
+            let other_i = shared_idx[lid.x + stride];
+            let v = other_v;
+            let acc2 = shared_val[lid.x];
+            // Stable tie-break: prefer the LOWER index when values are
+            // tied, so the result mirrors torch.argmax.
+            let take_other = ({cond_acc2}) || (v == acc2 && other_i < shared_idx[lid.x]);
+            if (take_other) {{
+                shared_val[lid.x] = v;
+                shared_idx[lid.x] = other_i;
+            }}
         }}
         workgroupBarrier();
         stride = stride / 2u;
     }}
 
     if (lid.x == 0u) {{
-        let acc = shared_buf[0];
-        out[row] = {finalize};
+        out[row] = shared_idx[0];
     }}
 }}
 "#,
         BLOCK = BLOCK,
         init = init,
-        combine = combine.replace("b", "b_"),
-        finalize = finalize,
+        cond = cond,
+        // Reuse the same comparison but on shared_val[lid.x] = acc2.
+        cond_acc2 = match kind {
+            ArgKind::Max => "v > acc2",
+            ArgKind::Min => "v < acc2",
+        },
     )
 }
 
-fn build_pipeline(backend: &WgpuBackend, kind: ReduceKind) -> wgpu::ComputePipeline {
+fn build_pipeline(backend: &WgpuBackend, kind: ArgKind) -> wgpu::ComputePipeline {
     let module = backend
         .device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(kind.op_name()),
-            source: wgpu::ShaderSource::Wgsl(reduce_wgsl(kind).into()),
+            source: wgpu::ShaderSource::Wgsl(argmax_wgsl(kind).into()),
         });
     backend
         .device
@@ -139,17 +139,17 @@ fn build_pipeline(backend: &WgpuBackend, kind: ReduceKind) -> wgpu::ComputePipel
         })
 }
 
-/// Row-wise reduce: input `[b, k]` → output `[b]`.
-pub fn reduce_rows(
+/// Row-wise argmax / argmin on `[b, k]` → `[b]` u32 index buffer.
+pub fn argmax_rows(
     backend: &WgpuBackend,
     inp: &WgpuStorage,
     b: usize,
     k: usize,
-    kind: ReduceKind,
+    kind: ArgKind,
 ) -> Result<WgpuStorage, WgpuError> {
     if inp.numel != b * k {
         return Err(WgpuError::ShapeMismatch(format!(
-            "reduce_rows: numel {} != b*k {}",
+            "argmax_rows: numel {} != b*k {}",
             inp.numel,
             b * k
         )));
@@ -160,17 +160,18 @@ pub fn reduce_rows(
 
     let key = PipelineKey {
         op: kind.op_name(),
-        dtype: "f32",
+        dtype: "u32",
         variant: "row",
     };
     let pipeline = backend
         .cache
         .get_or_insert_with(key, || build_pipeline(backend, kind));
 
-    let out = WgpuStorage::allocate(&backend.device, b, Dtype::F32)?;
+    // Output is u32 indices, one per row.
+    let out = WgpuStorage::allocate(&backend.device, b, Dtype::I32)?;
     let params_data = [b as u32, k as u32, 0_u32, 0_u32];
     let meta = backend.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("reduce-meta"),
+        label: Some("argmax-meta"),
         size: 16,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -224,81 +225,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wgsl_contains_workgroup_barrier() {
-        for k in [ReduceKind::Sum, ReduceKind::Mean, ReduceKind::Max] {
-            let s = reduce_wgsl(k);
-            assert!(s.contains("workgroupBarrier"), "{}", k.op_name());
-            assert!(s.contains("shared_buf"), "{}", k.op_name());
+    fn wgsl_uses_two_shared_arrays() {
+        for k in [ArgKind::Max, ArgKind::Min] {
+            let s = argmax_wgsl(k);
+            assert!(s.contains("shared_val"));
+            assert!(s.contains("shared_idx"));
+            assert!(s.contains("workgroupBarrier"));
         }
-    }
-
-    #[test]
-    fn op_names_are_distinct() {
-        assert_ne!(ReduceKind::Sum.op_name(), ReduceKind::Mean.op_name());
-        assert_ne!(ReduceKind::Sum.op_name(), ReduceKind::Max.op_name());
     }
 }
 
 #[cfg(all(test, feature = "gpu-tests"))]
 mod gpu_tests {
     use super::*;
-    use crate::transfer::{to_cpu, to_gpu};
+    use crate::transfer::to_gpu;
     use rustorch_core::tensor::tensor_impl::Tensor;
 
-    fn run(kind: ReduceKind, data: &[f32], b: usize, k: usize) -> Vec<f32> {
+    fn run(kind: ArgKind, data: &[f32], b: usize, k: usize) -> Vec<i32> {
         let backend = WgpuBackend::new_blocking().expect("init");
         let t = Tensor::from_vec([b, k], data.to_vec()).unwrap();
         let g = to_gpu(&backend, &t).unwrap();
-        let r = reduce_rows(&backend, &g, b, k, kind).unwrap();
-        let c = to_cpu(&backend, &r, vec![b]).unwrap();
-        c.as_slice::<f32>().unwrap().to_vec()
+        let r = argmax_rows(&backend, &g, b, k, kind).unwrap();
+        // Output is stored as I32 dtype (4-byte words). Read back via
+        // dtype reinterpret on host.
+        let bytes = pollster::block_on(crate::transfer::to_cpu_async(
+            &backend,
+            // Cheating: reinterpret as f32 then convert. Cleaner path
+            // is a dtype-aware to_cpu, but i32 round-trip via f32
+            // bitcast is fine for reads.
+            &WgpuStorage {
+                buffer: r.buffer.clone(),
+                dtype: Dtype::F32,
+                numel: r.numel,
+            },
+            vec![b],
+        ))
+        .unwrap();
+        bytes
+            .as_slice::<f32>()
+            .unwrap()
+            .iter()
+            .map(|f| f.to_bits() as i32)
+            .collect()
     }
 
     #[test]
-    fn sum_rows_simple() {
-        let r = run(ReduceKind::Sum, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
-        assert!((r[0] - 6.0).abs() < 1e-5);
-        assert!((r[1] - 15.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn mean_rows_simple() {
-        let r = run(ReduceKind::Mean, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
-        assert!((r[0] - 2.0).abs() < 1e-5);
-        assert!((r[1] - 5.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn max_rows_simple() {
+    fn argmax_simple() {
         let r = run(
-            ReduceKind::Max,
-            &[1.0, 5.0, 3.0, -2.0, -4.0, -1.0, 7.0, 2.0],
+            ArgKind::Max,
+            &[1.0, 5.0, 3.0, 2.0, /**/ 7.0, -1.0, 4.0, 0.0],
             2,
             4,
         );
-        assert!((r[0] - 5.0).abs() < 1e-5);
-        assert!((r[1] - 7.0).abs() < 1e-5);
+        assert_eq!(r, vec![1, 0]);
     }
 
     #[test]
-    fn min_rows_simple() {
+    fn argmin_simple() {
         let r = run(
-            ReduceKind::Min,
-            &[1.0, 5.0, 3.0, -2.0, -4.0, -1.0, 7.0, 2.0],
+            ArgKind::Min,
+            &[1.0, 5.0, 3.0, 2.0, /**/ 7.0, -1.0, 4.0, 0.0],
             2,
             4,
         );
-        assert!((r[0] - (-2.0)).abs() < 1e-5);
-        assert!((r[1] - (-4.0)).abs() < 1e-5);
+        assert_eq!(r, vec![0, 1]);
     }
 
     #[test]
-    fn sum_long_row() {
-        // K > BLOCK to exercise the strided loop.
-        let k = 1024;
-        let data: Vec<f32> = (0..k).map(|i| i as f32).collect();
-        let r = run(ReduceKind::Sum, &data, 1, k);
-        let expected = (0..k).map(|i| i as f32).sum::<f32>();
-        assert!((r[0] - expected).abs() / expected.abs() < 1e-4);
+    fn argmax_picks_first_occurrence_on_ties() {
+        // All-equal row should return 0 (lowest index wins).
+        let r = run(ArgKind::Max, &[1.0_f32, 1.0, 1.0, 1.0], 1, 4);
+        assert_eq!(r, vec![0]);
     }
 }

@@ -18,6 +18,8 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod argmax;
+pub mod attention;
 pub mod backend;
 pub mod cache;
 pub mod conv;
@@ -31,17 +33,21 @@ pub mod shaders;
 pub mod softmax;
 pub mod storage;
 pub mod transfer;
+pub mod transpose;
 
+pub use argmax::{argmax_rows, ArgKind};
+pub use attention::{attention_naive, mul_scalar};
 pub use backend::WgpuBackend;
 pub use conv::{conv2d_forward, transpose_weight, Conv2dCfg};
 pub use elementwise::{dispatch_binary, dispatch_unary};
 pub use error::WgpuError;
-pub use layernorm::layernorm_rows;
+pub use layernorm::{layernorm_rows, rmsnorm_rows};
 pub use matmul::matmul;
 pub use reduce::{reduce_rows, ReduceKind};
-pub use softmax::softmax_rows;
+pub use softmax::{log_softmax_rows, softmax_rows};
 pub use storage::WgpuStorage;
-pub use transfer::{to_cpu, to_gpu};
+pub use transfer::{to_cpu, to_cpu_async, to_gpu};
+pub use transpose::transpose2d;
 
 /// Crate version reported at runtime.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

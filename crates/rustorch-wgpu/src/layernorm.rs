@@ -116,6 +116,175 @@ fn build_pipeline(backend: &WgpuBackend) -> wgpu::ComputePipeline {
         })
 }
 
+/// WGSL for RMSNorm: `out[r, j] = x[r, j] / sqrt(mean(x²) + eps) * gamma[j]`.
+/// No mean-subtraction, no beta. One pass for the squared mean.
+fn rmsnorm_wgsl() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read>  inp: array<f32>;
+@group(0) @binding(1) var<storage, read>  gamma: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> params: array<vec4<u32>, 1>;
+
+var<workgroup> shared_acc: array<f32, {BLOCK}u>;
+
+@compute @workgroup_size({BLOCK})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id)        wgid: vec3<u32>,
+) {{
+    let b = params[0].x;
+    let k = params[0].y;
+    let eps = bitcast<f32>(params[0].z);
+    let row = wgid.x;
+    if (row >= b) {{ return; }}
+
+    // Phase 1: row sum-of-squares
+    var local_sq: f32 = 0.0;
+    var i: u32 = lid.x;
+    loop {{
+        if (i >= k) {{ break; }}
+        let v = inp[row * k + i];
+        local_sq = local_sq + v * v;
+        i = i + {BLOCK}u;
+    }}
+    shared_acc[lid.x] = local_sq;
+    workgroupBarrier();
+    var stride: u32 = {BLOCK}u / 2u;
+    loop {{
+        if (stride == 0u) {{ break; }}
+        if (lid.x < stride) {{
+            shared_acc[lid.x] = shared_acc[lid.x] + shared_acc[lid.x + stride];
+        }}
+        workgroupBarrier();
+        stride = stride / 2u;
+    }}
+    let rms_inv = 1.0 / sqrt(shared_acc[0] / f32(k) + eps);
+
+    // Phase 2: normalize + scale
+    i = lid.x;
+    loop {{
+        if (i >= k) {{ break; }}
+        out[row * k + i] = inp[row * k + i] * rms_inv * gamma[i];
+        i = i + {BLOCK}u;
+    }}
+}}
+"#,
+        BLOCK = BLOCK
+    )
+}
+
+fn build_rmsnorm_pipeline(backend: &WgpuBackend) -> wgpu::ComputePipeline {
+    let module = backend
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rmsnorm"),
+            source: wgpu::ShaderSource::Wgsl(rmsnorm_wgsl().into()),
+        });
+    backend
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rmsnorm"),
+            layout: None,
+            module: &module,
+            entry_point: "main",
+            compilation_options: Default::default(),
+            cache: None,
+        })
+}
+
+/// Row-wise RMSNorm: `out[r, j] = x[r, j] / sqrt(mean(x²) + eps) * gamma[j]`.
+/// No mean-subtraction, no bias. Standard in Llama-class LLMs.
+pub fn rmsnorm_rows(
+    backend: &WgpuBackend,
+    inp: &WgpuStorage,
+    gamma: &WgpuStorage,
+    b: usize,
+    k: usize,
+    eps: f32,
+) -> Result<WgpuStorage, WgpuError> {
+    if inp.numel != b * k {
+        return Err(WgpuError::ShapeMismatch(format!(
+            "rmsnorm: inp numel {} != b*k {}",
+            inp.numel,
+            b * k
+        )));
+    }
+    if gamma.numel != k {
+        return Err(WgpuError::ShapeMismatch(format!(
+            "rmsnorm: gamma numel {} != k {}",
+            gamma.numel, k
+        )));
+    }
+    if inp.dtype != Dtype::F32 || gamma.dtype != Dtype::F32 {
+        return Err(WgpuError::UnsupportedDtype(inp.dtype));
+    }
+
+    let key = PipelineKey {
+        op: "rmsnorm",
+        dtype: "f32",
+        variant: "row",
+    };
+    let pipeline = backend
+        .cache
+        .get_or_insert_with(key, || build_rmsnorm_pipeline(backend));
+
+    let out = WgpuStorage::allocate(&backend.device, b * k, Dtype::F32)?;
+    let params_data = [b as u32, k as u32, eps.to_bits(), 0_u32];
+    let meta = backend.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rmsnorm-meta"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    backend
+        .queue
+        .write_buffer(&meta, 0, bytemuck::cast_slice(&params_data));
+
+    let bind_group_layout = pipeline.get_bind_group_layout(0);
+    let bind_group = backend
+        .device
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rmsnorm"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: inp.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: gamma.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: meta.as_entire_binding(),
+                },
+            ],
+        });
+
+    let mut encoder = backend
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rmsnorm"),
+        });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("rmsnorm"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(b as u32, 1, 1);
+    }
+    backend.queue.submit(Some(encoder.finish()));
+    Ok(out)
+}
+
 /// Row-wise LayerNorm: input `[b, k]`, gamma & beta `[k]`, output `[b, k]`.
 pub fn layernorm_rows(
     backend: &WgpuBackend,
@@ -266,6 +435,32 @@ mod gpu_tests {
         let go = layernorm_rows(&backend, &gx, &gg, &gb, 2, 4, 1e-5).unwrap();
         let c = to_cpu(&backend, &go, vec![2, 4]).unwrap();
         let expected = cpu_layernorm(&x, &gamma, &beta, 2, 4, 1e-5);
+        for (g, e) in c.as_slice::<f32>().unwrap().iter().zip(&expected) {
+            assert!((g - e).abs() < 1e-4, "{g} vs {e}");
+        }
+    }
+
+    #[test]
+    fn rmsnorm_parity_2x4() {
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let x = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let gamma = vec![1.0_f32, 1.0, 1.0, 1.0];
+        let tx = Tensor::from_vec([2_usize, 4], x.clone()).unwrap();
+        let tg = Tensor::from_vec([4_usize], gamma.clone()).unwrap();
+        let gx = to_gpu(&backend, &tx).unwrap();
+        let gg = to_gpu(&backend, &tg).unwrap();
+        let go = rmsnorm_rows(&backend, &gx, &gg, 2, 4, 1e-5).unwrap();
+        let c = to_cpu(&backend, &go, vec![2, 4]).unwrap();
+        // CPU reference
+        let mut expected = vec![0.0_f32; 8];
+        for r in 0..2 {
+            let row = &x[r * 4..(r + 1) * 4];
+            let ms = row.iter().map(|v| v * v).sum::<f32>() / 4.0;
+            let inv = 1.0 / (ms + 1e-5).sqrt();
+            for j in 0..4 {
+                expected[r * 4 + j] = row[j] * inv * gamma[j];
+            }
+        }
         for (g, e) in c.as_slice::<f32>().unwrap().iter().zip(&expected) {
             assert!((g - e).abs() < 1e-4, "{g} vs {e}");
         }
