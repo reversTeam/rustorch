@@ -22,11 +22,13 @@
 pub mod dtype;
 pub mod gemm_int8;
 pub mod observer;
+pub mod qmodules;
 pub mod qops;
 
 pub use dtype::QParams;
 pub use gemm_int8::{gemm_f32_reference, gemm_int8_scalar, GemmError};
 pub use observer::{HistogramObserver, MinMaxObserver, ObserverError, PerChannelMinMaxObserver};
+pub use qmodules::{conv2d_output_size, Conv2dParams, QModuleError, QuantConv2d, QuantLinear};
 pub use qops::{dequantize, quantize, QError};
 
 /// Crate version reported at runtime.
