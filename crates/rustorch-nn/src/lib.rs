@@ -16,6 +16,7 @@
 
 pub mod activation;
 pub mod attention;
+pub mod checkpointed;
 pub mod container;
 pub mod conv;
 pub mod embedding;
@@ -34,6 +35,7 @@ pub use activation::{
     Relu, Sigmoid, Silu, Softmax, Tanh,
 };
 pub use attention::{scaled_dot_product_attention, SingleHeadAttention};
+pub use checkpointed::Checkpointed;
 pub use container::{ModuleDict, ModuleList};
 pub use conv::{Conv1d, Conv2d, MaxPool2d};
 pub use embedding::Embedding;
