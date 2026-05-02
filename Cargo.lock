@@ -2927,6 +2927,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-cuda"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "rustorch-data"
 version = "0.0.1"
 dependencies = [

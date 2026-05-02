@@ -1,0 +1,28 @@
+[package]
+name = "rustorch-cuda"
+description = "Native CUDA backend for rustorch — feature-gated cudarc + safe wrappers around cuBLAS / cuDNN / cuSPARSE / cuRAND. Without `cuda` feature, the public API still compiles and returns NoDeviceFound so call sites stay portable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+# Enable real CUDA bindings via cudarc. Requires the CUDA toolkit
+# installed on the host and an NVIDIA GPU at runtime.
+cuda = []
+# Reserved for future expandable-segment caching allocator path.
+cuda-allocator = ["cuda"]
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
