@@ -540,6 +540,48 @@ async fn runs_system_returns_mock_samples() {
 }
 
 #[tokio::test]
+async fn runs_fork_clones_cfg_and_tags_lineage() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let parent_id = seed_run(&state).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{addr}/runs/{parent_id}/fork"))
+        .json(&json!({
+            "title": "experiment-A",
+            "overrides": {"lr": 3e-4, "optim": "lion"},
+            "resume_from": "ckpt-10.safetensors"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let child: serde_json::Value = resp.json().await.unwrap();
+
+    // Child is queued, has its own ULID, and inherited the parent's cfg
+    // with the overrides applied.
+    assert_eq!(child["status"], "queued");
+    assert_eq!(child["title"], "experiment-A");
+    let cfg: serde_json::Value = serde_json::from_str(child["cfg_json"].as_str().unwrap()).unwrap();
+    assert_eq!(cfg["lr"], 3e-4);
+    assert_eq!(cfg["optim"], "lion");
+    assert_eq!(cfg["parent_run_id"], parent_id);
+    assert_eq!(cfg["resume_from"], "ckpt-10.safetensors");
+
+    // Parent and child are different rows.
+    assert_ne!(child["id"].as_str().unwrap(), parent_id);
+
+    // Forking a missing run → 404.
+    let resp = client
+        .post(format!("http://{addr}/runs/no-such-run/fork"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
 async fn checkpoint_against_missing_run_is_404() {
     let (_addr, state) = spawn(AuthConfig::default()).await;
     let err = db::insert_checkpoint(

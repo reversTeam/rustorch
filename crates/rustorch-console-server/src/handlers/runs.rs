@@ -162,6 +162,79 @@ pub async fn stop(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
     .await
 }
 
+#[derive(Deserialize, utoipa::ToSchema, Default)]
+pub struct ForkBody {
+    /// Optional new title — defaults to "fork of <source title>".
+    pub title: Option<String>,
+    /// Hyperparameter overrides merged into the source `cfg` (shallow
+    /// merge — top-level keys win on the override side).
+    #[serde(default)]
+    pub overrides: serde_json::Value,
+    /// Optional checkpoint path the new runner should resume from.
+    pub resume_from: Option<String>,
+}
+
+/// `POST /runs/:id/fork` — create a new queued run derived from
+/// `:id`. The new run inherits the source `cfg`, optionally
+/// overlaid with `body.overrides`, and remembers its parent via
+/// `cfg.parent_run_id` so the UI can render the lineage.
+///
+/// The actual training process spawn happens through the runner /
+/// CLI (P2.8). At the API layer fork is purely a data-layer
+/// operation: clone + tag.
+#[utoipa::path(
+    post, path = "/runs/{id}/fork",
+    request_body = ForkBody,
+    responses((status = 201, body = db::Run))
+)]
+pub async fn fork(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ForkBody>,
+) -> ApiResult<(StatusCode, Json<db::Run>)> {
+    let parent = db::get_run(&s.db, &id).await?;
+    let mut cfg: serde_json::Value = serde_json::from_str(&parent.cfg_json).unwrap_or_default();
+
+    // Shallow merge top-level keys from `overrides` into `cfg`.
+    if let (Some(cfg_obj), Some(over_obj)) = (cfg.as_object_mut(), body.overrides.as_object()) {
+        for (k, v) in over_obj {
+            cfg_obj.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Lineage tags so the frontend can show "forked from X".
+    if let Some(obj) = cfg.as_object_mut() {
+        obj.insert(
+            "parent_run_id".into(),
+            serde_json::Value::String(parent.id.clone()),
+        );
+        if let Some(rf) = body.resume_from.as_ref() {
+            obj.insert("resume_from".into(), serde_json::Value::String(rf.clone()));
+        }
+    }
+
+    let title = body
+        .title
+        .or_else(|| parent.title.as_deref().map(|t| format!("fork of {t}")));
+
+    let run = db::insert_run(
+        &s.db,
+        NewRun {
+            title,
+            cfg_json: cfg,
+            sweep_id: parent.sweep_id.clone(),
+        },
+    )
+    .await?;
+
+    s.hub.publish(
+        "runs.changed",
+        "runs.changed",
+        &serde_json::json!({"id": &run.id, "status": run.status, "forked_from": parent.id}),
+    );
+    Ok((StatusCode::CREATED, Json(run)))
+}
+
 // ---- read-only views (curves / hparams / code / log / checkpoints / artifacts / system) -----
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -371,6 +444,7 @@ pub fn routes() -> Router<AppState> {
         .route("/runs/:id/pause", post(pause))
         .route("/runs/:id/resume", post(resume))
         .route("/runs/:id/stop", post(stop))
+        .route("/runs/:id/fork", post(fork))
         .route("/runs/:id/curves", get(curves))
         .route("/runs/:id/hparams", get(hparams))
         .route("/runs/:id/code", get(code))
