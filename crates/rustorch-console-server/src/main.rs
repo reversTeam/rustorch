@@ -3,8 +3,15 @@
 //! router and listens.
 
 use clap::Parser;
-use rustorch_console_server::{auth::AuthConfig, db, router, sse::Hub, state::AppState};
+use rustorch_console_server::{
+    auth::AuthConfig,
+    cluster::{self, default_provider, spawn_tick_task},
+    db, router,
+    sse::Hub,
+    state::AppState,
+};
 use std::net::SocketAddr;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "rustorch-console", about = "rustorch console backend")]
@@ -38,9 +45,15 @@ async fn main() -> Result<(), DynError> {
     let pool = db::connect(&db_path)
         .await
         .map_err(|e| format!("db connect: {e}"))?;
-    let state = AppState::new(pool, Hub::new());
+    let hub = Hub::new();
+    let provider = default_provider();
+    let state = AppState::new(pool, hub.clone(), provider.clone());
     let auth = AuthConfig::from_env();
     let app = router::build(state, auth);
+
+    // Background producers: 1Hz NVML/mock cluster.tick.
+    let _tick_handle = spawn_tick_task(hub.clone(), provider.clone(), Duration::from_secs(1));
+    let _ = cluster::TICK_TOPIC;
 
     let listener = tokio::net::TcpListener::bind(cli.addr).await?;
     tracing::info!(addr = %cli.addr, db = %db_path, "rustorch-console listening");

@@ -11,6 +11,7 @@
 //! without re-implementing them.
 
 pub mod auth;
+pub mod cluster;
 pub mod db;
 pub mod error;
 pub mod handlers;

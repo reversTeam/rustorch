@@ -3,6 +3,7 @@
 //! `#[derive(OpenApi)]` `paths(...)` attribute so adding a new
 //! handler is a one-liner change.
 
+use crate::cluster::GpuSample;
 use crate::db;
 use crate::handlers::{catalog, cluster, me, runs};
 use utoipa::OpenApi;
@@ -42,7 +43,7 @@ use utoipa::OpenApi;
     components(schemas(
         me::MeResponse,
         me::WorkspaceResponse,
-        cluster::GpuSample,
+        GpuSample,
         cluster::ClusterHealth,
         catalog::ModelEntry,
         catalog::DatasetSummary,

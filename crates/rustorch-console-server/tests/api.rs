@@ -4,6 +4,7 @@
 
 use rustorch_console_server::{
     auth::AuthConfig,
+    cluster::MockClusterProvider,
     db::{self, NewCheckpoint},
     router,
     sse::Hub,
@@ -11,13 +12,14 @@ use rustorch_console_server::{
 };
 use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// Spawn a fresh server on an ephemeral port. Returns the bound
 /// address — the caller talks to it via `reqwest`.
 async fn spawn(auth: AuthConfig) -> (SocketAddr, AppState) {
     let pool = db::connect(":memory:").await.expect("db");
-    let state = AppState::new(pool, Hub::new());
+    let state = AppState::new(pool, Hub::new(), Arc::new(MockClusterProvider::new()));
     let app = router::build(state.clone(), auth);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -770,6 +772,47 @@ async fn sse_event_id_field_is_set() {
     let id = recv.await.unwrap().expect("sse delivery");
     // First event on a fresh topic always has id=1.
     assert_eq!(id, "1");
+}
+
+#[tokio::test]
+async fn cluster_tick_task_streams_via_sse() {
+    use eventsource_stream::Eventsource;
+    use futures::StreamExt;
+    use rustorch_console_server::cluster::{spawn_tick_task, TICK_TOPIC};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (addr, state) = spawn(AuthConfig::default()).await;
+
+    // Spin up a fast 50ms tick so the test doesn't sit on its hands.
+    let _handle = spawn_tick_task(
+        state.hub.clone(),
+        state.cluster.clone(),
+        Duration::from_millis(50),
+    );
+
+    // Subscribe via the public SSE endpoint and grab the first
+    // delivered event.
+    let url = format!("http://{addr}/sse/cluster.tick");
+    let recv = tokio::spawn(async move {
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let mut stream = resp.bytes_stream().eventsource();
+        let item = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .ok()
+            .flatten()
+            .ok_or("no event")?
+            .map_err(|e| format!("sse: {e}"))?;
+        Ok::<_, String>(item.data)
+    });
+
+    let payload = recv.await.unwrap().expect("cluster.tick delivery");
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let gpus = v["gpus"].as_array().expect("gpus array");
+    assert_eq!(gpus.len(), 2);
+    assert!(gpus[0]["util"].as_u64().unwrap() <= 100);
+    assert_eq!(gpus[0]["id"], 0);
+    assert!(state.hub.ring_len(TICK_TOPIC) >= 1);
 }
 
 #[tokio::test]

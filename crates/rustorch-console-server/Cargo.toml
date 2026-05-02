@@ -49,6 +49,15 @@ clap = { version = "4.5", features = ["derive", "env"] }
 utoipa            = { version = "5", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "8", features = ["axum"] }
 
+# Optional GPU telemetry — links against libnvidia-ml.so at runtime
+# so the default build stays portable (and macOS-friendly). The mock
+# provider always compiles and is used as fallback.
+nvml-wrapper = { version = "0.10", optional = true }
+
+[features]
+default = []
+nvml = ["dep:nvml-wrapper"]
+
 [dev-dependencies]
 reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tempfile   = "3.10"
