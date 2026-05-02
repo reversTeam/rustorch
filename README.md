@@ -16,21 +16,22 @@ PyTorch; the syntax is Rust.
 
 ## Status
 
-This project is **pre-1.0** but has shipped through Phase 3. The user-facing
-API is documented at [v0.7.2 docs](https://rustorch.dev/docs); the roadmap below
-tracks where each milestone stands.
+This project is **pre-1.0** but has shipped through Phase 3 — Phases 0, 1, 2,
+2.5 and 3 all closed ahead of their original target dates. The user-facing
+API is documented at [v0.7.2 docs](https://rustorch.dev/docs); the roadmap
+below tracks where each milestone stands as of `2026-05`.
 
-| Phase | Title                                                | Target  | Status        |
-|------:|------------------------------------------------------|---------|---------------|
-|     0 | Architecture & RFC                                    | 2026-05 | ✅ done       |
-|     1 | Fondations CPU + Autograd                             | 2026-08 | ✅ done       |
-|     2 | Backend GPU via wgpu (WASM)                           | 2026-11 | ✅ done       |
-|   2.5 | Ecosystem & Console backend (CLI, sweeps, RPC, serve) | 2027-08 | ✅ done       |
-|     3 | Optimisations avancées (Memory Planning, Flash Attn, Quant, Fusion, AMP, Checkpoint) | 2027-01 | ✅ done       |
-|     4 | Backend CUDA natif (opt-in)                           | 2027-04 | 📋 planned    |
-|     5 | Distributed Training (DDP, FSDP)                      | 2027-06 | 📋 planned    |
-|   2.7 | Console UI                                            | 2027-09 | 📋 planned    |
-|     6 | Écosystème & Adoption (1.0)                           | 2027-10 | 📋 planned    |
+| Phase | Title                                                                                | Status        |
+|------:|--------------------------------------------------------------------------------------|---------------|
+|     0 | Architecture & RFC                                                                    | ✅ done (within target 2026-05) |
+|     1 | Fondations CPU + Autograd                                                             | ✅ done (target was 2026-08 — shipped early) |
+|     2 | Backend GPU via wgpu (WASM)                                                           | ✅ done (target was 2026-11 — shipped early) |
+|     3 | Optimisations avancées (Memory Planning, Flash Attn, Quant, Fusion, AMP, Checkpoint)  | ✅ done (target was 2027-01 — shipped early) |
+|   2.5 | Ecosystem & Console backend (CLI, sweeps, RPC, serve)                                 | ✅ done (target was 2027-08 — shipped early) |
+|     4 | Backend CUDA natif (opt-in)                                                           | 📋 planned (target 2027-04) |
+|     5 | Distributed Training (DDP, FSDP)                                                      | 📋 planned (target 2027-06) |
+|   2.7 | Console UI                                                                            | 📋 planned (target 2027-09) |
+|     6 | Écosystème & Adoption (1.0)                                                           | 📋 planned (target 2027-10) |
 
 **1100+ tests pass, clippy clean across the workspace** as of the latest commit.
 
