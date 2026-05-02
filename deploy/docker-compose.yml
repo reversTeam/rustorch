@@ -1,0 +1,33 @@
+version: '3.8'
+
+# Local dev / demo setup. Spins up two `rustorch-serve` replicas
+# behind a tiny load balancer so you can exercise the dynamic-
+# batching path without a Kubernetes cluster.
+
+services:
+  rustorch-serve:
+    image: rustorch/serve:latest
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 4G
+    environment:
+      - RUSTORCH_MAX_BATCH=32
+      - RUSTORCH_MAX_WAIT_MS=20
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./k8s/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"

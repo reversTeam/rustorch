@@ -30,7 +30,13 @@
 
 mod sink;
 
+#[cfg(feature = "http")]
+mod external;
+
 pub use sink::{
     ConsoleHook, FileSink, LogEvent, LogLevel, Logger, LoggerBuilder, MemorySink, Metric, Sink,
     SinkError, StdoutJsonSink,
 };
+
+#[cfg(feature = "http")]
+pub use external::{MLflowSink, TensorBoardSink, WandbSink};

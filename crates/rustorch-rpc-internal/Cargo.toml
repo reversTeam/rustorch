@@ -18,6 +18,8 @@ tokio       = { version = "1.40", features = ["macros", "rt-multi-thread", "sync
 tracing     = { workspace = true }
 parking_lot = "0.12"
 ulid        = { version = "1.1", features = ["serde"] }
+chrono      = { version = "0.4", features = ["serde"] }
+rustorch-log = { path = "../rustorch-log" }
 
 [features]
 default = []

@@ -26,8 +26,10 @@
 
 #![allow(missing_docs)]
 
+mod bayes;
 mod range;
 mod spec;
+pub use bayes::{Acquisition, BayesPlanner, ContinuousAxis, Gp, GpError, MaternKernel52};
 pub use range::{linspace, logspace};
 pub use spec::{
     AshaConfig, BayesConfig, RandomConfig, Strategy, SweepBuilder, SweepError, SweepResult,

@@ -94,14 +94,17 @@ pub struct AshaConfig {
     pub max_resource: u32,
 }
 
-/// Knobs for `Strategy::Bayes` (placeholder).
+/// Knobs for `Strategy::Bayes`. The planner needs continuous axes
+/// (low/high pairs); discrete axes from `add(name, [v1,v2,...])`
+/// are interpreted as `[min(values), max(values)]` and rounded back
+/// to the nearest discrete value at trial-time.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BayesConfig {
-    /// How many random trials to draw before the GP would kick in.
+    /// How many random trials to draw before the GP kicks in.
     pub init_trials: usize,
     /// Total budget — the planner returns at most this many trials.
     pub trials: usize,
-    /// Acquisition function name. Currently informational.
+    /// Acquisition function: `"ei"` | `"ucb"` | `"pi"`.
     pub acquisition: String,
     pub seed: Option<u64>,
 }

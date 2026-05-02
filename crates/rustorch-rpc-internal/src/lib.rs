@@ -17,10 +17,14 @@
 //! as the test backend; production code switches to tonic with the
 //! same trait shape so callers don't change.
 
+mod client;
 mod registry;
+mod sink;
 mod types;
 
+pub use client::{ClientConfig, ClientStats, RunnerClient};
 pub use registry::{Registry, RegistryError, RunnerSession};
+pub use sink::{checkpoint_event, RpcRunnerSink};
 pub use types::{
     CheckpointSaved, ControlCommand, GpuTelemetry, LogLine, MetricSample, RegisterRequest,
     RegisterResponse, RunnerError, RunnerEvent, RunnerState, StatusUpdate,

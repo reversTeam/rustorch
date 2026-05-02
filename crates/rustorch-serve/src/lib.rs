@@ -34,8 +34,15 @@
 //! directly to the latency / throughput trade-off documented in the
 //! plan.
 
+mod autoscale;
 mod batcher;
+mod cuda_graphs;
 mod server;
 
+pub use autoscale::{
+    render_docker_compose, render_k8s_hpa_manifest, AutoscaleController, AutoscaleTarget,
+    LoadSnapshot, ScaleDecision,
+};
 pub use batcher::{BatchConfig, Batcher, InferFn};
+pub use cuda_graphs::{graph_aware_infer, GraphKey, GraphRunner, MockGraphRunner};
 pub use server::{ServeBuilder, ServeError};
