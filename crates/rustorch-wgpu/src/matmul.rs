@@ -93,6 +93,48 @@ fn build_pipeline(backend: &WgpuBackend) -> wgpu::ComputePipeline {
         })
 }
 
+/// Variant of [`matmul`] with explicit transpose flags. Computes
+///
+/// ```text
+///   C = (transpose_a ? Aᵀ : A) @ (transpose_b ? Bᵀ : B)
+/// ```
+///
+/// Inputs:
+/// - `lhs` : `[m, k]` if `!transpose_a`, else `[k, m]`.
+/// - `rhs` : `[k, n]` if `!transpose_b`, else `[n, k]`.
+/// - `m`, `k`, `n` describe the **logical** GEMM dims (post-transpose).
+///
+/// Implementation: applies [`crate::transpose2d`] on the host as a
+/// pre-pass for any flagged operand, then dispatches the standard
+/// tiled matmul. Two extra full-tensor reads vs a fused
+/// transpose-aware kernel — trade-off favors code clarity at this
+/// scope; a fused variant is a follow-up.
+pub fn matmul_with_transposes(
+    backend: &WgpuBackend,
+    lhs: &WgpuStorage,
+    rhs: &WgpuStorage,
+    m: usize,
+    k: usize,
+    n: usize,
+    transpose_a: bool,
+    transpose_b: bool,
+) -> Result<WgpuStorage, WgpuError> {
+    use crate::transpose::transpose2d;
+    let lhs_actual = if transpose_a {
+        // lhs is stored as [k, m] → produce [m, k].
+        transpose2d(backend, lhs, k, m)?
+    } else {
+        lhs.clone()
+    };
+    let rhs_actual = if transpose_b {
+        // rhs is stored as [n, k] → produce [k, n].
+        transpose2d(backend, rhs, n, k)?
+    } else {
+        rhs.clone()
+    };
+    matmul(backend, &lhs_actual, &rhs_actual, m, k, n)
+}
+
 /// `C = A @ B` on the GPU. `lhs` shape `[M, K]`, `rhs` shape `[K, N]`,
 /// returns shape `[M, N]`.
 pub fn matmul(
@@ -251,6 +293,105 @@ mod gpu_tests {
         let gc = matmul(&backend, &ga, &gb, m, k, n).unwrap();
         let c = to_cpu(&backend, &gc, vec![m, n]).unwrap();
         let expected = cpu_matmul(&a, &b, m, k, n);
+        for (g, e) in c.as_slice::<f32>().unwrap().iter().zip(&expected) {
+            assert!((g - e).abs() / e.abs().max(1e-3) < 1e-3, "{g} vs {e}");
+        }
+    }
+
+    /// Helper: CPU reference for `(transpose_a ? Aᵀ : A) @ (transpose_b ? Bᵀ : B)`.
+    /// Stored layouts: lhs is `[lhs_dim0, lhs_dim1]`, rhs `[rhs_dim0, rhs_dim1]`.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_matmul_t(
+        a: &[f32],
+        a_dim0: usize,
+        a_dim1: usize,
+        b: &[f32],
+        b_dim0: usize,
+        b_dim1: usize,
+        ta: bool,
+        tb: bool,
+    ) -> Vec<f32> {
+        let m = if ta { a_dim1 } else { a_dim0 };
+        let k = if ta { a_dim0 } else { a_dim1 };
+        let n = if tb { b_dim0 } else { b_dim1 };
+        // Sanity: K must match.
+        let kb = if tb { b_dim1 } else { b_dim0 };
+        assert_eq!(k, kb, "K mismatch in cpu_matmul_t");
+        let mut out = vec![0.0_f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0_f32;
+                for kk in 0..k {
+                    let av = if ta {
+                        a[kk * a_dim1 + i]
+                    } else {
+                        a[i * a_dim1 + kk]
+                    };
+                    let bv = if tb {
+                        b[j * b_dim1 + kk]
+                    } else {
+                        b[kk * b_dim1 + j]
+                    };
+                    s += av * bv;
+                }
+                out[i * n + j] = s;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn matmul_with_transposes_nt_8x4_4x6() {
+        // (no-transpose-A, transpose-B) — A=[8,4], B-stored=[6,4] → B^T=[4,6] → C=[8,6].
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let (m, k, n) = (8, 4, 6);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.2 - 0.5).collect();
+        let ta = Tensor::from_vec([m, k], a.clone()).unwrap();
+        let tb = Tensor::from_vec([n, k], b.clone()).unwrap();
+        let ga = to_gpu(&backend, &ta).unwrap();
+        let gb = to_gpu(&backend, &tb).unwrap();
+        let gc = matmul_with_transposes(&backend, &ga, &gb, m, k, n, false, true).unwrap();
+        let c = to_cpu(&backend, &gc, vec![m, n]).unwrap();
+        let expected = cpu_matmul_t(&a, m, k, &b, n, k, false, true);
+        for (g, e) in c.as_slice::<f32>().unwrap().iter().zip(&expected) {
+            assert!((g - e).abs() / e.abs().max(1e-3) < 1e-3, "{g} vs {e}");
+        }
+    }
+
+    #[test]
+    fn matmul_with_transposes_tn_5x4_5x3() {
+        // (transpose-A, no-transpose-B) — A-stored=[5,4]→A^T=[4,5]; B=[5,3] → C=[4,3].
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let (m, k, n) = (4, 5, 3);
+        let a: Vec<f32> = (0..k * m).map(|i| (i as f32) * 0.05).collect(); // stored as [5,4]
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.07 - 0.3).collect();
+        let ta = Tensor::from_vec([k, m], a.clone()).unwrap();
+        let tb = Tensor::from_vec([k, n], b.clone()).unwrap();
+        let ga = to_gpu(&backend, &ta).unwrap();
+        let gb = to_gpu(&backend, &tb).unwrap();
+        let gc = matmul_with_transposes(&backend, &ga, &gb, m, k, n, true, false).unwrap();
+        let c = to_cpu(&backend, &gc, vec![m, n]).unwrap();
+        let expected = cpu_matmul_t(&a, k, m, &b, k, n, true, false);
+        for (g, e) in c.as_slice::<f32>().unwrap().iter().zip(&expected) {
+            assert!((g - e).abs() / e.abs().max(1e-3) < 1e-3, "{g} vs {e}");
+        }
+    }
+
+    #[test]
+    fn matmul_with_transposes_tt_3x4_5x3() {
+        // (transpose-A, transpose-B) — A-stored=[4,3]→[3,4]; B-stored=[5,4]→[4,5]; C=[3,5].
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let (m, k, n) = (3, 4, 5);
+        let a: Vec<f32> = (0..k * m).map(|i| (i as f32) * 0.1).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.05).collect();
+        let ta = Tensor::from_vec([k, m], a.clone()).unwrap();
+        let tb = Tensor::from_vec([n, k], b.clone()).unwrap();
+        let ga = to_gpu(&backend, &ta).unwrap();
+        let gb = to_gpu(&backend, &tb).unwrap();
+        let gc = matmul_with_transposes(&backend, &ga, &gb, m, k, n, true, true).unwrap();
+        let c = to_cpu(&backend, &gc, vec![m, n]).unwrap();
+        let expected = cpu_matmul_t(&a, k, m, &b, n, k, true, true);
         for (g, e) in c.as_slice::<f32>().unwrap().iter().zip(&expected) {
             assert!((g - e).abs() / e.abs().max(1e-3) < 1e-3, "{g} vs {e}");
         }

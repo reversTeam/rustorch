@@ -21,6 +21,7 @@
 pub mod argmax;
 pub mod attention;
 pub mod backend;
+pub mod broadcast;
 pub mod cache;
 pub mod conv;
 pub mod elementwise;
@@ -40,8 +41,11 @@ pub mod transfer;
 pub mod transpose;
 
 pub use argmax::{argmax_rows, ArgKind};
-pub use attention::{attention_naive, mul_scalar};
+pub use attention::{
+    apply_causal_mask, attention_naive, attention_naive_causal, mul_scalar, multi_head_attention,
+};
 pub use backend::WgpuBackend;
+pub use broadcast::{broadcast_shape, dispatch_binary_broadcast};
 pub use conv::{conv2d_forward, transpose_weight, Conv2dCfg};
 pub use elementwise::{dispatch_binary, dispatch_unary};
 pub use error::WgpuError;
@@ -49,7 +53,7 @@ pub use flash_attn::flash_attention;
 pub use fused::{linear_gelu_fused, linear_relu_fused, FusedAct};
 pub use layernorm::{layernorm_rows, rmsnorm_rows};
 pub use mapped_upload::upload_mapped_at_creation;
-pub use matmul::matmul;
+pub use matmul::{matmul, matmul_with_transposes};
 pub use reduce::{reduce_rows, ReduceKind};
 pub use softmax::{log_softmax_rows, softmax_rows};
 pub use staging::StagingRing;

@@ -20,8 +20,14 @@ const BLOCK: u32 = 64;
 
 /// WGSL source for im2col.
 ///
-/// `meta = [N, C, H, W,  kH, kW, sH, sW,  pH, pW, Hout, Wout, total, _, _, _]`
-/// (3 vec4 in a uniform).
+/// `params` layout (4 vec4<u32>):
+/// - `[0]` = (N, C, H, W)
+/// - `[1]` = (kH, kW, sH, sW)
+/// - `[2]` = (pH, pW, Hout, Wout)
+/// - `[3]` = (total, dH, dW, _)
+///
+/// where `total = N · Hout · Wout · (C · kH · kW)` and `dH/dW` are the
+/// dilation factors (1 = no dilation).
 fn im2col_wgsl() -> String {
     format!(
         r#"
@@ -47,35 +53,33 @@ fn main(
     let pw   = params[2].y;
     let hout = params[2].z;
     let wout = params[2].w;
-    let total = params[3].x; // = N * Hout * Wout * (C * kH * kW)
+    let total = params[3].x;
+    let dh   = params[3].y;
+    let dw   = params[3].z;
 
     let idx = (wgid.y * nwg.x + wgid.x) * {BLOCK}u + lid.x;
     if (idx >= total) {{ return; }}
 
-    // out has shape [N*Hout*Wout, C*kH*kW] in row-major.
     let cols   = c * kh * kw;
-    let row    = idx / cols;        // 0..N*Hout*Wout
-    let col    = idx % cols;        // 0..C*kH*kW
+    let row    = idx / cols;
+    let col    = idx % cols;
 
-    // Decompose row → (n, oh, ow)
     let ow = row % wout;
     let oh = (row / wout) % hout;
     let n_idx = row / (hout * wout);
 
-    // Decompose col → (cc, ki, kj)
     let kj = col % kw;
     let ki = (col / kw) % kh;
     let cc = col / (kh * kw);
 
-    // Locate the source pixel
-    let ih_signed: i32 = i32(oh) * i32(sh_) + i32(ki) - i32(ph);
-    let iw_signed: i32 = i32(ow) * i32(sw) + i32(kj) - i32(pw);
+    // Dilated kernel position in the input: ki·dh, kj·dw.
+    let ih_signed: i32 = i32(oh) * i32(sh_) + i32(ki) * i32(dh) - i32(ph);
+    let iw_signed: i32 = i32(ow) * i32(sw) + i32(kj) * i32(dw) - i32(pw);
 
     var v: f32 = 0.0;
     if (ih_signed >= 0 && ih_signed < i32(h) && iw_signed >= 0 && iw_signed < i32(w)) {{
         let ih = u32(ih_signed);
         let iw = u32(iw_signed);
-        // input layout: [N, C, H, W]
         let src = ((n_idx * c + cc) * h + ih) * w + iw;
         v = inp[src];
     }}
@@ -120,6 +124,31 @@ pub struct Conv2dCfg {
     pub ph: usize,
     /// Padding width (zero-pad).
     pub pw: usize,
+    /// Dilation height (default 1; >1 spaces the kernel taps apart).
+    pub dh: usize,
+    /// Dilation width (default 1).
+    pub dw: usize,
+    /// Number of groups for grouped convolution. `groups = 1` is the
+    /// standard dense conv; `groups = c_in` is depthwise; in between
+    /// is "grouped" (e.g. ResNeXt). `c_in` and `c_out` must both be
+    /// divisible by `groups`.
+    pub groups: usize,
+}
+
+impl Default for Conv2dCfg {
+    fn default() -> Self {
+        Conv2dCfg {
+            kh: 3,
+            kw: 3,
+            sh: 1,
+            sw: 1,
+            ph: 0,
+            pw: 0,
+            dh: 1,
+            dw: 1,
+            groups: 1,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -162,8 +191,8 @@ fn dispatch_im2col(
         hout as u32,
         wout as u32,
         total as u32,
-        0,
-        0,
+        cfg.dh as u32,
+        cfg.dw as u32,
         0,
     ];
     let meta = backend.device.create_buffer(&wgpu::BufferDescriptor {
@@ -363,11 +392,25 @@ fn _unused_transpose_marker() {}
 
 /// `conv2d_forward(input, weight, cfg) → output` on the GPU.
 ///
+/// Compute `(Hout, Wout)` from the input shape and a [`Conv2dCfg`].
+/// Honours `dh / dw` (dilation) and the standard
+/// `H_out = (H + 2·pH − dH·(kH − 1) − 1) / sH + 1` formula.
+pub fn output_shape(h: usize, w: usize, cfg: Conv2dCfg) -> (usize, usize) {
+    let kh_eff = cfg.dh * (cfg.kh.saturating_sub(1)) + 1;
+    let kw_eff = cfg.dw * (cfg.kw.saturating_sub(1)) + 1;
+    let hout = (h + 2 * cfg.ph).saturating_sub(kh_eff) / cfg.sh + 1;
+    let wout = (w + 2 * cfg.pw).saturating_sub(kw_eff) / cfg.sw + 1;
+    (hout, wout)
+}
+
 /// `input`  : `[N, C, H, W]`.
 /// `weight` : `[K, Cout]` where `K = C * kH * kW` (i.e. weight already
 ///   transposed). Use [`transpose_weight`] on the host to convert from
 ///   the conventional `[Cout, C, kH, kW]` layout.
-/// Returns: `[N, Cout, Hout, Wout]`.
+/// Returns: `(WgpuStorage of shape [N, Cout, Hout, Wout], Hout, Wout)`.
+///
+/// Honours `cfg.dh`, `cfg.dw` (dilation) and `cfg.groups` (grouped
+/// conv via host-side splitting; v1 cost: one round-trip per group).
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_forward(
     backend: &WgpuBackend,
@@ -380,10 +423,7 @@ pub fn conv2d_forward(
     cout: usize,
     cfg: Conv2dCfg,
 ) -> Result<(WgpuStorage, usize, usize), WgpuError> {
-    let hout = (h + 2 * cfg.ph).saturating_sub(cfg.kh) / cfg.sh + 1;
-    let wout = (w + 2 * cfg.pw).saturating_sub(cfg.kw) / cfg.sw + 1;
-    let k = c * cfg.kh * cfg.kw;
-
+    let (hout, wout) = output_shape(h, w, cfg);
     if input.numel != n * c * h * w {
         return Err(WgpuError::ShapeMismatch(format!(
             "conv2d: input numel {} != N*C*H*W {}",
@@ -391,22 +431,118 @@ pub fn conv2d_forward(
             n * c * h * w
         )));
     }
-    if weight_kt.numel != k * cout {
+    if cfg.groups == 0 {
+        return Err(WgpuError::ShapeMismatch(
+            "conv2d: groups must be ≥ 1".to_string(),
+        ));
+    }
+    if c % cfg.groups != 0 || cout % cfg.groups != 0 {
         return Err(WgpuError::ShapeMismatch(format!(
-            "conv2d: weight^T numel {} != K*Cout {}",
-            weight_kt.numel,
-            k * cout
+            "conv2d: c {} and cout {} must both be divisible by groups {}",
+            c, cout, cfg.groups
         )));
     }
 
-    // 1) im2col → [N*Hout*Wout, K]
-    let cols = dispatch_im2col(backend, input, n, c, h, w, cfg, hout, wout)?;
-    // 2) matmul [N*Hout*Wout, K] @ [K, Cout] → [N*Hout*Wout, Cout]
-    let rows = n * hout * wout;
-    let mm_out = matmul(backend, &cols, weight_kt, rows, k, cout)?;
-    // 3) Permute from [N*Hout*Wout, Cout] → [N, Cout, Hout*Wout]
-    let permuted = dispatch_permute(backend, &mm_out, n, cout, hout * wout)?;
-    Ok((permuted, hout, wout))
+    // ===== Fast path: groups = 1 =====
+    if cfg.groups == 1 {
+        let k = c * cfg.kh * cfg.kw;
+        if weight_kt.numel != k * cout {
+            return Err(WgpuError::ShapeMismatch(format!(
+                "conv2d: weight^T numel {} != K*Cout {}",
+                weight_kt.numel,
+                k * cout
+            )));
+        }
+        let cols = dispatch_im2col(backend, input, n, c, h, w, cfg, hout, wout)?;
+        let rows = n * hout * wout;
+        let mm_out = matmul(backend, &cols, weight_kt, rows, k, cout)?;
+        let permuted = dispatch_permute(backend, &mm_out, n, cout, hout * wout)?;
+        return Ok((permuted, hout, wout));
+    }
+
+    // ===== Grouped conv (groups > 1) =====
+    // Strategy: split input on its C dim into `groups` slices of
+    // c/g channels each, split weight similarly, run conv2d_forward
+    // on each pair, concatenate the outputs on the Cout dim. v1
+    // does this on the host — fused-kernel grouped conv is a
+    // follow-up optimisation.
+    use crate::transfer::{to_cpu, to_gpu};
+    use rustorch_core::tensor::tensor_impl::Tensor;
+
+    let g = cfg.groups;
+    let c_per = c / g;
+    let cout_per = cout / g;
+    let k_per = c_per * cfg.kh * cfg.kw;
+    if weight_kt.numel != k_per * cout {
+        return Err(WgpuError::ShapeMismatch(format!(
+            "conv2d (grouped): weight^T numel {} != (k/g)*Cout {}",
+            weight_kt.numel,
+            k_per * cout
+        )));
+    }
+
+    let input_host = to_cpu(backend, input, vec![n, c, h, w])?;
+    let input_raw = input_host
+        .as_slice::<f32>()
+        .ok_or_else(|| WgpuError::ShapeMismatch("input not f32".into()))?;
+    let weight_host = to_cpu(backend, weight_kt, vec![k_per, cout])?;
+    let weight_raw = weight_host
+        .as_slice::<f32>()
+        .ok_or_else(|| WgpuError::ShapeMismatch("weight not f32".into()))?;
+
+    // Build per-group GPU storages by slicing the host buffers.
+    let mut out_per_group: Vec<Tensor> = Vec::with_capacity(g);
+    let mut cfg_inner = cfg;
+    cfg_inner.groups = 1;
+    for grp in 0..g {
+        // Input slice [n, c_per, h, w].
+        let mut x_g = Vec::with_capacity(n * c_per * h * w);
+        for nn in 0..n {
+            for cc in 0..c_per {
+                let src_c = grp * c_per + cc;
+                let off = (nn * c + src_c) * h * w;
+                x_g.extend_from_slice(&input_raw[off..off + h * w]);
+            }
+        }
+        // Weight slice — weight is laid out as [K, Cout]. We want the
+        // sub-block [k_per, cout_per] at K rows in [0..k_per] and Cout
+        // columns in [grp*cout_per, (grp+1)*cout_per].
+        let mut w_g = Vec::with_capacity(k_per * cout_per);
+        for kk in 0..k_per {
+            for co in 0..cout_per {
+                w_g.push(weight_raw[kk * cout + grp * cout_per + co]);
+            }
+        }
+        let tx = Tensor::from_vec([n, c_per, h, w], x_g)
+            .map_err(|e| WgpuError::ShapeMismatch(format!("{e}")))?;
+        let tw = Tensor::from_vec([k_per, cout_per], w_g)
+            .map_err(|e| WgpuError::ShapeMismatch(format!("{e}")))?;
+        let gx = to_gpu(backend, &tx)?;
+        let gw = to_gpu(backend, &tw)?;
+        let (gy, _, _) = conv2d_forward(backend, &gx, &gw, n, c_per, h, w, cout_per, cfg_inner)?;
+        let host = to_cpu(backend, &gy, vec![n, cout_per, hout, wout])?;
+        out_per_group.push(host);
+    }
+
+    // Concatenate per-group outputs on the Cout axis.
+    let mut out_full = vec![0.0_f32; n * cout * hout * wout];
+    for (grp, host) in out_per_group.iter().enumerate() {
+        let raw = host
+            .as_slice::<f32>()
+            .ok_or_else(|| WgpuError::ShapeMismatch("group out not f32".into()))?;
+        for nn in 0..n {
+            for co in 0..cout_per {
+                let dst_co = grp * cout_per + co;
+                let src_off = (nn * cout_per + co) * hout * wout;
+                let dst_off = (nn * cout + dst_co) * hout * wout;
+                out_full[dst_off..dst_off + hout * wout]
+                    .copy_from_slice(&raw[src_off..src_off + hout * wout]);
+            }
+        }
+    }
+    let tout = Tensor::from_vec([n, cout, hout, wout], out_full)
+        .map_err(|e| WgpuError::ShapeMismatch(format!("{e}")))?;
+    Ok((to_gpu(backend, &tout)?, hout, wout))
 }
 
 /// Host-side helper: convert weight `[Cout, C, kH, kW]` (row-major) to
@@ -526,6 +662,7 @@ mod gpu_tests {
             sw: 1,
             ph: 0,
             pw: 0,
+            ..Default::default()
         };
         let (gy, ho2, wo2) = conv2d_forward(&backend, &gx, &gw, n, c, h, wd, cout, cfg).unwrap();
         assert_eq!((ho, wo), (ho2, wo2));
@@ -556,6 +693,7 @@ mod gpu_tests {
             sw: 1,
             ph: 1,
             pw: 1,
+            ..Default::default()
         };
         let (gy, _, _) = conv2d_forward(&backend, &gx, &gw, n, c, h, wd, cout, cfg).unwrap();
         let y = to_cpu(&backend, &gy, vec![n, cout, ho, wo]).unwrap();
@@ -583,11 +721,159 @@ mod gpu_tests {
             sw,
             ph: 0,
             pw: 0,
+            ..Default::default()
         };
         let (gy, _, _) = conv2d_forward(&backend, &gx, &gw, n, c, h, wd, cout, cfg).unwrap();
         let y = to_cpu(&backend, &gy, vec![n, cout, ho, wo]).unwrap();
         for (g, e) in y.as_slice::<f32>().unwrap().iter().zip(&expected) {
             assert!((g - e).abs() < 1e-3, "{g} vs {e}");
+        }
+    }
+
+    #[test]
+    fn conv2d_dilation_3x3_d2() {
+        // Dilation = 2 on a 3x3 kernel: receptive field becomes 5x5.
+        // CPU reference also dilates the kernel taps.
+        #[allow(clippy::too_many_arguments)]
+        fn cpu_conv2d_dil(
+            x: &[f32],
+            w: &[f32],
+            n: usize,
+            c: usize,
+            h: usize,
+            wd: usize,
+            cout: usize,
+            kh: usize,
+            kw: usize,
+            ph: usize,
+            pw: usize,
+            dh: usize,
+            dw: usize,
+        ) -> (Vec<f32>, usize, usize) {
+            let kh_e = dh * (kh - 1) + 1;
+            let kw_e = dw * (kw - 1) + 1;
+            let hout = (h + 2 * ph).saturating_sub(kh_e) + 1;
+            let wout = (wd + 2 * pw).saturating_sub(kw_e) + 1;
+            let mut out = vec![0.0_f32; n * cout * hout * wout];
+            for nn in 0..n {
+                for co in 0..cout {
+                    for oh in 0..hout {
+                        for ow in 0..wout {
+                            let mut s = 0.0;
+                            for cc in 0..c {
+                                for ki in 0..kh {
+                                    for kj in 0..kw {
+                                        let ih = oh as isize + (ki * dh) as isize - ph as isize;
+                                        let iw = ow as isize + (kj * dw) as isize - pw as isize;
+                                        if ih >= 0 && ih < h as isize && iw >= 0 && iw < wd as isize
+                                        {
+                                            let xv = x[((nn * c + cc) * h + ih as usize) * wd
+                                                + iw as usize];
+                                            let wv = w[((co * c + cc) * kh + ki) * kw + kj];
+                                            s += xv * wv;
+                                        }
+                                    }
+                                }
+                            }
+                            out[((nn * cout + co) * hout + oh) * wout + ow] = s;
+                        }
+                    }
+                }
+            }
+            (out, hout, wout)
+        }
+
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let (n, c, h, wd, cout, kh, kw) = (1, 2, 9, 9, 2, 3, 3);
+        let x: Vec<f32> = (0..n * c * h * wd).map(|i| (i as f32) * 0.05).collect();
+        let w: Vec<f32> = (0..cout * c * kh * kw)
+            .map(|i| (i as f32) * 0.03 - 0.4)
+            .collect();
+        let (expected, ho, wo) = cpu_conv2d_dil(&x, &w, n, c, h, wd, cout, kh, kw, 0, 0, 2, 2);
+        let weight_t = transpose_weight(&w, cout, c, kh, kw);
+        let tx = Tensor::from_vec([n, c, h, wd], x).unwrap();
+        let tw = Tensor::from_vec([c * kh * kw, cout], weight_t).unwrap();
+        let gx = to_gpu(&backend, &tx).unwrap();
+        let gw = to_gpu(&backend, &tw).unwrap();
+        let cfg = Conv2dCfg {
+            kh,
+            kw,
+            dh: 2,
+            dw: 2,
+            ..Default::default()
+        };
+        let (gy, ho2, wo2) = conv2d_forward(&backend, &gx, &gw, n, c, h, wd, cout, cfg).unwrap();
+        assert_eq!((ho, wo), (ho2, wo2));
+        let y = to_cpu(&backend, &gy, vec![n, cout, ho, wo]).unwrap();
+        for (g, e) in y.as_slice::<f32>().unwrap().iter().zip(&expected) {
+            assert!((g - e).abs() < 1e-3, "{g} vs {e}");
+        }
+    }
+
+    #[test]
+    fn conv2d_groups_2_depthwise_like() {
+        // c=4, cout=4, groups=2 → 2 sub-convs each [c_in_per=2, cout_per=2].
+        // Each group's weight is independent of the other group's input.
+        let backend = WgpuBackend::new_blocking().expect("init");
+        let (n, c, h, wd, cout, kh, kw, g) = (1, 4, 5, 5, 4, 3, 3, 2);
+        let c_per = c / g;
+        let cout_per = cout / g;
+        let x: Vec<f32> = (0..n * c * h * wd)
+            .map(|i| (i as f32) * 0.04 - 0.5)
+            .collect();
+        // Weight in [Cout, C_in_per_group, kH, kW] = grouped weight layout.
+        // Total weight = cout * c_per * kh * kw.
+        let w_grouped: Vec<f32> = (0..cout * c_per * kh * kw)
+            .map(|i| (i as f32) * 0.03 - 0.2)
+            .collect();
+
+        // CPU reference: conv per group, concat on Cout.
+        let mut expected = vec![0.0_f32; n * cout * (h - kh + 1) * (wd - kw + 1)];
+        let hout = h - kh + 1;
+        let wout = wd - kw + 1;
+        for grp in 0..g {
+            for nn in 0..n {
+                for co in 0..cout_per {
+                    let dst_co = grp * cout_per + co;
+                    for oh in 0..hout {
+                        for ow in 0..wout {
+                            let mut s = 0.0_f32;
+                            for cc in 0..c_per {
+                                let src_c = grp * c_per + cc;
+                                for ki in 0..kh {
+                                    for kj in 0..kw {
+                                        let ih = oh + ki;
+                                        let iw = ow + kj;
+                                        let xv = x[((nn * c + src_c) * h + ih) * wd + iw];
+                                        let wv = w_grouped
+                                            [(((dst_co * c_per) + cc) * kh + ki) * kw + kj];
+                                        s += xv * wv;
+                                    }
+                                }
+                            }
+                            expected[((nn * cout + dst_co) * hout + oh) * wout + ow] = s;
+                        }
+                    }
+                }
+            }
+        }
+        // Convert weight to the [K, Cout] layout expected by conv2d_forward.
+        // K = c_per * kh * kw (per-group K).
+        let weight_t = transpose_weight(&w_grouped, cout, c_per, kh, kw);
+        let tx = Tensor::from_vec([n, c, h, wd], x).unwrap();
+        let tw = Tensor::from_vec([c_per * kh * kw, cout], weight_t).unwrap();
+        let gx = to_gpu(&backend, &tx).unwrap();
+        let gw = to_gpu(&backend, &tw).unwrap();
+        let cfg = Conv2dCfg {
+            kh,
+            kw,
+            groups: g,
+            ..Default::default()
+        };
+        let (gy, _, _) = conv2d_forward(&backend, &gx, &gw, n, c, h, wd, cout, cfg).unwrap();
+        let y = to_cpu(&backend, &gy, vec![n, cout, hout, wout]).unwrap();
+        for (g_, e) in y.as_slice::<f32>().unwrap().iter().zip(&expected) {
+            assert!((g_ - e).abs() < 1e-3, "{g_} vs {e}");
         }
     }
 }

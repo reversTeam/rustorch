@@ -26,6 +26,10 @@ pub enum ReduceKind {
     Max,
     /// Minimum along the row.
     Min,
+    /// Product along the row.
+    Prod,
+    /// L2 norm: sqrt(sum(x²)) along the row.
+    L2Norm,
 }
 
 impl ReduceKind {
@@ -35,28 +39,48 @@ impl ReduceKind {
             ReduceKind::Mean => "reduce_mean",
             ReduceKind::Max => "reduce_max",
             ReduceKind::Min => "reduce_min",
+            ReduceKind::Prod => "reduce_prod",
+            ReduceKind::L2Norm => "reduce_l2norm",
         }
     }
 
     fn init_value(self) -> &'static str {
         match self {
-            ReduceKind::Sum | ReduceKind::Mean => "0.0",
+            ReduceKind::Sum | ReduceKind::Mean | ReduceKind::L2Norm => "0.0",
             ReduceKind::Max => "-3.4e38",
             ReduceKind::Min => "3.4e38",
+            ReduceKind::Prod => "1.0",
         }
     }
 
-    fn combine(self) -> &'static str {
+    /// Combine expression for the per-element loop where `b` is the
+    /// freshly read input value `v`. For L2Norm this squares `b`.
+    fn combine_loop(self) -> &'static str {
         match self {
             ReduceKind::Sum | ReduceKind::Mean => "a + b",
             ReduceKind::Max => "max(a, b)",
             ReduceKind::Min => "min(a, b)",
+            ReduceKind::Prod => "a * b",
+            ReduceKind::L2Norm => "a + b * b",
+        }
+    }
+
+    /// Combine expression for the tree-reduction step. Both `a` and
+    /// `b` are partial accumulators of the same kind, so L2Norm
+    /// just adds (the squaring already happened in the loop).
+    fn combine_tree(self) -> &'static str {
+        match self {
+            ReduceKind::Sum | ReduceKind::Mean | ReduceKind::L2Norm => "a + b",
+            ReduceKind::Max => "max(a, b)",
+            ReduceKind::Min => "min(a, b)",
+            ReduceKind::Prod => "a * b",
         }
     }
 
     fn finalize(self) -> &'static str {
         match self {
             ReduceKind::Mean => "acc / f32(k)",
+            ReduceKind::L2Norm => "sqrt(acc)",
             _ => "acc",
         }
     }
@@ -64,7 +88,8 @@ impl ReduceKind {
 
 fn reduce_wgsl(kind: ReduceKind) -> String {
     let init = kind.init_value();
-    let combine = kind.combine();
+    let combine_loop = kind.combine_loop().replace("b", "b_");
+    let combine_tree = kind.combine_tree().replace("b", "b_");
     let finalize = kind.finalize();
     format!(
         r#"
@@ -90,7 +115,7 @@ fn main(
         if (i >= k) {{ break; }}
         let v = inp[row * k + i];
         let a = acc; let b_ = v;
-        acc = {combine};
+        acc = {combine_loop};
         i = i + {BLOCK}u;
     }}
     shared_buf[lid.x] = acc;
@@ -101,7 +126,7 @@ fn main(
         if (stride == 0u) {{ break; }}
         if (lid.x < stride) {{
             let a = shared_buf[lid.x]; let b_ = shared_buf[lid.x + stride];
-            shared_buf[lid.x] = {combine};
+            shared_buf[lid.x] = {combine_tree};
         }}
         workgroupBarrier();
         stride = stride / 2u;
@@ -115,7 +140,8 @@ fn main(
 "#,
         BLOCK = BLOCK,
         init = init,
-        combine = combine.replace("b", "b_"),
+        combine_loop = combine_loop,
+        combine_tree = combine_tree,
         finalize = finalize,
     )
 }
@@ -290,6 +316,33 @@ mod gpu_tests {
         );
         assert!((r[0] - (-2.0)).abs() < 1e-5);
         assert!((r[1] - (-4.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn prod_rows_simple() {
+        // Row 1: 1*2*3*4 = 24; Row 2: 0.5*0.5*0.5*0.5 = 0.0625
+        let r = run(
+            ReduceKind::Prod,
+            &[1.0, 2.0, 3.0, 4.0, 0.5, 0.5, 0.5, 0.5],
+            2,
+            4,
+        );
+        assert!((r[0] - 24.0).abs() < 1e-5);
+        assert!((r[1] - 0.0625).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2norm_rows_simple() {
+        // Row 1: sqrt(3² + 4²) = 5
+        // Row 2: sqrt(1 + 1 + 1 + 1) = 2
+        let r = run(
+            ReduceKind::L2Norm,
+            &[3.0, 4.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            2,
+            4,
+        );
+        assert!((r[0] - 5.0).abs() < 1e-5);
+        assert!((r[1] - 2.0).abs() < 1e-5);
     }
 
     #[test]
