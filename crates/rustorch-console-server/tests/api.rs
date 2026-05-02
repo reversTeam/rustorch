@@ -581,6 +581,197 @@ async fn runs_fork_clones_cfg_and_tags_lineage() {
     assert_eq!(resp.status(), 404);
 }
 
+// ---- SSE replay + scale -----------------------------------------------
+
+#[tokio::test]
+async fn sse_replays_via_last_event_id_header() {
+    let (addr, state) = spawn(AuthConfig::default()).await;
+
+    // Burn three events into the topic before any subscriber exists.
+    for v in 1..=3 {
+        state
+            .hub
+            .publish("runs.changed", "runs.changed", &json!({"v": v}));
+    }
+
+    // Reconnect with `Last-Event-ID: 1` → server should replay id=2 and id=3
+    // before going live, then we'll publish a 4th to confirm the live path.
+    use eventsource_stream::Eventsource;
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let recv = tokio::spawn(async move {
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/sse/runs.changed"))
+            .header("Last-Event-ID", "1")
+            .send()
+            .await
+            .unwrap();
+        let mut stream = resp.bytes_stream().eventsource();
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let item = timeout(Duration::from_secs(2), stream.next())
+                .await
+                .ok()
+                .flatten()
+                .ok_or("no event")?
+                .map_err(|e| format!("sse: {e}"))?;
+            got.push((item.id.clone(), item.data.clone()));
+        }
+        Ok::<_, String>(got)
+    });
+
+    // Give the subscriber a moment to subscribe before firing the live event.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    state
+        .hub
+        .publish("runs.changed", "runs.changed", &json!({"v": 4}));
+
+    let got = recv.await.unwrap().expect("sse delivery");
+    let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+    // Replay yields id=2,3 ; then id=4 from the live channel.
+    assert_eq!(ids, vec!["2", "3", "4"]);
+}
+
+#[tokio::test]
+async fn sse_handles_100_concurrent_subscribers() {
+    use eventsource_stream::Eventsource;
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (addr, state) = spawn(AuthConfig::default()).await;
+
+    // Spawn 100 tasks, each opens an SSE stream and waits for the
+    // first event. They all subscribe to the same topic before we
+    // publish anything.
+    let n = 100;
+    let mut handles = Vec::with_capacity(n);
+    for _ in 0..n {
+        handles.push(tokio::spawn(async move {
+            let resp = reqwest::Client::new()
+                .get(format!("http://{addr}/sse/runs.changed"))
+                .send()
+                .await
+                .unwrap();
+            let mut stream = resp.bytes_stream().eventsource();
+            let item = timeout(Duration::from_secs(5), stream.next())
+                .await
+                .ok()
+                .flatten()
+                .ok_or("no event")?
+                .map_err(|e| format!("sse: {e}"))?;
+            Ok::<_, String>(item.data)
+        }));
+    }
+
+    // Wait until the broadcast channel actually has 100 receivers
+    // hooked in (subscribe happens lazily on the GET handler).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while state.hub.subscriber_count("runs.changed") < n && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        state.hub.subscriber_count("runs.changed"),
+        n,
+        "all 100 subscribers should be hooked in before publish"
+    );
+
+    state
+        .hub
+        .publish("runs.changed", "runs.changed", &json!({"id": "fanout"}));
+
+    // Every subscriber must see the event.
+    for h in handles {
+        let payload = h.await.unwrap().expect("sub got the event");
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["id"], "fanout");
+    }
+}
+
+#[tokio::test]
+async fn sse_run_checkpoint_topic_fires_on_save() {
+    use eventsource_stream::Eventsource;
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (addr, state) = spawn(AuthConfig::default()).await;
+    let run_id = seed_run(&state).await;
+
+    // Subscribe to the per-run checkpoint topic before we POST.
+    let sse_url = format!("http://{addr}/sse/runs/{run_id}/checkpoint");
+    let recv = tokio::spawn(async move {
+        let resp = reqwest::Client::new().get(&sse_url).send().await.unwrap();
+        let mut stream = resp.bytes_stream().eventsource();
+        let item = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .ok()
+            .flatten()
+            .ok_or("no event")?
+            .map_err(|e| format!("sse: {e}"))?;
+        Ok::<_, String>(item.data)
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/runs/{run_id}/checkpoints"))
+        .json(&json!({
+            "path": "epoch_5.safetensors",
+            "step": 500,
+            "metrics": {"val_acc": 0.91},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let payload = recv.await.unwrap().expect("sse delivery");
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(v["run_id"], run_id);
+    assert_eq!(v["path"], "epoch_5.safetensors");
+    assert_eq!(v["step"], 500);
+    assert_eq!(v["metrics"]["val_acc"], 0.91);
+}
+
+#[tokio::test]
+async fn sse_event_id_field_is_set() {
+    use eventsource_stream::Eventsource;
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (addr, state) = spawn(AuthConfig::default()).await;
+
+    let recv = tokio::spawn(async move {
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/sse/runs.changed"))
+            .send()
+            .await
+            .unwrap();
+        let mut stream = resp.bytes_stream().eventsource();
+        let item = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .ok()
+            .flatten()
+            .ok_or("no event")?
+            .map_err(|e| format!("sse: {e}"))?;
+        Ok::<_, String>(item.id)
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    state
+        .hub
+        .publish("runs.changed", "runs.changed", &json!({"v": 1}));
+
+    let id = recv.await.unwrap().expect("sse delivery");
+    // First event on a fresh topic always has id=1.
+    assert_eq!(id, "1");
+}
+
 #[tokio::test]
 async fn checkpoint_against_missing_run_is_404() {
     let (_addr, state) = spawn(AuthConfig::default()).await;

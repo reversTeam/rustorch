@@ -368,6 +368,54 @@ pub async fn checkpoints(
     Ok(Json(cps))
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct NewCheckpointBody {
+    pub path: String,
+    pub step: i64,
+    /// Free-form metrics snapshot (val_acc, loss, …).
+    pub metrics: serde_json::Value,
+}
+
+/// `POST /runs/:id/checkpoints` — register a saved checkpoint.
+/// Today this is exposed for tests + an HTTP fallback when a runner
+/// can't speak gRPC (P2.8). Publishes `run.{id}.checkpoint` so the
+/// Run detail UI can refresh without polling.
+#[utoipa::path(
+    post, path = "/runs/{id}/checkpoints",
+    request_body = NewCheckpointBody,
+    responses((status = 201, body = db::Checkpoint))
+)]
+pub async fn save_checkpoint(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<NewCheckpointBody>,
+) -> ApiResult<(StatusCode, Json<db::Checkpoint>)> {
+    let cp = db::insert_checkpoint(
+        &s.db,
+        db::NewCheckpoint {
+            run_id: id.clone(),
+            path: body.path,
+            step: body.step,
+            metrics: body.metrics,
+        },
+    )
+    .await?;
+
+    let topic = format!("run.{id}.checkpoint");
+    s.hub.publish(
+        &topic,
+        "checkpoint",
+        &serde_json::json!({
+            "id": cp.id,
+            "run_id": cp.run_id,
+            "path": cp.path,
+            "step": cp.step,
+            "metrics": cp.metrics,
+        }),
+    );
+    Ok((StatusCode::CREATED, Json(cp)))
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ArtifactEntry {
     pub kind: &'static str,
@@ -449,7 +497,10 @@ pub fn routes() -> Router<AppState> {
         .route("/runs/:id/hparams", get(hparams))
         .route("/runs/:id/code", get(code))
         .route("/runs/:id/log", get(log))
-        .route("/runs/:id/checkpoints", get(checkpoints))
+        .route(
+            "/runs/:id/checkpoints",
+            get(checkpoints).post(save_checkpoint),
+        )
         .route("/runs/:id/artifacts", get(artifacts))
         .route("/runs/:id/system", get(system))
 }
