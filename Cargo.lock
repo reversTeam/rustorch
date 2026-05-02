@@ -2956,6 +2956,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-fusion-macros"
+version = "0.0.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "rustorch-log"
 version = "0.0.1"
 dependencies = [

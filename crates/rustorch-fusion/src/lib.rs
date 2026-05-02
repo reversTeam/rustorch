@@ -22,10 +22,12 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod dispatcher;
 pub mod matcher;
 pub mod pattern;
 pub mod patterns;
 
+pub use dispatcher::{no_fuse, set_no_fuse, FuseDecision, FusionRegistry, NoFuseGuard};
 pub use matcher::{find_matches, Match};
 pub use pattern::{OpKind, Pattern};
 pub use patterns::{

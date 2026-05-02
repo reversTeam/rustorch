@@ -41,6 +41,7 @@ members = [
     "crates/rustorch-fusion",
     "crates/rustorch-amp",
     "crates/rustorch-checkpoint",
+    "crates/rustorch-fusion-macros",
 ]
 exclude = [
     "pytorch", # reference clone of upstream PyTorch (read-only)
@@ -79,6 +80,7 @@ rustorch-quant     = { version = "0.0.1", path = "crates/rustorch-quant" }
 rustorch-fusion    = { version = "0.0.1", path = "crates/rustorch-fusion" }
 rustorch-amp       = { version = "0.0.1", path = "crates/rustorch-amp" }
 rustorch-checkpoint = { version = "0.0.1", path = "crates/rustorch-checkpoint" }
+rustorch-fusion-macros = { version = "0.0.1", path = "crates/rustorch-fusion-macros" }
 
 # Numerics & types
 half        = "2.4"   # f16 / bf16
