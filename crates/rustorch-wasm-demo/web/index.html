@@ -3,74 +3,214 @@
 <head>
   <meta charset="utf-8" />
   <title>rustorch — browser WebGPU demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0a0b09; color: #ddd; padding: 24px; }
-    h1 { color: #ce422b; }
-    .card { background: #111; border: 1px solid #222; padding: 16px; margin: 12px 0; border-radius: 6px; }
-    .ok { color: #8fcf6f; }
-    .warn { color: #e6b04b; }
-    pre { white-space: pre-wrap; word-break: break-all; max-height: 280px; overflow-y: auto; }
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: #0a0b09;
+      color: #e0e0e0;
+      padding: 24px;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    h1 { color: #ce422b; margin-bottom: 4px; }
+    h2 { color: #d8d8d8; font-size: 1.1em; margin-top: 1.6em; }
+    .lead { color: #aaa; margin-top: 0; }
+    .card {
+      background: #14140f;
+      border: 1px solid #2a2a26;
+      padding: 16px 18px;
+      margin: 14px 0;
+      border-radius: 8px;
+    }
+    .ok    { color: #8fcf6f; }
+    .warn  { color: #e6b04b; }
+    .err   { color: #e87b6f; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 280px;
+      overflow-y: auto;
+      background: #0a0a08;
+      padding: 10px;
+      border-radius: 4px;
+      font-size: 0.85em;
+    }
+    button {
+      background: #ce422b;
+      color: white;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 4px;
+      font: inherit;
+      cursor: pointer;
+      margin-right: 8px;
+      margin-top: 4px;
+    }
+    button:hover:not(:disabled) { background: #e25036; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    label { color: #aaa; margin-right: 8px; }
+    input[type="number"] {
+      background: #0a0a08;
+      color: #e0e0e0;
+      border: 1px solid #2a2a26;
+      padding: 4px 8px;
+      border-radius: 3px;
+      font: inherit;
+      width: 80px;
+      margin-right: 16px;
+    }
+    table {
+      border-collapse: collapse;
+      margin-top: 12px;
+      width: 100%;
+    }
+    th, td {
+      padding: 6px 12px;
+      border-bottom: 1px solid #2a2a26;
+      text-align: left;
+      font-size: 0.9em;
+    }
+    th { color: #888; font-weight: normal; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
   <h1>rustorch — browser WebGPU demo</h1>
+  <p class="lead">
+    Pure-Rust deep-learning kernels compiled to WASM, executing through
+    the browser's native WebGPU adapter.
+  </p>
 
   <div class="card">
-    <h2>Phase 2 deliverable</h2>
-    <p>
-      This page calls into a WASM module compiled from
-      <code>crates/rustorch-wasm-demo</code>. It allocates two
-      F32 tensors of shape <code>[B, K]</code>, runs
-      <code>add → relu → softmax</code> on the browser's WebGPU
-      adapter via the <code>rustorch-wgpu</code> crate, and reads
-      the result back to JS as a <code>Float32Array</code>.
-    </p>
-    <p>
-      Build:
-      <code>wasm-pack build crates/rustorch-wasm-demo --target web</code>
-    </p>
-  </div>
-
-  <div class="card">
-    <h2>WebGPU support</h2>
+    <h2>WebGPU adapter</h2>
     <p id="status">Checking…</p>
   </div>
 
+  <!-- ============ Demo 1: minimal smoke ============ -->
   <div class="card">
-    <h2>Result</h2>
-    <pre id="output">(not run yet — click below)</pre>
-    <button id="run">Run forward pass</button>
+    <h2>Demo 1 · Smoke test (add → relu → softmax)</h2>
+    <p>
+      The 1-shot pipeline that proves the WASM ↔ WebGPU bridge works.
+      Allocates two F32 tensors of shape <code>[B, K]</code>, runs the
+      chain, returns the row-stochastic output.
+    </p>
+    <p>
+      <label>B <input id="smoke-b" type="number" value="2" min="1" max="64" /></label>
+      <label>K <input id="smoke-k" type="number" value="8" min="1" max="2048" /></label>
+      <button id="run-smoke">Run smoke</button>
+    </p>
+    <pre id="smoke-output">(not run yet)</pre>
+  </div>
+
+  <!-- ============ Demo 2: transformer block ============ -->
+  <div class="card">
+    <h2>Demo 2 · Transformer-block forward pass</h2>
+    <p>
+      End-to-end forward pass through a single self-attention block
+      and LayerNorm. Exercises matmul + transpose + softmax + attention
+      + layernorm — the whole P2 kernel surface in one go.
+    </p>
+    <p>
+      <code>x [S, D]</code>
+      → <code>Q, K, V [S, D]</code> via <code>X @ {Wq, Wk, Wv}</code>
+      → <code>attention</code>
+      → <code>layernorm</code>
+    </p>
+    <p>
+      <label>S (sequence length) <input id="block-s" type="number" value="32" min="1" max="512" /></label>
+      <label>D (embedding dim) <input id="block-d" type="number" value="64" min="8" max="512" /></label>
+      <button id="run-block">Run block</button>
+    </p>
+    <table id="block-table" style="display:none">
+      <thead><tr><th>phase</th><th class="num">milliseconds</th></tr></thead>
+      <tbody>
+        <tr><td>upload (host → GPU)</td><td class="num" id="t-up"></td></tr>
+        <tr><td>compute (GPU kernels)</td><td class="num" id="t-c"></td></tr>
+        <tr><td>readback (GPU → host)</td><td class="num" id="t-r"></td></tr>
+        <tr><td><strong>total</strong></td><td class="num" id="t-tot"><strong></strong></td></tr>
+      </tbody>
+    </table>
+    <pre id="block-output">(not run yet)</pre>
+  </div>
+
+  <div class="card">
+    <h2>Build</h2>
+    <pre>./build.sh        # produces pkg/ next to web/
+python3 -m http.server 8080
+# open http://localhost:8080/web/ in Chrome 120+</pre>
   </div>
 
   <script type="module">
-    import init, { run_demo } from "../pkg/rustorch_wasm_demo.js";
+    import init, { run_demo, run_attention_block } from "../pkg/rustorch_wasm_demo.js";
 
-    const status = document.getElementById("status");
-    const output = document.getElementById("output");
-    const button = document.getElementById("run");
+    const $ = (id) => document.getElementById(id);
 
-    if (!("gpu" in navigator)) {
-      status.innerHTML = '<span class="warn">⚠ WebGPU not available. Use Chrome 120+ with WebGPU enabled.</span>';
-      button.disabled = true;
-    } else {
-      status.innerHTML = '<span class="ok">✓ navigator.gpu present.</span>';
+    function setStatus() {
+      if (!("gpu" in navigator)) {
+        $("status").innerHTML =
+          '<span class="warn">⚠ WebGPU not available. Use Chrome 120+ with WebGPU enabled.</span>';
+        $("run-smoke").disabled = true;
+        $("run-block").disabled = true;
+        return false;
+      }
+      $("status").innerHTML = '<span class="ok">✓ navigator.gpu present.</span>';
+      return true;
     }
 
-    button.addEventListener("click", async () => {
-      output.textContent = "Initializing WASM module…";
-      try {
+    let initialized = false;
+    async function ensureInit() {
+      if (!initialized) {
         await init();
-        output.textContent = "Running add → relu → softmax on the GPU…";
-        const buf = await run_demo(2, 8);
-        output.textContent =
-          "Result (shape [2, 8]):\n" +
-          Array.from(buf)
+        initialized = true;
+      }
+    }
+
+    $("run-smoke").addEventListener("click", async () => {
+      const out = $("smoke-output");
+      out.textContent = "Initializing WASM module…";
+      try {
+        await ensureInit();
+        const b = parseInt($("smoke-b").value);
+        const k = parseInt($("smoke-k").value);
+        out.textContent = `Running on shape [${b}, ${k}]…`;
+        const buf = await run_demo(b, k);
+        out.textContent = "Result (first 16 values):\n" +
+          Array.from(buf).slice(0, 16)
+            .map((v, i) => `[${i}] ${v.toFixed(6)}`)
+            .join("\n") +
+          (buf.length > 16 ? `\n... (${buf.length - 16} more)` : "");
+      } catch (err) {
+        out.innerHTML = `<span class="err">Error: ${err?.message || err}</span>`;
+      }
+    });
+
+    $("run-block").addEventListener("click", async () => {
+      const out = $("block-output");
+      const tbl = $("block-table");
+      out.textContent = "Initializing WASM module…";
+      tbl.style.display = "none";
+      try {
+        await ensureInit();
+        const s = parseInt($("block-s").value);
+        const d = parseInt($("block-d").value);
+        out.textContent = `Running attention block on [${s}, ${d}]…`;
+        const stats = await run_attention_block(s, d);
+        $("t-up").textContent = stats.upload_ms.toFixed(2);
+        $("t-c").textContent = stats.compute_ms.toFixed(2);
+        $("t-r").textContent = stats.readback_ms.toFixed(2);
+        $("t-tot").innerHTML = `<strong>${stats.total_ms.toFixed(2)}</strong>`;
+        tbl.style.display = "table";
+        out.textContent = "Output (first 8 values of [S, D] tensor):\n" +
+          Array.from(stats.first_eight)
             .map((v, i) => `[${i}] ${v.toFixed(6)}`)
             .join("\n");
       } catch (err) {
-        output.textContent = "Error: " + (err?.message || err);
+        out.innerHTML = `<span class="err">Error: ${err?.message || err}</span>`;
       }
     });
+
+    setStatus();
   </script>
 </body>
 </html>

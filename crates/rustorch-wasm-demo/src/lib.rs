@@ -19,8 +19,10 @@
 #[cfg(target_arch = "wasm32")]
 mod web {
     use rustorch_core::tensor::dtype::Dtype;
+    use rustorch_core::tensor::tensor_impl::Tensor;
     use rustorch_wgpu::{
-        dispatch_binary, dispatch_unary, softmax_rows, to_cpu, to_gpu, WgpuBackend,
+        attention_naive, dispatch_binary, dispatch_unary, layernorm_rows, matmul, softmax_rows,
+        to_cpu, to_gpu, WgpuBackend,
     };
     use wasm_bindgen::prelude::*;
 
@@ -30,8 +32,60 @@ mod web {
         console_error_panic_hook::set_once();
     }
 
-    /// Run the demo pipeline. Returns `[B, K]` softmax probabilities as
-    /// a `Float32Array`. Resolves the JS Promise with the final buffer.
+    /// Performance report from one demo run. Returned to JS as a
+    /// plain object so the page can render a small benchmark table.
+    #[wasm_bindgen]
+    pub struct DemoStats {
+        upload_ms: f64,
+        compute_ms: f64,
+        readback_ms: f64,
+        total_ms: f64,
+        first_eight: js_sys::Float32Array,
+    }
+
+    #[wasm_bindgen]
+    impl DemoStats {
+        /// Time spent uploading the input tensors to the GPU.
+        #[wasm_bindgen(getter)]
+        pub fn upload_ms(&self) -> f64 {
+            self.upload_ms
+        }
+        /// Time spent inside the GPU kernel chain.
+        #[wasm_bindgen(getter)]
+        pub fn compute_ms(&self) -> f64 {
+            self.compute_ms
+        }
+        /// Time spent mapping the output buffer back to host memory.
+        #[wasm_bindgen(getter)]
+        pub fn readback_ms(&self) -> f64 {
+            self.readback_ms
+        }
+        /// Sum of the three phases above.
+        #[wasm_bindgen(getter)]
+        pub fn total_ms(&self) -> f64 {
+            self.total_ms
+        }
+        /// First eight values of the final output for visual inspection.
+        #[wasm_bindgen(getter)]
+        pub fn first_eight(&self) -> js_sys::Float32Array {
+            self.first_eight.clone()
+        }
+    }
+
+    /// Read `performance.now()` from the `Window` object — the only
+    /// reasonably-precise wall clock available in browser WASM.
+    fn now_ms() -> f64 {
+        js_sys::Reflect::get(&js_sys::global(), &"performance".into())
+            .ok()
+            .and_then(|p| js_sys::Reflect::get(&p, &"now".into()).ok())
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+            .and_then(|f| f.call0(&js_sys::global()).ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// The original tiny demo: `add → relu → softmax` on `[B, K]` input.
+    /// Kept for backwards compatibility with the headless smoke test.
     #[wasm_bindgen]
     pub async fn run_demo(b: u32, k: u32) -> Result<js_sys::Float32Array, JsValue> {
         let b = b as usize;
@@ -41,30 +95,125 @@ mod web {
             .map_err(|e| JsValue::from_str(&format!("backend init: {e}")))?;
         let lhs: Vec<f32> = (0..(b * k)).map(|i| (i as f32) * 0.01).collect();
         let rhs: Vec<f32> = (0..(b * k)).map(|i| (i as f32).sin()).collect();
-        let tlhs = rustorch_core::tensor::tensor_impl::Tensor::from_vec([b, k], lhs)
+        let tlhs = Tensor::from_vec([b, k], lhs)
             .map_err(|e| JsValue::from_str(&format!("lhs tensor: {e}")))?;
-        let trhs = rustorch_core::tensor::tensor_impl::Tensor::from_vec([b, k], rhs)
+        let trhs = Tensor::from_vec([b, k], rhs)
             .map_err(|e| JsValue::from_str(&format!("rhs tensor: {e}")))?;
         let glhs =
             to_gpu(&backend, &tlhs).map_err(|e| JsValue::from_str(&format!("upload lhs: {e}")))?;
         let grhs =
             to_gpu(&backend, &trhs).map_err(|e| JsValue::from_str(&format!("upload rhs: {e}")))?;
-
         let summed = dispatch_binary(&backend, "add", &glhs, &grhs)
             .map_err(|e| JsValue::from_str(&format!("add: {e}")))?;
         let activated = dispatch_unary(&backend, "relu", &summed)
             .map_err(|e| JsValue::from_str(&format!("relu: {e}")))?;
         let probs = softmax_rows(&backend, &activated, b, k)
             .map_err(|e| JsValue::from_str(&format!("softmax: {e}")))?;
-
         let out = to_cpu(&backend, &probs, vec![b, k])
             .map_err(|e| JsValue::from_str(&format!("readback: {e}")))?;
         let slice = out
             .as_slice::<f32>()
             .ok_or_else(|| JsValue::from_str("output not f32"))?;
-        // SAFETY: Float32Array::from copies the data; ownership remains in Rust.
-        let _ = Dtype::F32; // suppress unused-import warning when feature off
+        let _ = Dtype::F32;
         Ok(js_sys::Float32Array::from(slice))
+    }
+
+    /// Larger demo pipeline that exercises the full P2 kernel surface
+    /// in a transformer-style block:
+    ///
+    ///   x ∈ [S, D]  --(matmul Wq, Wk, Wv)-->  Q, K, V ∈ [S, D]
+    ///   --(attention_naive)-->  attn_out ∈ [S, D]
+    ///   --(layernorm)-->         normed ∈ [S, D]
+    ///
+    /// `S` (sequence length) and `D` (embedding dim) are passed from
+    /// JS so the demo page can sweep across sizes for a benchmark.
+    /// Returns timing breakdown + the first 8 output values.
+    #[wasm_bindgen]
+    pub async fn run_attention_block(s: u32, d: u32) -> Result<DemoStats, JsValue> {
+        let s = s as usize;
+        let d = d as usize;
+        let backend = WgpuBackend::new()
+            .await
+            .map_err(|e| JsValue::from_str(&format!("backend init: {e}")))?;
+
+        // Synthetic inputs — a real demo would feed pre-tokenized text.
+        let mk = |seed: u64| -> Vec<f32> {
+            (0..(s * d))
+                .map(|i| {
+                    let bits = seed
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(i as u64);
+                    let unit = ((bits >> 33) as u32 as f32) / (u32::MAX as f32);
+                    unit - 0.5
+                })
+                .collect()
+        };
+        let x_data = mk(0xA1);
+        let wq_data = mk(0xB2);
+        let wk_data = mk(0xC3);
+        let wv_data = mk(0xD4);
+        let gamma_data = vec![1.0_f32; d];
+        let beta_data = vec![0.0_f32; d];
+
+        // ---- Upload phase ------------------------------------------------
+        let t_up = now_ms();
+        let tx = Tensor::from_vec([s, d], x_data)
+            .map_err(|e| JsValue::from_str(&format!("x tensor: {e}")))?;
+        let twq = Tensor::from_vec([d, d], wq_data)
+            .map_err(|e| JsValue::from_str(&format!("Wq tensor: {e}")))?;
+        let twk = Tensor::from_vec([d, d], wk_data)
+            .map_err(|e| JsValue::from_str(&format!("Wk tensor: {e}")))?;
+        let twv = Tensor::from_vec([d, d], wv_data)
+            .map_err(|e| JsValue::from_str(&format!("Wv tensor: {e}")))?;
+        let tg = Tensor::from_vec([d], gamma_data)
+            .map_err(|e| JsValue::from_str(&format!("gamma tensor: {e}")))?;
+        let tbb = Tensor::from_vec([d], beta_data)
+            .map_err(|e| JsValue::from_str(&format!("beta tensor: {e}")))?;
+        let gx = to_gpu(&backend, &tx).map_err(|e| JsValue::from_str(&format!("upload x: {e}")))?;
+        let gwq =
+            to_gpu(&backend, &twq).map_err(|e| JsValue::from_str(&format!("upload Wq: {e}")))?;
+        let gwk =
+            to_gpu(&backend, &twk).map_err(|e| JsValue::from_str(&format!("upload Wk: {e}")))?;
+        let gwv =
+            to_gpu(&backend, &twv).map_err(|e| JsValue::from_str(&format!("upload Wv: {e}")))?;
+        let ggamma =
+            to_gpu(&backend, &tg).map_err(|e| JsValue::from_str(&format!("upload γ: {e}")))?;
+        let gbeta =
+            to_gpu(&backend, &tbb).map_err(|e| JsValue::from_str(&format!("upload β: {e}")))?;
+        let upload_ms = now_ms() - t_up;
+
+        // ---- Compute phase -----------------------------------------------
+        let t_c = now_ms();
+        let q = matmul(&backend, &gx, &gwq, s, d, d)
+            .map_err(|e| JsValue::from_str(&format!("Q = X@Wq: {e}")))?;
+        let k = matmul(&backend, &gx, &gwk, s, d, d)
+            .map_err(|e| JsValue::from_str(&format!("K = X@Wk: {e}")))?;
+        let v = matmul(&backend, &gx, &gwv, s, d, d)
+            .map_err(|e| JsValue::from_str(&format!("V = X@Wv: {e}")))?;
+        let attn = attention_naive(&backend, &q, &k, &v, s, d)
+            .map_err(|e| JsValue::from_str(&format!("attention: {e}")))?;
+        let normed = layernorm_rows(&backend, &attn, &ggamma, &gbeta, s, d, 1e-5)
+            .map_err(|e| JsValue::from_str(&format!("layernorm: {e}")))?;
+        let compute_ms = now_ms() - t_c;
+
+        // ---- Readback phase ----------------------------------------------
+        let t_r = now_ms();
+        let out = to_cpu(&backend, &normed, vec![s, d])
+            .map_err(|e| JsValue::from_str(&format!("readback: {e}")))?;
+        let readback_ms = now_ms() - t_r;
+        let total_ms = upload_ms + compute_ms + readback_ms;
+
+        let slice = out
+            .as_slice::<f32>()
+            .ok_or_else(|| JsValue::from_str("output not f32"))?;
+        let head_len = slice.len().min(8);
+        Ok(DemoStats {
+            upload_ms,
+            compute_ms,
+            readback_ms,
+            total_ms,
+            first_eight: js_sys::Float32Array::from(&slice[..head_len]),
+        })
     }
 }
 

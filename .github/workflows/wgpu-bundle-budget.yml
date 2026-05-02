@@ -1,0 +1,70 @@
+name: wgpu-bundle-budget
+
+# Asserts that the rustorch-wasm-demo bundle stays under a configured
+# byte budget. Catches accidental fat dependencies before they ship
+# to production. Runs on every PR.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: wgpu-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Hard cap: the bundle (.wasm + .js + .html) MUST stay below this on
+  # every PR or the gate fails. Bump deliberately, never as a drive-by.
+  BUNDLE_BUDGET_BYTES: 10485760  # 10 MiB
+
+jobs:
+  budget:
+    name: bundle ≤ 10 MiB
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wgpu-bundle-budget
+
+      - name: Install wasm-pack + binaryen
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+          sudo apt-get update -y
+          sudo apt-get install -y binaryen
+
+      - name: Build WASM (release + size opts)
+        env:
+          RUSTFLAGS: "-C opt-level=z"
+        run: |
+          wasm-pack build crates/rustorch-wasm-demo \
+              --target web --release --out-dir pkg
+
+      - name: Optimise with wasm-opt -Oz
+        run: |
+          wasm-opt -Oz \
+              -o crates/rustorch-wasm-demo/pkg/rustorch_wasm_demo_bg.wasm \
+                 crates/rustorch-wasm-demo/pkg/rustorch_wasm_demo_bg.wasm
+
+      - name: Assert bundle size budget
+        run: |
+          BUNDLE_DIR=crates/rustorch-wasm-demo/pkg
+          WEB_DIR=crates/rustorch-wasm-demo/web
+          BYTES=$(du -bc "$BUNDLE_DIR"/*.wasm "$BUNDLE_DIR"/*.js "$WEB_DIR"/*.html \
+                   2>/dev/null | tail -1 | cut -f1)
+          BUDGET=${BUNDLE_BUDGET_BYTES}
+          echo "::notice ::Bundle bytes: $BYTES (budget $BUDGET)"
+          if [ "$BYTES" -gt "$BUDGET" ]; then
+              echo "::error ::Bundle is $BYTES bytes; budget is $BUDGET bytes."
+              exit 1
+          fi
+          echo "✓ Bundle within budget ($BYTES ≤ $BUDGET)"
+          # Print per-file breakdown for the PR comment.
+          ls -lh "$BUNDLE_DIR"/*.wasm "$BUNDLE_DIR"/*.js "$WEB_DIR"/*.html

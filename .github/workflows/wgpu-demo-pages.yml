@@ -1,0 +1,97 @@
+name: wgpu-demo-pages
+
+# Builds the rustorch-wasm-demo bundle and publishes it to GitHub Pages
+# at https://<owner>.github.io/<repo>/. Runs on every main merge so
+# the demo always reflects the current tip of main.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wgpu-demo-pages
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM bundle (release, opt-level=z)
+        env:
+          # `opt-level=z` keeps wasm-pack's release profile aggressive on
+          # size; combined with wasm-opt -Oz the bundle stays well under
+          # the 10 MB budget.
+          RUSTFLAGS: "-C opt-level=z"
+        run: |
+          wasm-pack build crates/rustorch-wasm-demo \
+              --target web --release --out-dir pkg
+
+      - name: Run wasm-opt -Oz on the artifact
+        run: |
+          # wasm-opt ships with binaryen on apt; install if missing.
+          sudo apt-get update -y
+          sudo apt-get install -y binaryen
+          wasm-opt -Oz \
+              -o crates/rustorch-wasm-demo/pkg/rustorch_wasm_demo_bg.wasm \
+                 crates/rustorch-wasm-demo/pkg/rustorch_wasm_demo_bg.wasm
+          ls -lh crates/rustorch-wasm-demo/pkg/
+
+      - name: Pre-compress with brotli for static serving
+        run: |
+          for f in crates/rustorch-wasm-demo/pkg/*.{js,wasm} \
+                   crates/rustorch-wasm-demo/web/*.html; do
+              [ -f "$f" ] && brotli -q 11 -k "$f" || true
+          done
+
+      - name: Assemble Pages site
+        run: |
+          mkdir -p _site
+          cp -r crates/rustorch-wasm-demo/web _site/web
+          cp -r crates/rustorch-wasm-demo/pkg _site/pkg
+          # Top-level index redirects to /web/.
+          cat > _site/index.html <<'EOF'
+          <!doctype html>
+          <html lang="en"><head>
+            <meta charset="utf-8" />
+            <meta http-equiv="refresh" content="0; url=web/" />
+            <title>rustorch — browser demo</title>
+          </head><body>
+            <p>Redirecting to <a href="web/">the demo</a>…</p>
+          </body></html>
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
