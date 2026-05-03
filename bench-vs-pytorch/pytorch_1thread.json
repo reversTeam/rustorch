@@ -1,0 +1,104 @@
+{
+  "framework": "pytorch",
+  "device": "cpu",
+  "num_threads": 1,
+  "version": "2.11.0",
+  "warmup_iters": 3,
+  "timed_iters": 20,
+  "results": [
+    {
+      "op": "matmul",
+      "shape": "[128,128] x [128,128]",
+      "median_ns": 4542,
+      "p99_ns": 5250,
+      "gflops": 923.4487010127697
+    },
+    {
+      "op": "matmul",
+      "shape": "[256,256] x [256,256]",
+      "median_ns": 24708,
+      "p99_ns": 25625,
+      "gflops": 1358.0391775943015
+    },
+    {
+      "op": "matmul",
+      "shape": "[512,512] x [512,512]",
+      "median_ns": 101083,
+      "p99_ns": 201333,
+      "gflops": 2655.594471869652
+    },
+    {
+      "op": "matmul",
+      "shape": "[1024,1024] x [1024,1024]",
+      "median_ns": 827375,
+      "p99_ns": 849750,
+      "gflops": 2595.538477715667
+    },
+    {
+      "op": "softmax",
+      "shape": "[128,32000]",
+      "median_ns": 4130917,
+      "p99_ns": 4187000
+    },
+    {
+      "op": "softmax",
+      "shape": "[512,50257]",
+      "median_ns": 30602958,
+      "p99_ns": 35489958
+    },
+    {
+      "op": "sdpa",
+      "shape": "B=1 H=1 N=512 D=64",
+      "median_ns": 259958,
+      "p99_ns": 279584
+    },
+    {
+      "op": "naive_attention_forward",
+      "shape": "B=1 H=1 N=512 D=64",
+      "median_ns": 367833,
+      "p99_ns": 380542
+    },
+    {
+      "op": "sdpa",
+      "shape": "B=1 H=4 N=1024 D=64",
+      "median_ns": 3043417,
+      "p99_ns": 3063083
+    },
+    {
+      "op": "naive_attention_forward",
+      "shape": "B=1 H=4 N=1024 D=64",
+      "median_ns": 5742167,
+      "p99_ns": 5834458
+    },
+    {
+      "op": "sdpa",
+      "shape": "B=2 H=4 N=2048 D=64",
+      "median_ns": 24259084,
+      "p99_ns": 25149125
+    },
+    {
+      "op": "naive_attention_forward",
+      "shape": "B=2 H=4 N=2048 D=64",
+      "median_ns": 59875084,
+      "p99_ns": 61316875
+    },
+    {
+      "op": "elementwise_add",
+      "shape": "[1000]",
+      "median_ns": 500,
+      "p99_ns": 583
+    },
+    {
+      "op": "elementwise_add",
+      "shape": "[100000]",
+      "median_ns": 9875,
+      "p99_ns": 10000
+    },
+    {
+      "op": "elementwise_add",
+      "shape": "[1000000]",
+      "median_ns": 93042,
+      "p99_ns": 93375
+    }
+  ]
+}
