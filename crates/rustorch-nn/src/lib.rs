@@ -36,7 +36,7 @@ pub use activation::{
     leaky_relu, log_softmax, mish, relu, sigmoid, silu, softmax, tanh, LeakyRelu, LogSoftmax, Mish,
     Relu, Sigmoid, Silu, Softmax, Tanh,
 };
-pub use attention::{scaled_dot_product_attention, SingleHeadAttention};
+pub use attention::{scaled_dot_product_attention, MultiHeadAttention, SingleHeadAttention};
 pub use checkpointed::Checkpointed;
 pub use container::{ModuleDict, ModuleList};
 pub use conv::{Conv1d, Conv2d, MaxPool2d};
