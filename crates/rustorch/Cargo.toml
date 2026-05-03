@@ -29,6 +29,18 @@ rocm        = []
 mkl         = []
 accelerate  = []
 mlir        = []
+# P3.Y plan, Phase E/F — wgpu (Metal/Vulkan/DX12/WebGPU) training dispatch.
+# Pulls rustorch-autograd's `wgpu` feature which transitively brings the
+# rustorch-wgpu backend in. Default OFF to keep CPU-only builds light.
+wgpu        = ["rustorch-autograd/wgpu"]
+
+[[example]]
+name = "mnist_wgpu"
+required-features = ["wgpu"]
+
+[[example]]
+name = "cpu_vs_wgpu_train"
+required-features = ["wgpu"]
 
 [dependencies]
 rustorch-core     = { workspace = true }

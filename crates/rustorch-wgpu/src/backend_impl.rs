@@ -476,6 +476,34 @@ impl Backend for WgpuBackend {
     fn argmax(&self, src: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor, BackendError> {
         cpu_backend().argmax(src, dim, keepdim).map(tag_wgpu)
     }
+
+    // Comparison ops (CPU fallback) — used by ReluBackward (gt) and for
+    // user-facing predicate ops. No native WGSL kernel yet.
+    fn ne(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().ne(lhs, rhs).map(tag_wgpu)
+    }
+    fn lt(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().lt(lhs, rhs).map(tag_wgpu)
+    }
+    fn le(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().le(lhs, rhs).map(tag_wgpu)
+    }
+    fn gt(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().gt(lhs, rhs).map(tag_wgpu)
+    }
+    fn ge(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().ge(lhs, rhs).map(tag_wgpu)
+    }
+
+    // Cast — needed when ReluBackward converts the bool mask to f32 to
+    // multiply against grad.
+    fn cast(
+        &self,
+        src: &Tensor,
+        target: rustorch_core::tensor::dtype::Dtype,
+    ) -> Result<Tensor, BackendError> {
+        cpu_backend().cast(src, target).map(tag_wgpu)
+    }
 }
 
 #[cfg(test)]

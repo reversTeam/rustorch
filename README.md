@@ -408,9 +408,68 @@ project knowledge graph. Highlights from Phase 3:
 See [`docs/rfcs/`](docs/rfcs/) for the full RFCs and the project's Decision
 graph (queryable via the Project Orchestrator MCP tools).
 
+## Training on GPU
+
+P3.Y plan delivers training-on-GPU through the `wgpu` backend
+(Metal on macOS, Vulkan on Linux/Android, DX12 on Windows, WebGPU on wasm32).
+Enable with the `wgpu` Cargo feature:
+
+```toml
+[dependencies]
+rustorch = { version = "...", features = ["wgpu"] }
+```
+
+```rust
+use rustorch::nn::{Linear, module::Module};
+use rustorch_autograd::{backward, ops, Variable};
+use rustorch_core::tensor::device::Device;
+use rustorch_optim::{AdamW, Optimizer};
+
+let mut model = Linear::new(784, 10);
+model.to_device(Device::Wgpu);   // walks parameters() and re-tags
+let mut opt = AdamW::new(model.parameters(), 0.001);
+
+for _step in 0..n_steps {
+    opt.zero_grad();
+    let pred = model.forward(&xs).unwrap();
+    let loss = ops::mse_loss(&pred, &ys, Reduction::Mean).unwrap();
+    backward(&loss, None).unwrap();
+    opt.step();
+}
+```
+
+Backend support matrix:
+
+| Platform | Backend | Status |
+|---|---|---|
+| macOS | Metal | ✅ Production |
+| Linux/Android | Vulkan | ✅ Production |
+| Windows | DX12 | ✅ Production |
+| Browser | WebGPU | ✅ via wasm32 target |
+| NVIDIA GPU | CUDA | 📋 Phase 4 (drop-in `impl Backend for CudaBackend`) |
+
+End-to-end examples:
+
+- [`crates/rustorch/examples/mnist_wgpu.rs`](crates/rustorch/examples/mnist_wgpu.rs) — MLP training on synthetic MNIST
+- [`crates/rustorch/examples/cpu_vs_wgpu_train.rs`](crates/rustorch/examples/cpu_vs_wgpu_train.rs) — CPU vs Wgpu training-step bench
+
+```sh
+cargo run -p rustorch --release --example mnist_wgpu --features wgpu
+cargo run -p rustorch --release --example cpu_vs_wgpu_train --features wgpu
+```
+
+**Architecture note** (Storage Option B, transitional): every wgpu op
+currently pays a host↔device round-trip because the Tensor stores its
+data in a CPU shadow with a `Device` tag. Correctness is solid (parity
+tests cosine ≥ 0.999 vs CPU on Metal, including forward+backward+optimiser
+chains) but raw throughput is lower than a fully-resident GPU storage.
+Storage Option A (Tensor enum `Cpu(Vec<f32>) | Wgpu(WgpuStorage)`) is the
+perf follow-up; it removes the round-trip and unlocks the speedup ceiling.
+
 ## Project documentation
 
 - [`docs/rfcs/`](docs/rfcs/) — architectural RFCs (Phase 0 deliverable)
+- [`ROADMAP.md`](ROADMAP.md) — phase-by-phase milestones
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution guide, commit style
 - [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor Covenant 2.1
 
