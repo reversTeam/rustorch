@@ -13,8 +13,20 @@ categories.workspace = true
 [dependencies]
 rustorch-core = { workspace = true }
 rustorch-cpu  = { workspace = true }
+# Optional: wgpu backend dispatch. Off by default so non-GPU consumers
+# don't pay the wgpu compile-time cost. Enable with `--features wgpu`
+# (or via the umbrella crate's `wgpu` feature).
+rustorch-wgpu = { workspace = true, optional = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
+
+[features]
+default = []
+# Enable Variable::device == Wgpu dispatch through the rustorch-wgpu
+# backend. Without this feature, dispatching to Wgpu panics with a clear
+# error. With it, every autograd op forwards to `wgpu_backend()` when
+# its inputs live on the GPU.
+wgpu = ["dep:rustorch-wgpu"]
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

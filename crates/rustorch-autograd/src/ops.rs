@@ -18,6 +18,7 @@
 //! pattern.
 
 use crate::backward::BackwardError;
+use crate::dispatch::{pick_backend, require_same_device_2};
 use crate::node::{Edge, Node};
 use crate::tape::is_grad_enabled;
 use crate::variable::Variable;
@@ -63,7 +64,8 @@ impl Node for AddBackward {
 
 /// `lhs + rhs` (autograd-aware).
 pub fn add(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("add", lhs, rhs)?;
+    let out = pick_backend(device)
         .add(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("add", e))?;
     let mut out = Variable::new(out);
@@ -106,7 +108,8 @@ impl Node for SubBackward {
 
 /// `lhs - rhs`.
 pub fn sub(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("sub", lhs, rhs)?;
+    let out = pick_backend(device)
         .sub(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("sub", e))?;
     let mut out = Variable::new(out);
@@ -158,7 +161,8 @@ impl Node for MulBackward {
 
 /// `lhs * rhs`.
 pub fn mul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("mul", lhs, rhs)?;
+    let out = pick_backend(device)
         .mul(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("mul", e))?;
     let mut out = Variable::new(out);
@@ -196,7 +200,7 @@ impl Node for NegBackward {
 
 /// `-src`.
 pub fn neg(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .neg(&src.tensor())
         .map_err(|e| backend_err("neg", e))?;
     let mut out = Variable::new(out);
@@ -238,7 +242,8 @@ impl Node for MatMulBackward {
 
 /// `lhs @ rhs` (rank-2 matmul).
 pub fn matmul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("matmul", lhs, rhs)?;
+    let out = pick_backend(device)
         .matmul(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("matmul", e))?;
     let mut out = Variable::new(out);
@@ -286,7 +291,7 @@ impl Node for ReluBackward {
 
 /// `relu(src)`.
 pub fn relu(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .relu(&src.tensor())
         .map_err(|e| backend_err("relu", e))?;
     let mut out = Variable::new(out);
@@ -333,7 +338,7 @@ impl Node for SigmoidBackward {
 
 /// `sigmoid(src)`.
 pub fn sigmoid(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .sigmoid(&src.tensor())
         .map_err(|e| backend_err("sigmoid", e))?;
     let mut out_var = Variable::new(out.clone());
@@ -379,7 +384,7 @@ impl Node for TanhBackward {
 
 /// `tanh(src)`.
 pub fn tanh(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .tanh(&src.tensor())
         .map_err(|e| backend_err("tanh", e))?;
     let mut out_var = Variable::new(out.clone());
@@ -426,7 +431,7 @@ impl Node for SumBackward {
 
 /// Full-tensor sum.
 pub fn sum(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .sum(&src.tensor())
         .map_err(|e| backend_err("sum", e))?;
     let mut out_var = Variable::new(out);
@@ -468,7 +473,7 @@ impl Node for MeanBackward {
 
 /// Full-tensor mean.
 pub fn mean(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .mean(&src.tensor())
         .map_err(|e| backend_err("mean", e))?;
     let mut out_var = Variable::new(out);
@@ -539,7 +544,8 @@ pub fn cross_entropy(
     reduction: Reduction,
 ) -> Result<Variable, BackwardError> {
     // Forward: cross_entropy via the backend (= log_softmax + nll).
-    let loss = cpu_backend()
+    let device = require_same_device_2("cross_entropy", input, target)?;
+    let loss = pick_backend(device)
         .cross_entropy(&input.tensor(), &target.tensor(), reduction)
         .map_err(|e| backend_err("cross_entropy", e))?;
     let mut out_var = Variable::new(loss);
@@ -599,6 +605,7 @@ impl Node for AddBiasBackward {
 
 /// `x + bias` where `bias.shape == x.shape[1..]` (broadcast across batch).
 pub fn add_bias(x: &Variable, bias: &Variable) -> Result<Variable, BackwardError> {
+    let device = require_same_device_2("add_bias", x, bias)?;
     let x_t = x.tensor();
     let bias_t = bias.tensor();
     if x_t.ndim() != 2 || bias_t.ndim() != 1 {
@@ -630,7 +637,7 @@ pub fn add_bias(x: &Variable, bias: &Variable) -> Result<Variable, BackwardError
         wide.extend_from_slice(bias_buf);
     }
     let bias_wide = Tensor::from_vec([batch, n_out], wide).expect("bias broadcast shape");
-    let out = cpu_backend()
+    let out = pick_backend(device)
         .add(&x_t, &bias_wide)
         .map_err(|e| backend_err("add_bias", e))?;
     let mut out_var = Variable::new(out);
@@ -684,7 +691,8 @@ pub fn mse_loss(
     target: &Variable,
     reduction: Reduction,
 ) -> Result<Variable, BackwardError> {
-    let loss = cpu_backend()
+    let device = require_same_device_2("mse_loss", input, target)?;
+    let loss = pick_backend(device)
         .mse_loss(&input.tensor(), &target.tensor(), reduction)
         .map_err(|e| backend_err("mse_loss", e))?;
     let mut out_var = Variable::new(loss);
@@ -743,7 +751,7 @@ impl Node for SiluBackward {
 
 /// `silu(src)` = `src * sigmoid(src)` (a.k.a. swish, autograd-aware).
 pub fn silu(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .silu(&src.tensor())
         .map_err(|e| backend_err("silu", e))?;
     let mut out_var = Variable::new(out);
@@ -794,7 +802,7 @@ impl Node for LeakyReluBackward {
 
 /// `leaky_relu(src, slope)` (autograd-aware).
 pub fn leaky_relu(src: &Variable, slope: f64) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .leaky_relu(&src.tensor(), slope)
         .map_err(|e| backend_err("leaky_relu", e))?;
     let mut out_var = Variable::new(out);
@@ -846,7 +854,7 @@ impl Node for SoftmaxBackward {
 
 /// `softmax(src, dim)` (numerically stable, autograd-aware).
 pub fn softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .softmax(&src.tensor(), dim)
         .map_err(|e| backend_err("softmax", e))?;
     let mut out_var = Variable::new(out.clone());
@@ -899,7 +907,7 @@ impl Node for LogSoftmaxBackward {
 
 /// `log_softmax(src, dim)` (autograd-aware).
 pub fn log_softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .log_softmax(&src.tensor(), dim)
         .map_err(|e| backend_err("log_softmax", e))?;
     let mut out_var = Variable::new(out.clone());
@@ -957,7 +965,8 @@ impl Node for DivBackward {
 
 /// `lhs / rhs` (autograd-aware).
 pub fn div(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("div", lhs, rhs)?;
+    let out = pick_backend(device)
         .div(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("div", e))?;
     let mut out_var = Variable::new(out);
@@ -999,7 +1008,7 @@ impl Node for ExpBackward {
 
 /// `exp(src)` (autograd-aware).
 pub fn exp(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .exp(&src.tensor())
         .map_err(|e| backend_err("exp", e))?;
     let mut out_var = Variable::new(out.clone());
@@ -1040,7 +1049,7 @@ impl Node for LogBackward {
 
 /// `log(src)` (natural log, autograd-aware).
 pub fn log(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .log(&src.tensor())
         .map_err(|e| backend_err("log", e))?;
     let mut out_var = Variable::new(out);
@@ -1088,7 +1097,7 @@ impl Node for SqrtBackward {
 
 /// `sqrt(src)` (autograd-aware).
 pub fn sqrt(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .sqrt(&src.tensor())
         .map_err(|e| backend_err("sqrt", e))?;
     let mut out_var = Variable::new(out.clone());
@@ -1140,7 +1149,7 @@ impl Node for AbsBackward {
 
 /// `abs(src)` (autograd-aware).
 pub fn abs(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .abs(&src.tensor())
         .map_err(|e| backend_err("abs", e))?;
     let mut out_var = Variable::new(out);
@@ -1188,7 +1197,7 @@ impl Node for PowScalarBackward {
 
 /// `src.pow(exponent)` (scalar exponent, autograd-aware).
 pub fn pow_scalar(src: &Variable, exponent: f64) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .pow_scalar(&src.tensor(), exponent)
         .map_err(|e| backend_err("pow_scalar", e))?;
     let mut out_var = Variable::new(out);
@@ -1250,7 +1259,7 @@ impl Node for IndexSelectBackward {
 /// `index_select(src, 0, indices)` — gather rows of `src` by 1-D I64
 /// indices (autograd-aware; backward via scatter-add).
 pub fn index_select(src: &Variable, indices: &Tensor) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .index_select(&src.tensor(), 0, indices)
         .map_err(|e| backend_err("index_select", e))?;
     let mut out_var = Variable::new(out);
@@ -1268,59 +1277,11 @@ pub fn index_select(src: &Variable, indices: &Tensor) -> Result<Variable, Backwa
 
 // --------------------------------------------------------------------------
 // bmm — batched matmul: [B, M, K] @ [B, K, N] = [B, M, N]
+// Forward now goes through the `Backend::bmm` trait method (added in P3.Y
+// Phase A3); this module keeps `bmm_grad_inputs` for the backward path
+// until Phase C1 wires backward through the trait too.
 // Backward: dA[bi] = grad[bi] @ B[bi].T;  dB[bi] = A[bi].T @ grad[bi]
 // --------------------------------------------------------------------------
-
-fn bmm_forward(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackwardError> {
-    let l_shape = lhs.shape();
-    let r_shape = rhs.shape();
-    if l_shape.len() != 3 || r_shape.len() != 3 {
-        return Err(BackwardError::Backend {
-            op: "bmm",
-            message: format!("bmm needs rank-3 inputs, got {l_shape:?} @ {r_shape:?}"),
-        });
-    }
-    let (b, m, k1) = (l_shape[0], l_shape[1], l_shape[2]);
-    let (b2, k2, n) = (r_shape[0], r_shape[1], r_shape[2]);
-    if b != b2 || k1 != k2 {
-        return Err(BackwardError::Backend {
-            op: "bmm",
-            message: format!("shape mismatch: {l_shape:?} @ {r_shape:?}"),
-        });
-    }
-    let l_data = lhs
-        .as_slice::<f32>()
-        .ok_or_else(|| BackwardError::Backend {
-            op: "bmm",
-            message: "lhs must be contiguous F32".to_string(),
-        })?;
-    let r_data = rhs
-        .as_slice::<f32>()
-        .ok_or_else(|| BackwardError::Backend {
-            op: "bmm",
-            message: "rhs must be contiguous F32".to_string(),
-        })?;
-    let k = k1;
-    let mut out = vec![0.0_f32; b * m * n];
-    for bi in 0..b {
-        let l_off = bi * m * k;
-        let r_off = bi * k * n;
-        let o_off = bi * m * n;
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0_f32;
-                for kk in 0..k {
-                    acc += l_data[l_off + i * k + kk] * r_data[r_off + kk * n + j];
-                }
-                out[o_off + i * n + j] = acc;
-            }
-        }
-    }
-    Tensor::from_vec([b, m, n], out).map_err(|e| BackwardError::Backend {
-        op: "bmm",
-        message: format!("output build: {e}"),
-    })
-}
 
 struct BmmBackward {
     lhs_saved: Tensor,
@@ -1725,7 +1686,10 @@ pub fn reshape(src: &Variable, shape: Vec<usize>) -> Result<Variable, BackwardEr
 
 /// Batched matmul `[B, M, K] @ [B, K, N] = [B, M, N]` (autograd-aware).
 pub fn bmm(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = bmm_forward(&lhs.tensor(), &rhs.tensor())?;
+    let device = require_same_device_2("bmm", lhs, rhs)?;
+    let out = pick_backend(device)
+        .bmm(&lhs.tensor(), &rhs.tensor())
+        .map_err(|e| backend_err("bmm", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
         let node = std::sync::Arc::new(BmmBackward {
@@ -1774,7 +1738,7 @@ impl Node for MeanDimBackward {
 
 /// `mean(src, dims, keepdim=true)` (autograd-aware; v1 requires keepdim=true).
 pub fn mean_dim(src: &Variable, dims: &[usize]) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .mean_dim(&src.tensor(), dims, true)
         .map_err(|e| backend_err("mean_dim", e))?;
     let mut out_var = Variable::new(out);

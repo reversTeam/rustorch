@@ -34,6 +34,21 @@ pub enum BackwardError {
         /// The backend message.
         message: String,
     },
+    /// An op was called with operands on different devices (e.g. one CPU,
+    /// one Wgpu). PyTorch-style: no auto-promotion; caller must
+    /// `to_device()` first.
+    #[error(
+        "device mismatch in {op}: lhs={lhs:?}, rhs={rhs:?}; \
+         use Variable::to_device() to bring operands onto the same device"
+    )]
+    DeviceMismatch {
+        /// The op name.
+        op: &'static str,
+        /// LHS device.
+        lhs: rustorch_core::tensor::device::Device,
+        /// RHS device.
+        rhs: rustorch_core::tensor::device::Device,
+    },
 }
 
 /// Run reverse-mode autograd starting from `output`. Accumulates

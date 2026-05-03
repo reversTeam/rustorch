@@ -20,6 +20,7 @@ pub mod backward;
 pub mod broadcast;
 pub mod checkpoint;
 pub mod custom_function;
+pub(crate) mod dispatch;
 pub mod higher_order;
 pub mod node;
 pub mod ops;
