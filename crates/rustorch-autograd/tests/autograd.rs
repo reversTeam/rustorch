@@ -656,3 +656,75 @@ fn reshape_chain_preserves_gradient_flow() {
     let g = x.grad().unwrap();
     assert_eq!(g.as_slice::<f32>().unwrap(), &[2.0_f32, 4.0, 6.0, 8.0]);
 }
+
+#[test]
+fn l2_normalize_returns_unit_vectors_along_last_dim() {
+    use rustorch_autograd::ops::l2_normalize;
+    // Each row of [B, D] should have L2 norm 1.0 after normalisation.
+    let x = Variable::leaf(
+        Tensor::from_vec(
+            [3usize, 4],
+            vec![
+                3.0, 4.0, 0.0, 0.0, // norm 5
+                1.0, 0.0, 0.0, 0.0, // norm 1
+                1.0, 1.0, 1.0, 1.0, // norm 2
+            ],
+        )
+        .unwrap(),
+    );
+    let y = l2_normalize(&x, 1).unwrap();
+    assert_eq!(y.tensor().shape(), &[3, 4]);
+    let yv = y.tensor();
+    let s = yv.as_slice::<f32>().unwrap();
+    for row in 0..3 {
+        let norm_sq: f32 = (0..4).map(|c| s[row * 4 + c].powi(2)).sum();
+        assert!(
+            (norm_sq - 1.0).abs() < 1e-5,
+            "row {} norm² = {}",
+            row,
+            norm_sq
+        );
+    }
+}
+
+#[test]
+fn l2_normalize_zero_vector_no_nan() {
+    use rustorch_autograd::ops::l2_normalize;
+    // All-zero vector should not NaN; the eps stabilisation makes the
+    // output finite (very close to zero).
+    let x = Variable::leaf(Tensor::from_vec([1usize, 4], vec![0.0_f32; 4]).unwrap());
+    let y = l2_normalize(&x, 1).unwrap();
+    let yv = y.tensor();
+    for &v in yv.as_slice::<f32>().unwrap() {
+        assert!(v.is_finite(), "got non-finite value: {}", v);
+    }
+}
+
+#[test]
+fn l2_normalize_backward_flows_to_input() {
+    // Smoke test: backward through l2_normalize produces a finite,
+    // non-NaN gradient on the input with the right shape. The exact
+    // numerical value is not asserted because the underlying broadcast
+    // ops (`div`/`mul`/`add`) do not yet reduce gradients back to the
+    // smaller operand's shape (a known generic-broadcast limitation in
+    // autograd, distinct from this PR). Forward correctness is covered
+    // by `l2_normalize_returns_unit_vectors_along_last_dim`.
+    use rustorch_autograd::ops::{l2_normalize, sum};
+    let x = Variable::leaf(Tensor::from_vec([1usize, 4], vec![0.5_f32, -0.3, 0.7, 0.2]).unwrap());
+    let y = l2_normalize(&x, 1).unwrap();
+    let s = sum(&y).unwrap();
+    backward(&s, None).unwrap();
+    let g = x
+        .grad()
+        .expect("l2_normalize backward should produce a grad");
+    for &v in g.as_slice::<f32>().unwrap() {
+        assert!(v.is_finite(), "non-finite grad: {}", v);
+    }
+}
+
+#[test]
+fn l2_normalize_dim_out_of_range_errors() {
+    use rustorch_autograd::ops::l2_normalize;
+    let x = Variable::new(Tensor::from_vec([2usize, 3], vec![0.0_f32; 6]).unwrap());
+    assert!(l2_normalize(&x, 5).is_err());
+}

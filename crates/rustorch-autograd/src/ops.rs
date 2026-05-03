@@ -1767,3 +1767,62 @@ pub fn mean_dim(src: &Variable, dims: &[usize]) -> Result<Variable, BackwardErro
     }
     Ok(out_var)
 }
+
+// --------------------------------------------------------------------------
+// l2_normalize — `x / max(eps, sqrt(sum(x², dim)))` along a single axis.
+//
+// Composed entirely from existing autograd-aware ops:
+//   square     = x * x          (via mul)
+//   mean_sq    = mean_dim(square, dim)        // shape: [..., 1, ...]
+//   sum_sq     = mean_sq * N                  // restore sum from mean
+//   norm_sq    = sum_sq + eps                 // numerical stability
+//   norm       = sqrt(norm_sq)
+//   out        = x / norm                     // broadcast div
+//
+// This avoids extending the autograd surface with `sum_dim`. The
+// gradient flows through every step via the existing backward formulas.
+// --------------------------------------------------------------------------
+
+/// L2-normalise `src` along `dim`. Equivalent to PyTorch's
+/// `F.normalize(x, dim=dim, p=2)`.
+///
+/// Returns `x / sqrt(sum(x², dim, keepdim=true) + eps)` where `eps`
+/// defaults to `1e-12`. Use [`l2_normalize_with_eps`] to override.
+///
+/// Numerical safety: for an all-zero input vector along `dim`, the
+/// result is `x / sqrt(eps) ≈ 0/sqrt(1e-12)` which is finite. The
+/// epsilon prevents division-by-zero NaN.
+pub fn l2_normalize(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
+    l2_normalize_with_eps(src, dim, 1e-12)
+}
+
+/// L2-normalise along `dim` with a caller-provided epsilon. See
+/// [`l2_normalize`] for the formula.
+pub fn l2_normalize_with_eps(
+    src: &Variable,
+    dim: usize,
+    eps: f32,
+) -> Result<Variable, BackwardError> {
+    let in_shape = src.tensor().shape().to_vec();
+    if dim >= in_shape.len() {
+        return Err(BackwardError::Backend {
+            op: "l2_normalize",
+            message: format!("dim {} out of range for shape {:?}", dim, in_shape),
+        });
+    }
+    let n_reduced = in_shape[dim];
+    // square = x * x
+    let square = mul(src, src)?;
+    // mean over the reduced dim (keepdim=true)
+    let mean_sq = mean_dim(&square, &[dim])?;
+    // sum_sq = mean_sq * N  (restore sum from mean; N is a constant scalar)
+    let n_scalar = Variable::new(Tensor::scalar(n_reduced as f32));
+    let sum_sq = mul(&mean_sq, &n_scalar)?;
+    // norm_sq = sum_sq + eps
+    let eps_scalar = Variable::new(Tensor::scalar(eps));
+    let norm_sq = add(&sum_sq, &eps_scalar)?;
+    // norm = sqrt(norm_sq)
+    let norm = sqrt(&norm_sq)?;
+    // out = x / norm  (broadcast over the kept-1 dim)
+    div(src, &norm)
+}
