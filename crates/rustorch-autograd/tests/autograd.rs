@@ -728,3 +728,174 @@ fn l2_normalize_dim_out_of_range_errors() {
     let x = Variable::new(Tensor::from_vec([2usize, 3], vec![0.0_f32; 6]).unwrap());
     assert!(l2_normalize(&x, 5).is_err());
 }
+
+// ============================================================================
+// Broadcast backward tests — fixes for the bug reported by the user
+// (mul [B,T,2,1] × [B,T,2,256] crashes at backward).
+// ============================================================================
+
+#[test]
+fn mul_broadcast_backward_reduces_gradient_to_input_shape_b_t_2_1() {
+    // The exact failure mode the user reported.
+    let b = 2usize;
+    let t = 3usize;
+    let d = 8usize; // small for the test; the real case is 256
+    let lhs_data: Vec<f32> = (0..(b * t * 2)).map(|i| (i + 1) as f32 / 10.0).collect();
+    let rhs_data: Vec<f32> = (0..(b * t * 2 * d))
+        .map(|i| (i + 1) as f32 / 100.0)
+        .collect();
+
+    let lhs = Variable::leaf(Tensor::from_vec([b, t, 2, 1], lhs_data).unwrap());
+    let rhs = Variable::leaf(Tensor::from_vec([b, t, 2, d], rhs_data).unwrap());
+
+    let out = mul(&lhs, &rhs).unwrap();
+    assert_eq!(out.tensor().shape(), &[b, t, 2, d]);
+
+    let s = sum(&out).unwrap();
+    backward(&s, None).unwrap();
+
+    let g_lhs = lhs.grad().expect("lhs grad missing");
+    let g_rhs = rhs.grad().expect("rhs grad missing");
+
+    // The fix: gradients have the SAME shape as the original inputs.
+    assert_eq!(
+        g_lhs.shape(),
+        &[b, t, 2, 1],
+        "lhs grad shape should be reduced back"
+    );
+    assert_eq!(g_rhs.shape(), &[b, t, 2, d], "rhs grad shape unchanged");
+
+    // All finite.
+    for &v in g_lhs.as_slice::<f32>().unwrap() {
+        assert!(v.is_finite(), "non-finite lhs grad: {v}");
+    }
+    for &v in g_rhs.as_slice::<f32>().unwrap() {
+        assert!(v.is_finite(), "non-finite rhs grad: {v}");
+    }
+}
+
+#[test]
+fn mul_broadcast_gradcheck_finite_difference() {
+    // Validates that the unbroadcast reduction produces NUMERICALLY correct
+    // gradients (not just well-shaped). f(x, y) = sum(x * y), df/dx = sum_over_broadcast_axes(y).
+    let x_shape = [2usize, 3, 1];
+    let y_shape = [2usize, 3, 4];
+    let x_data: Vec<f32> = vec![0.5, -0.2, 0.3, 0.7, -0.1, 0.4];
+    let y_data: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) / 10.0).collect();
+
+    let x = Variable::leaf(Tensor::from_vec(x_shape, x_data.clone()).unwrap());
+    let y = Variable::leaf(Tensor::from_vec(y_shape, y_data.clone()).unwrap());
+    let z = sum(&mul(&x, &y).unwrap()).unwrap();
+    backward(&z, None).unwrap();
+
+    let analytic_x = x.grad().unwrap().as_slice::<f32>().unwrap().to_vec();
+    let analytic_y = y.grad().unwrap().as_slice::<f32>().unwrap().to_vec();
+
+    // Finite-difference check on x (the broadcast operand).
+    let eps = 1e-3;
+    for i in 0..x_data.len() {
+        let mut lo = x_data.clone();
+        let mut hi = x_data.clone();
+        lo[i] -= eps;
+        hi[i] += eps;
+        let fl = forward_sum_xy(&lo, x_shape, &y_data, y_shape);
+        let fh = forward_sum_xy(&hi, x_shape, &y_data, y_shape);
+        let fd = (fh - fl) / (2.0 * eps);
+        assert!(
+            (analytic_x[i] - fd).abs() < 1e-2,
+            "x[{i}] grad mismatch: analytic={} fd={}",
+            analytic_x[i],
+            fd
+        );
+    }
+
+    // Finite-difference check on y (full-shape operand).
+    for i in 0..y_data.len() {
+        let mut lo = y_data.clone();
+        let mut hi = y_data.clone();
+        lo[i] -= eps;
+        hi[i] += eps;
+        let fl = forward_sum_xy(&x_data, x_shape, &lo, y_shape);
+        let fh = forward_sum_xy(&x_data, x_shape, &hi, y_shape);
+        let fd = (fh - fl) / (2.0 * eps);
+        assert!(
+            (analytic_y[i] - fd).abs() < 1e-2,
+            "y[{i}] grad mismatch: analytic={} fd={}",
+            analytic_y[i],
+            fd
+        );
+    }
+}
+
+fn forward_sum_xy(x: &[f32], xs: [usize; 3], y: &[f32], ys: [usize; 3]) -> f32 {
+    let xv = Variable::new(Tensor::from_vec(xs, x.to_vec()).unwrap());
+    let yv = Variable::new(Tensor::from_vec(ys, y.to_vec()).unwrap());
+    let z = sum(&mul(&xv, &yv).unwrap()).unwrap();
+    z.tensor().as_slice::<f32>().unwrap()[0]
+}
+
+#[test]
+fn add_broadcast_backward_reduces_to_smaller_shape() {
+    // a [B, 1] + b [B, N] -> output [B, N]. Backward to a needs sum over axis 1 keepdim.
+    let b = 3usize;
+    let n = 5usize;
+    let a_data = vec![0.1_f32, 0.2, 0.3];
+    let bb_data: Vec<f32> = (0..(b * n)).map(|i| i as f32 / 10.0).collect();
+
+    let a = Variable::leaf(Tensor::from_vec([b, 1usize], a_data).unwrap());
+    let bb = Variable::leaf(Tensor::from_vec([b, n], bb_data).unwrap());
+    let out = add(&a, &bb).unwrap();
+    let s = sum(&out).unwrap();
+    backward(&s, None).unwrap();
+
+    let g_a = a.grad().unwrap();
+    let g_b = bb.grad().unwrap();
+    assert_eq!(g_a.shape(), &[b, 1]);
+    assert_eq!(g_b.shape(), &[b, n]);
+    // Each row of g_a should equal n (since d/da_i sum(a_i + b_ij) = N).
+    for &v in g_a.as_slice::<f32>().unwrap() {
+        assert!((v - n as f32).abs() < 1e-5, "expected {n}, got {v}");
+    }
+}
+
+#[test]
+fn div_broadcast_backward_reduces_to_smaller_shape() {
+    // x [B, 1] / y [B, N] -> output [B, N]. Both grads must reduce correctly.
+    let b = 2usize;
+    let n = 4usize;
+    let x_data = vec![1.0_f32, 2.0];
+    let y_data: Vec<f32> = (1..=(b * n)).map(|i| i as f32).collect();
+
+    let x = Variable::leaf(Tensor::from_vec([b, 1usize], x_data).unwrap());
+    let y = Variable::leaf(Tensor::from_vec([b, n], y_data).unwrap());
+    let out = div(&x, &y).unwrap();
+    let s = sum(&out).unwrap();
+    backward(&s, None).unwrap();
+
+    assert_eq!(x.grad().unwrap().shape(), &[b, 1]);
+    assert_eq!(y.grad().unwrap().shape(), &[b, n]);
+    for &v in x.grad().unwrap().as_slice::<f32>().unwrap() {
+        assert!(v.is_finite());
+    }
+    for &v in y.grad().unwrap().as_slice::<f32>().unwrap() {
+        assert!(v.is_finite());
+    }
+}
+
+#[test]
+fn sub_broadcast_backward_reduces_to_smaller_shape() {
+    // [B, 1] - [B, N]: g_a = sum_axis1, g_b = -grad
+    let b = 2usize;
+    let n = 3usize;
+    let a = Variable::leaf(Tensor::from_vec([b, 1usize], vec![1.0_f32, 2.0]).unwrap());
+    let bb = Variable::leaf(Tensor::from_vec([b, n], vec![0.5_f32; b * n]).unwrap());
+    let out = sub(&a, &bb).unwrap();
+    let s = sum(&out).unwrap();
+    backward(&s, None).unwrap();
+
+    assert_eq!(a.grad().unwrap().shape(), &[b, 1]);
+    assert_eq!(bb.grad().unwrap().shape(), &[b, n]);
+    for &v in a.grad().unwrap().as_slice::<f32>().unwrap() {
+        assert!((v - n as f32).abs() < 1e-5);
+    }
+}

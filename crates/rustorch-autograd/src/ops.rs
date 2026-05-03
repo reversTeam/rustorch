@@ -38,6 +38,10 @@ fn backend_err(op: &'static str, e: rustorch_cpu::error::BackendError) -> Backwa
 // --------------------------------------------------------------------------
 
 struct AddBackward {
+    /// Original input shapes — used to unbroadcast the upstream gradient
+    /// when forward broadcast was performed (e.g. `[B, T, 1] + [B, T, D]`).
+    lhs_shape: Vec<usize>,
+    rhs_shape: Vec<usize>,
     edges: [Edge; 2],
 }
 
@@ -46,8 +50,11 @@ impl Node for AddBackward {
         "AddBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        // Both inputs receive the same upstream gradient.
-        vec![Some(grad.clone()), Some(grad.clone())]
+        // Both inputs receive the same upstream gradient, but each must be
+        // reduced back to the input's original shape if forward broadcast.
+        let g_lhs = crate::broadcast::unbroadcast_to(grad, &self.lhs_shape);
+        let g_rhs = crate::broadcast::unbroadcast_to(grad, &self.rhs_shape);
+        vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {
         &self.edges
@@ -62,6 +69,8 @@ pub fn add(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
     let mut out = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
         let node = std::sync::Arc::new(AddBackward {
+            lhs_shape: lhs.tensor().shape().to_vec(),
+            rhs_shape: rhs.tensor().shape().to_vec(),
             edges: [lhs.edge(), rhs.edge()],
         });
         out.grad_fn = Some(node);
@@ -75,6 +84,8 @@ pub fn add(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
 // --------------------------------------------------------------------------
 
 struct SubBackward {
+    lhs_shape: Vec<usize>,
+    rhs_shape: Vec<usize>,
     edges: [Edge; 2],
 }
 
@@ -84,7 +95,9 @@ impl Node for SubBackward {
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
         let neg_grad = cpu_backend().neg(grad).expect("neg never fails on f32/f64");
-        vec![Some(grad.clone()), Some(neg_grad)]
+        let g_lhs = crate::broadcast::unbroadcast_to(grad, &self.lhs_shape);
+        let g_rhs = crate::broadcast::unbroadcast_to(&neg_grad, &self.rhs_shape);
+        vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {
         &self.edges
@@ -99,6 +112,8 @@ pub fn sub(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
     let mut out = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
         let node = std::sync::Arc::new(SubBackward {
+            lhs_shape: lhs.tensor().shape().to_vec(),
+            rhs_shape: rhs.tensor().shape().to_vec(),
             edges: [lhs.edge(), rhs.edge()],
         });
         out.grad_fn = Some(node);
@@ -122,12 +137,18 @@ impl Node for MulBackward {
         "MulBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        let g_lhs = cpu_backend()
+        // d(x*y)/dx = y, d(x*y)/dy = x. The mul operates with broadcast,
+        // so the raw products take the broadcast output shape — they must
+        // be reduced back to each input's original shape before being
+        // accumulated into the input slots.
+        let g_lhs_raw = cpu_backend()
             .mul(grad, &self.rhs_saved)
             .expect("mul backward");
-        let g_rhs = cpu_backend()
+        let g_rhs_raw = cpu_backend()
             .mul(grad, &self.lhs_saved)
             .expect("mul backward");
+        let g_lhs = crate::broadcast::unbroadcast_to(&g_lhs_raw, self.lhs_saved.shape());
+        let g_rhs = crate::broadcast::unbroadcast_to(&g_rhs_raw, self.rhs_saved.shape());
         vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {
@@ -909,10 +930,12 @@ impl Node for DivBackward {
         "DivBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        let g_lhs = cpu_backend()
+        // d(x/y)/dx = 1/y ; d(x/y)/dy = -x/y²
+        // Both raw products take the broadcast output shape — reduce back
+        // to each input's original shape before accumulating.
+        let g_lhs_raw = cpu_backend()
             .div(grad, &self.rhs_saved)
             .expect("div bw: g/rhs");
-        // dy = -x/y² * grad = -lhs * grad / (rhs*rhs)
         let rhs_sq = cpu_backend()
             .mul(&self.rhs_saved, &self.rhs_saved)
             .expect("div bw: rhs²");
@@ -922,7 +945,9 @@ impl Node for DivBackward {
         let div_term = cpu_backend()
             .div(&lhs_grad, &rhs_sq)
             .expect("div bw: x*g/rhs²");
-        let g_rhs = cpu_backend().neg(&div_term).expect("div bw: neg");
+        let g_rhs_raw = cpu_backend().neg(&div_term).expect("div bw: neg");
+        let g_lhs = crate::broadcast::unbroadcast_to(&g_lhs_raw, self.lhs_saved.shape());
+        let g_rhs = crate::broadcast::unbroadcast_to(&g_rhs_raw, self.rhs_saved.shape());
         vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {

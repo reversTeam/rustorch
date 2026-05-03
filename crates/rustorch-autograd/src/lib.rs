@@ -17,6 +17,7 @@
 pub mod anomaly;
 pub mod autocast;
 pub mod backward;
+pub mod broadcast;
 pub mod checkpoint;
 pub mod custom_function;
 pub mod higher_order;
