@@ -21,6 +21,7 @@
 pub mod argmax;
 pub mod attention;
 pub mod backend;
+pub mod backend_singleton;
 pub mod broadcast;
 pub mod cache;
 pub mod capabilities;
@@ -50,6 +51,7 @@ pub use attention::{
     apply_causal_mask, attention_naive, attention_naive_causal, mul_scalar, multi_head_attention,
 };
 pub use backend::WgpuBackend;
+pub use backend_singleton::{try_wgpu_backend, wgpu_backend};
 pub use broadcast::{broadcast_shape, dispatch_binary_broadcast};
 pub use capabilities::Capabilities;
 pub use conv::{conv2d_forward, transpose_weight, Conv2dCfg};

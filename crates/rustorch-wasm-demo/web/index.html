@@ -324,6 +324,33 @@ python3 -m http.server 8080
     <a href="resnet.html">ResNet block (raw WGPU)</a>
   </p>
 
+  <script>
+    // Compatibility shim — wgpu 22 (still pinned in this workspace) sends
+    // `maxInterStageShaderComponents` in the requestDevice descriptor.
+    // Chrome 130+ removed that limit from the WebGPU spec and now rejects
+    // any non-undefined value with `OperationError`. We monkey-patch the
+    // adapter's requestDevice once at page load to drop the offending
+    // field in place before the descriptor reaches the browser.
+    // Drop this when wgpu is bumped to a version that no longer emits
+    // the field.
+    (function () {
+      if (typeof GPUAdapter === "undefined" || !GPUAdapter.prototype) return;
+      const orig = GPUAdapter.prototype.requestDevice;
+      const STRIPPED = ["maxInterStageShaderComponents"];
+      GPUAdapter.prototype.requestDevice = function (descriptor) {
+        try {
+          if (descriptor && descriptor.requiredLimits) {
+            for (const k of STRIPPED) {
+              if (k in descriptor.requiredLimits) {
+                delete descriptor.requiredLimits[k];
+              }
+            }
+          }
+        } catch (_) { /* descriptor was a frozen WebIDL dict — let it go through unchanged */ }
+        return orig.call(this, descriptor);
+      };
+    })();
+  </script>
   <script type="module">
     import init, {
       run_demo,

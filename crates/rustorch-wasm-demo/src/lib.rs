@@ -142,8 +142,9 @@ mod web {
             .map_err(|e| JsValue::from_str(&format!("backend init: {e}")))?;
 
         // Synthetic inputs — a real demo would feed pre-tokenized text.
-        let mk = |seed: u64| -> Vec<f32> {
-            (0..(s * d))
+        // `mk(seed, n)` generates `n` deterministic f32 values in [-0.5, 0.5].
+        let mk = |seed: u64, n: usize| -> Vec<f32> {
+            (0..n)
                 .map(|i| {
                     let bits = seed
                         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -153,10 +154,12 @@ mod web {
                 })
                 .collect()
         };
-        let x_data = mk(0xA1);
-        let wq_data = mk(0xB2);
-        let wk_data = mk(0xC3);
-        let wv_data = mk(0xD4);
+        // `x` has shape [S, D] (S*D elements); the projection matrices
+        // have shape [D, D] (D*D elements each).
+        let x_data = mk(0xA1, s * d);
+        let wq_data = mk(0xB2, d * d);
+        let wk_data = mk(0xC3, d * d);
+        let wv_data = mk(0xD4, d * d);
         let gamma_data = vec![1.0_f32; d];
         let beta_data = vec![0.0_f32; d];
 

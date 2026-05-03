@@ -1429,6 +1429,10 @@ const GEMM_DISPATCH_MIN: usize = 32;
 /// Pure Rust state-of-the-art: `gemm` 0.18, NEON+AVX-512 explicit
 /// vectorization, ~70-80% Intel MKL on M4 Max NEON. Plan P3.X T2-new.
 /// Baseline before this change: 924 ms on 1024³ f32 (3.16 GF/s).
+///
+/// On wasm32 the `gemm` crate is unavailable (NEON/AVX intrinsics), so
+/// the wasm32 path always uses the scalar [`matmul_naive`] kernel.
+#[cfg(not(target_arch = "wasm32"))]
 fn matmul_dispatch_f32(
     lhs: &Tensor,
     rhs: &Tensor,
@@ -1494,8 +1498,23 @@ fn matmul_dispatch_f32(
     })
 }
 
+/// wasm32 fallback for `matmul_dispatch_f32` — `gemm` 0.18 doesn't
+/// support wasm32 (NEON/AVX intrinsics) so we always go through the
+/// scalar [`matmul_naive`] kernel.
+#[cfg(target_arch = "wasm32")]
+fn matmul_dispatch_f32(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Tensor, BackendError> {
+    matmul_naive::<f32>(lhs, rhs, m, k, n)
+}
+
 /// f64 matmul dispatch: SIMD `gemm` crate above [`GEMM_DISPATCH_MIN`],
 /// scalar fallback otherwise.
+#[cfg(not(target_arch = "wasm32"))]
 fn matmul_dispatch_f64(
     lhs: &Tensor,
     rhs: &Tensor,
@@ -1550,6 +1569,18 @@ fn matmul_dispatch_f64(
     Tensor::from_vec_typed::<f64, _>(vec![m, n], out_buf).map_err(|_| BackendError::OutOfMemory {
         bytes: m * n * core::mem::size_of::<f64>(),
     })
+}
+
+/// wasm32 fallback for `matmul_dispatch_f64` — scalar [`matmul_naive`].
+#[cfg(target_arch = "wasm32")]
+fn matmul_dispatch_f64(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Tensor, BackendError> {
+    matmul_naive::<f64>(lhs, rhs, m, k, n)
 }
 
 /// Generic naïve `O(M*K*N)` matmul. Walks contiguous-or-not via
