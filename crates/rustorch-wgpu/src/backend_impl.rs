@@ -377,10 +377,105 @@ impl Backend for WgpuBackend {
         }
     }
 
-    // Other optional methods (abs, sqrt, exp, log, softmax, log_softmax,
-    // transpose, bmm, softmax_grad, gather, scatter, conv2d, …) inherit
-    // the default `UnsupportedOp` impl from the trait. Phases B2+ and
-    // C2+ override them progressively as kernels are written.
+    // -------------------- CPU-fallback overrides (correctness-first) --------------------
+    //
+    // These methods proxy through CpuBackend and re-tag the result as Wgpu.
+    // Round-trip cost is identical to the native Wgpu helpers since data
+    // already lives in the CPU shadow under Storage Option B. Native WGSL
+    // kernels are perf optimisation backlog — but for plan completeness
+    // every method on the trait surface returns the correct result.
+
+    fn abs(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().abs(src).map(tag_wgpu)
+    }
+    fn sqrt(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().sqrt(src).map(tag_wgpu)
+    }
+    fn exp(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().exp(src).map(tag_wgpu)
+    }
+    fn log(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().log(src).map(tag_wgpu)
+    }
+    fn pow_scalar(&self, src: &Tensor, exponent: f64) -> Result<Tensor, BackendError> {
+        cpu_backend().pow_scalar(src, exponent).map(tag_wgpu)
+    }
+    fn leaky_relu(&self, src: &Tensor, slope: f64) -> Result<Tensor, BackendError> {
+        cpu_backend().leaky_relu(src, slope).map(tag_wgpu)
+    }
+    fn softmax(&self, src: &Tensor, dim: usize) -> Result<Tensor, BackendError> {
+        cpu_backend().softmax(src, dim).map(tag_wgpu)
+    }
+    fn log_softmax(&self, src: &Tensor, dim: usize) -> Result<Tensor, BackendError> {
+        cpu_backend().log_softmax(src, dim).map(tag_wgpu)
+    }
+    fn transpose(&self, src: &Tensor, d0: usize, d1: usize) -> Result<Tensor, BackendError> {
+        cpu_backend().transpose(src, d0, d1).map(tag_wgpu)
+    }
+    fn bmm(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().bmm(lhs, rhs).map(tag_wgpu)
+    }
+    fn index_select(
+        &self,
+        src: &Tensor,
+        dim: usize,
+        indices: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        cpu_backend().index_select(src, dim, indices).map(tag_wgpu)
+    }
+    fn scatter_add(
+        &self,
+        dst: &Tensor,
+        dim: usize,
+        idx: &Tensor,
+        src: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        cpu_backend().scatter_add(dst, dim, idx, src).map(tag_wgpu)
+    }
+    fn gather(&self, src: &Tensor, dim: usize, idx: &Tensor) -> Result<Tensor, BackendError> {
+        cpu_backend().gather(src, dim, idx).map(tag_wgpu)
+    }
+    fn cross_entropy(
+        &self,
+        input: &Tensor,
+        target: &Tensor,
+        reduction: rustorch_cpu::backend::Reduction,
+    ) -> Result<Tensor, BackendError> {
+        cpu_backend()
+            .cross_entropy(input, target, reduction)
+            .map(tag_wgpu)
+    }
+    fn mse_loss(
+        &self,
+        input: &Tensor,
+        target: &Tensor,
+        reduction: rustorch_cpu::backend::Reduction,
+    ) -> Result<Tensor, BackendError> {
+        cpu_backend()
+            .mse_loss(input, target, reduction)
+            .map(tag_wgpu)
+    }
+    fn nll_loss(
+        &self,
+        log_probs: &Tensor,
+        target: &Tensor,
+        reduction: rustorch_cpu::backend::Reduction,
+    ) -> Result<Tensor, BackendError> {
+        cpu_backend()
+            .nll_loss(log_probs, target, reduction)
+            .map(tag_wgpu)
+    }
+    fn softmax_grad(
+        &self,
+        grad: &Tensor,
+        output: &Tensor,
+        dim: usize,
+    ) -> Result<Tensor, BackendError> {
+        cpu_backend().softmax_grad(grad, output, dim).map(tag_wgpu)
+    }
+    fn argmax(&self, src: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor, BackendError> {
+        cpu_backend().argmax(src, dim, keepdim).map(tag_wgpu)
+    }
 }
 
 #[cfg(test)]
