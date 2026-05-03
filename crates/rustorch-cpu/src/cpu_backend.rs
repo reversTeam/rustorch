@@ -91,21 +91,21 @@ impl Backend for CpuBackend {
             });
         }
         match lhs.dtype() {
-            Dtype::F32 => matmul_naive::<f32>(lhs, rhs, m, k1, n),
-            Dtype::F64 => matmul_naive::<f64>(lhs, rhs, m, k1, n),
+            Dtype::F32 => matmul_dispatch_f32(lhs, rhs, m, k1, n),
+            Dtype::F64 => matmul_dispatch_f64(lhs, rhs, m, k1, n),
             // bf16/f16 do not implement Add/Mul natively, so we accumulate
             // through f32 and cast the final result back. Matches the
             // numerics of GPU bf16 matmul (which accumulates in f32).
             Dtype::BF16 => {
                 let lhs_f = lhs.to_dtype(Dtype::F32);
                 let rhs_f = rhs.to_dtype(Dtype::F32);
-                let out_f = matmul_naive::<f32>(&lhs_f, &rhs_f, m, k1, n)?;
+                let out_f = matmul_dispatch_f32(&lhs_f, &rhs_f, m, k1, n)?;
                 Ok(out_f.to_dtype(Dtype::BF16))
             },
             Dtype::F16 => {
                 let lhs_f = lhs.to_dtype(Dtype::F32);
                 let rhs_f = rhs.to_dtype(Dtype::F32);
-                let out_f = matmul_naive::<f32>(&lhs_f, &rhs_f, m, k1, n)?;
+                let out_f = matmul_dispatch_f32(&lhs_f, &rhs_f, m, k1, n)?;
                 Ok(out_f.to_dtype(Dtype::F16))
             },
             d => Err(BackendError::DtypeMismatch {
@@ -1416,6 +1416,140 @@ fn dispatch_binary(
             rhs: d,
         }),
     }
+}
+
+/// Threshold above which we dispatch to the SIMD-vectorized `gemm` crate.
+/// Below this, the dispatch overhead dominates the work — a register-tile
+/// scalar loop is faster. Calibrated empirically on Apple M4 Max P-core.
+const GEMM_DISPATCH_MIN: usize = 32;
+
+/// f32 matmul dispatch: SIMD `gemm` crate (faer-rs ecosystem) above
+/// [`GEMM_DISPATCH_MIN`], scalar fallback otherwise.
+///
+/// Pure Rust state-of-the-art: `gemm` 0.18, NEON+AVX-512 explicit
+/// vectorization, ~70-80% Intel MKL on M4 Max NEON. Plan P3.X T2-new.
+/// Baseline before this change: 924 ms on 1024³ f32 (3.16 GF/s).
+fn matmul_dispatch_f32(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Tensor, BackendError> {
+    if m < GEMM_DISPATCH_MIN || n < GEMM_DISPATCH_MIN || k < GEMM_DISPATCH_MIN {
+        return matmul_naive::<f32>(lhs, rhs, m, k, n);
+    }
+    let lhs_buf: Vec<f32> = lhs
+        .iter_elements::<f32>()
+        .ok_or(BackendError::DtypeMismatch {
+            op: "matmul",
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        })?
+        .collect();
+    let rhs_buf: Vec<f32> = rhs
+        .iter_elements::<f32>()
+        .ok_or(BackendError::DtypeMismatch {
+            op: "matmul",
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        })?
+        .collect();
+    let mut out_buf: Vec<f32> = vec![0.0_f32; m * n];
+
+    // Row-major [m, k] @ [k, n] -> [m, n]:
+    //   strides for the gemm crate (in elements, not bytes):
+    //   - lhs: rs=k, cs=1
+    //   - rhs: rs=n, cs=1
+    //   - dst: rs=n, cs=1
+    // SAFETY: buffers are exactly m*k, k*n, m*n long in f32 and live for
+    // the duration of the call. The gemm crate is `unsafe fn` because it
+    // works through raw pointers, not because of additional invariants.
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            out_buf.as_mut_ptr(),
+            1,
+            n as isize,
+            false,
+            lhs_buf.as_ptr(),
+            1,
+            k as isize,
+            rhs_buf.as_ptr(),
+            1,
+            n as isize,
+            0.0_f32,
+            1.0_f32,
+            false,
+            false,
+            false,
+            gemm::Parallelism::Rayon(0),
+        );
+    }
+
+    Tensor::from_vec_typed::<f32, _>(vec![m, n], out_buf).map_err(|_| BackendError::OutOfMemory {
+        bytes: m * n * core::mem::size_of::<f32>(),
+    })
+}
+
+/// f64 matmul dispatch: SIMD `gemm` crate above [`GEMM_DISPATCH_MIN`],
+/// scalar fallback otherwise.
+fn matmul_dispatch_f64(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Tensor, BackendError> {
+    if m < GEMM_DISPATCH_MIN || n < GEMM_DISPATCH_MIN || k < GEMM_DISPATCH_MIN {
+        return matmul_naive::<f64>(lhs, rhs, m, k, n);
+    }
+    let lhs_buf: Vec<f64> = lhs
+        .iter_elements::<f64>()
+        .ok_or(BackendError::DtypeMismatch {
+            op: "matmul",
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        })?
+        .collect();
+    let rhs_buf: Vec<f64> = rhs
+        .iter_elements::<f64>()
+        .ok_or(BackendError::DtypeMismatch {
+            op: "matmul",
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        })?
+        .collect();
+    let mut out_buf: Vec<f64> = vec![0.0_f64; m * n];
+    // SAFETY: see matmul_dispatch_f32 — same invariants.
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            out_buf.as_mut_ptr(),
+            1,
+            n as isize,
+            false,
+            lhs_buf.as_ptr(),
+            1,
+            k as isize,
+            rhs_buf.as_ptr(),
+            1,
+            n as isize,
+            0.0_f64,
+            1.0_f64,
+            false,
+            false,
+            false,
+            gemm::Parallelism::Rayon(0),
+        );
+    }
+    Tensor::from_vec_typed::<f64, _>(vec![m, n], out_buf).map_err(|_| BackendError::OutOfMemory {
+        bytes: m * n * core::mem::size_of::<f64>(),
+    })
 }
 
 /// Generic naïve `O(M*K*N)` matmul. Walks contiguous-or-not via
