@@ -27,6 +27,10 @@ default = []
 # error. With it, every autograd op forwards to `wgpu_backend()` when
 # its inputs live on the GPU.
 wgpu = ["dep:rustorch-wgpu"]
+# Run wgpu parity tests that require a real GPU adapter. CI without GPU
+# skips them (cargo test runs them as `ignored`); local dev enables
+# `--features wgpu,gpu-tests` to exercise them.
+gpu-tests = ["wgpu"]
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

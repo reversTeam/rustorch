@@ -36,10 +36,24 @@ use crate::elementwise::{dispatch_binary, dispatch_unary};
 use crate::matmul::matmul;
 use crate::storage::WgpuStorage;
 use crate::transfer::{to_cpu, to_gpu};
+use rustorch_core::tensor::device::Device;
 use rustorch_core::tensor::tensor_impl::Tensor;
 use rustorch_cpu::backend::Backend;
 use rustorch_cpu::cpu_backend::cpu_backend;
 use rustorch_cpu::error::BackendError;
+
+/// Tag a Tensor as living on the Wgpu device.
+///
+/// With Storage Option B (transitional, P3.Y plan), the actual storage
+/// is the CPU shadow. Tagging the device-of-record as Wgpu makes
+/// follow-on autograd ops keep dispatching through `wgpu_backend()` —
+/// without it, `to_cpu` returns a CPU-tagged tensor and the next op
+/// would route to `cpu_backend()`, which then mismatches against any
+/// Wgpu operands and trips `DeviceMismatch`. Future Storage Option A
+/// (Tensor enum Cpu | Wgpu) eliminates this round-trip + retag pattern.
+fn tag_wgpu(t: Tensor) -> Tensor {
+    t.with_device(Device::Wgpu)
+}
 
 /// Map `WgpuError` → `BackendError::NumericalError(...)`. The trait expects
 /// the latter (string-based) so device-specific errors are surfaced
@@ -59,7 +73,8 @@ fn unary_roundtrip(
 ) -> Result<Tensor, BackendError> {
     let inp = to_gpu(backend, src).map_err(|e| wgpu_err(op_name, e))?;
     let out = dispatch_unary(backend, op_name, &inp).map_err(|e| wgpu_err(op_name, e))?;
-    to_cpu(backend, &out, src.shape().to_vec()).map_err(|e| wgpu_err(op_name, e))
+    let t = to_cpu(backend, &out, src.shape().to_vec()).map_err(|e| wgpu_err(op_name, e))?;
+    Ok(tag_wgpu(t))
 }
 
 /// Round-trip helper: upload two Tensors, run a binary kernel, download.
@@ -88,7 +103,8 @@ fn binary_roundtrip(
             .map_err(|e| wgpu_err(op_name, e))?
     };
     drop((lhs_g, rhs_g)); // explicit drop after kernel done
-    to_cpu(backend, &out, out_shape).map_err(|e| wgpu_err(op_name, e))
+    let t = to_cpu(backend, &out, out_shape).map_err(|e| wgpu_err(op_name, e))?;
+    Ok(tag_wgpu(t))
 }
 
 /// CPU fallback: download both operands, run on `cpu_backend()`, return.
@@ -158,7 +174,8 @@ impl Backend for WgpuBackend {
         let lhs_g: WgpuStorage = to_gpu(self, lhs).map_err(|e| wgpu_err("matmul", e))?;
         let rhs_g: WgpuStorage = to_gpu(self, rhs).map_err(|e| wgpu_err("matmul", e))?;
         let out = matmul(self, &lhs_g, &rhs_g, m, k1, n).map_err(|e| wgpu_err("matmul", e))?;
-        to_cpu(self, &out, vec![m, n]).map_err(|e| wgpu_err("matmul", e))
+        let t = to_cpu(self, &out, vec![m, n]).map_err(|e| wgpu_err("matmul", e))?;
+        Ok(tag_wgpu(t))
     }
 
     fn relu(&self, src: &Tensor) -> Result<Tensor, BackendError> {
@@ -186,11 +203,49 @@ impl Backend for WgpuBackend {
         unary_roundtrip(self, "silu", src)
     }
 
-    // All other optional methods (abs, sqrt, exp, log, …, sum, mean,
-    // softmax, log_softmax, transpose, reshape, bmm, add_bias,
-    // unbroadcast_to, softmax_grad, gather, scatter, …) inherit the
-    // default `UnsupportedOp` impl from the trait. Phases B+ override
-    // them progressively as kernels are written.
+    // -------------------- Composed methods (no native wgpu kernel) --------------------
+    //
+    // These methods don't have a dedicated WGSL kernel yet; they're
+    // implemented by composing existing primitives. Progressive override
+    // as Phase B+ writes more kernels.
+
+    /// `x + bias` where `bias.shape == x.shape[1..]` (broadcast across the
+    /// batch axis). Composes via `dispatch_binary_broadcast("add")` on the
+    /// host-uploaded tensors so a Linear forward `xw + b` runs on the GPU
+    /// without a CPU round-trip in the middle.
+    fn add_bias(&self, x: &Tensor, bias: &Tensor) -> Result<Tensor, BackendError> {
+        // Validate shapes the same way CpuBackend does.
+        if x.ndim() != 2 || bias.ndim() != 1 {
+            return Err(BackendError::ShapeMismatch {
+                op: "add_bias",
+                lhs: x.shape().to_vec(),
+                rhs: bias.shape().to_vec(),
+            });
+        }
+        let n_out = x.shape()[1];
+        if bias.shape() != [n_out] {
+            return Err(BackendError::ShapeMismatch {
+                op: "add_bias",
+                lhs: x.shape().to_vec(),
+                rhs: bias.shape().to_vec(),
+            });
+        }
+        // Round-trip + dispatch_binary_broadcast: lhs[B, N] + rhs[N] → [B, N].
+        let x_g = to_gpu(self, x).map_err(|e| wgpu_err("add_bias", e))?;
+        let bias_g = to_gpu(self, bias).map_err(|e| wgpu_err("add_bias", e))?;
+        let (out, out_shape) =
+            dispatch_binary_broadcast(self, "add", &x_g, x.shape(), &bias_g, bias.shape())
+                .map_err(|e| wgpu_err("add_bias", e))?;
+        drop((x_g, bias_g));
+        let t = to_cpu(self, &out, out_shape).map_err(|e| wgpu_err("add_bias", e))?;
+        Ok(tag_wgpu(t))
+    }
+
+    // Other optional methods (abs, sqrt, exp, log, sum, mean, softmax,
+    // log_softmax, transpose, reshape, bmm, unbroadcast_to, softmax_grad,
+    // gather, scatter, conv2d, …) inherit the default `UnsupportedOp` impl
+    // from the trait. Phases B2+ and C2+ override them progressively as
+    // kernels are written.
 }
 
 #[cfg(test)]
