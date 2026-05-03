@@ -27,6 +27,7 @@
 //! assert!(t.is_contiguous());
 //! ```
 
+use super::device::Device;
 use super::dtype::{Dtype, Element};
 use super::layout::Layout;
 use super::shape::Shape;
@@ -47,6 +48,12 @@ pub struct Tensor {
     layout: Layout,
     version: VersionCounter,
     requires_grad: bool,
+    /// Device tag for autograd dispatch (P3.Y plan, Phase A).
+    /// Defaults to `Device::Cpu`; set to `Device::Wgpu` after a
+    /// `to_gpu` upload.  The actual GPU buffer is held externally
+    /// in `WgpuStorage`; this field is the *marker* used by the
+    /// `Backend` dispatcher to pick the right kernel path.
+    device: Device,
 }
 
 // --------------------------------------------------------------------------
@@ -110,6 +117,7 @@ impl Tensor {
             layout,
             version: VersionCounter::new(),
             requires_grad: false,
+            device: Device::Cpu,
         })
     }
 
@@ -130,6 +138,7 @@ impl Tensor {
             layout,
             version: VersionCounter::new(),
             requires_grad: false,
+            device: Device::Cpu,
         }
     }
 
@@ -161,7 +170,17 @@ impl Tensor {
             layout,
             version,
             requires_grad,
+            device: Device::Cpu,
         }
+    }
+
+    /// Tag this tensor with `device` (in-place builder). Used by the
+    /// wgpu backend after `to_gpu` to mark the tensor as living on the
+    /// GPU side. The CPU storage stays as a shadow until dropped.
+    #[inline]
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.device = device;
+        self
     }
 }
 
@@ -198,6 +217,14 @@ impl Tensor {
     #[inline]
     pub fn dtype(&self) -> Dtype {
         self.layout.dtype()
+    }
+
+    /// Device tag — `Device::Cpu` by default, `Device::Wgpu` after a
+    /// `to_gpu` upload. Used by the autograd dispatcher to pick the
+    /// right backend at op time. See P3.Y plan, Phase A.
+    #[inline]
+    pub fn device(&self) -> Device {
+        self.device
     }
 
     /// Number of dimensions (rank).

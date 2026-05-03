@@ -899,3 +899,26 @@ fn sub_broadcast_backward_reduces_to_smaller_shape() {
         assert!((v - n as f32).abs() < 1e-5);
     }
 }
+
+// ============================================================================
+// P3.Y plan — Phase A1 : Variable::device() getter for autograd dispatch.
+// ============================================================================
+
+#[test]
+fn variable_device_defaults_to_cpu() {
+    use rustorch_core::tensor::device::Device;
+    let x = Variable::leaf(Tensor::from_vec([3], vec![1.0_f32, 2.0, 3.0]).unwrap());
+    assert_eq!(x.device(), Device::Cpu);
+    let y = Variable::new(Tensor::zeros([2usize, 3]));
+    assert_eq!(y.device(), Device::Cpu);
+}
+
+#[test]
+fn variable_device_propagates_through_with_device() {
+    use rustorch_core::tensor::device::Device;
+    let raw = Tensor::from_vec([3], vec![1.0_f32, 2.0, 3.0])
+        .unwrap()
+        .with_device(Device::Wgpu);
+    let v = Variable::leaf(raw);
+    assert_eq!(v.device(), Device::Wgpu);
+}

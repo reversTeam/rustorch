@@ -80,6 +80,14 @@ impl Variable {
         self.tensor()
     }
 
+    /// Device the underlying tensor lives on. Used by the autograd
+    /// dispatcher to pick the right backend (CPU vs Wgpu) at op time.
+    /// See P3.Y plan, Phase A.
+    #[inline]
+    pub fn device(&self) -> rustorch_core::tensor::device::Device {
+        self.data.lock().unwrap().device()
+    }
+
     /// Replace the shared `data` with a new tensor. Used by optimisers
     /// after computing the parameter update.
     pub fn set_data(&self, new: Tensor) {
