@@ -21,6 +21,7 @@
 pub mod argmax;
 pub mod attention;
 pub mod backend;
+pub mod backend_impl;
 pub mod backend_singleton;
 pub mod broadcast;
 pub mod cache;
