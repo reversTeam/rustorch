@@ -1,14 +1,51 @@
 //! # rustorch-nn — Neural network building blocks (P1.6).
 //!
-//! Public surface:
-//! - [`Module`] — common trait (forward, parameters, train/eval).
-//! - [`Linear`] — y = x @ W + b (rustorch convention: weight is [in, out]).
+//! ## Public surface
+//!
+//! ### Core
+//! - [`Module`] — common trait (forward, parameters, train/eval, to_dtype).
+//! - [`Linear`] — `y = x @ W + b` with PyTorch parity for arbitrary
+//!   leading batch dims (`[*, in_features] -> [*, out_features]`).
+//! - [`Sequential`] — chained Module composition.
+//!
+//! ### Activations & losses
 //! - Activation functions and Module wrappers: [`relu`] / [`sigmoid`] /
 //!   [`tanh`] / [`silu`] / [`leaky_relu`] / [`softmax`] / [`log_softmax`]
 //!   and [`Relu`] / [`Sigmoid`] / [`Tanh`] / [`Silu`] / [`LeakyRelu`] /
 //!   [`Softmax`] / [`LogSoftmax`].
-//! - Loss modules via [`Criterion`]: [`MseLoss`], [`CrossEntropyLoss`].
-//! - [`Sequential`] — chained Module composition.
+//! - Loss modules via [`Criterion`]: [`MseLoss`], [`CrossEntropyLoss`],
+//!   [`CTCLoss`].
+//!
+//! ### Normalisation
+//! - [`LayerNorm`], [`RMSNorm`], [`BatchNorm2d`].
+//!
+//! ### Convolution & RNN
+//! - [`Conv1d`], [`Conv2d`], [`MaxPool2d`].
+//! - [`RnnCell`], [`LstmCell`].
+//!
+//! ### Embedding & positional
+//! - [`Embedding`] — vocabulary lookup.
+//! - [`SinusoidalPositionalEncoding`] (Vaswani et al. 2017, non-trainable),
+//!   [`LearnedPositionalEncoding`] (trainable `[max_len, dim]` table).
+//!
+//! ### Attention
+//! - [`scaled_dot_product_attention`] — stateless rank-3 SDP.
+//! - [`SingleHeadAttention`] — Q/K/V/O projections, single head.
+//! - [`MultiHeadAttention`] — `torch.nn.MultiheadAttention` parity, with
+//!   self- and cross-attention. Rank-3 fold-batch path internally.
+//! - [`causal_mask`], [`sliding_window_mask`], [`bool_to_additive`] —
+//!   autograd-aware Variable masks (additive bias, [`MASK_NEG`] for
+//!   masked positions).
+//! - [`CrossAttentionPool`] — Perceiver / Q-Former / BLIP-2 style pooling
+//!   from `[B, T, D]` to `[B, num_queries, D]`.
+//!
+//! ### Containers
+//! - [`ModuleDict`], [`ModuleList`].
+//! - [`Checkpointed`] — gradient-checkpointing wrapper.
+//! - [`HookedModule`], [`HookHandle`] — pre/post forward hooks.
+//!
+//! ### State dict
+//! - [`state_dict`], [`load_state_dict`], [`LoadReport`], [`StateDictError`].
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]

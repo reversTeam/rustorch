@@ -1,15 +1,25 @@
 //! # rustorch-optim — Optimizers + LR schedulers (P1.7).
 //!
-//! v1 ships:
+//! ## Public surface
+//!
+//! ### Optimizers
 //! - [`Optimizer`] trait — `step`, `zero_grad`, `set_lr`, `lr`.
 //! - [`Sgd`] — vanilla + momentum + Nesterov + weight_decay.
 //! - [`Adam`] / [`AdamW`] — adaptive optimisers with bias correction.
+//! - [`Adagrad`], [`Adamax`], [`Adafactor`], [`Lion`], [`NAdam`],
+//!   [`RAdam`], [`RMSprop`].
+//!
+//! ### LR schedulers
 //! - [`LrScheduler`] trait + [`StepLR`] / [`ExponentialLR`] /
 //!   [`CosineAnnealingLR`] / [`LinearWarmup`] schedulers.
 //!
-//! More optimisers (Lion, Adafactor, RMSprop, NAdam, RAdam, LBFGS,
-//! Adadelta) and schedulers (OneCycle, Plateau, MultiStep, LambdaLR)
-//! plug into the same traits — they remain pending per the project plan.
+//! ### Gradient post-processing
+//! - [`clip_grad_norm_`] — global L2 grad clip
+//!   (`torch.nn.utils.clip_grad_norm_` parity).
+//! - [`clip_grad_norm_per_param_`] — per-parameter L2 clip variant.
+//!
+//! Pending the same traits: LBFGS, Adadelta; OneCycle / Plateau /
+//! MultiStep / LambdaLR schedulers.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]

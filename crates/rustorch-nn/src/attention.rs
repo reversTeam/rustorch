@@ -1,13 +1,26 @@
 //! Scaled Dot-Product Attention (P1.6).
 //!
-//! v1 ships **single-head** attention with the standard formula:
+//! Standard formula:
 //! ```text
-//!   attn(Q, K, V) = softmax(Q @ K.T / sqrt(d)) @ V
+//!   attn(Q, K, V) = softmax(Q @ K.T / sqrt(d_k)) @ V
 //! ```
 //!
-//! Inputs are 3-D `[B, T, D]` (batch, sequence, embed_dim). Multi-head
-//! support requires either a 4-D batched matmul or autograd-aware
-//! reshape — both pending follow-ups.
+//! ## Variants
+//!
+//! - [`scaled_dot_product_attention`]: stateless rank-3 SDP on
+//!   pre-projected `[B, T, D]` Q/K/V tensors.
+//! - [`SingleHeadAttention`]: SDP wrapped with learned Q/K/V/O
+//!   projections (`nn.MultiheadAttention(d, num_heads=1)` parity).
+//!   Rank-3 input, B=1 only in v1.
+//! - [`MultiHeadAttention`]: full multi-head parity with
+//!   `torch.nn.MultiheadAttention(batch_first=True)`. Supports
+//!   self-attention and cross-attention (different `T_q` and `T_kv`).
+//!   Internally folds the rank-4 head-split `[B, H, T, head_dim]` to
+//!   `[B*H, T, head_dim]` for the rank-3 `bmm` path.
+//!
+//! Combine with [`crate::masks::causal_mask`] /
+//! [`crate::masks::sliding_window_mask`] for decoder-style or
+//! local-attention models.
 
 use crate::module::{Module, ModuleError};
 use rustorch_autograd::{ops, Variable};
