@@ -12,6 +12,7 @@
 //! Helper [`ModuleError`] wraps autograd errors uniformly.
 
 use rustorch_autograd::{BackwardError, Variable};
+use rustorch_core::tensor::device::Device;
 use rustorch_core::tensor::dtype::Dtype;
 
 /// Errors returned by [`Module::forward`].
@@ -100,6 +101,34 @@ pub trait Module: Send + Sync {
     fn to_f32(&mut self) {
         self.to_dtype(Dtype::F32);
     }
+
+    /// Move every parameter to the requested device **in place**.
+    ///
+    /// P3.Y plan, Phase E — walks `parameters()` and re-tags each
+    /// Variable's stored Tensor with the new device. With Storage
+    /// Option B, the actual data stays in the CPU shadow; the device
+    /// tag drives autograd's `pick_backend(...)` dispatch so the
+    /// forward / backward / optimiser ops route to the right backend
+    /// at op time.
+    ///
+    /// Composite modules (Sequential, MLP, …) inherit this default
+    /// because their `parameters()` walks recursively into children;
+    /// no per-module override needed.
+    ///
+    /// ```ignore
+    /// let mut model: MyMlp = MyMlp::new();
+    /// model.to_device(Device::Wgpu);
+    /// // forward / backward / optimiser.step now run on Wgpu.
+    /// ```
+    fn to_device(&mut self, device: Device) {
+        for p in self.parameters() {
+            let cur = p.tensor();
+            if cur.device() != device {
+                let new_t = cur.clone().with_device(device);
+                p.set_data(new_t);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +151,47 @@ mod cast_tests {
         layer.to_f32();
         for p in layer.parameters() {
             assert_eq!(p.tensor().dtype(), Dtype::F32);
+        }
+    }
+
+    #[test]
+    fn sequential_to_device_propagates_recursively() {
+        // P3.Y plan, Phase E step d1a387c5 — Sequential's default
+        // `to_device` impl walks `parameters()` which recurses into all
+        // child modules. So `model.to_device(Wgpu)` tags every Linear
+        // (and any future child module) without per-module override.
+        use crate::Sequential;
+        let mut net: Sequential = Sequential::new()
+            .add(Linear::new(8, 4))
+            .add(Linear::new(4, 2));
+        // Sanity: 4 params (2 linear × {weight, bias}) all on Cpu.
+        assert_eq!(net.parameters().len(), 4);
+        for p in net.parameters() {
+            assert_eq!(p.tensor().device(), Device::Cpu);
+        }
+        net.to_device(Device::Wgpu);
+        for p in net.parameters() {
+            assert_eq!(p.tensor().device(), Device::Wgpu);
+        }
+    }
+
+    #[test]
+    fn linear_to_device_propagates_to_all_params() {
+        // P3.Y plan, Phase E — `to_device` should walk parameters() and
+        // tag each one. Verifies the default impl on the Module trait
+        // works for a real module (Linear) without any per-module override.
+        let mut layer = Linear::new(4, 3);
+        for p in layer.parameters() {
+            assert_eq!(p.tensor().device(), Device::Cpu);
+        }
+        layer.to_device(Device::Wgpu);
+        for p in layer.parameters() {
+            assert_eq!(p.tensor().device(), Device::Wgpu);
+        }
+        // Round-trip back to Cpu.
+        layer.to_device(Device::Cpu);
+        for p in layer.parameters() {
+            assert_eq!(p.tensor().device(), Device::Cpu);
         }
     }
 
