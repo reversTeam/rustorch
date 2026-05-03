@@ -44,6 +44,19 @@ are tracked in the Project Orchestrator's Plan graph.
   { Cpu(Vec<f32>), Wgpu(WgpuStorage) }`. Removes the per-op
   host↔device round-trip and unlocks the wgpu speedup ceiling.
 
+**Same-machine perf reference** (Apple M4 Max, Linear 1024×1024 + MSE + AdamW,
+ms/step lower is better):
+
+| Stack | ms/step | Notes |
+|---|---:|---|
+| PyTorch MPS | 0.89 | gold standard target |
+| PyTorch CPU | 1.75 | MKL/Accelerate + multithreading |
+| rustorch CPU | 12.81 | gemm-rs + rayon, single-thread bench |
+| rustorch Wgpu | 22.30 | Storage Option B round-trip dominates |
+
+Closing the rustorch Wgpu → PyTorch MPS gap is the explicit goal of
+Phases 3.5 + 3.6.
+
 ## Phase 4 — CUDA
 
 - 🚧 NVIDIA-specific backend via `rustorch-cuda` crate (cuBLAS, cuDNN,

@@ -466,6 +466,26 @@ chains) but raw throughput is lower than a fully-resident GPU storage.
 Storage Option A (Tensor enum `Cpu(Vec<f32>) | Wgpu(WgpuStorage)`) is the
 perf follow-up; it removes the round-trip and unlocks the speedup ceiling.
 
+### Same-machine perf reference (Apple M4 Max, Linear 1024×1024, MSE+AdamW)
+
+| Stack | ms/step | vs PyTorch CPU |
+|---|---:|---:|
+| PyTorch MPS | **0.89** | 0.5× (best) |
+| PyTorch CPU | **1.75** | 1× (baseline) |
+| rustorch CPU | 12.81 | 7.3× slower |
+| rustorch Wgpu | 22.30 | 12.7× slower |
+
+The rustorch Wgpu number reflects the Storage Option B round-trip cost
++ CPU-fallback backward kernels. Closing the gap to PyTorch MPS is
+tracked as Phase 3.5 (native WGSL backward kernels) and Phase 3.6
+(Storage Option A migration) in [`ROADMAP.md`](ROADMAP.md). Reproduce
+the PyTorch numbers on your machine via:
+
+```sh
+cd /tmp  # avoid shadowing the installed torch by the local pytorch/ source
+python3 /path/to/rustorch/crates/rustorch/examples/pytorch_compare.py
+```
+
 ## Project documentation
 
 - [`docs/rfcs/`](docs/rfcs/) — architectural RFCs (Phase 0 deliverable)
