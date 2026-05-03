@@ -9,80 +9,43 @@
 //! it for shape mismatch (or accumulates the wrong shape silently).
 //!
 //! This is the canonical PyTorch `Tensor::sum_to_size(target_shape)`
-//! algorithm, adapted to the rustorch CPU backend.
+//! algorithm.
+//!
+//! P3.Y plan, Phase C1: dispatches via `pick_backend(device)` so the
+//! reduction runs on the right backend (Cpu or Wgpu) — keyed on the
+//! `device` field stored in each `*Backward` node.
 //!
 //! Discovered while implementing `l2_normalize` (PR 4 of the transformer
 //! building blocks plan). Tracked in note `7a32584a` (gotcha) and
 //! addressed here as the generic fix referenced by that note.
 
+use crate::dispatch::pick_backend;
+use rustorch_core::tensor::device::Device;
 use rustorch_core::tensor::tensor_impl::Tensor;
-use rustorch_cpu::cpu_backend::cpu_backend;
 
 /// Sum the upstream gradient down to `target_shape` so it matches the
 /// shape of the input that was broadcast on the forward path.
 ///
-/// Implements PyTorch's right-aligned broadcast rules:
-/// 1. Strip leading dims when `grad` has more dims than `target_shape`
-///    (sum them with `keepdim=false`).
-/// 2. For each remaining axis, sum (with `keepdim=true`) when
-///    `target_shape[i] == 1` and `grad.shape()[aligned_i] > 1`.
+/// The reduction runs on the backend selected by `device`, so a backward
+/// over a Wgpu Variable stays GPU-resident (once the `wgpu` feature is on
+/// and Wgpu kernels for `sum_dim`/`reshape` exist; otherwise this falls
+/// through to whatever the Backend trait's `unbroadcast_to` returns —
+/// `Unsupported` until those land).
 ///
-/// Returns `grad` unchanged when no reduction is needed (the common case
-/// where shapes already match).
+/// Implements PyTorch's right-aligned broadcast rules via the
+/// `Backend::unbroadcast_to` trait method (see `rustorch-cpu/src/backend.rs`):
+/// 1. Pad `target_shape` on the left with 1s to match `grad.ndim()`.
+/// 2. Sum every axis where the padded target is 1 but `grad.shape[axis]` > 1.
+/// 3. Reshape back to `target_shape`.
 ///
 /// # Panics
 ///
 /// Panics if the shapes are not broadcast-compatible — the forward path
 /// would have rejected them in that case, so this is an invariant.
-pub fn unbroadcast_to(grad: &Tensor, target_shape: &[usize]) -> Tensor {
-    let g_shape = grad.shape();
-
-    // Fast path: shapes already match.
-    if g_shape == target_shape {
-        return grad.clone();
-    }
-
-    // Step 1 — Strip leading dims when grad has more rank than target.
-    let leading = g_shape.len().saturating_sub(target_shape.len());
-    let mut current = if leading > 0 {
-        let dims: Vec<usize> = (0..leading).collect();
-        cpu_backend()
-            .sum_dim(grad, &dims, false)
-            .expect("unbroadcast_to: sum_dim leading axes")
-    } else {
-        grad.clone()
-    };
-
-    // Step 2 — Sum axes where target had size 1 but current is larger.
-    let cur_shape = current.shape().to_vec();
-    debug_assert_eq!(
-        cur_shape.len(),
-        target_shape.len(),
-        "rank mismatch after leading reduction"
-    );
-    let mut axes_to_sum: Vec<usize> = Vec::new();
-    for (i, (&c, &t)) in cur_shape.iter().zip(target_shape.iter()).enumerate() {
-        if t == 1 && c > 1 {
-            axes_to_sum.push(i);
-        } else if t != 1 && t != c {
-            panic!(
-                "unbroadcast_to: incompatible shapes grad={:?} target={:?} at axis {}",
-                g_shape, target_shape, i
-            );
-        }
-    }
-    if !axes_to_sum.is_empty() {
-        current = cpu_backend()
-            .sum_dim(&current, &axes_to_sum, true)
-            .expect("unbroadcast_to: sum_dim broadcast axes");
-    }
-
-    debug_assert_eq!(
-        current.shape(),
-        target_shape,
-        "unbroadcast_to: result shape mismatch"
-    );
-    current
+pub fn unbroadcast_to(device: Device, grad: &Tensor, target_shape: &[usize]) -> Tensor {
+    pick_backend(device)
+        .unbroadcast_to(grad, target_shape)
+        .expect("unbroadcast_to never fails on broadcast-compatible shapes")
 }
 
 #[cfg(test)]
@@ -92,7 +55,7 @@ mod tests {
     #[test]
     fn no_reduction_when_shapes_match() {
         let g = Tensor::from_vec([2usize, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let r = unbroadcast_to(&g, &[2, 3]);
+        let r = unbroadcast_to(Device::Cpu, &g, &[2, 3]);
         assert_eq!(r.shape(), &[2, 3]);
         assert_eq!(
             r.as_slice::<f32>().unwrap(),
@@ -104,7 +67,7 @@ mod tests {
     fn sum_trailing_size_one_axis_with_keepdim() {
         // grad [2, 3] -> target [2, 1] : sum over axis 1 keepdim.
         let g = Tensor::from_vec([2usize, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let r = unbroadcast_to(&g, &[2, 1]);
+        let r = unbroadcast_to(Device::Cpu, &g, &[2, 1]);
         assert_eq!(r.shape(), &[2, 1]);
         assert_eq!(r.as_slice::<f32>().unwrap(), &[6.0, 15.0]);
     }
@@ -119,7 +82,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let r = unbroadcast_to(&g, &[3]);
+        let r = unbroadcast_to(Device::Cpu, &g, &[3]);
         assert_eq!(r.shape(), &[3]);
         // sum of columns: 1+4+7+10=22, 2+5+8+11=26, 3+6+9+12=30
         assert_eq!(r.as_slice::<f32>().unwrap(), &[22.0, 26.0, 30.0]);
@@ -137,7 +100,7 @@ mod tests {
         let total = b * t * 2 * last;
         let data: Vec<f32> = (0..total).map(|i| (i + 1) as f32).collect();
         let g = Tensor::from_vec([b, t, 2, last], data.clone()).unwrap();
-        let r = unbroadcast_to(&g, &[b, t, 2, 1]);
+        let r = unbroadcast_to(Device::Cpu, &g, &[b, t, 2, 1]);
         assert_eq!(r.shape(), &[b, t, 2, 1]);
         // For each [b, t, 2] slot, expect sum of `last` consecutive entries.
         let r_data = r.as_slice::<f32>().unwrap();
@@ -157,7 +120,7 @@ mod tests {
             (1..=24).map(|x| x as f32).collect::<Vec<_>>(),
         )
         .unwrap();
-        let r = unbroadcast_to(&g, &[2, 1]);
+        let r = unbroadcast_to(Device::Cpu, &g, &[2, 1]);
         assert_eq!(r.shape(), &[2, 1]);
     }
 }
