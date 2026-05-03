@@ -19,6 +19,7 @@
 pub mod gpt_block;
 pub mod model_loader;
 pub mod resnet_block;
+pub mod transformer_block;
 
 #[cfg(target_arch = "wasm32")]
 mod web {
