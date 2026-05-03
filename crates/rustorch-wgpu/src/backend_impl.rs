@@ -34,6 +34,7 @@ use crate::backend::WgpuBackend;
 use crate::broadcast::dispatch_binary_broadcast;
 use crate::elementwise::{dispatch_binary, dispatch_unary};
 use crate::matmul::matmul;
+use crate::reduce::{reduce_rows, ReduceKind};
 use crate::storage::WgpuStorage;
 use crate::transfer::{to_cpu, to_gpu};
 use rustorch_core::tensor::device::Device;
@@ -201,6 +202,42 @@ impl Backend for WgpuBackend {
 
     fn silu(&self, src: &Tensor) -> Result<Tensor, BackendError> {
         unary_roundtrip(self, "silu", src)
+    }
+
+    /// Full-tensor sum reduction → scalar `[1]`. Composes via
+    /// `reduce_rows(b=1, k=numel)` after a no-cost reshape.
+    fn sum(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        let numel = src.numel();
+        if numel == 0 {
+            return Err(BackendError::ShapeMismatch {
+                op: "sum",
+                lhs: src.shape().to_vec(),
+                rhs: vec![],
+            });
+        }
+        let inp = to_gpu(self, src).map_err(|e| wgpu_err("sum", e))?;
+        let out =
+            reduce_rows(self, &inp, 1, numel, ReduceKind::Sum).map_err(|e| wgpu_err("sum", e))?;
+        let t = to_cpu(self, &out, vec![1]).map_err(|e| wgpu_err("sum", e))?;
+        Ok(tag_wgpu(t))
+    }
+
+    /// Full-tensor mean reduction → scalar `[1]`. Composes via
+    /// `reduce_rows(ReduceKind::Mean)`.
+    fn mean(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        let numel = src.numel();
+        if numel == 0 {
+            return Err(BackendError::ShapeMismatch {
+                op: "mean",
+                lhs: src.shape().to_vec(),
+                rhs: vec![],
+            });
+        }
+        let inp = to_gpu(self, src).map_err(|e| wgpu_err("mean", e))?;
+        let out =
+            reduce_rows(self, &inp, 1, numel, ReduceKind::Mean).map_err(|e| wgpu_err("mean", e))?;
+        let t = to_cpu(self, &out, vec![1]).map_err(|e| wgpu_err("mean", e))?;
+        Ok(tag_wgpu(t))
     }
 
     // -------------------- Composed methods (no native wgpu kernel) --------------------

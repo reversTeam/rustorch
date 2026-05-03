@@ -244,8 +244,20 @@ impl Node for MatMulBackward {
         "MatMulBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        let rhs_t = self.rhs_saved.transpose(0, 1).expect("transpose");
-        let lhs_t = self.lhs_saved.transpose(0, 1).expect("transpose");
+        // `Tensor::transpose` returns a non-contiguous view; we need a
+        // contiguous F32 layout before handing the tensor to a backend
+        // (Wgpu's `to_gpu` requires contiguous slice access; CpuBackend
+        // tolerates either but the contiguous() call is cheap and uniform).
+        let rhs_t = self
+            .rhs_saved
+            .transpose(0, 1)
+            .expect("transpose")
+            .contiguous();
+        let lhs_t = self
+            .lhs_saved
+            .transpose(0, 1)
+            .expect("transpose")
+            .contiguous();
         let g_lhs = pick_backend(self.device)
             .matmul(grad, &rhs_t)
             .expect("matmul lhs grad");
