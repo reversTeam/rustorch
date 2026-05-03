@@ -951,6 +951,85 @@ impl Backend for CpuBackend {
         // false → 0.0). We just delegate.
         Ok(src.to_dtype(target))
     }
+
+    // -------------------- A3 — autograd dispatch plumbing (P3.Y) --------------------
+
+    fn bmm(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+        bmm_impl(lhs, rhs)
+    }
+
+    fn transpose(&self, src: &Tensor, d0: usize, d1: usize) -> Result<Tensor, BackendError> {
+        let view = src
+            .transpose(d0, d1)
+            .map_err(|e| BackendError::NumericalError(format!("transpose: {e}")))?;
+        Ok(view.contiguous())
+    }
+
+    fn reshape(&self, src: &Tensor, shape: &[usize]) -> Result<Tensor, BackendError> {
+        let numel: usize = shape.iter().product();
+        if numel != src.numel() {
+            return Err(BackendError::ShapeMismatch {
+                op: "reshape",
+                lhs: src.shape().to_vec(),
+                rhs: shape.to_vec(),
+            });
+        }
+        let data = src.as_slice::<f32>().ok_or_else(|| {
+            BackendError::NumericalError("reshape: expected contiguous F32 source".to_string())
+        })?;
+        Tensor::from_vec(shape.to_vec(), data.to_vec())
+            .map_err(|e| BackendError::NumericalError(format!("reshape build: {e}")))
+    }
+
+    fn add_bias(&self, x: &Tensor, bias: &Tensor) -> Result<Tensor, BackendError> {
+        if x.ndim() != 2 || bias.ndim() != 1 {
+            return Err(BackendError::ShapeMismatch {
+                op: "add_bias",
+                lhs: x.shape().to_vec(),
+                rhs: bias.shape().to_vec(),
+            });
+        }
+        let batch = x.shape()[0];
+        let n_out = x.shape()[1];
+        if bias.shape() != [n_out] {
+            return Err(BackendError::ShapeMismatch {
+                op: "add_bias",
+                lhs: x.shape().to_vec(),
+                rhs: bias.shape().to_vec(),
+            });
+        }
+        let bias_buf: &[f32] = bias.as_slice::<f32>().ok_or_else(|| {
+            BackendError::NumericalError("add_bias: expected contiguous F32 bias".to_string())
+        })?;
+        let mut wide = Vec::with_capacity(batch * n_out);
+        for _ in 0..batch {
+            wide.extend_from_slice(bias_buf);
+        }
+        let bias_wide = Tensor::from_vec([batch, n_out], wide)
+            .map_err(|e| BackendError::NumericalError(format!("add_bias broadcast: {e}")))?;
+        self.add(x, &bias_wide)
+    }
+
+    fn unbroadcast_to(
+        &self,
+        grad: &Tensor,
+        target_shape: &[usize],
+    ) -> Result<Tensor, BackendError> {
+        unbroadcast_to_impl(self, grad, target_shape)
+    }
+
+    fn softmax_grad(
+        &self,
+        grad: &Tensor,
+        output: &Tensor,
+        dim: usize,
+    ) -> Result<Tensor, BackendError> {
+        // d_input = output * (grad - sum(grad * output, dim, keepdim=true))
+        let prod = self.mul(grad, output)?;
+        let sum_keep = self.sum_dim(&prod, &[dim], true)?;
+        let diff = self.sub(grad, &sum_keep)?;
+        self.mul(output, &diff)
+    }
 }
 
 /// Compare-kinds shared by eq/ne/lt/le/gt/ge.
@@ -1645,6 +1724,123 @@ where
     Tensor::from_vec_typed::<T, _>([], vec![acc]).map_err(|_| BackendError::OutOfMemory {
         bytes: core::mem::size_of::<T>(),
     })
+}
+
+// -------------------- A3 — autograd dispatch plumbing helpers --------------------
+
+/// CPU bmm: `[B, M, K] @ [B, K, N] = [B, M, N]`. Triple-loop per batch.
+/// Ported from `rustorch-autograd/src/ops.rs::bmm_forward` so the kernel
+/// becomes part of the Backend trait surface (enables device dispatch).
+fn bmm_impl(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
+    let l_shape = lhs.shape();
+    let r_shape = rhs.shape();
+    if l_shape.len() != 3 || r_shape.len() != 3 {
+        return Err(BackendError::ShapeMismatch {
+            op: "bmm",
+            lhs: l_shape.to_vec(),
+            rhs: r_shape.to_vec(),
+        });
+    }
+    let (b, m, k1) = (l_shape[0], l_shape[1], l_shape[2]);
+    let (b2, k2, n) = (r_shape[0], r_shape[1], r_shape[2]);
+    if b != b2 || k1 != k2 {
+        return Err(BackendError::ShapeMismatch {
+            op: "bmm",
+            lhs: l_shape.to_vec(),
+            rhs: r_shape.to_vec(),
+        });
+    }
+    let l_data = lhs
+        .as_slice::<f32>()
+        .ok_or_else(|| BackendError::NumericalError("bmm: lhs must be contiguous F32".into()))?;
+    let r_data = rhs
+        .as_slice::<f32>()
+        .ok_or_else(|| BackendError::NumericalError("bmm: rhs must be contiguous F32".into()))?;
+    let k = k1;
+    let mut out = vec![0.0_f32; b * m * n];
+    for bi in 0..b {
+        let l_off = bi * m * k;
+        let r_off = bi * k * n;
+        let o_off = bi * m * n;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0_f32;
+                for kk in 0..k {
+                    acc += l_data[l_off + i * k + kk] * r_data[r_off + kk * n + j];
+                }
+                out[o_off + i * n + j] = acc;
+            }
+        }
+    }
+    Tensor::from_vec([b, m, n], out)
+        .map_err(|e| BackendError::NumericalError(format!("bmm output build: {e}")))
+}
+
+/// Sum `grad` across axes that were broadcasted up to its current shape,
+/// returning a tensor of `target_shape`.
+///
+/// Algorithm:
+/// 1. Pad `target_shape` on the left with 1s to match `grad.ndim()`.
+/// 2. For each axis where the padded target is 1 but `grad.shape[axis]` > 1,
+///    sum along that axis with `keepdim=true`.
+/// 3. Reshape back to `target_shape` (drops the padded leading dims).
+///
+/// This is the inverse of NumPy/PyTorch broadcasting and is required by
+/// every binary op backward (add/sub/mul/div) when the inputs were
+/// broadcasted.
+fn unbroadcast_to_impl(
+    backend: &CpuBackend,
+    grad: &Tensor,
+    target_shape: &[usize],
+) -> Result<Tensor, BackendError> {
+    let grad_shape = grad.shape();
+    if grad_shape == target_shape {
+        return Ok(grad.clone());
+    }
+    let g_ndim = grad_shape.len();
+    let t_ndim = target_shape.len();
+    if t_ndim > g_ndim {
+        return Err(BackendError::ShapeMismatch {
+            op: "unbroadcast_to",
+            lhs: grad_shape.to_vec(),
+            rhs: target_shape.to_vec(),
+        });
+    }
+    // Pad target_shape on the left with 1s up to g_ndim.
+    let pad = g_ndim - t_ndim;
+    let mut padded = vec![1usize; pad];
+    padded.extend_from_slice(target_shape);
+    // Validate compatibility along each axis: target_padded[i] must be 1
+    // or equal to grad_shape[i].
+    for (i, (&g, &t)) in grad_shape.iter().zip(padded.iter()).enumerate() {
+        if t != 1 && t != g {
+            return Err(BackendError::ShapeMismatch {
+                op: "unbroadcast_to",
+                lhs: grad_shape.to_vec(),
+                rhs: target_shape.to_vec(),
+            });
+        }
+        let _ = i;
+    }
+    // Collect axes to reduce (where padded == 1 and grad > 1).
+    let reduce_axes: Vec<usize> = padded
+        .iter()
+        .zip(grad_shape.iter())
+        .enumerate()
+        .filter_map(|(axis, (&p, &g))| if p == 1 && g > 1 { Some(axis) } else { None })
+        .collect();
+    let reduced = if reduce_axes.is_empty() {
+        grad.clone()
+    } else {
+        backend.sum_dim(grad, &reduce_axes, true)?
+    };
+    // reduced now has shape `padded` (with reduced axes = 1). Reshape to
+    // target_shape (drops the leading padded 1s).
+    if reduced.shape() == target_shape {
+        Ok(reduced)
+    } else {
+        backend.reshape(&reduced, target_shape)
+    }
 }
 
 /// Public function returning the static CPU backend singleton.
@@ -2342,5 +2538,225 @@ mod tests {
         cmp_via_f32(&r16, &r32, 1e-2);
         assert_eq!(r16.shape(), [4, 3]);
         assert_eq!(r16.dtype(), Dtype::BF16);
+    }
+
+    // -------------------- A3 — autograd dispatch plumbing tests --------------------
+
+    fn close(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol
+    }
+
+    fn assert_close_slice(actual: &[f32], expected: &[f32], tol: f32, label: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{label}: len mismatch {} vs {}",
+            actual.len(),
+            expected.len()
+        );
+        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                close(*a, *e, tol),
+                "{label}: idx {i} actual {a} expected {e} (tol {tol})"
+            );
+        }
+    }
+
+    #[test]
+    fn bmm_simple_rank3() {
+        // [B=2, M=2, K=3] @ [B=2, K=3, N=2] = [B=2, M=2, N=2]
+        let a = Tensor::from_vec(
+            [2usize, 2, 3],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1.0, 0.0, -1.0, 2.0, 1.0, 0.0],
+        )
+        .unwrap();
+        let b_t = Tensor::from_vec(
+            [2usize, 3, 2],
+            vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, -1.0, 0.0],
+        )
+        .unwrap();
+        let out = b().bmm(&a, &b_t).unwrap();
+        assert_eq!(out.shape(), [2, 2, 2]);
+        let got = out.as_slice::<f32>().unwrap();
+        // batch 0: [[1*1+2*0+3*1, 1*0+2*1+3*1], [4*1+5*0+6*1, 4*0+5*1+6*1]]
+        //         = [[4, 5], [10, 11]]
+        // batch 1: [[1*1+0*0+(-1)*(-1), 1*1+0*1+(-1)*0],
+        //           [2*1+1*0+0*(-1),    2*1+1*1+0*0]]
+        //         = [[2, 1], [2, 3]]
+        assert_close_slice(
+            got,
+            &[4.0, 5.0, 10.0, 11.0, 2.0, 1.0, 2.0, 3.0],
+            1e-6,
+            "bmm",
+        );
+    }
+
+    #[test]
+    fn bmm_shape_mismatch_returns_err() {
+        let a = Tensor::from_vec([2usize, 3, 4], vec![0.0; 24]).unwrap();
+        let b_t = Tensor::from_vec([2usize, 5, 6], vec![0.0; 60]).unwrap();
+        let err = b().bmm(&a, &b_t).unwrap_err();
+        assert!(matches!(err, BackendError::ShapeMismatch { op: "bmm", .. }));
+    }
+
+    #[test]
+    fn transpose_rank3_swap_last_two() {
+        let a = Tensor::from_vec(
+            [2usize, 2, 3],
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
+        )
+        .unwrap();
+        let out = b().transpose(&a, 1, 2).unwrap();
+        assert_eq!(out.shape(), [2, 3, 2]);
+        // batch 0 was rows [1,2,3] / [4,5,6] → cols (1,4),(2,5),(3,6)
+        // contiguous layout: 1,4,2,5,3,6,7,10,8,11,9,12
+        assert_close_slice(
+            out.as_slice::<f32>().unwrap(),
+            &[
+                1.0, 4.0, 2.0, 5.0, 3.0, 6.0, 7.0, 10.0, 8.0, 11.0, 9.0, 12.0,
+            ],
+            1e-6,
+            "transpose",
+        );
+    }
+
+    #[test]
+    fn reshape_basic() {
+        let a = Tensor::from_vec([2usize, 6], (0..12).map(|i| i as f32).collect()).unwrap();
+        let out = b().reshape(&a, &[3, 4]).unwrap();
+        assert_eq!(out.shape(), [3, 4]);
+        // Data is the same flat sequence.
+        assert_close_slice(
+            out.as_slice::<f32>().unwrap(),
+            &(0..12).map(|i| i as f32).collect::<Vec<_>>(),
+            1e-6,
+            "reshape",
+        );
+    }
+
+    #[test]
+    fn reshape_numel_mismatch_errs() {
+        let a = Tensor::from_vec([2usize, 3], vec![0.0; 6]).unwrap();
+        let err = b().reshape(&a, &[2, 4]).unwrap_err();
+        assert!(matches!(
+            err,
+            BackendError::ShapeMismatch { op: "reshape", .. }
+        ));
+    }
+
+    #[test]
+    fn add_bias_broadcast_along_batch() {
+        let x = Tensor::from_vec([3usize, 2], vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let bias = Tensor::from_vec([2usize], vec![10.0_f32, 100.0]).unwrap();
+        let out = b().add_bias(&x, &bias).unwrap();
+        assert_eq!(out.shape(), [3, 2]);
+        assert_close_slice(
+            out.as_slice::<f32>().unwrap(),
+            &[11.0, 102.0, 13.0, 104.0, 15.0, 106.0],
+            1e-6,
+            "add_bias",
+        );
+    }
+
+    #[test]
+    fn add_bias_rank_mismatch_errs() {
+        let x = Tensor::from_vec([2usize, 2, 2], vec![0.0; 8]).unwrap(); // rank-3
+        let bias = Tensor::from_vec([2usize], vec![0.0; 2]).unwrap();
+        let err = b().add_bias(&x, &bias).unwrap_err();
+        assert!(matches!(
+            err,
+            BackendError::ShapeMismatch { op: "add_bias", .. }
+        ));
+    }
+
+    #[test]
+    fn unbroadcast_to_identity() {
+        // Same shape — no-op identity.
+        let g = Tensor::from_vec([2usize, 3], (0..6).map(|i| i as f32).collect()).unwrap();
+        let out = b().unbroadcast_to(&g, &[2, 3]).unwrap();
+        assert_eq!(out.shape(), [2, 3]);
+        assert_close_slice(
+            out.as_slice::<f32>().unwrap(),
+            &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            1e-6,
+            "unbroadcast_id",
+        );
+    }
+
+    #[test]
+    fn unbroadcast_to_drop_leading_dim() {
+        // grad [2, 3], target [3] → sum along axis 0, return [3].
+        let g = Tensor::from_vec([2usize, 3], vec![1.0_f32, 2.0, 3.0, 10.0, 20.0, 30.0]).unwrap();
+        let out = b().unbroadcast_to(&g, &[3]).unwrap();
+        assert_eq!(out.shape(), [3]);
+        assert_close_slice(
+            out.as_slice::<f32>().unwrap(),
+            &[11.0, 22.0, 33.0],
+            1e-6,
+            "unbroadcast_drop_lead",
+        );
+    }
+
+    #[test]
+    fn unbroadcast_to_size_one_axis() {
+        // grad [2, 3], target [2, 1] → sum along axis 1 keepdim.
+        let g = Tensor::from_vec([2usize, 3], vec![1.0_f32, 2.0, 3.0, 10.0, 20.0, 30.0]).unwrap();
+        let out = b().unbroadcast_to(&g, &[2, 1]).unwrap();
+        assert_eq!(out.shape(), [2, 1]);
+        assert_close_slice(
+            out.as_slice::<f32>().unwrap(),
+            &[6.0, 60.0],
+            1e-6,
+            "unbroadcast_axis_one",
+        );
+    }
+
+    #[test]
+    fn unbroadcast_to_scalar_target() {
+        // grad [2, 3], target [] (scalar via numel=1) → sum all.
+        let g = Tensor::from_vec([2usize, 3], vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        // Empty target shape isn't representable, but [1] works and is what
+        // the autograd dispatcher uses for scalar grad targets.
+        let out = b().unbroadcast_to(&g, &[1]).unwrap();
+        assert_eq!(out.shape(), [1]);
+        assert_close_slice(
+            out.as_slice::<f32>().unwrap(),
+            &[21.0],
+            1e-6,
+            "unbroadcast_scalar",
+        );
+    }
+
+    #[test]
+    fn softmax_grad_matches_manual_formula() {
+        // Build output = softmax(input). Pick an arbitrary grad and compare
+        // backend.softmax_grad with the manual formula
+        // d_input = output * (grad - sum(grad * output, dim, keepdim=true)).
+        let input = Tensor::from_vec([2usize, 3], vec![1.0_f32, 2.0, 3.0, 0.5, 0.5, 0.5]).unwrap();
+        let output = b().softmax(&input, 1).unwrap();
+        let grad = Tensor::from_vec([2usize, 3], vec![0.1_f32, -0.2, 0.3, 1.0, 0.0, -1.0]).unwrap();
+        let computed = b().softmax_grad(&grad, &output, 1).unwrap();
+
+        // Manual: row 0
+        let o = output.as_slice::<f32>().unwrap();
+        let g = grad.as_slice::<f32>().unwrap();
+        let mut expected = vec![0.0_f32; 6];
+        for row in 0..2 {
+            let mut sum_go = 0.0;
+            for j in 0..3 {
+                sum_go += g[row * 3 + j] * o[row * 3 + j];
+            }
+            for j in 0..3 {
+                expected[row * 3 + j] = o[row * 3 + j] * (g[row * 3 + j] - sum_go);
+            }
+        }
+        assert_close_slice(
+            computed.as_slice::<f32>().unwrap(),
+            &expected,
+            1e-6,
+            "softmax_grad",
+        );
     }
 }

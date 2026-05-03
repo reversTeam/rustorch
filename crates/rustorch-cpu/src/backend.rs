@@ -474,6 +474,79 @@ pub trait Backend: Send + Sync {
     ) -> Result<Tensor, BackendError> {
         Err(unsupported("cast", self.name()))
     }
+
+    // -------------------- A3 — autograd dispatch plumbing (P3.Y) --------------------
+    //
+    // Methods added to support the wgpu autograd wiring (RFC P3.Y / Phase A3).
+    // All have default `Unsupported` impls so existing backends are unaffected;
+    // CpuBackend overrides them, future WgpuBackend overrides them progressively.
+
+    /// Batched matmul: `[B, M, K] @ [B, K, N] = [B, M, N]`.
+    ///
+    /// Used by `MultiHeadAttention` and any rank-3 matmul flow. The CPU
+    /// implementation is a simple triple-loop per batch; production GPU
+    /// kernels can fuse the batch dim into a single dispatch.
+    fn bmm(&self, _lhs: &Tensor, _rhs: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("bmm", self.name()))
+    }
+
+    /// Swap two axes of `src` (rank-N), returning a contiguous tensor.
+    ///
+    /// Equivalent to `Tensor::transpose(d0, d1).contiguous()` but exposed
+    /// on the Backend trait so device-specific backends can use a fused
+    /// permute kernel rather than a view-then-copy.
+    fn transpose(&self, _src: &Tensor, _d0: usize, _d1: usize) -> Result<Tensor, BackendError> {
+        Err(unsupported("transpose", self.name()))
+    }
+
+    /// Reshape `src` to `shape`. Requires `numel(src) == numel(shape)` and
+    /// a contiguous source. CPU impl materialises a fresh `from_vec`; GPU
+    /// impls may share storage when alignment allows.
+    fn reshape(&self, _src: &Tensor, _shape: &[usize]) -> Result<Tensor, BackendError> {
+        Err(unsupported("reshape", self.name()))
+    }
+
+    /// `x + bias` where `bias.shape == x.shape[1..]` (broadcast across the
+    /// leading batch dim). Equivalent to `add(x, bias.broadcast_to(x.shape))`
+    /// but exposed as its own method so backends can fuse the broadcast +
+    /// add into a single kernel.
+    fn add_bias(&self, _x: &Tensor, _bias: &Tensor) -> Result<Tensor, BackendError> {
+        Err(unsupported("add_bias", self.name()))
+    }
+
+    // ---- A3 backward helpers ----
+
+    /// Sum `grad` across axes that were broadcasted up to produce its
+    /// current shape, returning a tensor of `target_shape`.
+    ///
+    /// Used by every binary op backward (add/sub/mul/div) to undo
+    /// broadcasting before passing the gradient to the corresponding
+    /// input edge. Concretely: pads `target_shape` on the left with 1s
+    /// to match `grad.ndim()`, then sums along every axis where the
+    /// padded target is 1 but `grad.shape` is > 1, then squeezes the
+    /// leading padded dims.
+    fn unbroadcast_to(
+        &self,
+        _grad: &Tensor,
+        _target_shape: &[usize],
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("unbroadcast_to", self.name()))
+    }
+
+    /// Backward of `softmax(input, dim) = output`:
+    /// `d_input = output * (grad - sum(grad * output, dim, keepdim=true))`.
+    ///
+    /// Composable from `mul + sum_dim + sub`, but exposed as its own
+    /// method so backends can fuse the three reductions into a single
+    /// pass — significant on GPU where each launch has fixed overhead.
+    fn softmax_grad(
+        &self,
+        _grad: &Tensor,
+        _output: &Tensor,
+        _dim: usize,
+    ) -> Result<Tensor, BackendError> {
+        Err(unsupported("softmax_grad", self.name()))
+    }
 }
 
 #[allow(unused)]
