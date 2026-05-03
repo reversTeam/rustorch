@@ -266,19 +266,35 @@ impl MultiHeadAttention {
         attn_mask: Option<&Variable>,
     ) -> Result<Variable, ModuleError> {
         let q_shape = q.tensor().shape().to_vec();
-        if q_shape.len() != 3 {
-            return Err(rustorch_autograd::BackwardError::Backend {
-                op: "MultiHeadAttention::forward",
-                message: format!("expected rank-3 Q [B, T, D], got {q_shape:?}"),
-            });
+        let k_shape = k.tensor().shape().to_vec();
+        let v_shape = v.tensor().shape().to_vec();
+        for (name, sh) in [("q", &q_shape), ("k", &k_shape), ("v", &v_shape)] {
+            if sh.len() != 3 {
+                return Err(rustorch_autograd::BackwardError::Backend {
+                    op: "MultiHeadAttention::forward",
+                    message: format!("expected rank-3 {name} [B, T, D], got {sh:?}"),
+                });
+            }
         }
         let batch = q_shape[0];
-        let seq = q_shape[1];
+        let t_q = q_shape[1];
+        let t_kv = k_shape[1];
         let embed = q_shape[2];
-        if embed != self.embed_dim {
+        if embed != self.embed_dim || k_shape[2] != self.embed_dim || v_shape[2] != self.embed_dim {
             return Err(rustorch_autograd::BackwardError::Backend {
                 op: "MultiHeadAttention::forward",
-                message: format!("embed dim {} != configured {}", embed, self.embed_dim),
+                message: format!(
+                    "embed dim mismatch: q={}, k={}, v={}, configured={}",
+                    embed, k_shape[2], v_shape[2], self.embed_dim
+                ),
+            });
+        }
+        if k_shape[0] != batch || v_shape[0] != batch || v_shape[1] != t_kv {
+            return Err(rustorch_autograd::BackwardError::Backend {
+                op: "MultiHeadAttention::forward",
+                message: format!(
+                    "k/v batch or seq mismatch: q={q_shape:?}, k={k_shape:?}, v={v_shape:?}"
+                ),
             });
         }
 
@@ -287,16 +303,15 @@ impl MultiHeadAttention {
         let k = self.k_proj.forward(k)?;
         let v = self.v_proj.forward(v)?;
 
-        // 2. Split heads: [B, T, D] → [B, T, H, head_dim] → [B, H, T, head_dim]
-        //    via reshape + transpose, then fold to [B*H, T, head_dim] for bmm.
-        let bh = batch * self.num_heads;
-        let q = self.split_heads(&q, batch, seq)?;
-        let k = self.split_heads(&k, batch, seq)?;
-        let v = self.split_heads(&v, batch, seq)?;
+        // 2. Split heads. Q uses t_q; K and V use t_kv (cross-attention
+        //    can have different query and key/value sequence lengths).
+        let q = self.split_heads(&q, batch, t_q)?;
+        let k = self.split_heads(&k, batch, t_kv)?;
+        let v = self.split_heads(&v, batch, t_kv)?;
 
-        // 3. K transpose for QK^T: [B*H, T, hd] → [B*H, hd, T]
+        // 3. K transpose for QK^T: [B*H, T_kv, hd] → [B*H, hd, T_kv]
         let k_t = ops::transpose(&k, 1, 2)?;
-        // 4. Scores = (Q @ K^T) / sqrt(head_dim)
+        // 4. Scores = (Q @ K^T) / sqrt(head_dim) → [B*H, T_q, T_kv]
         let raw = ops::bmm(&q, &k_t)?;
         let inv_scale = Variable::new(Tensor::scalar(1.0_f32 / (self.head_dim as f32).sqrt()));
         let scores = ops::mul(&raw, &inv_scale)?;
@@ -308,10 +323,10 @@ impl MultiHeadAttention {
         };
         // 6. Softmax over last dim
         let attn = ops::softmax(&scores, 2)?;
-        // 7. Attn @ V → [B*H, T, head_dim]
+        // 7. Attn @ V → [B*H, T_q, head_dim]
         let context = ops::bmm(&attn, &v)?;
-        // 8. Unfold + transpose + reshape back to [B, T, D]
-        let context = self.merge_heads(&context, batch, seq, bh)?;
+        // 8. Unfold + transpose + reshape back to [B, T_q, D]
+        let context = self.merge_heads(&context, batch, t_q)?;
         // 9. Output projection
         self.o_proj.forward(&context)
     }
@@ -337,13 +352,7 @@ impl MultiHeadAttention {
     }
 
     /// Inverse of `split_heads`: `[B*H, T, head_dim] → [B, T, D]`.
-    fn merge_heads(
-        &self,
-        x: &Variable,
-        batch: usize,
-        seq: usize,
-        _bh: usize,
-    ) -> Result<Variable, ModuleError> {
+    fn merge_heads(&self, x: &Variable, batch: usize, seq: usize) -> Result<Variable, ModuleError> {
         // [B*H, T, hd] → [B, H, T, hd]
         let x4 = ops::reshape(x, vec![batch, self.num_heads, seq, self.head_dim])?;
         // [B, H, T, hd] → [B, T, H, hd]
