@@ -97,6 +97,16 @@ impl Variable {
         *self.grad.lock().unwrap() = None;
     }
 
+    /// Replace the accumulated gradient with `new_grad`. Used by
+    /// gradient post-processors (e.g. `clip_grad_norm_` in
+    /// `rustorch-optim`) that need to scale or clip the grad in
+    /// place after `backward()` has run but before `optimizer.step()`.
+    ///
+    /// Pass `None` to reset (equivalent to [`Self::zero_grad`]).
+    pub fn set_grad(&self, new_grad: Option<Tensor>) {
+        *self.grad.lock().unwrap() = new_grad;
+    }
+
     /// Return a *detached* copy — same data snapshot, no grad_fn,
     /// requires_grad false. Detach breaks the autograd graph.
     pub fn detach(&self) -> Variable {
