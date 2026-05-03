@@ -38,6 +38,8 @@ pub fn clip_grad_norm_(parameters: &[Variable], max_norm: f32) -> f32 {
     let global_norm = total_sq.sqrt() as f32;
 
     // 2) If clipping needed, scale every grad in place.
+    // P3.Y plan, Phase D: preserve the grad's device tag so subsequent
+    // ops (optimiser.step) keep dispatching to the correct backend.
     if global_norm > max_norm && global_norm > 0.0 {
         let scale = max_norm / global_norm;
         for p in parameters {
@@ -49,7 +51,9 @@ pub fn clip_grad_norm_(parameters: &[Variable], max_norm: f32) -> f32 {
                     .map(|v| v * scale)
                     .collect();
                 let shape = g.shape().to_vec();
-                let new_g = Tensor::from_vec(shape, scaled).expect("clipped grad shape");
+                let new_g = Tensor::from_vec(shape, scaled)
+                    .expect("clipped grad shape")
+                    .with_device(g.device());
                 p.set_grad(Some(new_g));
             }
         }
@@ -77,7 +81,10 @@ pub fn clip_grad_norm_per_param_(parameters: &[Variable], max_norm: f32) -> Vec<
             let scale = max_norm / n;
             let scaled: Vec<f32> = s.iter().map(|v| v * scale).collect();
             let shape = g.shape().to_vec();
-            let new_g = Tensor::from_vec(shape, scaled).expect("clipped grad shape");
+            // P3.Y plan, Phase D: preserve grad device tag.
+            let new_g = Tensor::from_vec(shape, scaled)
+                .expect("clipped grad shape")
+                .with_device(g.device());
             p.set_grad(Some(new_g));
         }
     }

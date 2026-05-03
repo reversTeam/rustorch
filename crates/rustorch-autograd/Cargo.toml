@@ -20,6 +20,10 @@ rustorch-wgpu = { workspace = true, optional = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 
+[dev-dependencies]
+# Used by the gpu-tests training-loop test (Phase D step c6aaded6).
+rustorch-optim = { workspace = true }
+
 [features]
 default = []
 # Enable Variable::device == Wgpu dispatch through the rustorch-wgpu

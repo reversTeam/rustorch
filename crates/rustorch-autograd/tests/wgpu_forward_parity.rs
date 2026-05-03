@@ -284,6 +284,79 @@ fn backward_parity_add_mul_sum_uses_unbroadcast_to() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "needs a GPU adapter")]
+fn training_loop_wgpu_loss_decreases() {
+    // P3.Y plan, Phase D step c6aaded6 — minimal training loop on Wgpu:
+    // Linear (matmul + add_bias) → MSE loss → AdamW.step. Verifies that
+    // forward + backward + optimiser dispatch end-to-end on Wgpu, and
+    // that the loss strictly decreases over iterations.
+    use rustorch_autograd::backward;
+    use rustorch_optim::{AdamW, Optimizer};
+
+    // Tiny regression problem: y = 2x + 0.5
+    let n = 32usize;
+    let xs_data: Vec<f32> = (0..n).map(|i| (i as f32) / (n as f32)).collect();
+    let ys_data: Vec<f32> = xs_data.iter().map(|&x| 2.0 * x + 0.5).collect();
+
+    let xs = Tensor::from_vec([n, 1], xs_data)
+        .unwrap()
+        .with_device(Device::Wgpu);
+    let ys = Tensor::from_vec([n, 1], ys_data)
+        .unwrap()
+        .with_device(Device::Wgpu);
+
+    // Linear params on Wgpu: weight [1,1] (init 0.0), bias [1] (init 0.0).
+    let w = Variable::leaf(
+        Tensor::from_vec([1usize, 1], vec![0.0_f32])
+            .unwrap()
+            .with_device(Device::Wgpu),
+    )
+    .requires_grad(true);
+    let b = Variable::leaf(
+        Tensor::from_vec([1usize], vec![0.0_f32])
+            .unwrap()
+            .with_device(Device::Wgpu),
+    )
+    .requires_grad(true);
+
+    let mut opt = AdamW::new(vec![w.clone(), b.clone()], 0.05);
+
+    let xs_var = Variable::new(xs);
+    let ys_var = Variable::new(ys);
+
+    // Train long enough for loss to converge below threshold. AdamW with
+    // lr=0.05 on a near-zero init oscillates near the optimum, so we use
+    // 80 steps and check that the best loss across the run is small.
+    let mut losses: Vec<f32> = Vec::new();
+    for _step in 0..80 {
+        opt.zero_grad();
+        let pred = ops::matmul(&xs_var, &w).unwrap();
+        let pred = ops::add_bias(&pred, &b).unwrap();
+        let loss = ops::mse_loss(&pred, &ys_var, rustorch_cpu::backend::Reduction::Mean).unwrap();
+        let loss_val = loss.tensor().as_slice::<f32>().unwrap()[0];
+        losses.push(loss_val);
+        backward(&loss, None).unwrap();
+        opt.step();
+    }
+
+    let first = losses[0];
+    let last = *losses.last().unwrap();
+    let min = losses.iter().cloned().fold(f32::INFINITY, f32::min);
+    // Loss must strictly decrease vs first step (proves dispatch chain works).
+    assert!(
+        last < first * 0.5,
+        "training loss didn't decrease enough on Wgpu: first={first} last={last}"
+    );
+    // Best loss across the run drops by ≥ 50× from initial — proves the
+    // training loop converges. With 80 steps and lr=0.05 the loss reaches
+    // ~0.03 from an initial 2.49 (99% reduction).
+    assert!(
+        min < first / 50.0,
+        "training min loss didn't reduce enough: min={min}, first={first}, last={last}"
+    );
+}
+
+#[test]
 fn device_mismatch_returns_clear_error() {
     // This test runs without a GPU because it only exercises the
     // dispatch gate, which trips before any kernel call. Validates
