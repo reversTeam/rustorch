@@ -227,6 +227,63 @@ fn backward_parity_matmul_sigmoid_matmul_sum() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "needs a GPU adapter")]
+fn backward_parity_add_mul_sum_uses_unbroadcast_to() {
+    // Backward parity for Add+Mul backward — exercises `unbroadcast_to`
+    // (used by AddBackward/MulBackward when forward broadcast happens
+    // along the bias axis). Confirms WgpuBackend::sum_dim + reshape +
+    // unbroadcast_to compose correctly to match CPU gradients.
+    //
+    // Chain: (x + b) * w summed; backward through MulBackward + AddBackward.
+    // x [4, 8], b [8] (broadcast), w [4, 8] same as x.
+    use rustorch_autograd::backward;
+
+    let x_data = det_tensor(&[4, 8], 1.0);
+    let b_data = det_tensor(&[8], 0.5);
+    let w_data = det_tensor(&[4, 8], 0.7);
+
+    fn forward_and_backward(
+        x_data: Tensor,
+        b_data: Tensor,
+        w_data: Tensor,
+        device: Device,
+    ) -> (Tensor, Tensor) {
+        let x = Variable::leaf(to_dev(x_data, device)).requires_grad(true);
+        let b = Variable::leaf(to_dev(b_data, device)).requires_grad(true);
+        let w = Variable::leaf(to_dev(w_data, device));
+
+        // y = (x + b) * w  [4, 8]
+        let xb = ops::add(&x, &b).unwrap(); // x.shape == b.shape (broadcast happens via the trait if shapes differed)
+        let y = ops::mul(&xb, &w).unwrap();
+        let loss = ops::sum(&y).unwrap();
+
+        backward(&loss, None).unwrap();
+
+        (
+            x.grad().expect("x.grad after backward"),
+            b.grad().expect("b.grad after backward"),
+        )
+    }
+
+    let (gx_cpu, gb_cpu) =
+        forward_and_backward(x_data.clone(), b_data.clone(), w_data.clone(), Device::Cpu);
+    let (gx_gpu, gb_gpu) = forward_and_backward(x_data, b_data, w_data, Device::Wgpu);
+
+    assert_eq!(gx_cpu.shape(), gx_gpu.shape());
+    assert_eq!(gb_cpu.shape(), gb_gpu.shape());
+    let cs_x = cosine_similarity(
+        gx_cpu.as_slice::<f32>().unwrap(),
+        gx_gpu.as_slice::<f32>().unwrap(),
+    );
+    let cs_b = cosine_similarity(
+        gb_cpu.as_slice::<f32>().unwrap(),
+        gb_gpu.as_slice::<f32>().unwrap(),
+    );
+    assert!(cs_x > 0.999, "x.grad cosine sim too low: {cs_x}");
+    assert!(cs_b > 0.999, "b.grad cosine sim too low: {cs_b}");
+}
+
+#[test]
 fn device_mismatch_returns_clear_error() {
     // This test runs without a GPU because it only exercises the
     // dispatch gate, which trips before any kernel call. Validates

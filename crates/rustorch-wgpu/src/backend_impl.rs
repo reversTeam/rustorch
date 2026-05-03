@@ -278,11 +278,109 @@ impl Backend for WgpuBackend {
         Ok(tag_wgpu(t))
     }
 
-    // Other optional methods (abs, sqrt, exp, log, sum, mean, softmax,
-    // log_softmax, transpose, reshape, bmm, unbroadcast_to, softmax_grad,
-    // gather, scatter, conv2d, …) inherit the default `UnsupportedOp` impl
-    // from the trait. Phases B2+ and C2+ override them progressively as
-    // kernels are written.
+    /// Reshape — pure metadata change (no kernel needed). With Storage
+    /// Option B, the data lives in the CPU shadow, so we rebuild the
+    /// Tensor from the contiguous F32 slice with the new shape.
+    fn reshape(&self, src: &Tensor, shape: &[usize]) -> Result<Tensor, BackendError> {
+        let numel: usize = shape.iter().product();
+        if numel != src.numel() {
+            return Err(BackendError::ShapeMismatch {
+                op: "reshape",
+                lhs: src.shape().to_vec(),
+                rhs: shape.to_vec(),
+            });
+        }
+        let data = src.as_slice::<f32>().ok_or_else(|| {
+            BackendError::NumericalError("reshape: expected contiguous F32".to_string())
+        })?;
+        Tensor::from_vec(shape.to_vec(), data.to_vec())
+            .map(tag_wgpu)
+            .map_err(|e| BackendError::NumericalError(format!("reshape build: {e}")))
+    }
+
+    /// Reduce-sum along `dims`. CPU fallback for now — round-trips to
+    /// CpuBackend so backward ops that use sum_dim (Add/Sub/Mul/Div via
+    /// `unbroadcast_to`, Softmax via the dot trick, MeanDim) get a
+    /// correct result. Phase B2 will add a native wgpu kernel that
+    /// permutes axes and reuses `reduce_rows`.
+    fn sum_dim(&self, src: &Tensor, dims: &[usize], keepdim: bool) -> Result<Tensor, BackendError> {
+        let result = cpu_backend().sum_dim(src, dims, keepdim)?;
+        Ok(tag_wgpu(result))
+    }
+
+    /// Reduce-mean along `dims`. CPU fallback (same justification as
+    /// `sum_dim`).
+    fn mean_dim(
+        &self,
+        src: &Tensor,
+        dims: &[usize],
+        keepdim: bool,
+    ) -> Result<Tensor, BackendError> {
+        let result = cpu_backend().mean_dim(src, dims, keepdim)?;
+        Ok(tag_wgpu(result))
+    }
+
+    /// Sum the upstream `grad` down to `target_shape` so it matches the
+    /// shape of the input that was broadcast on the forward path.
+    /// Composes via `self.sum_dim` + `self.reshape` — same algorithm as
+    /// CpuBackend's `unbroadcast_to_impl` but expressed against the trait
+    /// surface so it works for any backend with those two primitives.
+    ///
+    /// Unlocks Add/Sub/Mul/Div backward on Wgpu via the autograd
+    /// `crate::broadcast::unbroadcast_to(device, grad, target_shape)`
+    /// helper which dispatches here.
+    fn unbroadcast_to(
+        &self,
+        grad: &Tensor,
+        target_shape: &[usize],
+    ) -> Result<Tensor, BackendError> {
+        let grad_shape = grad.shape();
+        if grad_shape == target_shape {
+            return Ok(grad.clone());
+        }
+        let g_ndim = grad_shape.len();
+        let t_ndim = target_shape.len();
+        if t_ndim > g_ndim {
+            return Err(BackendError::ShapeMismatch {
+                op: "unbroadcast_to",
+                lhs: grad_shape.to_vec(),
+                rhs: target_shape.to_vec(),
+            });
+        }
+        let pad = g_ndim - t_ndim;
+        let mut padded = vec![1usize; pad];
+        padded.extend_from_slice(target_shape);
+        for (&g, &t) in grad_shape.iter().zip(padded.iter()) {
+            if t != 1 && t != g {
+                return Err(BackendError::ShapeMismatch {
+                    op: "unbroadcast_to",
+                    lhs: grad_shape.to_vec(),
+                    rhs: target_shape.to_vec(),
+                });
+            }
+        }
+        let reduce_axes: Vec<usize> = padded
+            .iter()
+            .zip(grad_shape.iter())
+            .enumerate()
+            .filter_map(|(axis, (&p, &g))| if p == 1 && g > 1 { Some(axis) } else { None })
+            .collect();
+        let reduced = if reduce_axes.is_empty() {
+            grad.clone()
+        } else {
+            self.sum_dim(grad, &reduce_axes, true)?
+        };
+        if reduced.shape() == target_shape {
+            Ok(reduced)
+        } else {
+            self.reshape(&reduced, target_shape)
+        }
+    }
+
+    // Other optional methods (abs, sqrt, exp, log, softmax, log_softmax,
+    // transpose, bmm, softmax_grad, gather, scatter, conv2d, …) inherit
+    // the default `UnsupportedOp` impl from the trait. Phases B2+ and
+    // C2+ override them progressively as kernels are written.
 }
 
 #[cfg(test)]
