@@ -23,6 +23,14 @@ ndarray = ["dep:ndarray"]
 # storage/version concurrent-model tests to verify Arc/Atomic correctness
 # under all interleavings.
 loom    = ["dep:loom"]
+# Multi-device Storage variants (P3.Z Storage Option A — Task A).
+# Each feature pulls the underlying GPU crate and unlocks a corresponding
+# `Storage::*` variant (Wgpu / WgpuShared / Cuda / Metal). Backends
+# (rustorch-wgpu / rustorch-cuda / rustorch-metal) ENABLE the matching
+# feature on their `rustorch-core` dependency line.
+wgpu  = ["dep:wgpu", "dep:pollster"]
+cuda  = []   # rustorch-cuda will populate concrete CudaStorage when impl lands (Task M)
+metal = []   # rustorch-metal will populate concrete MetalStorage when crate is created (Task J)
 
 [dependencies]
 half       = { workspace = true }
@@ -32,6 +40,9 @@ thiserror  = { workspace = true }
 serde      = { workspace = true, optional = true }
 ndarray    = { workspace = true, optional = true }
 loom       = { workspace = true, optional = true }
+# Multi-device Storage GPU handles (feature-gated, Task A).
+wgpu       = { workspace = true, optional = true }
+pollster   = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
