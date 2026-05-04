@@ -3348,6 +3348,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-gguf"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "half",
+ "rayon",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustorch-llm"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,25 @@
+[package]
+name = "rustorch-gguf"
+description = "GGUF (llama.cpp) format parser + Q4_K_M / Q6_K dequantization. Reads sharded GGUF files, exposes tensor metadata and raw blocks, dequantizes K-quants to f32. Companion to rustorch-llm for loading real Qwen / Llama checkpoints."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+half       = { workspace = true }
+bytemuck   = { workspace = true }
+thiserror  = { workspace = true }
+rayon      = { workspace = true }
+
+[[example]]
+name = "gguf_inspect"
+path = "examples/gguf_inspect.rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
