@@ -490,48 +490,103 @@ impl Tensor {
     /// Panics if the underlying storage is shared with a clone (an
     /// alias) — the caller must `.contiguous()` or own the buffer.
     pub fn add_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
-        // macOS-specific fast path: route contiguous f32 element-wise
-        // add through `vDSP_vadd` (Accelerate). vDSP saturates the
-        // single-thread NEON bandwidth on M-series Macs (~85 GB/s)
-        // where the auto-vectorised generic loop tops out at ~25
-        // GB/s (closure abstraction costs LLVM the prefetch
-        // pattern). This is the hottest binary op (residual adds,
-        // gradient accumulation in optim.step) so the path warrants
-        // a dedicated implementation. P3.X T8 (vDSP elementwise).
-        #[cfg(target_os = "macos")]
+        // T9 — monomorphic dense f32 fast path. The generic
+        // `binary_inplace` carries an `op: impl Fn(f32, f32) -> f32`
+        // closure which LLVM cannot reliably hoist out of the inner
+        // loop on aarch64; the resulting code path tops out at
+        // ~10 GB/s on M-series Macs (12-15× behind PyTorch ATen which
+        // calls NEON intrinsics directly). Hardcoding `+` collapses
+        // the closure barrier and lets the auto-vectoriser emit a
+        // tight `fadd.4s` loop with prefetch. Matches PyTorch's
+        // `at::vec::Vectorized<float>::operator+` strategy.
+        if self.dtype() == Dtype::F32
+            && other.dtype() == Dtype::F32
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.storage_offset() == 0
+            && other.storage_offset() == 0
+            && self.shape() == other.shape()
         {
-            // vDSP_vadd has ~150 ns FFI overhead. Below ~64 K elements
-            // the auto-vectorised inline loop wins; above it vDSP
-            // saturates the bandwidth ceiling. Threshold calibrated
-            // on M4 Max — empirically 64 K is the crossover.
-            const VDSP_MIN: usize = 64 * 1024;
-            if self.numel() >= VDSP_MIN
-                && self.dtype() == Dtype::F32
-                && other.dtype() == Dtype::F32
-                && self.is_contiguous()
-                && other.is_contiguous()
-                && self.storage_offset() == 0
-                && other.storage_offset() == 0
-                && self.shape() == other.shape()
+            // macOS: `vDSP_vadd` saturates ~85 GB/s single-thread on
+            // M4 Max above the FFI break-even point (~64 K elements).
+            // Below that, the inline monomorphic loop wins.
+            #[cfg(target_os = "macos")]
             {
-                return add_f32_vdsp_inplace(self, other);
+                const VDSP_MIN: usize = 64 * 1024;
+                if self.numel() >= VDSP_MIN {
+                    return add_f32_vdsp_inplace(self, other);
+                }
             }
+            return add_f32_dense_inplace(self, other);
         }
         binary_inplace(self, other, "add_", |a, b| a + b, |a, b| a + b)
     }
 
     /// In-place subtraction: `self -= other`.
     pub fn sub_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        // T9 — monomorphic dense f32 fast path (see `add_` rationale).
+        if self.dtype() == Dtype::F32
+            && other.dtype() == Dtype::F32
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.storage_offset() == 0
+            && other.storage_offset() == 0
+            && self.shape() == other.shape()
+        {
+            #[cfg(target_os = "macos")]
+            {
+                const VDSP_MIN: usize = 64 * 1024;
+                if self.numel() >= VDSP_MIN {
+                    return sub_f32_vdsp_inplace(self, other);
+                }
+            }
+            return sub_f32_dense_inplace(self, other);
+        }
         binary_inplace(self, other, "sub_", |a, b| a - b, |a, b| a - b)
     }
 
     /// In-place multiplication: `self *= other`.
     pub fn mul_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        // T9 — monomorphic dense f32 fast path. Mul is the hottest
+        // op in optimizer.step (param * learning_rate, momentum
+        // updates) so the closure-collapse pays off heavily.
+        if self.dtype() == Dtype::F32
+            && other.dtype() == Dtype::F32
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.storage_offset() == 0
+            && other.storage_offset() == 0
+            && self.shape() == other.shape()
+        {
+            #[cfg(target_os = "macos")]
+            {
+                const VDSP_MIN: usize = 64 * 1024;
+                if self.numel() >= VDSP_MIN {
+                    return mul_f32_vdsp_inplace(self, other);
+                }
+            }
+            return mul_f32_dense_inplace(self, other);
+        }
         binary_inplace(self, other, "mul_", |a, b| a * b, |a, b| a * b)
     }
 
     /// In-place division: `self /= other`.
     pub fn div_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        // T9 — monomorphic dense f32 fast path. Div is rarer than
+        // add/mul but still appears in normalisation and softmax
+        // backward, so closure-collapse helps. No vDSP path:
+        // `vDSP_vdiv` exists but offers minimal advantage on f32
+        // because divide isn't bandwidth-bound on M-series.
+        if self.dtype() == Dtype::F32
+            && other.dtype() == Dtype::F32
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.storage_offset() == 0
+            && other.storage_offset() == 0
+            && self.shape() == other.shape()
+        {
+            return div_f32_dense_inplace(self, other);
+        }
         binary_inplace(self, other, "div_", |a, b| a / b, |a, b| a / b)
     }
 
@@ -934,6 +989,215 @@ fn add_f32_vdsp_inplace<'a>(
 #[link(name = "Accelerate", kind = "framework")]
 #[cfg(target_os = "macos")]
 extern "C" {}
+
+/// In-place f32 contiguous subtract through `vDSP_vsub` (T9).
+///
+/// `vDSP_vsub(B, 1, A, 1, C, 1, N)` computes `C[i] = A[i] - B[i]`
+/// — note the **reversed argument order** in vDSP (B is subtracted
+/// from A). The aliased call `vDSP_vsub(rhs, 1, lhs, 1, lhs, 1, n)`
+/// computes `lhs[i] = lhs[i] - rhs[i]`.
+#[cfg(target_os = "macos")]
+fn sub_f32_vdsp_inplace<'a>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = lhs.numel();
+    if n == 0 {
+        return Ok(lhs);
+    }
+    let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+    let storage = lhs
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "sub_" })?;
+    let lhs_ptr = storage.as_mut_ptr() as *mut f32;
+
+    extern "C" {
+        fn vDSP_vsub(
+            b: *const f32,
+            ib: isize,
+            a: *const f32,
+            ia: isize,
+            c: *mut f32,
+            ic: isize,
+            n: usize,
+        );
+    }
+    // SAFETY: bounds checked by caller; vDSP supports aliased C=A.
+    unsafe {
+        vDSP_vsub(rhs_ptr, 1, lhs_ptr, 1, lhs_ptr, 1, n);
+    }
+    lhs.version().bump();
+    Ok(lhs)
+}
+
+/// In-place f32 contiguous multiply through `vDSP_vmul` (T9).
+///
+/// `vDSP_vmul(A, 1, B, 1, C, 1, N)` computes `C[i] = A[i] * B[i]`.
+/// Heavily used in optim.step (param * lr, momentum updates).
+#[cfg(target_os = "macos")]
+fn mul_f32_vdsp_inplace<'a>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = lhs.numel();
+    if n == 0 {
+        return Ok(lhs);
+    }
+    let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+    let storage = lhs
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "mul_" })?;
+    let lhs_ptr = storage.as_mut_ptr() as *mut f32;
+
+    extern "C" {
+        fn vDSP_vmul(
+            a: *const f32,
+            ia: isize,
+            b: *const f32,
+            ib: isize,
+            c: *mut f32,
+            ic: isize,
+            n: usize,
+        );
+    }
+    // SAFETY: bounds checked by caller; vDSP supports aliased C=A.
+    unsafe {
+        vDSP_vmul(lhs_ptr, 1, rhs_ptr, 1, lhs_ptr, 1, n);
+    }
+    lhs.version().bump();
+    Ok(lhs)
+}
+
+/// Macro: emit a monomorphic dense f32 in-place binary op. The
+/// `op` token is the actual operator (`+=`, `-=`, `*=`, `/=`),
+/// which collapses to a single hardware instruction inside the
+/// vectorised inner loop. Matches PyTorch's `at::vec::Vectorized`
+/// strategy (NEON `fadd.4s` / AVX2 `vfmadd231ps` etc.).
+///
+/// Caller invariants (already checked by the `Tensor::*_` callers):
+/// - both tensors are F32, contiguous, zero offset, equal shape.
+macro_rules! emit_dense_f32_binary {
+    ($name:ident, $op_name:literal, $op:tt) => {
+        fn $name<'a>(
+            lhs: &'a mut Tensor,
+            rhs: &Tensor,
+        ) -> Result<&'a mut Tensor, TensorError> {
+            let n = lhs.numel();
+            if n == 0 {
+                return Ok(lhs);
+            }
+            let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+            let rhs_len = rhs.storage().byte_len() / core::mem::size_of::<f32>();
+            debug_assert!(rhs_len >= n);
+            // SAFETY: dtype + length checked by caller; rhs immutable.
+            let rhs_slice: &[f32] = unsafe { core::slice::from_raw_parts(rhs_ptr, n) };
+
+            let storage = lhs
+                .storage_mut_for_inplace()
+                .ok_or(TensorError::Aliased { op: $op_name })?;
+            let lhs_typed_len = storage.len() / core::mem::size_of::<f32>();
+            debug_assert!(lhs_typed_len >= n);
+            // SAFETY: unique borrow + dtype match.
+            let lhs_slice: &mut [f32] =
+                unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut f32, n) };
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                const PARALLEL_MIN: usize = 4_000_000;
+                if n >= PARALLEL_MIN {
+                    use rayon::prelude::*;
+                    let chunk = (n / rayon::current_num_threads().max(1)).max(256 * 1024);
+                    lhs_slice
+                        .par_chunks_mut(chunk)
+                        .zip(rhs_slice.par_chunks(chunk))
+                        .for_each(|(l_chunk, r_chunk)| {
+                            for (l, r) in l_chunk.iter_mut().zip(r_chunk.iter()) {
+                                *l $op *r;
+                            }
+                        });
+                    lhs.version().bump();
+                    return Ok(lhs);
+                }
+            }
+            for (l, r) in lhs_slice.iter_mut().zip(rhs_slice.iter()) {
+                *l $op *r;
+            }
+            lhs.version().bump();
+            Ok(lhs)
+        }
+    };
+}
+
+emit_dense_f32_binary!(sub_f32_dense_inplace, "sub_", -=);
+emit_dense_f32_binary!(mul_f32_dense_inplace, "mul_", *=);
+emit_dense_f32_binary!(div_f32_dense_inplace, "div_", /=);
+
+/// Monomorphic dense f32 in-place add (T9). Bypasses the generic
+/// `binary_inplace` closure barrier so LLVM can emit straight-line
+/// `fadd.4s` NEON / AVX2 instructions with the right prefetch
+/// pattern. Matches PyTorch's `at::vec::Vectorized<float> + ` strategy.
+///
+/// Caller invariants (already checked by `Tensor::add_`):
+/// - both tensors are F32, contiguous, zero offset, equal shape.
+fn add_f32_dense_inplace<'a>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = lhs.numel();
+    if n == 0 {
+        return Ok(lhs);
+    }
+    // Read rhs first — immutable borrow drops before we acquire the
+    // unique mutable borrow on lhs.
+    let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+    let rhs_len = rhs.storage().byte_len() / core::mem::size_of::<f32>();
+    debug_assert!(rhs_len >= n);
+    // SAFETY: dtype matches, length checked, lifetime tied to rhs.
+    let rhs_slice: &[f32] = unsafe { core::slice::from_raw_parts(rhs_ptr, n) };
+
+    let storage = lhs
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "add_" })?;
+    let lhs_typed_len = storage.len() / core::mem::size_of::<f32>();
+    debug_assert!(lhs_typed_len >= n);
+    // SAFETY: unique mutable borrow + dtype match.
+    let lhs_slice: &mut [f32] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut f32, n) };
+
+    // Rayon shard for memory-bandwidth-bound regimes — same threshold
+    // as `binary_inplace_typed` to keep the calibration consistent.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        const PARALLEL_MIN: usize = 4_000_000;
+        if n >= PARALLEL_MIN {
+            use rayon::prelude::*;
+            let chunk = (n / rayon::current_num_threads().max(1)).max(256 * 1024);
+            lhs_slice
+                .par_chunks_mut(chunk)
+                .zip(rhs_slice.par_chunks(chunk))
+                .for_each(|(l_chunk, r_chunk)| {
+                    // Hot inner loop: monomorphic fadd. LLVM unrolls
+                    // and emits NEON `fadd.4s` (4 lanes × f32 per
+                    // cycle on M-series Macs).
+                    for (l, r) in l_chunk.iter_mut().zip(r_chunk.iter()) {
+                        *l += *r;
+                    }
+                });
+            lhs.version().bump();
+            return Ok(lhs);
+        }
+    }
+
+    // Single-thread tight loop. The `+=` operator on f32 collapses
+    // to a single `fadd` instruction; LLVM auto-vectorises across
+    // 4-element lanes (NEON) or 8-element (AVX2 fma) without the
+    // closure barrier of the generic path.
+    for (l, r) in lhs_slice.iter_mut().zip(rhs_slice.iter()) {
+        *l += *r;
+    }
+    lhs.version().bump();
+    Ok(lhs)
+}
 
 fn strided_index(linear: usize, shape: &[usize], strides: &[isize], offset: usize) -> usize {
     let mut idx = linear;
