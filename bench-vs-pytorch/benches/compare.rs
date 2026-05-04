@@ -209,6 +209,14 @@ fn bench_flash_attention(c: &mut Criterion) {
 }
 
 /// Element-wise `add_` via the in-place tensor API.
+///
+/// **T23 fairness fix**: prior versions cloned `a_data` and built a
+/// fresh Tensor inside the iter loop, which on n=1M ≈ 4 MB charged
+/// the measurement with a DRAM-bandwidth-bound clone (~50 µs) plus
+/// allocator + Tensor::from_vec setup. PyTorch's bench loop does
+/// `a = make(...)` ONCE outside the timer and then `a.add_(b)`
+/// in-place, so we matched that — `iter_batched` prepares a fresh
+/// `a` per iteration but only the `add_` call is timed.
 fn bench_elementwise_add(c: &mut Criterion) {
     let mut group = c.benchmark_group("elementwise_add_inplace");
     // Span L1d → DRAM cache tiers (4 KB → 40 MB)
@@ -218,11 +226,14 @@ fn bench_elementwise_add(c: &mut Criterion) {
         let b = Tensor::from_vec(vec![n], b_data).unwrap();
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bb, _| {
-            bb.iter(|| {
-                let mut a = Tensor::from_vec(vec![n], a_data.clone()).unwrap();
-                a.add_(black_box(&b)).unwrap();
-                hint_black_box(a)
-            });
+            bb.iter_batched(
+                || Tensor::from_vec(vec![n], a_data.clone()).unwrap(),
+                |mut a| {
+                    a.add_(black_box(&b)).unwrap();
+                    hint_black_box(a)
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
