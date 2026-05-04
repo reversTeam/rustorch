@@ -348,10 +348,22 @@ fn layer_norm_forward_f32_fused(
     #[cfg(not(target_arch = "wasm32"))]
     if outer >= PARALLEL_OUTER_MIN {
         use rayon::prelude::*;
+        // T38 — chunk multiple rows per rayon task. With one row per
+        // task (3 KB f32 work unit on D=768), rayon's per-task
+        // dispatch overhead (~1 µs) compounds to ~500 µs across 512
+        // rows. Bundling 16 rows per chunk amortises the dispatch
+        // and keeps each task at 48 KB which still fits comfortably
+        // in L1d.
+        const ROWS_PER_TASK: usize = 16;
+        let chunk_bytes = d * ROWS_PER_TASK;
         out_data
-            .par_chunks_mut(d)
-            .zip(x_slice.par_chunks(d))
-            .for_each(|(out_row, x_row)| process_row(x_row, out_row));
+            .par_chunks_mut(chunk_bytes)
+            .zip(x_slice.par_chunks(chunk_bytes))
+            .for_each(|(out_chunk, x_chunk)| {
+                for (out_row, x_row) in out_chunk.chunks_mut(d).zip(x_chunk.chunks(d)) {
+                    process_row(x_row, out_row);
+                }
+            });
     } else {
         for o in 0..outer {
             process_row(
@@ -464,10 +476,22 @@ fn rms_norm_forward_f32_fused(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Te
     #[cfg(not(target_arch = "wasm32"))]
     if outer >= PARALLEL_OUTER_MIN {
         use rayon::prelude::*;
+        // T38 — chunk multiple rows per rayon task. With one row per
+        // task (3 KB f32 work unit on D=768), rayon's per-task
+        // dispatch overhead (~1 µs) compounds to ~500 µs across 512
+        // rows. Bundling 16 rows per chunk amortises the dispatch
+        // and keeps each task at 48 KB which still fits comfortably
+        // in L1d.
+        const ROWS_PER_TASK: usize = 16;
+        let chunk_bytes = d * ROWS_PER_TASK;
         out_data
-            .par_chunks_mut(d)
-            .zip(x_slice.par_chunks(d))
-            .for_each(|(out_row, x_row)| process_row(x_row, out_row));
+            .par_chunks_mut(chunk_bytes)
+            .zip(x_slice.par_chunks(chunk_bytes))
+            .for_each(|(out_chunk, x_chunk)| {
+                for (out_row, x_row) in out_chunk.chunks_mut(d).zip(x_chunk.chunks(d)) {
+                    process_row(x_row, out_row);
+                }
+            });
     } else {
         for o in 0..outer {
             process_row(
