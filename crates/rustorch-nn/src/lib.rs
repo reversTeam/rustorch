@@ -59,6 +59,7 @@ pub mod conv;
 pub mod embedding;
 pub mod hooks;
 pub mod init;
+pub mod kv_cache;
 pub mod linear;
 pub mod loss;
 pub mod masks;
