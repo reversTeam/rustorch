@@ -66,6 +66,34 @@ pub(crate) fn require_same_device_2(
     Ok(l)
 }
 
+/// Three-operand variant of [`require_same_device_2`] — used by ops
+/// like `linear(x, w, bias)` that bind three inputs.
+pub(crate) fn require_same_device_3(
+    op: &'static str,
+    a: &Variable,
+    b: &Variable,
+    c: &Variable,
+) -> Result<Device, BackwardError> {
+    let da = a.device();
+    let db = b.device();
+    let dc = c.device();
+    if da != db {
+        return Err(BackwardError::DeviceMismatch {
+            op,
+            lhs: da,
+            rhs: db,
+        });
+    }
+    if da != dc {
+        return Err(BackwardError::DeviceMismatch {
+            op,
+            lhs: da,
+            rhs: dc,
+        });
+    }
+    Ok(da)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

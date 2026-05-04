@@ -38,6 +38,48 @@ pub trait Backend: Send + Sync {
     /// Matrix multiplication on rank-2 tensors.
     fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError>;
 
+    /// Matmul with optional transpose flags on the operands.
+    /// Default impl runs `transpose + matmul`; backends with
+    /// transpose-aware kernels (e.g. Metal `simdgroup_load` with
+    /// `transpose` flag) override to skip the explicit transpose
+    /// dispatch and avoid materialising the intermediate.
+    fn matmul_with_transposes(
+        &self,
+        lhs: &Tensor,
+        rhs: &Tensor,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<Tensor, BackendError> {
+        let lhs_eff = if transpose_a {
+            self.transpose(lhs, 0, 1)?
+        } else {
+            lhs.clone()
+        };
+        let rhs_eff = if transpose_b {
+            self.transpose(rhs, 0, 1)?
+        } else {
+            rhs.clone()
+        };
+        self.matmul(&lhs_eff, &rhs_eff)
+    }
+
+    /// Linear forward: `C = A @ B + bias_broadcast(N)`. Default impl
+    /// composes `matmul + add_bias` (two dispatches + one ~M×N
+    /// intermediate buffer). Backends that support a single fused
+    /// kernel (e.g. Metal `matmul_simdgroup_f32_coarsened_wide_bias`)
+    /// override to collapse this into a single dispatch / write-back.
+    ///
+    /// Shapes: `A:[M,K]`, `B:[K,N]`, `bias:[N]`, output `[M,N]`.
+    fn matmul_with_bias(
+        &self,
+        lhs: &Tensor,
+        rhs: &Tensor,
+        bias: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        let mm = self.matmul(lhs, rhs)?;
+        self.add_bias(&mm, bias)
+    }
+
     /// Sum over all elements.
     fn sum(&self, _src: &Tensor) -> Result<Tensor, BackendError> {
         Err(BackendError::UnsupportedOp {
