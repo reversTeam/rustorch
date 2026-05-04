@@ -59,9 +59,23 @@ impl Tensor {
     /// Iterate over the typed elements of the tensor in shape order
     /// (works for any contiguity).
     ///
-    /// Returns `None` if `T` does not match the tensor's dtype.
+    /// Returns `None` if `T` does not match the tensor's dtype OR
+    /// if the storage lives on a GPU device (callers must call
+    /// `tensor_to_cpu()` / `to_cpu()` first to materialise host
+    /// bytes — P3.Z Task A strict semantics).
     pub fn iter_elements<T: Element>(&self) -> Option<ShapeIter<'_, T>> {
         if self.dtype() != T::DTYPE {
+            return None;
+        }
+        // P3.Z Task A: refuse non-Cpu storage. The unsafe `as_slice`
+        // call below would otherwise read an empty `&[]` for GPU
+        // storage and ShapeIter::next would panic with "index out of
+        // bounds: the len is 0 but the index is 0" on the first
+        // element. By returning `None` here, callers who `.expect()`
+        // get a clear "iter_elements called on non-Cpu tensor"
+        // message and can be migrated to download via
+        // `rustorch_wgpu::transfer::tensor_to_cpu` first.
+        if !self.storage().is_cpu() {
             return None;
         }
         // SAFETY: dtype matches, storage holds at least

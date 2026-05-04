@@ -244,20 +244,20 @@ impl Node for MatMulBackward {
         "MatMulBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        // `Tensor::transpose` returns a non-contiguous view; we need a
-        // contiguous F32 layout before handing the tensor to a backend
-        // (Wgpu's `to_gpu` requires contiguous slice access; CpuBackend
-        // tolerates either but the contiguous() call is cheap and uniform).
-        let rhs_t = self
-            .rhs_saved
-            .transpose(0, 1)
-            .expect("transpose")
-            .contiguous();
-        let lhs_t = self
-            .lhs_saved
-            .transpose(0, 1)
-            .expect("transpose")
-            .contiguous();
+        // P3.Z Task A round-trip elim: route transpose through the
+        // backend so it stays on-device (Storage::Wgpu in, Storage::Wgpu
+        // out) instead of going via `Tensor::transpose().contiguous()`
+        // which would call `as_slice` on a Wgpu storage and read an
+        // empty host slice. CpuBackend's `transpose` builds a fresh
+        // contiguous Tensor; WgpuBackend's `transpose` materialises
+        // through CPU (legacy fallback) and re-tags Wgpu — both end
+        // states are contiguous + on the right device.
+        let rhs_t = pick_backend(self.device)
+            .transpose(&self.rhs_saved, 0, 1)
+            .expect("transpose rhs");
+        let lhs_t = pick_backend(self.device)
+            .transpose(&self.lhs_saved, 0, 1)
+            .expect("transpose lhs");
         let g_lhs = pick_backend(self.device)
             .matmul(grad, &rhs_t)
             .expect("matmul lhs grad");

@@ -3104,9 +3104,11 @@ dependencies = [
  "loom",
  "ndarray",
  "num-traits",
+ "pollster",
  "proptest",
  "serde",
  "thiserror 1.0.69",
+ "wgpu",
 ]
 
 [[package]]

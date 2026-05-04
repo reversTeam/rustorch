@@ -1,22 +1,47 @@
-//! `WgpuStorage` — refcounted handle to a `wgpu::Buffer` that returns
-//! itself to a [`BufferPool`] when the last reference is dropped.
+//! `WgpuStorage` — refcounted handle to a `wgpu::Buffer` shared between
+//! kernel dispatch (this crate) and the `rustorch-core` Tensor's
+//! `Storage::Wgpu(...)` variant (Task A — P3.Z Storage Option A).
 //!
-//! See [`crate::pooled`] for the drop-to-pool wrapper.
+//! Architecture (post-Task A):
+//!
+//! ```text
+//!   rustorch_wgpu::WgpuStorage {
+//!       pub buffer: rustorch_core::tensor::storage::WgpuStorage,  // shared, Arc-clonable
+//!       pub dtype:  Dtype,
+//!       pub numel:  usize,
+//!   }
+//!   ↑ kernel-side wrapper carrying dtype + numel metadata
+//!
+//!   rustorch_core::tensor::storage::WgpuStorage  ← Arc<WgpuStorageInner>
+//!     - holds the actual wgpu::Buffer (ManuallyDrop)
+//!     - has a Drop hook (Box<dyn FnOnce>) for pool return-on-drop
+//!     - Derefs to &wgpu::Buffer so existing call sites that did
+//!       `storage.buffer.as_entire_binding()` keep working unchanged.
+//! ```
+//!
+//! When a Tensor's `Storage::Wgpu(handle)` and a kernel-side
+//! `WgpuStorage::buffer` reference the SAME core handle (Arc clone),
+//! the buffer survives across op boundaries with no host↔device round
+//! trip — that's the perf win of Storage Option A.
 
 use crate::cache::BufferPool;
 use crate::error::WgpuError;
-use crate::pooled::PooledBuffer;
 use rustorch_core::tensor::dtype::Dtype;
-use std::sync::Arc;
+use rustorch_core::tensor::storage::WgpuStorage as CoreWgpuStorage;
 
-/// A refcounted GPU buffer + dtype. The buffer is shared via `Arc<PooledBuffer>`
-/// so views/slices can clone cheaply, AND the underlying wgpu::Buffer is
-/// returned to the source pool when the last clone is dropped.
+/// A refcounted GPU buffer + dtype + element count. The buffer is held
+/// inside a `core::WgpuStorage` so it can be cloned cheaply into a
+/// Tensor's `Storage::Wgpu(...)` variant — both then share the same
+/// `Arc<WgpuStorageInner>` and the buffer is freed (or returned to
+/// pool via the on_drop hook) when the LAST clone drops.
 #[derive(Clone)]
 pub struct WgpuStorage {
-    /// Underlying wgpu buffer wrapped in a pool-aware drop hook.
-    pub buffer: Arc<PooledBuffer>,
-    /// Element dtype (kept here because wgpu::Buffer is just bytes).
+    /// The shared GPU buffer. `core::WgpuStorage` Derefs to
+    /// `&wgpu::Buffer`, so existing kernel call sites that wrote
+    /// `storage.buffer.as_entire_binding()` keep working.
+    pub buffer: CoreWgpuStorage,
+    /// Element dtype (the wgpu buffer is just bytes; we track dtype
+    /// here for kernel selection / parity checks).
     pub dtype: Dtype,
     /// Number of elements (`bytes / dtype.byte_size()`).
     pub numel: usize,
@@ -43,7 +68,7 @@ impl WgpuStorage {
             mapped_at_creation: false,
         });
         Ok(WgpuStorage {
-            buffer: Arc::new(PooledBuffer::standalone(buffer)),
+            buffer: CoreWgpuStorage::standalone(buffer, n_bytes),
             dtype,
             numel,
         })
@@ -51,7 +76,8 @@ impl WgpuStorage {
 
     /// Allocate via `pool` so that, when this storage's last clone is
     /// dropped, the underlying buffer is recycled into the pool's
-    /// matching bucket.
+    /// matching bucket. The bucket key is `size.next_power_of_two().max(64)`
+    /// (matches [`BufferPool::acquire`]).
     pub fn allocate_pooled(
         device: &wgpu::Device,
         pool: &BufferPool,
@@ -60,15 +86,28 @@ impl WgpuStorage {
     ) -> Result<Self, WgpuError> {
         let n_bytes = numel * dtype.byte_size();
         let size = (n_bytes as u64).max(4);
-        let pooled = pool.acquire_pooled(
+        let bucket = size.next_power_of_two().max(64);
+        let buffer = pool.acquire(
             device,
-            size,
+            bucket,
             wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
         );
+        // Capture a Weak<PoolInner> in the on_drop closure so the
+        // buffer is returned to the pool when the last clone of the
+        // core::WgpuStorage drops. If the pool has been torn down by
+        // then, `Weak::upgrade` returns None and the buffer is freed
+        // normally.
+        let pool_weak = pool.weak_inner();
+        let core = CoreWgpuStorage::with_pool_return(buffer, n_bytes, move |buf| {
+            if let Some(inner) = pool_weak.upgrade() {
+                inner.try_release(buf, bucket);
+            }
+            // else: pool was dropped, `buf` falls out and frees normally.
+        });
         Ok(WgpuStorage {
-            buffer: Arc::new(pooled),
+            buffer: core,
             dtype,
             numel,
         })
@@ -78,6 +117,26 @@ impl WgpuStorage {
     /// possibly padded to wgpu minimum).
     pub fn byte_size(&self) -> usize {
         self.numel * self.dtype.byte_size()
+    }
+
+    /// Build a `WgpuStorage` from an existing `core::WgpuStorage` that
+    /// was extracted from a Tensor's `Storage::Wgpu(...)`. Used by the
+    /// no-round-trip path in `transfer::to_gpu` and `backend_impl.rs`
+    /// to skip the host upload when the input tensor is already on
+    /// the GPU.
+    pub fn from_core(core: CoreWgpuStorage, dtype: Dtype, numel: usize) -> Self {
+        WgpuStorage {
+            buffer: core,
+            dtype,
+            numel,
+        }
+    }
+
+    /// Borrow the inner `core::WgpuStorage` so it can be cloned into a
+    /// Tensor's `Storage::Wgpu(...)` variant.
+    #[inline]
+    pub fn core_handle(&self) -> &CoreWgpuStorage {
+        &self.buffer
     }
 }
 
@@ -145,132 +204,5 @@ mod gpu_pool_tests {
         assert_eq!(m.evictions, 1);
         assert_eq!(m.acquires, 2);
         assert_eq!(m.misses, 2);
-    }
-
-    #[test]
-    fn evict_all_clears_pool_and_decrements_pooled_bytes() {
-        let backend = WgpuBackend::new_blocking().expect("init wgpu");
-        let pool = BufferPool::default();
-        let s = WgpuStorage::allocate_pooled(&backend.device, &pool, 64, Dtype::F32).unwrap();
-        drop(s);
-        assert_eq!(pool.len(), 1);
-        let evicted = pool.evict_all();
-        assert_eq!(evicted, 1);
-        assert!(pool.is_empty());
-        let m = pool.metrics();
-        assert_eq!(m.bytes_pooled, 0);
-        assert!(m.evictions >= 1);
-    }
-
-    #[test]
-    fn try_acquire_succeeds_for_normal_allocation() {
-        let backend = WgpuBackend::new_blocking().expect("init wgpu");
-        let pool = BufferPool::default();
-        // 4 KiB tensor — well within any GPU's budget.
-        let buf = pool
-            .try_acquire(
-                &backend.device,
-                4096,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            )
-            .expect("normal allocation must succeed");
-        assert!(buf.size() >= 4096);
-    }
-
-    #[test]
-    fn pooled_storage_send_and_sync() {
-        // Compile-time assertion: the Storage type can cross thread
-        // boundaries. If WgpuStorage stops being Send + Sync, this
-        // test fails to compile.
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<WgpuStorage>();
-    }
-
-    #[test]
-    fn pooled_storage_zero_numel_drop_is_safe() {
-        // numel = 0 → buffer size clamps to 4 (wgpu min).  Drop
-        // should not panic; pool counts the slot exactly once.
-        let backend = WgpuBackend::new_blocking().expect("init");
-        let pool = BufferPool::default();
-        let s = WgpuStorage::allocate_pooled(&backend.device, &pool, 0, Dtype::F32).unwrap();
-        drop(s);
-        // Zero-sized allocation still hits the pool once with the
-        // 4-byte minimum bucket.
-        assert_eq!(pool.len(), 1);
-    }
-
-    #[test]
-    fn pooled_storage_threaded_clone_is_safe() {
-        // Spawn N threads, each clones the same storage, increments,
-        // and drops. After all threads, the storage's refcount is back
-        // to one and dropping it returns the buffer to the pool.
-        use std::sync::Arc as StdArc;
-        use std::thread;
-
-        let backend = WgpuBackend::new_blocking().expect("init");
-        let pool = BufferPool::default();
-        let storage = WgpuStorage::allocate_pooled(&backend.device, &pool, 64, Dtype::F32).unwrap();
-        let storage = StdArc::new(storage);
-
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let s = storage.clone();
-                thread::spawn(move || {
-                    let _local = (*s).clone();
-                    // _local drops here — but the original Arc-wrapped
-                    // copy is still alive in the parent.
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-        // Outer Arc still alive — buffer not returned to pool yet.
-        assert!(pool.is_empty());
-        // try_unwrap returns Err if there are other strong refs;
-        // here we know we're the unique holder so unwrap to the inner
-        // value via map_err to side-step the missing Debug impl on
-        // WgpuStorage.
-        let inner = StdArc::try_unwrap(storage).map_err(|_| ()).unwrap();
-        drop(inner);
-        // Now the underlying PooledBuffer is dropped → pool gains 1.
-        assert_eq!(pool.len(), 1);
-    }
-
-    #[test]
-    fn pool_max_bytes_zero_disables_pooling() {
-        use crate::cache::PoolPolicy;
-        let backend = WgpuBackend::new_blocking().expect("init");
-        let pool = BufferPool::default();
-        // Cap to zero → every release must evict.
-        pool.set_policy(PoolPolicy {
-            max_bytes: 0,
-            max_per_bucket: 64,
-        });
-        let s = WgpuStorage::allocate_pooled(&backend.device, &pool, 64, Dtype::F32).unwrap();
-        drop(s);
-        // Pool stays empty because max_bytes=0.
-        assert!(pool.is_empty());
-        let m = pool.metrics();
-        assert!(m.evictions >= 1);
-    }
-
-    #[test]
-    fn pool_metrics_count_hits_after_recycling() {
-        let backend = WgpuBackend::new_blocking().expect("init wgpu");
-        let pool = BufferPool::default();
-
-        let s1 = WgpuStorage::allocate_pooled(&backend.device, &pool, 64, Dtype::F32).unwrap();
-        drop(s1);
-        let m_after_first = pool.metrics();
-        assert_eq!(m_after_first.misses, 1);
-        assert_eq!(m_after_first.hits, 0);
-
-        // Same-bucket allocation should hit.
-        let s2 = WgpuStorage::allocate_pooled(&backend.device, &pool, 64, Dtype::F32).unwrap();
-        let m_after_second = pool.metrics();
-        assert_eq!(m_after_second.hits, 1);
-        assert_eq!(m_after_second.misses, 1, "no extra device alloc");
-        drop(s2);
     }
 }

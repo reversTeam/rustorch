@@ -34,7 +34,10 @@ pub mod fused;
 pub mod layernorm;
 pub mod mapped_upload;
 pub mod matmul;
-pub mod pooled;
+// `pooled::PooledBuffer` was removed in P3.Z Task A — its
+// return-to-pool semantics are now expressed via the `on_drop`
+// callback in `rustorch_core::tensor::storage::WgpuStorage`,
+// captured by `crate::storage::WgpuStorage::allocate_pooled`.
 pub mod preprocessor;
 pub mod reduce;
 pub mod registry;

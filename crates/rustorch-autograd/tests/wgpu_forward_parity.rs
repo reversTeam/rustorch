@@ -22,6 +22,20 @@
 use rustorch_autograd::{ops, Variable};
 use rustorch_core::tensor::device::Device;
 use rustorch_core::tensor::tensor_impl::Tensor;
+use rustorch_wgpu::transfer::tensor_to_cpu;
+
+/// Materialise a Tensor on the host and return a fresh `Vec<f32>`.
+///
+/// P3.Z Task A made `as_slice<T>` strict (returns `None` for GPU
+/// storage) so tests must explicitly download via this helper
+/// instead of relying on the old CPU shadow. The owned `Vec` lets
+/// callers freely borrow `&[f32]` without lifetime juggling.
+fn cpu_data(t: &Tensor) -> Vec<f32> {
+    let host = tensor_to_cpu(t).expect("tensor_to_cpu readback failed");
+    host.as_slice::<f32>()
+        .expect("after tensor_to_cpu, storage must be CPU")
+        .to_vec()
+}
 
 /// Cosine similarity between two flat F32 buffers.
 ///
@@ -80,10 +94,7 @@ fn add_parity_cpu_vs_wgpu() {
     let r_cpu = ops::add(&var(a.clone(), Device::Cpu), &var(b.clone(), Device::Cpu)).unwrap();
     let r_gpu = ops::add(&var(a, Device::Wgpu), &var(b, Device::Wgpu)).unwrap();
 
-    let cs = cosine_similarity(
-        r_cpu.tensor().as_slice::<f32>().unwrap(),
-        r_gpu.tensor().as_slice::<f32>().unwrap(),
-    );
+    let cs = cosine_similarity(&cpu_data(&r_cpu.tensor()), &cpu_data(&r_gpu.tensor()));
     assert!(cs > 0.9999, "add cosine sim too low: {cs}");
 }
 
@@ -96,10 +107,7 @@ fn matmul_parity_cpu_vs_wgpu() {
     let r_cpu = ops::matmul(&var(a.clone(), Device::Cpu), &var(b.clone(), Device::Cpu)).unwrap();
     let r_gpu = ops::matmul(&var(a, Device::Wgpu), &var(b, Device::Wgpu)).unwrap();
 
-    let cs = cosine_similarity(
-        r_cpu.tensor().as_slice::<f32>().unwrap(),
-        r_gpu.tensor().as_slice::<f32>().unwrap(),
-    );
+    let cs = cosine_similarity(&cpu_data(&r_cpu.tensor()), &cpu_data(&r_gpu.tensor()));
     assert!(cs > 0.999, "matmul cosine sim too low: {cs}");
 }
 
@@ -126,10 +134,7 @@ fn linear_relu_parity_cpu_vs_wgpu() {
     let r_cpu = forward(x.clone(), w1.clone(), w2.clone(), Device::Cpu);
     let r_gpu = forward(x, w1, w2, Device::Wgpu);
 
-    let cs = cosine_similarity(
-        r_cpu.as_slice::<f32>().unwrap(),
-        r_gpu.as_slice::<f32>().unwrap(),
-    );
+    let cs = cosine_similarity(&cpu_data(&r_cpu), &cpu_data(&r_gpu));
     assert!(cs > 0.999, "linear+relu cosine sim too low: {cs}");
 }
 
@@ -155,10 +160,7 @@ fn linear_bias_relu_parity_cpu_vs_wgpu() {
     let r_cpu = forward(x.clone(), w.clone(), b.clone(), Device::Cpu);
     let r_gpu = forward(x, w, b, Device::Wgpu);
 
-    let cs = cosine_similarity(
-        r_cpu.as_slice::<f32>().unwrap(),
-        r_gpu.as_slice::<f32>().unwrap(),
-    );
+    let cs = cosine_similarity(&cpu_data(&r_cpu), &cpu_data(&r_gpu));
     assert!(cs > 0.999, "linear+bias+relu cosine sim too low: {cs}");
 }
 
@@ -214,15 +216,12 @@ fn backward_parity_matmul_sigmoid_matmul_sum() {
     let g_gpu = forward_and_backward(x_data, w1_data, w2_data, Device::Wgpu);
 
     assert_eq!(g_cpu.shape(), g_gpu.shape());
-    let cs = cosine_similarity(
-        g_cpu.as_slice::<f32>().unwrap(),
-        g_gpu.as_slice::<f32>().unwrap(),
-    );
+    let cs = cosine_similarity(&cpu_data(&g_cpu), &cpu_data(&g_gpu));
     assert!(
         cs > 0.999,
         "x.grad cosine sim too low: {cs} (cpu={:?}, gpu={:?})",
-        g_cpu.as_slice::<f32>().unwrap(),
-        g_gpu.as_slice::<f32>().unwrap()
+        &cpu_data(&g_cpu),
+        &cpu_data(&g_gpu)
     );
 }
 
@@ -271,14 +270,8 @@ fn backward_parity_add_mul_sum_uses_unbroadcast_to() {
 
     assert_eq!(gx_cpu.shape(), gx_gpu.shape());
     assert_eq!(gb_cpu.shape(), gb_gpu.shape());
-    let cs_x = cosine_similarity(
-        gx_cpu.as_slice::<f32>().unwrap(),
-        gx_gpu.as_slice::<f32>().unwrap(),
-    );
-    let cs_b = cosine_similarity(
-        gb_cpu.as_slice::<f32>().unwrap(),
-        gb_gpu.as_slice::<f32>().unwrap(),
-    );
+    let cs_x = cosine_similarity(&cpu_data(&gx_cpu), &cpu_data(&gx_gpu));
+    let cs_b = cosine_similarity(&cpu_data(&gb_cpu), &cpu_data(&gb_gpu));
     assert!(cs_x > 0.999, "x.grad cosine sim too low: {cs_x}");
     assert!(cs_b > 0.999, "b.grad cosine sim too low: {cs_b}");
 }
@@ -333,7 +326,7 @@ fn training_loop_wgpu_loss_decreases() {
         let pred = ops::matmul(&xs_var, &w).unwrap();
         let pred = ops::add_bias(&pred, &b).unwrap();
         let loss = ops::mse_loss(&pred, &ys_var, rustorch_cpu::backend::Reduction::Mean).unwrap();
-        let loss_val = loss.tensor().as_slice::<f32>().unwrap()[0];
+        let loss_val = cpu_data(&loss.tensor())[0];
         losses.push(loss_val);
         backward(&loss, None).unwrap();
         opt.step();

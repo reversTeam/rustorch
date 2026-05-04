@@ -465,11 +465,31 @@ mod wgpu_storage {
             &self.inner.buffer
         }
 
+        /// Strong reference count for the underlying inner allocation.
+        /// Used by backend code that wants to detect "this is the only
+        /// owner — safe to drop without leaking pool semantics".
+        #[inline]
+        pub fn strong_count(&self) -> usize {
+            Arc::strong_count(&self.inner)
+        }
+
         /// Logical byte length (may be ≤ `buffer.size()` because of
         /// wgpu alignment padding).
         #[inline]
         pub fn byte_len(&self) -> usize {
             self.inner.byte_len
+        }
+    }
+
+    /// `Deref` lets existing call sites that expect a `&wgpu::Buffer`
+    /// keep working unchanged: e.g. `storage.buffer.as_entire_binding()`
+    /// when `WgpuStorage` is held in a struct with a `pub buffer`
+    /// field of this type.
+    impl core::ops::Deref for WgpuStorage {
+        type Target = wgpu::Buffer;
+        #[inline]
+        fn deref(&self) -> &wgpu::Buffer {
+            &self.inner.buffer
         }
     }
 

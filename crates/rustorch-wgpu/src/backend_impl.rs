@@ -36,7 +36,7 @@ use crate::elementwise::{dispatch_binary, dispatch_unary};
 use crate::matmul::matmul;
 use crate::reduce::{reduce_rows, ReduceKind};
 use crate::storage::WgpuStorage;
-use crate::transfer::{to_cpu, to_gpu};
+use crate::transfer::to_gpu;
 use rustorch_core::tensor::device::Device;
 use rustorch_core::tensor::tensor_impl::Tensor;
 use rustorch_cpu::backend::Backend;
@@ -45,15 +45,27 @@ use rustorch_cpu::error::BackendError;
 
 /// Tag a Tensor as living on the Wgpu device.
 ///
-/// With Storage Option B (transitional, P3.Y plan), the actual storage
-/// is the CPU shadow. Tagging the device-of-record as Wgpu makes
-/// follow-on autograd ops keep dispatching through `wgpu_backend()` —
-/// without it, `to_cpu` returns a CPU-tagged tensor and the next op
-/// would route to `cpu_backend()`, which then mismatches against any
-/// Wgpu operands and trips `DeviceMismatch`. Future Storage Option A
-/// (Tensor enum Cpu | Wgpu) eliminates this round-trip + retag pattern.
+/// With Storage Option A (P3.Z), Tensors built via
+/// `Tensor::from_wgpu_storage(...)` are already device-tagged
+/// `Device::Wgpu` and carry `Storage::Wgpu(handle)` natively (no
+/// host shadow). This helper remains for the rare CPU-fallback paths
+/// (e.g. `eq` which has no native kernel yet) — those still produce
+/// CPU-storage tensors that must be retagged so subsequent ops keep
+/// routing through `wgpu_backend()`.
 fn tag_wgpu(t: Tensor) -> Tensor {
     t.with_device(Device::Wgpu)
+}
+
+/// Wrap a kernel-side `WgpuStorage` in a Tensor with `Storage::Wgpu`
+/// natively — no host round trip. P3.Z Task A round-trip elimination.
+///
+/// The Tensor's storage holds the same `core::WgpuStorage` Arc clone
+/// that the kernel produced, so a follow-on op invoking `to_gpu` on
+/// this Tensor takes the fast path and reuses the buffer.
+fn finish_wgpu_op(out: WgpuStorage, shape: Vec<usize>) -> Tensor {
+    let dtype = out.dtype;
+    let core = out.buffer; // CoreWgpuStorage with Drop hook intact
+    Tensor::from_wgpu_storage(core, shape, dtype)
 }
 
 /// Map `WgpuError` → `BackendError::NumericalError(...)`. The trait expects
@@ -63,27 +75,31 @@ fn wgpu_err(op: &'static str, err: crate::error::WgpuError) -> BackendError {
     BackendError::NumericalError(format!("{op}: wgpu: {err}"))
 }
 
-/// Round-trip helper: upload a Tensor, run a unary kernel, download.
+/// **No-round-trip** helper: upload (or reuse) a Tensor's GPU buffer,
+/// run a unary kernel, wrap the kernel output as a fresh Tensor with
+/// `Storage::Wgpu(...)` natively. P3.Z Task A round-trip elimination.
 ///
 /// Used by the elementary unary ops (relu/sigmoid/tanh/silu/neg) which
 /// share the dispatch_unary signature.
-fn unary_roundtrip(
+fn unary_op(
     backend: &WgpuBackend,
     op_name: &'static str,
     src: &Tensor,
 ) -> Result<Tensor, BackendError> {
     let inp = to_gpu(backend, src).map_err(|e| wgpu_err(op_name, e))?;
     let out = dispatch_unary(backend, op_name, &inp).map_err(|e| wgpu_err(op_name, e))?;
-    let t = to_cpu(backend, &out, src.shape().to_vec()).map_err(|e| wgpu_err(op_name, e))?;
-    Ok(tag_wgpu(t))
+    Ok(finish_wgpu_op(out, src.shape().to_vec()))
 }
 
-/// Round-trip helper: upload two Tensors, run a binary kernel, download.
+/// **No-round-trip** helper: upload (or reuse) two Tensors' GPU
+/// buffers, run a binary kernel, wrap the kernel output as a fresh
+/// Tensor with `Storage::Wgpu(...)` natively. P3.Z Task A round-trip
+/// elimination.
 ///
 /// Uses `dispatch_binary_broadcast` so element-wise broadcasting (matching
 /// the CPU semantics in `dispatch_binary` of `cpu_backend.rs`) works
 /// out of the box.
-fn binary_roundtrip(
+fn binary_op(
     backend: &WgpuBackend,
     op_name: &'static str,
     lhs: &Tensor,
@@ -104,8 +120,17 @@ fn binary_roundtrip(
             .map_err(|e| wgpu_err(op_name, e))?
     };
     drop((lhs_g, rhs_g)); // explicit drop after kernel done
-    let t = to_cpu(backend, &out, out_shape).map_err(|e| wgpu_err(op_name, e))?;
-    Ok(tag_wgpu(t))
+    Ok(finish_wgpu_op(out, out_shape))
+}
+
+/// Materialise a Tensor to host (CPU storage) so `cpu_backend()` ops
+/// can read its bytes via `.as_slice::<f32>()`. P3.Z Task A:
+/// `Storage::Wgpu` returns an empty slice from `as_slice` so any
+/// CPU-fallback path needs an explicit download first.
+///
+/// CPU-storage Tensors pass through unchanged (cheap clone).
+fn host(t: &Tensor) -> Result<Tensor, BackendError> {
+    crate::transfer::tensor_to_cpu(t).map_err(|e| wgpu_err("cpu_fallback", e))
 }
 
 /// CPU fallback: download both operands, run on `cpu_backend()`, return.
@@ -123,7 +148,9 @@ where
     F: Fn(&dyn Backend, &Tensor, &Tensor) -> Result<Tensor, BackendError>,
 {
     let _ = op_name;
-    f(cpu_backend(), lhs, rhs)
+    let l = host(lhs)?;
+    let r = host(rhs)?;
+    f(cpu_backend(), &l, &r)
 }
 
 impl Backend for WgpuBackend {
@@ -134,23 +161,23 @@ impl Backend for WgpuBackend {
     // -------------------- Required methods --------------------
 
     fn add(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        binary_roundtrip(self, "add", lhs, rhs)
+        binary_op(self, "add", lhs, rhs)
     }
 
     fn sub(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        binary_roundtrip(self, "sub", lhs, rhs)
+        binary_op(self, "sub", lhs, rhs)
     }
 
     fn mul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        binary_roundtrip(self, "mul", lhs, rhs)
+        binary_op(self, "mul", lhs, rhs)
     }
 
     fn div(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        binary_roundtrip(self, "div", lhs, rhs)
+        binary_op(self, "div", lhs, rhs)
     }
 
     fn neg(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        unary_roundtrip(self, "neg", src)
+        unary_op(self, "neg", src)
     }
 
     fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
@@ -175,12 +202,11 @@ impl Backend for WgpuBackend {
         let lhs_g: WgpuStorage = to_gpu(self, lhs).map_err(|e| wgpu_err("matmul", e))?;
         let rhs_g: WgpuStorage = to_gpu(self, rhs).map_err(|e| wgpu_err("matmul", e))?;
         let out = matmul(self, &lhs_g, &rhs_g, m, k1, n).map_err(|e| wgpu_err("matmul", e))?;
-        let t = to_cpu(self, &out, vec![m, n]).map_err(|e| wgpu_err("matmul", e))?;
-        Ok(tag_wgpu(t))
+        Ok(finish_wgpu_op(out, vec![m, n]))
     }
 
     fn relu(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        unary_roundtrip(self, "relu", src)
+        unary_op(self, "relu", src)
     }
 
     fn eq(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
@@ -193,15 +219,15 @@ impl Backend for WgpuBackend {
     // -------------------- Optional methods with native wgpu kernels --------------------
 
     fn sigmoid(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        unary_roundtrip(self, "sigmoid", src)
+        unary_op(self, "sigmoid", src)
     }
 
     fn tanh(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        unary_roundtrip(self, "tanh", src)
+        unary_op(self, "tanh", src)
     }
 
     fn silu(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        unary_roundtrip(self, "silu", src)
+        unary_op(self, "silu", src)
     }
 
     /// Full-tensor sum reduction → scalar `[1]`. Composes via
@@ -218,8 +244,7 @@ impl Backend for WgpuBackend {
         let inp = to_gpu(self, src).map_err(|e| wgpu_err("sum", e))?;
         let out =
             reduce_rows(self, &inp, 1, numel, ReduceKind::Sum).map_err(|e| wgpu_err("sum", e))?;
-        let t = to_cpu(self, &out, vec![1]).map_err(|e| wgpu_err("sum", e))?;
-        Ok(tag_wgpu(t))
+        Ok(finish_wgpu_op(out, vec![1]))
     }
 
     /// Full-tensor mean reduction → scalar `[1]`. Composes via
@@ -236,8 +261,7 @@ impl Backend for WgpuBackend {
         let inp = to_gpu(self, src).map_err(|e| wgpu_err("mean", e))?;
         let out =
             reduce_rows(self, &inp, 1, numel, ReduceKind::Mean).map_err(|e| wgpu_err("mean", e))?;
-        let t = to_cpu(self, &out, vec![1]).map_err(|e| wgpu_err("mean", e))?;
-        Ok(tag_wgpu(t))
+        Ok(finish_wgpu_op(out, vec![1]))
     }
 
     // -------------------- Composed methods (no native wgpu kernel) --------------------
@@ -267,15 +291,14 @@ impl Backend for WgpuBackend {
                 rhs: bias.shape().to_vec(),
             });
         }
-        // Round-trip + dispatch_binary_broadcast: lhs[B, N] + rhs[N] → [B, N].
+        // Native GPU broadcast (no round-trip): lhs[B, N] + rhs[N] → [B, N].
         let x_g = to_gpu(self, x).map_err(|e| wgpu_err("add_bias", e))?;
         let bias_g = to_gpu(self, bias).map_err(|e| wgpu_err("add_bias", e))?;
         let (out, out_shape) =
             dispatch_binary_broadcast(self, "add", &x_g, x.shape(), &bias_g, bias.shape())
                 .map_err(|e| wgpu_err("add_bias", e))?;
         drop((x_g, bias_g));
-        let t = to_cpu(self, &out, out_shape).map_err(|e| wgpu_err("add_bias", e))?;
-        Ok(tag_wgpu(t))
+        Ok(finish_wgpu_op(out, out_shape))
     }
 
     /// Reshape — pure metadata change (no kernel needed). With Storage
@@ -290,6 +313,22 @@ impl Backend for WgpuBackend {
                 rhs: shape.to_vec(),
             });
         }
+        // Storage Option A: under the hood reshape is a metadata-only
+        // op (same buffer, new layout). For now we keep the GPU buffer
+        // alive by cloning the `Storage::Wgpu(handle)` and rebuilding
+        // the Tensor with the new shape — no host trip. CPU storage
+        // also takes the metadata-only path via `from_vec`.
+        if let Some(wgpu_storage) = src.as_wgpu_storage() {
+            return Ok(Tensor::from_wgpu_storage(
+                wgpu_storage.clone(),
+                shape.to_vec(),
+                src.dtype(),
+            ));
+        }
+        // CPU path: copy bytes (cheap, contiguous) and re-tag Wgpu so
+        // the dispatch chain stays consistent (this branch is hit
+        // only for Tensors that have not yet been migrated to
+        // Storage::Wgpu — typically scalar broadcasts in autograd).
         let data = src.as_slice::<f32>().ok_or_else(|| {
             BackendError::NumericalError("reshape: expected contiguous F32".to_string())
         })?;
@@ -298,13 +337,16 @@ impl Backend for WgpuBackend {
             .map_err(|e| BackendError::NumericalError(format!("reshape build: {e}")))
     }
 
-    /// Reduce-sum along `dims`. CPU fallback for now — round-trips to
-    /// CpuBackend so backward ops that use sum_dim (Add/Sub/Mul/Div via
-    /// `unbroadcast_to`, Softmax via the dot trick, MeanDim) get a
-    /// correct result. Phase B2 will add a native wgpu kernel that
-    /// permutes axes and reuses `reduce_rows`.
+    /// Reduce-sum along `dims`. CPU fallback for now — Storage Option
+    /// A makes the GPU buffer the canonical home, so we explicitly
+    /// download via [`crate::transfer::tensor_to_cpu`] before handing
+    /// to `cpu_backend().sum_dim`, then re-tag the result Wgpu so
+    /// follow-on autograd ops keep dispatching here. Task N (P3.Z)
+    /// adds a native WGSL kernel that permutes axes and reuses
+    /// `reduce_rows`, eliminating the host trip entirely.
     fn sum_dim(&self, src: &Tensor, dims: &[usize], keepdim: bool) -> Result<Tensor, BackendError> {
-        let result = cpu_backend().sum_dim(src, dims, keepdim)?;
+        let host_src = crate::transfer::tensor_to_cpu(src).map_err(|e| wgpu_err("sum_dim", e))?;
+        let result = cpu_backend().sum_dim(&host_src, dims, keepdim)?;
         Ok(tag_wgpu(result))
     }
 
@@ -316,7 +358,8 @@ impl Backend for WgpuBackend {
         dims: &[usize],
         keepdim: bool,
     ) -> Result<Tensor, BackendError> {
-        let result = cpu_backend().mean_dim(src, dims, keepdim)?;
+        let host_src = crate::transfer::tensor_to_cpu(src).map_err(|e| wgpu_err("mean_dim", e))?;
+        let result = cpu_backend().mean_dim(&host_src, dims, keepdim)?;
         Ok(tag_wgpu(result))
     }
 
@@ -386,34 +429,36 @@ impl Backend for WgpuBackend {
     // every method on the trait surface returns the correct result.
 
     fn abs(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().abs(src).map(tag_wgpu)
+        cpu_backend().abs(&host(src)?).map(tag_wgpu)
     }
     fn sqrt(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().sqrt(src).map(tag_wgpu)
+        cpu_backend().sqrt(&host(src)?).map(tag_wgpu)
     }
     fn exp(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().exp(src).map(tag_wgpu)
+        cpu_backend().exp(&host(src)?).map(tag_wgpu)
     }
     fn log(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().log(src).map(tag_wgpu)
+        cpu_backend().log(&host(src)?).map(tag_wgpu)
     }
     fn pow_scalar(&self, src: &Tensor, exponent: f64) -> Result<Tensor, BackendError> {
-        cpu_backend().pow_scalar(src, exponent).map(tag_wgpu)
+        cpu_backend()
+            .pow_scalar(&host(src)?, exponent)
+            .map(tag_wgpu)
     }
     fn leaky_relu(&self, src: &Tensor, slope: f64) -> Result<Tensor, BackendError> {
-        cpu_backend().leaky_relu(src, slope).map(tag_wgpu)
+        cpu_backend().leaky_relu(&host(src)?, slope).map(tag_wgpu)
     }
     fn softmax(&self, src: &Tensor, dim: usize) -> Result<Tensor, BackendError> {
-        cpu_backend().softmax(src, dim).map(tag_wgpu)
+        cpu_backend().softmax(&host(src)?, dim).map(tag_wgpu)
     }
     fn log_softmax(&self, src: &Tensor, dim: usize) -> Result<Tensor, BackendError> {
-        cpu_backend().log_softmax(src, dim).map(tag_wgpu)
+        cpu_backend().log_softmax(&host(src)?, dim).map(tag_wgpu)
     }
     fn transpose(&self, src: &Tensor, d0: usize, d1: usize) -> Result<Tensor, BackendError> {
-        cpu_backend().transpose(src, d0, d1).map(tag_wgpu)
+        cpu_backend().transpose(&host(src)?, d0, d1).map(tag_wgpu)
     }
     fn bmm(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().bmm(lhs, rhs).map(tag_wgpu)
+        cpu_backend().bmm(&host(lhs)?, &host(rhs)?).map(tag_wgpu)
     }
     fn index_select(
         &self,
@@ -421,7 +466,9 @@ impl Backend for WgpuBackend {
         dim: usize,
         indices: &Tensor,
     ) -> Result<Tensor, BackendError> {
-        cpu_backend().index_select(src, dim, indices).map(tag_wgpu)
+        cpu_backend()
+            .index_select(&host(src)?, dim, &host(indices)?)
+            .map(tag_wgpu)
     }
     fn scatter_add(
         &self,
@@ -430,10 +477,14 @@ impl Backend for WgpuBackend {
         idx: &Tensor,
         src: &Tensor,
     ) -> Result<Tensor, BackendError> {
-        cpu_backend().scatter_add(dst, dim, idx, src).map(tag_wgpu)
+        cpu_backend()
+            .scatter_add(&host(dst)?, dim, &host(idx)?, &host(src)?)
+            .map(tag_wgpu)
     }
     fn gather(&self, src: &Tensor, dim: usize, idx: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().gather(src, dim, idx).map(tag_wgpu)
+        cpu_backend()
+            .gather(&host(src)?, dim, &host(idx)?)
+            .map(tag_wgpu)
     }
     fn cross_entropy(
         &self,
@@ -442,7 +493,7 @@ impl Backend for WgpuBackend {
         reduction: rustorch_cpu::backend::Reduction,
     ) -> Result<Tensor, BackendError> {
         cpu_backend()
-            .cross_entropy(input, target, reduction)
+            .cross_entropy(&host(input)?, &host(target)?, reduction)
             .map(tag_wgpu)
     }
     fn mse_loss(
@@ -452,7 +503,7 @@ impl Backend for WgpuBackend {
         reduction: rustorch_cpu::backend::Reduction,
     ) -> Result<Tensor, BackendError> {
         cpu_backend()
-            .mse_loss(input, target, reduction)
+            .mse_loss(&host(input)?, &host(target)?, reduction)
             .map(tag_wgpu)
     }
     fn nll_loss(
@@ -462,7 +513,7 @@ impl Backend for WgpuBackend {
         reduction: rustorch_cpu::backend::Reduction,
     ) -> Result<Tensor, BackendError> {
         cpu_backend()
-            .nll_loss(log_probs, target, reduction)
+            .nll_loss(&host(log_probs)?, &host(target)?, reduction)
             .map(tag_wgpu)
     }
     fn softmax_grad(
@@ -471,28 +522,32 @@ impl Backend for WgpuBackend {
         output: &Tensor,
         dim: usize,
     ) -> Result<Tensor, BackendError> {
-        cpu_backend().softmax_grad(grad, output, dim).map(tag_wgpu)
+        cpu_backend()
+            .softmax_grad(&host(grad)?, &host(output)?, dim)
+            .map(tag_wgpu)
     }
     fn argmax(&self, src: &Tensor, dim: usize, keepdim: bool) -> Result<Tensor, BackendError> {
-        cpu_backend().argmax(src, dim, keepdim).map(tag_wgpu)
+        cpu_backend()
+            .argmax(&host(src)?, dim, keepdim)
+            .map(tag_wgpu)
     }
 
     // Comparison ops (CPU fallback) — used by ReluBackward (gt) and for
     // user-facing predicate ops. No native WGSL kernel yet.
     fn ne(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().ne(lhs, rhs).map(tag_wgpu)
+        cpu_backend().ne(&host(lhs)?, &host(rhs)?).map(tag_wgpu)
     }
     fn lt(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().lt(lhs, rhs).map(tag_wgpu)
+        cpu_backend().lt(&host(lhs)?, &host(rhs)?).map(tag_wgpu)
     }
     fn le(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().le(lhs, rhs).map(tag_wgpu)
+        cpu_backend().le(&host(lhs)?, &host(rhs)?).map(tag_wgpu)
     }
     fn gt(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().gt(lhs, rhs).map(tag_wgpu)
+        cpu_backend().gt(&host(lhs)?, &host(rhs)?).map(tag_wgpu)
     }
     fn ge(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().ge(lhs, rhs).map(tag_wgpu)
+        cpu_backend().ge(&host(lhs)?, &host(rhs)?).map(tag_wgpu)
     }
 
     // Cast — needed when ReluBackward converts the bool mask to f32 to

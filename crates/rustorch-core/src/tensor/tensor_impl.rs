@@ -182,6 +182,44 @@ impl Tensor {
         self.device = device;
         self
     }
+
+    /// Build a Tensor whose storage is a wgpu GPU buffer (no CPU
+    /// shadow). P3.Z Task A round-trip elimination: backend kernels
+    /// that produce a fresh `core::WgpuStorage` (e.g. matmul / fused
+    /// ops output) wrap it directly into a Tensor without ever
+    /// shipping the bytes back to the host.
+    ///
+    /// The Tensor is marked `Device::Wgpu` so autograd dispatch
+    /// routes follow-on ops to `wgpu_backend()`. Layout is
+    /// contiguous + offset 0.
+    #[cfg(feature = "wgpu")]
+    pub fn from_wgpu_storage<S: Into<Shape>>(
+        wgpu_storage: super::storage::WgpuStorage,
+        shape: S,
+        dtype: Dtype,
+    ) -> Tensor {
+        let shape = shape.into();
+        let layout = Layout::contiguous(shape, dtype);
+        Tensor {
+            storage: Storage::Wgpu(wgpu_storage),
+            layout,
+            version: VersionCounter::new(),
+            requires_grad: false,
+            device: Device::Wgpu,
+        }
+    }
+
+    /// Borrow the inner `core::WgpuStorage` if this Tensor lives on
+    /// the wgpu device. Returns `None` for CPU / Cuda / Metal /
+    /// WgpuShared tensors — callers needing a wgpu handle from a
+    /// non-wgpu tensor must first migrate the storage.
+    #[cfg(feature = "wgpu")]
+    pub fn as_wgpu_storage(&self) -> Option<&super::storage::WgpuStorage> {
+        match &self.storage {
+            Storage::Wgpu(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 // --------------------------------------------------------------------------

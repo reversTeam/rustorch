@@ -75,9 +75,31 @@ impl Variable {
         self.data.lock().unwrap().clone()
     }
 
-    /// Alias for [`Variable::tensor`] kept for legacy callers.
+    /// Snapshot the underlying tensor as a **host-readable** Tensor.
+    ///
+    /// Used by optimisers (Adam, AdamW, SGD, ...) that need to read
+    /// parameter bytes via `.as_slice::<f32>()`. With P3.Z Task A
+    /// strict semantics, that call returns `None` for tensors whose
+    /// storage lives on the GPU — so this method auto-materialises
+    /// via `tensor_to_cpu` when the wgpu feature is enabled.
+    ///
+    /// Transitional bridge: P3.Z Task O FusedAdamW will operate on
+    /// `Storage::Wgpu` natively (no host trip), removing this
+    /// download from the optimiser hot path.
     pub fn data_snapshot(&self) -> Tensor {
-        self.tensor()
+        let t = self.tensor();
+        #[cfg(feature = "wgpu")]
+        {
+            if !t.storage().is_cpu() {
+                if let Ok(host) = rustorch_wgpu::transfer::tensor_to_cpu(&t) {
+                    // Preserve the device tag so the next op still
+                    // dispatches through wgpu_backend(); the storage
+                    // is now CPU but the routing decision survives.
+                    return host.with_device(t.device());
+                }
+            }
+        }
+        t
     }
 
     /// Device the underlying tensor lives on. Used by the autograd
@@ -96,8 +118,22 @@ impl Variable {
 
     /// Read the accumulated gradient (returns `None` until
     /// `backward()` has run on a downstream output).
+    ///
+    /// **P3.Z Task A**: when the wgpu feature is on and the gradient
+    /// lives on the GPU, this auto-materialises to host so optimisers
+    /// (Adam / AdamW / SGD / ...) can read its bytes via
+    /// `.as_slice::<f32>()`. Removed once Task O FusedAdamW lands.
     pub fn grad(&self) -> Option<Tensor> {
-        self.grad.lock().unwrap().clone()
+        let g = self.grad.lock().unwrap().clone()?;
+        #[cfg(feature = "wgpu")]
+        {
+            if !g.storage().is_cpu() {
+                if let Ok(host) = rustorch_wgpu::transfer::tensor_to_cpu(&g) {
+                    return Some(host.with_device(g.device()));
+                }
+            }
+        }
+        Some(g)
     }
 
     /// Reset the accumulated gradient to `None`.
