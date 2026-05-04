@@ -27,7 +27,7 @@
 //! - QKV bias is loaded if present (Qwen2.5/Qwen3 use bias on
 //!   Q/K/V) but not yet plumbed through the kernel — TODO.
 
-use crate::{hf_block_key, hf_keys, HfWeights, LlamaConfig, LlmError};
+use crate::{hf_block_key, hf_keys, GgufWeights, HfWeights, LlamaConfig, LlmError};
 use rustorch_core::tensor::tensor_impl::Tensor;
 use rustorch_fusion::patterns::matmul_bias_act::{fused_matmul_bias_activation, Activation};
 use rustorch_nn::gqa::gqa_forward_f32;
@@ -51,6 +51,11 @@ struct BlockWeights {
     w_up: Vec<f32>,
     /// SwiGLU down projection: [F, D].
     w_down: Vec<f32>,
+    /// Optional Qwen3 per-head Q-norm — `[head_dim]`. Applied after
+    /// the Q projection, before RoPE, to each query head independently.
+    q_norm: Option<Vec<f32>>,
+    /// Optional Qwen3 per-head K-norm — `[head_dim]`.
+    k_norm: Option<Vec<f32>>,
 }
 
 /// A loaded Llama / Qwen model ready for autoregressive decode.
@@ -147,6 +152,90 @@ impl LlamaModel {
                 w_gate,
                 w_up,
                 w_down,
+                q_norm: None,
+                k_norm: None,
+            });
+        }
+
+        let rope = RoPE::new(
+            config.head_dim(),
+            max_seq.min(config.max_position_embeddings),
+            config.rope_theta,
+        );
+
+        Ok(LlamaModel {
+            config,
+            blocks,
+            token_emb,
+            final_norm,
+            lm_head,
+            rope,
+        })
+    }
+
+    /// Build a runnable model from a parsed config and a fully
+    /// dequantized [`GgufWeights`] bundle. GGUF stores linear weights
+    /// in the same `[out, in]` row-major layout as HF safetensors —
+    /// we apply the same transpose at load time so the sgemv hot path
+    /// always sees `[in, out]`.
+    ///
+    /// Optional Qwen3 per-head Q/K norms are kept as-is (they are
+    /// shape `[head_dim]`).
+    pub fn from_gguf(
+        config: LlamaConfig,
+        weights: GgufWeights,
+        max_seq: usize,
+    ) -> Result<Self, LlmError> {
+        let d = config.hidden_size;
+        let kv_dim = config.n_kv_heads() * config.head_dim();
+        let f = config.intermediate_size;
+
+        // For sgemv we need [in, out] row-major. GGUF / numpy gives us
+        // [out, in] in `weights.*` — transpose once.
+        let token_emb = weights.token_emb; // [V, D] — direct lookup, no transpose
+        let final_norm = weights.final_norm;
+        let lm_head = if weights.tied_lm_head {
+            // tied: transpose [V, D] → [D, V] so the LM-head sgemv sees [in=D, out=V].
+            transpose_2d(&token_emb, config.vocab_size, d)
+        } else {
+            // weights.lm_head_t is [V, D]; transpose to [D, V].
+            transpose_2d(&weights.lm_head_t, config.vocab_size, d)
+        };
+
+        let mut blocks: Vec<BlockWeights> = Vec::with_capacity(config.num_hidden_layers);
+        for (i, b) in weights.blocks.into_iter().enumerate() {
+            // Sanity-check shapes before transposing — catches dim
+            // mix-ups much earlier than the eventual NaN-cascade.
+            check_len("attn_norm", i, &b.attn_norm, d)?;
+            check_len("w_q", i, &b.w_q, d * d)?;
+            check_len("w_k", i, &b.w_k, kv_dim * d)?;
+            check_len("w_v", i, &b.w_v, kv_dim * d)?;
+            check_len("w_o", i, &b.w_o, d * d)?;
+            check_len("ffn_norm", i, &b.ffn_norm, d)?;
+            check_len("w_gate", i, &b.w_gate, f * d)?;
+            check_len("w_up", i, &b.w_up, f * d)?;
+            check_len("w_down", i, &b.w_down, d * f)?;
+
+            let w_q = transpose_2d(&b.w_q, d, d);
+            let w_k = transpose_2d(&b.w_k, kv_dim, d);
+            let w_v = transpose_2d(&b.w_v, kv_dim, d);
+            let w_o = transpose_2d(&b.w_o, d, d);
+            let w_gate = transpose_2d(&b.w_gate, f, d);
+            let w_up = transpose_2d(&b.w_up, f, d);
+            let w_down = transpose_2d(&b.w_down, d, f);
+
+            blocks.push(BlockWeights {
+                rms_attn: b.attn_norm,
+                w_q,
+                w_k,
+                w_v,
+                w_o,
+                rms_ffn: b.ffn_norm,
+                w_gate,
+                w_up,
+                w_down,
+                q_norm: b.attn_q_norm,
+                k_norm: b.attn_k_norm,
             });
         }
 
@@ -259,7 +348,23 @@ impl LlamaModel {
                 kv_dim,
             );
 
-            // 2. RoPE on Q and K.
+            // 2a. Optional Qwen3 per-head Q/K RMSNorm (before RoPE).
+            //     Shape is [head_dim]; applied independently to each head's
+            //     contiguous head_dim-slice in q[..d] and k[..kv_dim].
+            if let Some(qn) = block.q_norm.as_deref() {
+                rms_norm_per_head(&mut scratch.q[..d], qn, n_heads, head_dim, cfg.rms_norm_eps);
+            }
+            if let Some(kn) = block.k_norm.as_deref() {
+                rms_norm_per_head(
+                    &mut scratch.k[..kv_dim],
+                    kn,
+                    n_kv,
+                    head_dim,
+                    cfg.rms_norm_eps,
+                );
+            }
+
+            // 2b. RoPE on Q and K.
             self.rope
                 .apply_inplace(&mut scratch.q[..d], 1, n_heads, 1, position)
                 .unwrap();
@@ -410,6 +515,31 @@ fn rms_norm_inplace(x: &mut [f32], gamma: &[f32], eps: f32) {
     for i in 0..d {
         x[i] = x[i] * inv_rms * gamma[i];
     }
+}
+
+/// Apply RMSNorm independently to each head of a packed `[n_heads * head_dim]`
+/// activation (Qwen3 q_norm / k_norm). `gamma` is shared across heads
+/// and has shape `[head_dim]`.
+fn rms_norm_per_head(x: &mut [f32], gamma: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
+    debug_assert_eq!(x.len(), n_heads * head_dim);
+    debug_assert_eq!(gamma.len(), head_dim);
+    for h in 0..n_heads {
+        let head = &mut x[h * head_dim..(h + 1) * head_dim];
+        rms_norm_inplace(head, gamma, eps);
+    }
+}
+
+/// Validate that a deserialized GGUF tensor has the expected number of
+/// f32 elements before we hand it to `transpose_2d`.
+fn check_len(label: &str, layer: usize, v: &[f32], expected: usize) -> Result<(), LlmError> {
+    if v.len() != expected {
+        return Err(LlmError::Config(format!(
+            "blk.{layer}.{label}: got {} f32, expected {}",
+            v.len(),
+            expected
+        )));
+    }
+    Ok(())
 }
 
 /// Hybrid sgemv — same calibration as T53 in the demo: cBLAS via

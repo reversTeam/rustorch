@@ -3363,6 +3363,7 @@ version = "0.0.1"
 dependencies = [
  "rustorch-core",
  "rustorch-fusion",
+ "rustorch-gguf",
  "rustorch-nn",
  "rustorch-serde",
  "rustorch-tokenizer",

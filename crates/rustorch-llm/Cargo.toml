@@ -16,5 +16,10 @@ rustorch-serde     = { workspace = true }
 rustorch-nn        = { workspace = true }
 rustorch-tokenizer = { workspace = true }
 rustorch-fusion    = { workspace = true }
+rustorch-gguf      = { workspace = true }
 serde              = { workspace = true, features = ["derive"] }
 serde_json         = { version = "1" }
+
+[[example]]
+name = "qwen_inference"
+path = "examples/qwen_inference.rs"

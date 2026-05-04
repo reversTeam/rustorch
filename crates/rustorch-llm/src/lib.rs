@@ -43,7 +43,9 @@ use std::path::{Path, PathBuf};
 use rustorch_core::tensor::tensor_impl::Tensor;
 use serde::Deserialize;
 
+pub mod gguf_loader;
 pub mod model;
+pub use gguf_loader::{GgufBlockWeights, GgufWeights};
 pub use model::LlamaModel;
 
 /// Errors raised by this crate.
