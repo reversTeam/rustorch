@@ -186,6 +186,64 @@ def bench_embedding(num_embeds, embed_dim, batch):
     return {"op": "embedding", "shape": f"vocab={num_embeds} dim={embed_dim} b={batch}", "median_ns": med, "p99_ns": p99}
 
 
+def bench_gpt2_full_stack(num_layers, batch, seq, d_model, n_heads, d_ff, vocab_size):
+    """Full GPT-2-small forward stack — embedding + N blocks + LN + LM head.
+
+    Shape parity with bench_gpt2_full_stack on the Rust side. Uses
+    torch.nn modules directly (LayerNorm, MultiheadAttention, Linear,
+    Embedding) under torch.no_grad. ReLU instead of GELU for parity.
+    """
+    tok_emb = torch.nn.Embedding(vocab_size, d_model)
+    pos_emb = torch.nn.Embedding(seq, d_model)
+    layers = []
+    for _ in range(num_layers):
+        layers.append(
+            (
+                torch.nn.LayerNorm(d_model),
+                torch.nn.MultiheadAttention(d_model, n_heads, batch_first=True),
+                torch.nn.LayerNorm(d_model),
+                torch.nn.Linear(d_model, d_ff),
+                torch.nn.Linear(d_ff, d_model),
+            )
+        )
+    final_ln = torch.nn.LayerNorm(d_model)
+    lm_head = torch.nn.Linear(d_model, vocab_size)
+    for m in [tok_emb, pos_emb, final_ln, lm_head]:
+        for p in m.parameters():
+            p.requires_grad_(False)
+    for tup in layers:
+        for sub in tup:
+            for p in sub.parameters():
+                p.requires_grad_(False)
+
+    g = torch.Generator().manual_seed(0xC1A4)
+    ids = torch.randint(0, vocab_size, (batch, seq), generator=g)
+    pos_ids = torch.arange(seq)
+
+    def step():
+        with torch.no_grad():
+            x = tok_emb(ids) + pos_emb(pos_ids)
+            for ln1, mha, ln2, fc1, fc2 in layers:
+                h = ln1(x)
+                h, _ = mha(h, h, h, need_weights=False)
+                x = x + h
+                h = ln2(x)
+                h = fc1(h)
+                h = torch.relu(h)
+                h = fc2(h)
+                x = x + h
+            h = final_ln(x)
+            return lm_head(h)
+
+    med, p99 = time_fn(step)
+    return {
+        "op": "gpt2_full_stack_forward",
+        "shape": f"L={num_layers} B={batch} S={seq} D={d_model} H={n_heads} F={d_ff} V={vocab_size}",
+        "median_ns": med,
+        "p99_ns": p99,
+    }
+
+
 def bench_transformer_block(batch, seq, d_model, n_heads, d_ff):
     """GPT-2-style transformer block forward (no_grad inference).
 
@@ -270,6 +328,8 @@ def run(num_threads, device_label="cpu"):
     results.append(bench_linear(512, 768, 768))
     results.append(bench_relu_isolated(1, 512, 3072))
     results.append(bench_embedding(50257, 768, 128))
+    # T30 — GPT-2-small full stack (12 layers, embedding + final LN + LM head).
+    results.append(bench_gpt2_full_stack(12, 1, 128, 768, 12, 3072, 50257))
     return {
         "framework": "pytorch",
         "device": device_label,

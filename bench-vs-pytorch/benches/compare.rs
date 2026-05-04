@@ -239,6 +239,105 @@ fn bench_elementwise_add(c: &mut Criterion) {
     group.finish();
 }
 
+/// T30 — full GPT-2-small forward stack: 12 transformer blocks
+/// chained, with input-side embedding + final LayerNorm + LM head.
+/// This is what a real LLM does on a single forward pass.
+fn bench_gpt2_full_stack(c: &mut Criterion) {
+    use rustorch_autograd::{no_grad, ops, Variable};
+    use rustorch_fusion::patterns::matmul_bias_act::Activation;
+    use rustorch_nn::{Embedding, LayerNorm, Linear, Module, MultiHeadAttention};
+
+    // GPT-2 small reduced to fit a single bench iter in <100 ms.
+    // Real GPT-2 small = 12 layers × {LN, MHA(D=768,H=12), LN, FFN(F=3072)} +
+    //                    Embedding(50257, 768) + final LN + LM head(768→50257).
+    let batch = 1_usize;
+    let seq = 128_usize; // shorter than 512 for tractable iter time
+    let d_model = 768_usize;
+    let n_heads = 12_usize;
+    let d_ff = 3072_usize;
+    let num_layers = 12_usize;
+    let vocab_size = 50257_usize;
+
+    // Build 12 layers' worth of modules.
+    let token_emb = Embedding::with_seed(vocab_size, d_model, 0xC1A4);
+    let pos_emb = Embedding::with_seed(seq, d_model, 0xC1A5);
+
+    let mut layers: Vec<(LayerNorm, MultiHeadAttention, LayerNorm, Linear, Linear)> =
+        Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        layers.push((
+            LayerNorm::new(d_model),
+            MultiHeadAttention::new(d_model, n_heads),
+            LayerNorm::new(d_model),
+            Linear::new(d_model, d_ff),
+            Linear::new(d_ff, d_model),
+        ));
+    }
+    let final_ln = LayerNorm::new(d_model);
+    let lm_head = Linear::new(d_model, vocab_size);
+
+    // Pre-build deterministic input token ids.
+    let mut ids: Vec<i64> = Vec::with_capacity(seq);
+    let mut s: u64 = 1;
+    for _ in 0..seq {
+        s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        ids.push(((s >> 32) as i64).rem_euclid(vocab_size as i64));
+    }
+    let ids_t = Tensor::from_vec_typed::<i64, _>([batch, seq], ids).unwrap();
+
+    let pos_ids: Vec<i64> = (0..seq as i64).collect();
+    let pos_t = Tensor::from_vec_typed::<i64, _>([seq], pos_ids).unwrap();
+
+    let mut group = c.benchmark_group("gpt2_full_stack_forward");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(800));
+    group.measurement_time(std::time::Duration::from_secs(8));
+    group.bench_function(
+        BenchmarkId::from_parameter(format!(
+            "L{}B{}S{}D{}H{}F{}V{}",
+            num_layers, batch, seq, d_model, n_heads, d_ff, vocab_size
+        )),
+        |bb| {
+            bb.iter(|| {
+                no_grad(|| {
+                    // 1. Token embedding lookup. forward_indices wants
+                    //    a 1-D index tensor so we squeeze the batch dim.
+                    let flat_ids = Tensor::from_vec_typed::<i64, _>(
+                        [batch * seq],
+                        ids_t.as_slice::<i64>().unwrap().to_vec(),
+                    )
+                    .unwrap();
+                    let tok_emb = token_emb.forward_indices(&flat_ids).unwrap();
+                    let pos = pos_emb.forward_indices(&pos_t).unwrap();
+                    // tok_emb is [batch*seq, D]; pos is [seq, D] —
+                    // for batch=1 they broadcast cleanly.
+                    let mut x = ops::add(&tok_emb, &pos).unwrap();
+                    // Reshape to [B, S, D] for MHA.
+                    x = ops::reshape(&x, vec![batch, seq, d_model]).unwrap();
+
+                    // 2. 12 transformer blocks.
+                    for (ln1, mha, ln2, fc1, fc2) in layers.iter() {
+                        let h = ln1.forward(&x).unwrap();
+                        let h = mha.forward(&h, &h, &h, None).unwrap();
+                        x = ops::add(&x, &h).unwrap();
+                        let h = ln2.forward(&x).unwrap();
+                        let h = fc1.forward_with_activation(&h, Activation::Relu).unwrap();
+                        let h = fc2.forward(&h).unwrap();
+                        x = ops::add(&x, &h).unwrap();
+                    }
+
+                    // 3. Final layer norm + LM head -> logits over
+                    //    vocabulary.
+                    let h = final_ln.forward(&x).unwrap();
+                    let logits = lm_head.forward(&h).unwrap();
+                    hint_black_box(logits)
+                })
+            });
+        },
+    );
+    group.finish();
+}
+
 /// T21 — full-scale GPT-2 small block forward (B=1 S=512 D=768
 /// H=12 F=3072). Verifies the T18+T19+T20 wins hold on the real
 /// production shape, not just the small dev shape.
@@ -542,5 +641,6 @@ criterion_group! {
         bench_transformer_block_gpt2_small,
         bench_transformer_block_breakdown,
         bench_transformer_ops,
+        bench_gpt2_full_stack,
 }
 criterion_main!(benches);
