@@ -58,6 +58,30 @@ extern "C" {
         c: *mut c_float,
         ldc: c_int,
     );
+
+    /// Single-precision matrix-vector product: `y := alpha · op(A) · x + beta · y`.
+    ///
+    /// Critical for the M=1 (or N=1) matmul case in LLM single-token
+    /// decode (LM head projection on a single query row), where
+    /// `cblas_sgemm` falls back to a sub-optimal generic dispatch on
+    /// Apple Silicon. `cblas_sgemv` instead drives a tuned bandwidth-
+    /// bound kernel that saturates DRAM throughput for the
+    /// matrix-vector pattern.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cblas_sgemv(
+        order: c_int,
+        trans: c_int,
+        m: c_int,
+        n: c_int,
+        alpha: c_float,
+        a: *const c_float,
+        lda: c_int,
+        x: *const c_float,
+        incx: c_int,
+        beta: c_float,
+        y: *mut c_float,
+        incy: c_int,
+    );
 }
 
 /// Safe Rust wrapper for the row-major `C = A @ B` case (no transpose,
@@ -72,6 +96,15 @@ pub unsafe fn sgemm_row_major(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]
     debug_assert!(a.len() >= m * k, "a too small: {} < {}", a.len(), m * k);
     debug_assert!(b.len() >= k * n, "b too small: {} < {}", b.len(), k * n);
     debug_assert!(c.len() >= m * n, "c too small: {} < {}", c.len(), m * n);
+    // T33 — dispatch M=1 to sgemv. cblas_sgemm has a generic dispatch
+    // path on M=1 that bottlenecks at ~2 GB/s (40 ms for an LM head
+    // [1, 768] @ [768, 50257]); cblas_sgemv saturates DRAM
+    // bandwidth (~80 GB/s) for the matrix-vector pattern, dropping
+    // the same op to ~2 ms.
+    if m == 1 {
+        sgemv_row_major_m1(k, n, a, b, c);
+        return;
+    }
     cblas_sgemm(
         CBLAS_ROW_MAJOR,
         CBLAS_NO_TRANS,
@@ -87,6 +120,42 @@ pub unsafe fn sgemm_row_major(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]
         0.0,
         c.as_mut_ptr(),
         n as c_int, // ldc = N
+    );
+}
+
+/// Safe Rust wrapper for the row-major M=1 matrix-vector product
+/// `c[1, n] = a[1, k] @ b[k, n]`. Internally drives `cblas_sgemv`
+/// with the B matrix transposed: when `op(A) = A^T`, the output is
+/// `y[n] = A^T[n, k] @ x[k]` — which matches our row-major
+/// `b @ a^T` interpretation. Faster than `sgemm` with M=1 because
+/// the gemv kernel is bandwidth-tuned for the matrix-vector case.
+///
+/// # Safety
+/// - `a.len() >= k`, `b.len() >= k * n`, `c.len() >= n`.
+/// - The C buffer is fully overwritten (beta=0).
+pub unsafe fn sgemv_row_major_m1(k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    debug_assert!(a.len() >= k, "a too small: {} < {}", a.len(), k);
+    debug_assert!(b.len() >= k * n, "b too small: {} < {}", b.len(), k * n);
+    debug_assert!(c.len() >= n, "c too small: {} < {}", c.len(), n);
+    // We want y[n] = b^T @ a where b is row-major [k, n] (so b^T is
+    // [n, k]). cblas_sgemv with trans=CBLAS_TRANS treats the input
+    // matrix as transposed: y = alpha * A^T @ x + beta * y.
+    // Pass b as the matrix (laid out row-major as [k, n], lda=n,
+    // m_dim=k, n_dim=n) with trans=CBLAS_TRANS to compute
+    // y[n] = b[k,n]^T @ a[k] = a · b.
+    cblas_sgemv(
+        CBLAS_ROW_MAJOR,
+        CBLAS_TRANS,
+        k as c_int, // m_dim of source matrix = K rows of B
+        n as c_int, // n_dim of source matrix = N cols of B
+        1.0,
+        b.as_ptr(),
+        n as c_int, // lda = N (row-major B has stride N between rows)
+        a.as_ptr(),
+        1, // incx = 1 (a is contiguous f32)
+        0.0,
+        c.as_mut_ptr(),
+        1, // incy = 1
     );
 }
 
@@ -127,6 +196,34 @@ mod tests {
             sgemm_row_major(m, k, n, &a, &b, &mut got);
         }
         for i in 0..m * n {
+            let rel = (got[i] - expected[i]).abs() / expected[i].abs().max(1e-6);
+            assert!(
+                rel < 1e-4,
+                "i={i}: got {} vs expected {} rel_err {}",
+                got[i],
+                expected[i],
+                rel
+            );
+        }
+    }
+
+    /// T33 — sgemv path correctness on the LM head shape.
+    #[test]
+    fn sgemm_row_major_m1_dispatches_sgemv_correctly() {
+        let m = 1;
+        let k = 32;
+        let n = 17;
+        let a: Vec<f32> = (0..k).map(|i| ((i as f32 + 1.0) * 0.01).sin()).collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i as f32 + 1.0) * 0.005).cos())
+            .collect();
+        let expected = naive(m, k, n, &a, &b);
+        let mut got = vec![0.0f32; m * n];
+        // SAFETY: matches signature.
+        unsafe {
+            sgemm_row_major(m, k, n, &a, &b, &mut got);
+        }
+        for i in 0..n {
             let rel = (got[i] - expected[i]).abs() / expected[i].abs().max(1e-6);
             assert!(
                 rel < 1e-4,

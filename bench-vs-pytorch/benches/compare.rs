@@ -266,6 +266,94 @@ fn bench_lm_head(c: &mut Criterion) {
     group.finish();
 }
 
+/// T33 — per-stage breakdown of the S=1 single-token decode to
+/// pinpoint where the 29.5× gap vs PyTorch comes from. Same
+/// methodology as T17 did for the S=128 block.
+fn bench_single_token_breakdown(c: &mut Criterion) {
+    use rustorch_autograd::{no_grad, ops, Variable};
+    use rustorch_fusion::patterns::matmul_bias_act::Activation;
+    use rustorch_nn::{Embedding, LayerNorm, Linear, Module, MultiHeadAttention};
+
+    let d_model = 768_usize;
+    let n_heads = 12_usize;
+    let d_ff = 3072_usize;
+    let vocab_size = 50257_usize;
+
+    let token_emb = Embedding::with_seed(vocab_size, d_model, 0xC1A4);
+    let ln = LayerNorm::new(d_model);
+    let mha = MultiHeadAttention::new(d_model, n_heads);
+    let fc1 = Linear::new(d_model, d_ff);
+    let fc2 = Linear::new(d_ff, d_model);
+    let lm_head = Linear::new(d_model, vocab_size);
+
+    let ids_t = Tensor::from_vec_typed::<i64, _>([1_usize], vec![42_i64]).unwrap();
+    let x_t = Tensor::from_vec(vec![1usize, 1, d_model], vec![0.1_f32; d_model]).unwrap();
+
+    let mut group = c.benchmark_group("single_token_stage");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_secs(2));
+
+    group.bench_function("variable_wrap", |bb| {
+        bb.iter(|| no_grad(|| hint_black_box(Variable::new(x_t.clone()))));
+    });
+
+    group.bench_function("embedding_lookup_S1", |bb| {
+        bb.iter(|| no_grad(|| hint_black_box(token_emb.forward_indices(&ids_t).unwrap())));
+    });
+
+    group.bench_function("layernorm_S1", |bb| {
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(x_t.clone());
+                hint_black_box(ln.forward(&x).unwrap())
+            })
+        });
+    });
+
+    group.bench_function("mha_self_S1", |bb| {
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(x_t.clone());
+                hint_black_box(mha.forward(&x, &x, &x, None).unwrap())
+            })
+        });
+    });
+
+    group.bench_function("ffn_S1", |bb| {
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(x_t.clone());
+                let h = fc1.forward_with_activation(&x, Activation::Relu).unwrap();
+                hint_black_box(fc2.forward(&h).unwrap())
+            })
+        });
+    });
+
+    group.bench_function("residual_add_S1", |bb| {
+        let y_t = x_t.clone();
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(x_t.clone());
+                let y = Variable::new(y_t.clone());
+                hint_black_box(ops::add(&x, &y).unwrap())
+            })
+        });
+    });
+
+    group.bench_function("lm_head_S1", |bb| {
+        let small_t = Tensor::from_vec(vec![1usize, d_model], vec![0.1_f32; d_model]).unwrap();
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(small_t.clone());
+                hint_black_box(lm_head.forward(&x).unwrap())
+            })
+        });
+    });
+
+    group.finish();
+}
+
 /// T32 — single-token forward (S=1) pass through the GPT-2-small
 /// stack. Models the cold-start latency of generating the FIRST
 /// token of an autoregressive decode. Without KV-cache this also
@@ -737,5 +825,6 @@ criterion_group! {
         bench_gpt2_full_stack,
         bench_lm_head,
         bench_gpt2_single_token_decode,
+        bench_single_token_breakdown,
 }
 criterion_main!(benches);
