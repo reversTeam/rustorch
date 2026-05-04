@@ -149,13 +149,36 @@ fn try_fused_linear_act(
 
     let x_slice = in_t.as_slice::<f32>().expect("checked F32 contiguous");
     let w_slice = w_t.as_slice::<f32>().expect("checked F32 contiguous");
-    let bias_owned: Option<Vec<f32>> = layer
-        .bias
+    // T35 — borrow the bias tensor directly instead of cloning the
+    // whole vector on every call. The previous `to_vec()` allocated
+    // and copied N f32s per Linear forward, which on MHA S=1
+    // (4 × Linear[1, 768] = 4 × 3 KB clone + alloc) compounded to
+    // ~10 µs of pure copy overhead per layer × 12 layers = ~120 µs
+    // wasted on the LM-serving hot path. We bind the Tensor (which
+    // is a cheap Arc-clone of the storage) to a local so the slice
+    // borrow it produces stays valid through the matmul call.
+    let bias_tensor: Option<Tensor> = layer.bias.as_ref().map(|b| b.tensor());
+    let bias_ref: Option<&[f32]> = bias_tensor
         .as_ref()
-        .map(|b| b.tensor().as_slice::<f32>().unwrap().to_vec());
-    let bias_ref: Option<&[f32]> = bias_owned.as_deref();
+        .map(|t| t.as_slice::<f32>().expect("checked F32 contiguous"));
 
-    let mut y = vec![0.0_f32; m * n];
+    // T35 — uninitialised output buffer; the fused kernel calls
+    // sgemm/sgemv with beta=0, so every cell is overwritten. Skips
+    // the m*n f32 zero-fill that `vec![0.0; m*n]` emits.
+    let mut y_storage: Vec<core::mem::MaybeUninit<f32>> = Vec::with_capacity(m * n);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        y_storage.set_len(m * n);
+    }
+    let mut y: Vec<f32> = unsafe {
+        let (ptr, len, cap) = (
+            y_storage.as_mut_ptr() as *mut f32,
+            y_storage.len(),
+            y_storage.capacity(),
+        );
+        core::mem::forget(y_storage);
+        Vec::from_raw_parts(ptr, len, cap)
+    };
     fused_matmul_bias_activation(x_slice, w_slice, bias_ref, &mut y, m, k, n, activation).map_err(
         |e| ModuleError::Backend {
             op: "Linear::forward_with_activation(fused)",
