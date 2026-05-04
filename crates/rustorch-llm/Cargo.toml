@@ -23,3 +23,7 @@ serde_json         = { version = "1" }
 [[example]]
 name = "qwen_inference"
 path = "examples/qwen_inference.rs"
+
+[[example]]
+name = "inspect_qnorm"
+path = "examples/inspect_qnorm.rs"

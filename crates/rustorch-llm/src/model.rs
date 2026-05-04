@@ -245,6 +245,33 @@ impl LlamaModel {
             config.rope_theta,
         );
 
+        // Optional: dump first 8 floats of w_gate per layer after
+        // transpose to compare layer-0 (known good) vs layer-1+
+        // (known buggy offset DC).
+        if std::env::var("RUSTORCH_DEBUG_DUMP_WEIGHTS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            for (i, b) in blocks.iter().enumerate() {
+                if i > 3 && i + 1 < blocks.len() {
+                    continue;
+                }
+                // w_gate is laid out [in=D, out=F] row-major after transpose,
+                // so b.w_gate[i*F + j] = W[i, j]. mean_per_row[i] = (1/F) Σ_j W[i, j].
+                let mut mean_per_row = vec![0f32; d];
+                for (ii, slot) in mean_per_row.iter_mut().enumerate() {
+                    let row = &b.w_gate[ii * f..(ii + 1) * f];
+                    *slot = row.iter().sum::<f32>() / f as f32;
+                }
+                let mpr_l2 = mean_per_row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let mpr_mean = mean_per_row.iter().sum::<f32>() / d as f32;
+                eprintln!(
+                    "  [w_gate L{i:>2} mean_per_row] len={d} l2={mpr_l2:.4} mean={mpr_mean:+.6} first8={:?}",
+                    &mean_per_row[..8]
+                );
+            }
+        }
+
         Ok(LlamaModel {
             config,
             blocks,
@@ -306,6 +333,43 @@ impl LlamaModel {
         new_tokens
     }
 
+    /// Debug helper — runs prefill then a single decode step on the
+    /// last prompt token and returns the top-`k` `(token_id, logit)`
+    /// entries from the resulting logits, sorted descending. Useful
+    /// for sanity-checking that the model produces a non-degenerate
+    /// distribution.
+    pub fn debug_top_logits(
+        &self,
+        prompt_ids: &[u32],
+        max_seq: usize,
+        k: usize,
+    ) -> Vec<(u32, f32)> {
+        let cfg = &self.config;
+        let mut cache = KVCache::new(
+            cfg.num_hidden_layers,
+            1,
+            cfg.n_kv_heads(),
+            cfg.head_dim(),
+            max_seq,
+        );
+        let mut scratch = Scratch::new(cfg);
+        for (pos, &tok) in prompt_ids.iter().enumerate() {
+            self.decode_step(tok as i64, pos, &mut cache, &mut scratch);
+            cache.advance(1).unwrap();
+        }
+        // Sort logits to get the top-k.
+        let mut idx: Vec<u32> = (0..cfg.vocab_size as u32).collect();
+        idx.sort_by(|&a, &b| {
+            scratch.logits[b as usize]
+                .partial_cmp(&scratch.logits[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx.into_iter()
+            .take(k)
+            .map(|i| (i, scratch.logits[i as usize]))
+            .collect()
+    }
+
     /// One decode step. Reads token_id, writes logits into
     /// `scratch.logits`. Caller is responsible for sampling +
     /// `cache.advance(1)`.
@@ -327,6 +391,26 @@ impl LlamaModel {
         // Embed.
         let off = (token_id as usize) * d;
         scratch.x[..d].copy_from_slice(&self.token_emb[off..off + d]);
+
+        // Optional residual-stream tracing — set RUSTORCH_DEBUG_TRACE=1
+        // to dump the L2 norm and first-8 values of scratch.x at each
+        // checkpoint. Used to bisect "model ignores input" bugs.
+        let trace = std::env::var("RUSTORCH_DEBUG_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let dump = |tag: &str, v: &[f32]| {
+            let n = v.len();
+            let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let mean = v.iter().sum::<f32>() / n as f32;
+            eprintln!(
+                "  [trace] {tag:>20}  l2={l2:>10.4}  mean={mean:>+10.5}  first8={:?}",
+                &v[..n.min(8)]
+            );
+        };
+        if trace {
+            eprintln!("  [trace] === decode_step token_id={token_id} pos={position} ===");
+            dump("after_embed", &scratch.x[..d]);
+        }
 
         for (layer_idx, block) in self.blocks.iter().enumerate() {
             // 1. RMSNorm + Q/K/V proj.
@@ -351,17 +435,23 @@ impl LlamaModel {
             // 2a. Optional Qwen3 per-head Q/K RMSNorm (before RoPE).
             //     Shape is [head_dim]; applied independently to each head's
             //     contiguous head_dim-slice in q[..d] and k[..kv_dim].
-            if let Some(qn) = block.q_norm.as_deref() {
-                rms_norm_per_head(&mut scratch.q[..d], qn, n_heads, head_dim, cfg.rms_norm_eps);
-            }
-            if let Some(kn) = block.k_norm.as_deref() {
-                rms_norm_per_head(
-                    &mut scratch.k[..kv_dim],
-                    kn,
-                    n_kv,
-                    head_dim,
-                    cfg.rms_norm_eps,
-                );
+            //     Toggle via env var RUSTORCH_DEBUG_DISABLE_QK_NORM=1 to A/B test.
+            let qk_norm_disabled = std::env::var("RUSTORCH_DEBUG_DISABLE_QK_NORM")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if !qk_norm_disabled {
+                if let Some(qn) = block.q_norm.as_deref() {
+                    rms_norm_per_head(&mut scratch.q[..d], qn, n_heads, head_dim, cfg.rms_norm_eps);
+                }
+                if let Some(kn) = block.k_norm.as_deref() {
+                    rms_norm_per_head(
+                        &mut scratch.k[..kv_dim],
+                        kn,
+                        n_kv,
+                        head_dim,
+                        cfg.rms_norm_eps,
+                    );
+                }
             }
 
             // 2b. RoPE on Q and K.
@@ -413,13 +503,26 @@ impl LlamaModel {
                 d,
                 d,
             );
+            if trace && (layer_idx == 0 || layer_idx == 1) {
+                dump(&format!("L{layer_idx} q[..8]"), &scratch.q[..8]);
+                dump(&format!("L{layer_idx} k[..8]"), &scratch.k[..8]);
+                dump(&format!("L{layer_idx} v[..8]"), &scratch.v[..8]);
+                dump(&format!("L{layer_idx} attn_out"), &scratch.attn_out[..d]);
+                dump(&format!("L{layer_idx} o_out"), &scratch.o_out[..d]);
+            }
             for i in 0..d {
                 scratch.x[i] += scratch.o_out[i];
+            }
+            if trace && (layer_idx == 0 || layer_idx == 1) {
+                dump(&format!("L{layer_idx} after_attn_res"), &scratch.x[..d]);
             }
 
             // 6. RMSNorm + SwiGLU FFN + residual.
             scratch.h[..d].copy_from_slice(&scratch.x[..d]);
             rms_norm_inplace(&mut scratch.h[..d], &block.rms_ffn, cfg.rms_norm_eps);
+            if trace && (layer_idx == 0 || layer_idx == 1) {
+                dump(&format!("L{layer_idx} ffn_h_post_rms"), &scratch.h[..d]);
+            }
             sgemv_dispatch(
                 &scratch.h[..d],
                 &block.w_gate,
@@ -428,11 +531,21 @@ impl LlamaModel {
                 f,
             );
             sgemv_dispatch(&scratch.h[..d], &block.w_up, &mut scratch.up_out[..f], d, f);
+            if trace && (layer_idx == 0 || layer_idx == 1) {
+                dump(
+                    &format!("L{layer_idx} gate_pre_silu"),
+                    &scratch.gate_out[..f],
+                );
+                dump(&format!("L{layer_idx} up"), &scratch.up_out[..f]);
+            }
             // SwiGLU: silu(gate) * up — element-wise.
             for i in 0..f {
                 let g = scratch.gate_out[i];
                 let s = g / (1.0 + (-g).exp()); // silu(x) = x * sigmoid(x)
                 scratch.gate_out[i] = s * scratch.up_out[i];
+            }
+            if trace && (layer_idx == 0 || layer_idx == 1) {
+                dump(&format!("L{layer_idx} swiglu_out"), &scratch.gate_out[..f]);
             }
             sgemv_dispatch(
                 &scratch.gate_out[..f],
@@ -441,9 +554,19 @@ impl LlamaModel {
                 f,
                 d,
             );
+            if trace && (layer_idx == 0 || layer_idx == 1) {
+                dump(&format!("L{layer_idx} fc2_out"), &scratch.fc2_out[..d]);
+            }
             for i in 0..d {
                 scratch.x[i] += scratch.fc2_out[i];
             }
+            if trace && (layer_idx == 0 || layer_idx == 1 || layer_idx + 1 == self.blocks.len()) {
+                dump(&format!("L{layer_idx} after_ffn_res"), &scratch.x[..d]);
+            }
+        }
+
+        if trace {
+            dump("pre_final_norm", &scratch.x[..d]);
         }
 
         // 7. Final RMSNorm + LM head.
@@ -546,7 +669,10 @@ fn check_len(label: &str, layer: usize, v: &[f32], expected: usize) -> Result<()
 /// `fused_matmul_bias_activation` for shapes ≥ 200 K FLOPs,
 /// custom row-major loop otherwise.
 fn sgemv_dispatch(x: &[f32], w: &[f32], y: &mut [f32], k: usize, n: usize) {
-    if k * n >= 200_000 {
+    let force_naive = std::env::var("RUSTORCH_DEBUG_FORCE_NAIVE_SGEMV")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !force_naive && k * n >= 200_000 {
         fused_matmul_bias_activation(x, w, None, y, 1, k, n, Activation::None).unwrap();
     } else {
         y.fill(0.0);

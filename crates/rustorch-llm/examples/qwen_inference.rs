@@ -115,6 +115,17 @@ fn main() -> ExitCode {
         "  built in {build_secs:.2}s — running {max_new} decode steps from prompt {prompt_ids:?}"
     );
 
+    // Diagnostic: print the top-10 logits for the first decode step
+    // so we can sanity-check the output distribution.
+    let top = model.debug_top_logits(&prompt_ids, max_seq, 10);
+    println!("\n══════ TOP-10 LOGITS (after prefill) ══════");
+    for (i, (id, l)) in top.iter().enumerate() {
+        println!("  rank {:>2}: token_id={:>6}  logit={:>10.4}", i + 1, id, l);
+    }
+    let l_max = top.first().map(|x| x.1).unwrap_or(0.0);
+    let l_min = top.last().map(|x| x.1).unwrap_or(0.0);
+    println!("  spread top1-top10 = {:.4}", l_max - l_min);
+
     let sampling = SamplingConfig::greedy();
     let t2 = Instant::now();
     let new_tokens = model.generate(&prompt_ids, &sampling, max_new, max_seq);
