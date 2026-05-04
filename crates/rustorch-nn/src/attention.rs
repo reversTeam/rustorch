@@ -23,7 +23,8 @@
 //! local-attention models.
 
 use crate::module::{Module, ModuleError};
-use rustorch_autograd::{ops, Variable};
+use rustorch_autograd::{is_grad_enabled, ops, Variable};
+use rustorch_core::tensor::dtype::Dtype;
 use rustorch_core::tensor::tensor_impl::Tensor;
 
 /// Stateless single-head scaled dot-product attention.
@@ -319,6 +320,36 @@ impl MultiHeadAttention {
         let k = self.k_proj.forward(k)?;
         let v = self.v_proj.forward(v)?;
 
+        // T19 — fast path: route to the optimised flash_forward
+        // kernel under no_grad when the full self-attention path
+        // applies (no mask, f32, equal seq lengths). Bypasses 2
+        // bmms + 2 reshapes + 2 transposes + softmax that the
+        // autograd-composed path strings together (each producing a
+        // fresh Tensor allocation). On the GPT-2 block bench (B=2
+        // S=128 D=256 H=4) this collapses ~10 ms of MHA into ~500 µs.
+        if !is_grad_enabled()
+            && attn_mask.is_none()
+            && t_q == t_kv
+            && q.tensor().dtype() == Dtype::F32
+            && k.tensor().dtype() == Dtype::F32
+            && v.tensor().dtype() == Dtype::F32
+            && q.tensor().is_contiguous()
+            && k.tensor().is_contiguous()
+            && v.tensor().is_contiguous()
+        {
+            let context_t = mha_flash_forward_f32(
+                &q.tensor(),
+                &k.tensor(),
+                &v.tensor(),
+                batch,
+                t_q,
+                self.num_heads,
+                self.head_dim,
+            )?;
+            let context = Variable::new(context_t);
+            return self.o_proj.forward(&context);
+        }
+
         // 2. Split heads. Q uses t_q; K and V use t_kv (cross-attention
         //    can have different query and key/value sequence lengths).
         let q = self.split_heads(&q, batch, t_q)?;
@@ -381,6 +412,116 @@ impl MultiHeadAttention {
         let x4 = ops::transpose(&x4, 1, 2)?;
         // [B, T, H, hd] → [B, T, D]
         ops::reshape(&x4, vec![batch, seq, self.embed_dim])
+    }
+}
+
+/// T19 — fused flash-attention forward for the no_grad MHA path.
+///
+/// Inputs `q`, `k`, `v` are the **already-projected** tensors of
+/// shape `[B, T, embed_dim]` with `embed_dim = H * head_dim`.
+/// Returns the attention output (still `[B, T, embed_dim]`) ready
+/// for the `o_proj` linear; the output projection is applied by
+/// the caller.
+///
+/// Internally:
+///   1. Transposes `[B, T, H, hd]` → `[B, H, T, hd]` for q/k/v
+///      via a manual contiguous copy (one alloc per tensor, vs ~5
+///      autograd-aware reshape+transpose allocs in the slow path).
+///   2. Calls `rustorch_attention::flash_forward` — the same
+///      Apple-Accelerate-tile-fed kernel that hits 145× speedup
+///      vs naive in the standalone bench, runs softmax online so
+///      no full B*H*T*T scores tensor is materialised.
+///   3. Transposes `[B, H, T, hd]` → `[B, T, embed_dim]` back.
+fn mha_flash_forward_f32(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Result<Tensor, ModuleError> {
+    use rustorch_attention::{flash_forward, AttentionShape};
+
+    let n = batch * seq * heads * head_dim;
+    let q_in = q.as_slice::<f32>().expect("checked F32 contiguous");
+    let k_in = k.as_slice::<f32>().expect("checked F32 contiguous");
+    let v_in = v.as_slice::<f32>().expect("checked F32 contiguous");
+
+    let mut q_bhtd = vec![0.0_f32; n];
+    let mut k_bhtd = vec![0.0_f32; n];
+    let mut v_bhtd = vec![0.0_f32; n];
+    transpose_BTHD_to_BHTD_f32(q_in, &mut q_bhtd, batch, seq, heads, head_dim);
+    transpose_BTHD_to_BHTD_f32(k_in, &mut k_bhtd, batch, seq, heads, head_dim);
+    transpose_BTHD_to_BHTD_f32(v_in, &mut v_bhtd, batch, seq, heads, head_dim);
+
+    let mut out_bhtd = vec![0.0_f32; n];
+    let shape = AttentionShape::new(batch, heads, seq, head_dim);
+    flash_forward(&shape, &q_bhtd, &k_bhtd, &v_bhtd, &mut out_bhtd).map_err(|e| {
+        ModuleError::Backend {
+            op: "MultiHeadAttention::forward(flash)",
+            message: format!("{e:?}"),
+        }
+    })?;
+
+    let mut out_bthd = vec![0.0_f32; n];
+    transpose_BHTD_to_BTHD_f32(&out_bhtd, &mut out_bthd, batch, seq, heads, head_dim);
+
+    Tensor::from_vec(vec![batch, seq, heads * head_dim], out_bthd).map_err(|e| {
+        ModuleError::Backend {
+            op: "MultiHeadAttention::forward(flash)",
+            message: format!("{e:?}"),
+        }
+    })
+}
+
+/// `[B, T, H, hd]` (logical view of `[B, T, D]` with D = H*hd)
+/// → `[B, H, T, hd]` contiguous f32 copy. The input is assumed
+/// row-major contiguous on `[B, T, D]`.
+#[allow(non_snake_case)]
+fn transpose_BTHD_to_BHTD_f32(
+    src: &[f32],
+    dst: &mut [f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+) {
+    let d = heads * head_dim;
+    // For each (b, h, t) write a head_dim-long slice; the inner
+    // copy is bandwidth-bound so we let LLVM lower it to NEON
+    // load/store rather than splitting per-element.
+    for b in 0..batch {
+        for h in 0..heads {
+            for t in 0..seq {
+                let src_off = b * seq * d + t * d + h * head_dim;
+                let dst_off = b * heads * seq * head_dim + h * seq * head_dim + t * head_dim;
+                dst[dst_off..dst_off + head_dim].copy_from_slice(&src[src_off..src_off + head_dim]);
+            }
+        }
+    }
+}
+
+/// Inverse of `transpose_BTHD_to_BHTD_f32`: `[B, H, T, hd]` →
+/// `[B, T, H, hd]` row-major contiguous.
+#[allow(non_snake_case)]
+fn transpose_BHTD_to_BTHD_f32(
+    src: &[f32],
+    dst: &mut [f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+) {
+    let d = heads * head_dim;
+    for b in 0..batch {
+        for h in 0..heads {
+            for t in 0..seq {
+                let src_off = b * heads * seq * head_dim + h * seq * head_dim + t * head_dim;
+                let dst_off = b * seq * d + t * d + h * head_dim;
+                dst[dst_off..dst_off + head_dim].copy_from_slice(&src[src_off..src_off + head_dim]);
+            }
+        }
     }
 }
 

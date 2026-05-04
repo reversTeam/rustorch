@@ -3212,6 +3212,7 @@ dependencies = [
  "num-traits",
  "rand 0.8.6",
  "rayon",
+ "rustorch-attention",
  "rustorch-autograd",
  "rustorch-core",
  "rustorch-cpu",

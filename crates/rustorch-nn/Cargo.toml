@@ -18,6 +18,7 @@ derive = ["dep:rustorch-derive"]
 rustorch-core     = { workspace = true }
 rustorch-autograd = { workspace = true }
 rustorch-cpu      = { workspace = true }
+rustorch-attention = { workspace = true }
 rustorch-derive   = { workspace = true, optional = true }
 half              = { workspace = true }
 num-traits        = { workspace = true }
