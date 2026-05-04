@@ -18,7 +18,7 @@ use rustorch_fusion::patterns::matmul_bias_act::{fused_matmul_bias_activation, A
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::kernels::{
     matmul_simdgroup_f32, matmul_simdgroup_f32_coarsened, matmul_simdgroup_f32_coarsened_wide,
-    matmul_simdgroup_f32_multisg,
+    matmul_simdgroup_f32_multisg, sgemv_f32_simd,
 };
 use std::time::Instant;
 
@@ -26,6 +26,45 @@ fn det_vec(n: usize, seed: f32) -> Vec<f32> {
     (0..n)
         .map(|i| ((i as f32 + 1.0) * seed * 0.001).sin())
         .collect()
+}
+
+/// Native M=1 sgemv via the new `sgemv_f32_simd` kernel.
+fn time_metal_sgemv(k: usize, n: usize, n_iter: usize) -> std::time::Duration {
+    let backend = metal_backend();
+    let x_buf = backend.alloc_shared(k * 4).expect("x alloc");
+    let w_buf = backend.alloc_shared(k * n * 4).expect("w alloc");
+    unsafe {
+        let px = x_buf.contents() as *mut f32;
+        for (i, val) in det_vec(k, 1.0).iter().enumerate() {
+            *px.add(i) = *val;
+        }
+        let pw = w_buf.contents() as *mut f32;
+        for (i, val) in det_vec(k * n, 0.5).iter().enumerate() {
+            *pw.add(i) = *val;
+        }
+    }
+    // Warmup.
+    let _ = sgemv_f32_simd(backend, &x_buf, &w_buf, k, n).unwrap();
+    backend.drain();
+    let t0 = Instant::now();
+    for _ in 0..n_iter {
+        let _ = sgemv_f32_simd(backend, &x_buf, &w_buf, k, n).unwrap();
+    }
+    backend.drain();
+    t0.elapsed()
+}
+
+/// CPU AMX path with M=1 (the real shape during decode).
+fn time_cpu_m1(k: usize, n: usize, n_iter: usize) -> std::time::Duration {
+    let a = det_vec(k, 1.0);
+    let b = det_vec(k * n, 0.5);
+    let mut c = vec![0.0_f32; n];
+    fused_matmul_bias_activation(&a, &b, None, &mut c, 1, k, n, Activation::None).unwrap();
+    let t0 = Instant::now();
+    for _ in 0..n_iter {
+        fused_matmul_bias_activation(&a, &b, None, &mut c, 1, k, n, Activation::None).unwrap();
+    }
+    t0.elapsed()
 }
 
 fn time_metal(m: usize, k: usize, n: usize, n_iter: usize) -> std::time::Duration {
@@ -106,6 +145,25 @@ fn run(label: &str, m: usize, k: usize, n: usize, n_iter: usize) {
     );
 }
 
+fn run_sgemv(label: &str, k: usize, n: usize, n_iter: usize) {
+    let metal_d = time_metal_sgemv(k, n, n_iter);
+    let cpu_d = time_cpu_m1(k, n, n_iter);
+    let metal_per = metal_d / n_iter as u32;
+    let cpu_per = cpu_d / n_iter as u32;
+    let bytes_w = k as f64 * n as f64 * 4.0;
+    let metal_gbps = bytes_w / metal_per.as_secs_f64() / 1e9;
+    let cpu_gbps = bytes_w / cpu_per.as_secs_f64() / 1e9;
+    let speedup = cpu_per.as_secs_f64() / metal_per.as_secs_f64();
+    println!(
+        "{label:<32} K={k:>5} N={n:>6}  Metal sgemv {:>7.3}ms ({:>5.0} GB/s)  CPU AMX {:>7.3}ms ({:>5.0} GB/s)  speedup {:>4.2}×",
+        metal_per.as_secs_f64() * 1e3,
+        metal_gbps,
+        cpu_per.as_secs_f64() * 1e3,
+        cpu_gbps,
+        speedup,
+    );
+}
+
 fn main() {
     let backend = metal_backend();
     println!(
@@ -114,34 +172,40 @@ fn main() {
         backend.adapter_name(),
         backend.supports_metal3(),
     );
-    println!(
-        "{:<28} {:>20}  {:>34}  {:>34}  {:>10}",
-        "shape (label)", "shape", "Metal", "CPU AMX (cblas_sgemm)", "speedup"
-    );
-    println!("{:-<140}", "");
 
-    let n_iter = 30;
-
-    // Decode autoregressive: M=1, but kernels need M%8==0, so pad to M=8
-    // (8× more compute, but B is loaded once per matmul so the cost is
-    // dominated by B reads — should still beat CPU).
+    let n_iter = 100;
     let d = 5120;
     let f = 17408;
     let kv_dim = 1024;
+    let vocab = 151_936;
 
-    // Fused QKV: [8, D] @ [D, D + 2*KV_DIM] = [8, 5120] @ [5120, 7168]
-    run("qkv_proj (M=8 padded)", 8, d, d + 2 * kv_dim, n_iter);
+    println!("--- M=1 native sgemv (the real decode shape) ---");
+    println!(
+        "{:<32} {:>16}  {:>40}  {:>34}  {:>10}",
+        "shape (label)",
+        "K, N",
+        "Metal sgemv_f32_simd (NATIVE M=1)",
+        "CPU AMX cblas_sgemm M=1",
+        "speedup"
+    );
+    println!("{:-<160}", "");
+    run_sgemv("qkv_proj (fused)", d, d + 2 * kv_dim, n_iter);
+    run_sgemv("gate_up_proj (fused)", d, 2 * f, n_iter);
+    run_sgemv("down_proj", f, d, n_iter);
+    run_sgemv("o_proj", d, d, n_iter);
+    run_sgemv("lm_head", d, vocab, n_iter);
 
-    // Fused gate_up: [8, D] @ [D, 2*F] = [8, 5120] @ [5120, 34816]
-    run("gate_up_proj (M=8 padded)", 8, d, 2 * f, n_iter);
-
-    // Down: [8, F] @ [F, D] = [8, 17408] @ [17408, 5120]
-    run("down_proj (M=8 padded)", 8, f, d, n_iter);
-
-    // O proj: [8, D] @ [D, D]
-    run("o_proj (M=8 padded)", 8, d, d, n_iter);
-
-    // LM head: [8, D] @ [D, V] (V padded to multiple of 256 below)
-    let vocab = 151_936; // already mult of 64 (151936 = 593 × 256)
-    run("lm_head (M=8 padded)", 8, d, vocab, n_iter);
+    println!();
+    println!("--- For comparison: M=8 padded (matmul_simdgroup_f32_*) ---");
+    println!(
+        "{:<32} {:>20}  {:>34}  {:>34}  {:>10}",
+        "shape (label)", "shape", "Metal", "CPU AMX (cblas_sgemm)", "speedup"
+    );
+    println!("{:-<160}", "");
+    let n_iter_big = 30;
+    run("qkv_proj (M=8 padded)", 8, d, d + 2 * kv_dim, n_iter_big);
+    run("gate_up_proj (M=8 padded)", 8, d, 2 * f, n_iter_big);
+    run("down_proj (M=8 padded)", 8, f, d, n_iter_big);
+    run("o_proj (M=8 padded)", 8, d, d, n_iter_big);
+    run("lm_head (M=8 padded)", 8, d, vocab, n_iter_big);
 }
