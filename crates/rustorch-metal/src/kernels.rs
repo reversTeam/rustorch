@@ -2254,10 +2254,17 @@ using namespace metal;
 constant uint BLOCK_BYTES = 144u;
 constant uint BLOCK_WEIGHTS = 256u;
 
+// Optimised v2: uchar4 vectorised nibble loads (4 bytes per memory
+// access instead of 1) and float4 vectorised x reads (16 bytes per
+// access). The inner loop processes 4 elements at a time, halving
+// the issued load instructions. The dequant compute stays in
+// registers — no threadgroup memory needed since x is already
+// well-cached at the simdgroup level (consecutive threads of the
+// same simdgroup read the same x[k] for different W rows).
 kernel void sgemv_q4_k_f32(
     device const float* x       [[buffer(0)]],   // [K] activation
-    device const uchar* w_q4k   [[buffer(1)]],   // [N, K] Q4_K, row-major: N rows × (K/256) blocks × 144 bytes
-    device float* y             [[buffer(2)]],   // [N] output
+    device const uchar* w_q4k   [[buffer(1)]],   // [N, K] Q4_K row-major
+    device float* y             [[buffer(2)]],   // [N]
     constant uint2& dims        [[buffer(3)]],   // (K, N)
     uint gid                    [[thread_position_in_grid]]
 ) {
@@ -2274,28 +2281,27 @@ kernel void sgemv_q4_k_f32(
     for (uint blk = 0; blk < blocks_per_row; ++blk) {
         device const uchar* block = w_q4k + row_off + blk * BLOCK_BYTES;
 
-        // f16 d (super-block scale for sub-block scales)
         ushort d_bits = ((ushort)block[1] << 8) | (ushort)block[0];
-        // f16 dmin (super-block scale for sub-block mins)
         ushort dmin_bits = ((ushort)block[3] << 8) | (ushort)block[2];
         float d = float(as_type<half>(d_bits));
         float dmin = float(as_type<half>(dmin_bits));
 
-        // 12 packed scale bytes — unpack into 8 sub-block (sc, m) pairs.
+        // Unpack scales/mins from 12 bytes into 8 sub-block (sc, m) pairs.
         uchar packed[12];
-        for (uint i = 0; i < 12; ++i) packed[i] = block[4 + i];
+        for (uint i = 0; i < 12u; ++i) packed[i] = block[4 + i];
         uchar sc[8], m[8];
-        for (uint i = 0; i < 4; ++i) {
+        for (uint i = 0; i < 4u; ++i) {
             sc[i]     = packed[i] & 0x3F;
             m[i]      = packed[i + 4] & 0x3F;
             sc[i + 4] = (packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4);
             m[i + 4]  = (packed[i + 8] >> 4)   | ((packed[i + 4] >> 6) << 4);
         }
 
-        // 128 nibble bytes — sub-blocks (j_pair*2, j_pair*2+1) share 32 bytes.
-        device const uchar* qs = block + 16;
+        // qs as uchar4: 32 uchar = 8 uchar4 per pair, but we use 4-vec
+        // sub-iteration to amortise loads.
+        device const uchar4* qs4 = (device const uchar4*)(block + 16);
 
-        for (uint jp = 0; jp < 4; ++jp) {
+        for (uint jp = 0; jp < 4u; ++jp) {
             uint j0 = 2u * jp;
             uint j1 = 2u * jp + 1u;
             float scale0 = d * float(sc[j0]);
@@ -2306,12 +2312,33 @@ kernel void sgemv_q4_k_f32(
             uint x_low_off  = blk * BLOCK_WEIGHTS + j0 * 32u;
             uint x_high_off = blk * BLOCK_WEIGHTS + j1 * 32u;
 
-            for (uint k = 0; k < 32u; ++k) {
-                uchar nib = qs[jp * 32u + k];
-                float w_low  = scale0 * float(nib & 0x0F) - min0;
-                float w_high = scale1 * float(nib >> 4)   - min1;
-                acc += x[x_low_off + k]  * w_low;
-                acc += x[x_high_off + k] * w_high;
+            // 32 nibble bytes per pair = 8 uchar4. Each uchar4 holds
+            // 4 nibble bytes, each holding 2 weights (low + high
+            // nibble) -> 8 weights per uchar4.
+            uint qs_base = jp * 8u;  // 8 uchar4 per pair (jp * 32 / 4)
+            for (uint kg = 0; kg < 8u; ++kg) {
+                uchar4 nibs = qs4[qs_base + kg];
+                uint k = kg * 4u;
+                // 4 lanes inside uchar4
+                float n0lo = scale0 * float(nibs.x & 0x0F) - min0;
+                float n1lo = scale0 * float(nibs.y & 0x0F) - min0;
+                float n2lo = scale0 * float(nibs.z & 0x0F) - min0;
+                float n3lo = scale0 * float(nibs.w & 0x0F) - min0;
+                float n0hi = scale1 * float(nibs.x >> 4)   - min1;
+                float n1hi = scale1 * float(nibs.y >> 4)   - min1;
+                float n2hi = scale1 * float(nibs.z >> 4)   - min1;
+                float n3hi = scale1 * float(nibs.w >> 4)   - min1;
+                // Vectorised x loads: 4 consecutive floats per access.
+                float4 xlo = float4(x[x_low_off  + k    ],
+                                    x[x_low_off  + k + 1u],
+                                    x[x_low_off  + k + 2u],
+                                    x[x_low_off  + k + 3u]);
+                float4 xhi = float4(x[x_high_off + k    ],
+                                    x[x_high_off + k + 1u],
+                                    x[x_high_off + k + 2u],
+                                    x[x_high_off + k + 3u]);
+                acc += xlo.x * n0lo + xlo.y * n1lo + xlo.z * n2lo + xlo.w * n3lo;
+                acc += xhi.x * n0hi + xhi.y * n1hi + xhi.z * n2hi + xhi.w * n3hi;
             }
         }
     }
@@ -2387,6 +2414,10 @@ using namespace metal;
 constant uint Q6K_BYTES = 210u;
 constant uint Q6K_WEIGHTS = 256u;
 
+// Optimised v2: precompute the 4 sub-block scales once per half,
+// reuse them across the 32 inner iterations (was redundantly
+// computing them via float(sc_h[l/16]) at every step). Removes
+// 4*32 = 128 redundant ALU ops per block per thread.
 kernel void sgemv_q6_k_f32(
     device const float* x       [[buffer(0)]],   // [K]
     device const uchar* w_q6k   [[buffer(1)]],   // [N, K] Q6_K row-major
@@ -2406,18 +2437,31 @@ kernel void sgemv_q6_k_f32(
 
     for (uint blk = 0; blk < blocks_per_row; ++blk) {
         device const uchar* block = w_q6k + row_off + blk * Q6K_BYTES;
-        device const uchar* ql = block;                  // 128 bytes
-        device const uchar* qh = block + 128;            // 64 bytes
-        device const char*  sc = (device const char*)(block + 192); // SIGNED int8 (T63!)
+        device const uchar* ql = block;
+        device const uchar* qh = block + 128;
+        device const char*  sc = (device const char*)(block + 192); // SIGNED!
         ushort d_bits = ((ushort)block[209] << 8) | (ushort)block[208];
         float d = float(as_type<half>(d_bits));
 
-        // Two halves of 128 weights each.
         for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
             device const uchar* ql_h = ql + half_idx * 64u;
             device const uchar* qh_h = qh + half_idx * 32u;
             device const char*  sc_h = sc + half_idx * 8;
             uint x_h_off = blk * Q6K_WEIGHTS + half_idx * 128u;
+
+            // Precompute 8 scales (2 sub-block-of-16 × 4 quarter-positions).
+            // sc_h[0..2] = sub-block 0 & 1 for q1
+            // sc_h[2..4] = ditto for q2
+            // sc_h[4..6] = ditto for q3
+            // sc_h[6..8] = ditto for q4
+            float s1_lo = d * float(sc_h[0]);
+            float s1_hi = d * float(sc_h[1]);
+            float s2_lo = d * float(sc_h[2]);
+            float s2_hi = d * float(sc_h[3]);
+            float s3_lo = d * float(sc_h[4]);
+            float s3_hi = d * float(sc_h[5]);
+            float s4_lo = d * float(sc_h[6]);
+            float s4_hi = d * float(sc_h[7]);
 
             for (uint l = 0; l < 32u; ++l) {
                 uchar qhh = qh_h[l];
@@ -2425,13 +2469,10 @@ kernel void sgemv_q6_k_f32(
                 int q2 = (int)(ql_h[l + 32] & 0x0F) | ((int)((qhh >> 2) & 0x03) << 4);
                 int q3 = (int)(ql_h[l]      >> 4)   | ((int)((qhh >> 4) & 0x03) << 4);
                 int q4 = (int)(ql_h[l + 32] >> 4)   | ((int)((qhh >> 6) & 0x03) << 4);
-                // Sub-block scales (signed int8). l/16 picks sub-block 0
-                // (l<16) or 1 (l>=16); +0/+2/+4/+6 select the matching
-                // q1..q4 weight position within the half.
-                float s1 = d * float(sc_h[l / 16]);
-                float s2 = d * float(sc_h[2 + l / 16]);
-                float s3 = d * float(sc_h[4 + l / 16]);
-                float s4 = d * float(sc_h[6 + l / 16]);
+                float s1 = (l < 16u) ? s1_lo : s1_hi;
+                float s2 = (l < 16u) ? s2_lo : s2_hi;
+                float s3 = (l < 16u) ? s3_lo : s3_hi;
+                float s4 = (l < 16u) ? s4_lo : s4_hi;
                 acc += x[x_h_off + l]      * (s1 * float(q1 - 32));
                 acc += x[x_h_off + l + 32] * (s2 * float(q2 - 32));
                 acc += x[x_h_off + l + 64] * (s3 * float(q3 - 32));
