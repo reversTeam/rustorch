@@ -1,0 +1,19 @@
+[package]
+name = "rustorch-tokenizer"
+description = "BPE / SentencePiece tokenizer for RusTorch LLM-runner. Wraps the HuggingFace `tokenizers` crate with a minimal API tailored for autoregressive decode."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# HuggingFace tokenizers — the canonical Rust BPE / Unigram /
+# WordPiece implementation. Loads `tokenizer.json` files from any
+# HF Hub model directly. We disable default features (which pull
+# in HTTP for direct hub download) to keep the dep tree lean;
+# users load tokenizer.json from disk via `Tokenizer::from_file`.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
