@@ -239,6 +239,99 @@ fn bench_elementwise_add(c: &mut Criterion) {
     group.finish();
 }
 
+/// T32 — LM head isolated bench: a `Linear(D=768 → V=50257)`
+/// matmul on `[128, 768]` rows. This is the final logit
+/// projection in any LLM forward, dominating ~10 G FLOPs and
+/// often the biggest single op. Critical for autoregressive
+/// decode where the full vocab is materialised every token.
+fn bench_lm_head(c: &mut Criterion) {
+    use rustorch_autograd::{no_grad, Variable};
+    use rustorch_nn::{Linear, Module};
+
+    let lm_head = Linear::new(768, 50257);
+    let x_data = det(0xC1A6, 128 * 768);
+    let x_t = Tensor::from_vec(vec![128usize, 768], x_data).unwrap();
+    let mut group = c.benchmark_group("lm_head");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.bench_function("linear_128x768x50257", |bb| {
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(x_t.clone());
+                hint_black_box(lm_head.forward(&x).unwrap())
+            })
+        });
+    });
+    group.finish();
+}
+
+/// T32 — single-token forward (S=1) pass through the GPT-2-small
+/// stack. Models the cold-start latency of generating the FIRST
+/// token of an autoregressive decode. Without KV-cache this also
+/// represents the per-token cost of every subsequent decode step
+/// (worst case naive).
+fn bench_gpt2_single_token_decode(c: &mut Criterion) {
+    use rustorch_autograd::{no_grad, ops, Variable};
+    use rustorch_fusion::patterns::matmul_bias_act::Activation;
+    use rustorch_nn::{Embedding, LayerNorm, Linear, Module, MultiHeadAttention};
+
+    let batch = 1_usize;
+    let seq = 1_usize;
+    let d_model = 768_usize;
+    let n_heads = 12_usize;
+    let d_ff = 3072_usize;
+    let num_layers = 12_usize;
+    let vocab_size = 50257_usize;
+
+    let token_emb = Embedding::with_seed(vocab_size, d_model, 0xC1A4);
+    let pos_emb = Embedding::with_seed(seq.max(1), d_model, 0xC1A5);
+    let mut layers: Vec<(LayerNorm, MultiHeadAttention, LayerNorm, Linear, Linear)> =
+        Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        layers.push((
+            LayerNorm::new(d_model),
+            MultiHeadAttention::new(d_model, n_heads),
+            LayerNorm::new(d_model),
+            Linear::new(d_model, d_ff),
+            Linear::new(d_ff, d_model),
+        ));
+    }
+    let final_ln = LayerNorm::new(d_model);
+    let lm_head = Linear::new(d_model, vocab_size);
+
+    let ids: Vec<i64> = vec![42_i64];
+    let ids_t = Tensor::from_vec_typed::<i64, _>([1_usize], ids).unwrap();
+    let pos_t = Tensor::from_vec_typed::<i64, _>([1_usize], vec![0_i64]).unwrap();
+
+    let mut group = c.benchmark_group("gpt2_single_token_decode");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(4));
+    group.bench_function("L12_S1_D768", |bb| {
+        bb.iter(|| {
+            no_grad(|| {
+                let tok = token_emb.forward_indices(&ids_t).unwrap();
+                let pos = pos_emb.forward_indices(&pos_t).unwrap();
+                let mut x = ops::add(&tok, &pos).unwrap();
+                x = ops::reshape(&x, vec![batch, seq, d_model]).unwrap();
+                for (ln1, mha, ln2, fc1, fc2) in layers.iter() {
+                    let h = ln1.forward(&x).unwrap();
+                    let h = mha.forward(&h, &h, &h, None).unwrap();
+                    x = ops::add(&x, &h).unwrap();
+                    let h = ln2.forward(&x).unwrap();
+                    let h = fc1.forward_with_activation(&h, Activation::Relu).unwrap();
+                    let h = fc2.forward(&h).unwrap();
+                    x = ops::add(&x, &h).unwrap();
+                }
+                let h = final_ln.forward(&x).unwrap();
+                hint_black_box(lm_head.forward(&h).unwrap())
+            })
+        });
+    });
+    group.finish();
+}
+
 /// T30 — full GPT-2-small forward stack: 12 transformer blocks
 /// chained, with input-side embedding + final LayerNorm + LM head.
 /// This is what a real LLM does on a single forward pass.
@@ -642,5 +735,7 @@ criterion_group! {
         bench_transformer_block_breakdown,
         bench_transformer_ops,
         bench_gpt2_full_stack,
+        bench_lm_head,
+        bench_gpt2_single_token_decode,
 }
 criterion_main!(benches);

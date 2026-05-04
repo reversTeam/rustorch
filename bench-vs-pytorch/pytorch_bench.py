@@ -186,6 +186,83 @@ def bench_embedding(num_embeds, embed_dim, batch):
     return {"op": "embedding", "shape": f"vocab={num_embeds} dim={embed_dim} b={batch}", "median_ns": med, "p99_ns": p99}
 
 
+def bench_lm_head(rows, d_model, vocab_size):
+    """LM head matmul — Linear(d_model -> vocab_size) on `rows` token rows.
+
+    Models the final logit projection in any LLM forward; ~10 G FLOPs
+    on 128×768×50257 dominates the per-iter cost.
+    """
+    fc = torch.nn.Linear(d_model, vocab_size)
+    for p in fc.parameters():
+        p.requires_grad_(False)
+    g = torch.Generator().manual_seed(0xC1A6)
+    x = torch.empty(rows, d_model).uniform_(-1.0, 1.0, generator=g)
+
+    def step():
+        with torch.no_grad():
+            return fc(x)
+
+    med, p99 = time_fn(step)
+    return {"op": "lm_head", "shape": f"[{rows},{d_model}]->[{rows},{vocab_size}]", "median_ns": med, "p99_ns": p99}
+
+
+def bench_gpt2_single_token_decode(num_layers, d_model, n_heads, d_ff, vocab_size):
+    """Single-token decode latency — the per-token cost of an
+    autoregressive generation step (without KV-cache, which neither
+    framework's basic nn.MultiheadAttention exposes natively here).
+    """
+    seq = 1
+    batch = 1
+    tok_emb = torch.nn.Embedding(vocab_size, d_model)
+    pos_emb = torch.nn.Embedding(max(seq, 1), d_model)
+    layers = []
+    for _ in range(num_layers):
+        layers.append(
+            (
+                torch.nn.LayerNorm(d_model),
+                torch.nn.MultiheadAttention(d_model, n_heads, batch_first=True),
+                torch.nn.LayerNorm(d_model),
+                torch.nn.Linear(d_model, d_ff),
+                torch.nn.Linear(d_ff, d_model),
+            )
+        )
+    final_ln = torch.nn.LayerNorm(d_model)
+    lm_head = torch.nn.Linear(d_model, vocab_size)
+    for m in [tok_emb, pos_emb, final_ln, lm_head]:
+        for p in m.parameters():
+            p.requires_grad_(False)
+    for tup in layers:
+        for sub in tup:
+            for p in sub.parameters():
+                p.requires_grad_(False)
+
+    ids = torch.tensor([[42]], dtype=torch.long)
+    pos_ids = torch.zeros(1, dtype=torch.long)
+
+    def step():
+        with torch.no_grad():
+            x = tok_emb(ids) + pos_emb(pos_ids)
+            for ln1, mha, ln2, fc1, fc2 in layers:
+                h = ln1(x)
+                h, _ = mha(h, h, h, need_weights=False)
+                x = x + h
+                h = ln2(x)
+                h = fc1(h)
+                h = torch.relu(h)
+                h = fc2(h)
+                x = x + h
+            h = final_ln(x)
+            return lm_head(h)
+
+    med, p99 = time_fn(step)
+    return {
+        "op": "gpt2_single_token_decode",
+        "shape": f"L={num_layers} S=1 D={d_model} V={vocab_size}",
+        "median_ns": med,
+        "p99_ns": p99,
+    }
+
+
 def bench_gpt2_full_stack(num_layers, batch, seq, d_model, n_heads, d_ff, vocab_size):
     """Full GPT-2-small forward stack — embedding + N blocks + LN + LM head.
 
@@ -330,6 +407,10 @@ def run(num_threads, device_label="cpu"):
     results.append(bench_embedding(50257, 768, 128))
     # T30 — GPT-2-small full stack (12 layers, embedding + final LN + LM head).
     results.append(bench_gpt2_full_stack(12, 1, 128, 768, 12, 3072, 50257))
+    # T32 — LM head isolated (the dominant final matmul) and
+    # single-token decode (per-token cost of LLM serving).
+    results.append(bench_lm_head(128, 768, 50257))
+    results.append(bench_gpt2_single_token_decode(12, 768, 12, 3072, 50257))
     return {
         "framework": "pytorch",
         "device": device_label,
