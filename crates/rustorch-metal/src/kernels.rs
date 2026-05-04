@@ -2504,6 +2504,75 @@ pub fn rms_norm_f32(
     Ok(())
 }
 
+const RMS_NORM_PER_HEAD_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Per-head RMSNorm (Qwen3 q_norm / k_norm). One threadgroup = one head;
+// 32 threads cooperate on head_dim. gamma is shared across heads
+// (shape [head_dim]).
+kernel void rms_norm_per_head_f32(
+    device float* x           [[buffer(0)]],     // [n_heads * head_dim]
+    device const float* gamma [[buffer(1)]],     // [head_dim]
+    constant uint2& dims      [[buffer(2)]],     // (n_heads, head_dim)
+    constant float& eps       [[buffer(3)]],
+    uint h                    [[threadgroup_position_in_grid]],
+    uint tid                  [[thread_position_in_threadgroup]],
+    uint sg_size              [[threads_per_simdgroup]]
+) {
+    uint n_heads = dims.x;
+    uint head_dim = dims.y;
+    if (h >= n_heads) return;
+
+    device float* head = x + h * head_dim;
+    float partial = 0.0;
+    for (uint i = tid; i < head_dim; i += sg_size) {
+        float v = head[i];
+        partial += v * v;
+    }
+    float total = simd_sum(partial);
+    float inv_rms = 1.0 / sqrt(total / float(head_dim) + eps);
+    for (uint i = tid; i < head_dim; i += sg_size) {
+        head[i] = head[i] * inv_rms * gamma[i];
+    }
+}
+"#;
+
+/// Per-head in-place RMSNorm — Qwen3 q_norm / k_norm.
+pub fn rms_norm_per_head_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    gamma_buf: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "rms_norm_per_head_f32",
+        RMS_NORM_PER_HEAD_F32_SHADER,
+        "rms_norm_per_head_f32",
+    )?;
+    let dims_buf = backend.alloc_shared(8)?;
+    let eps_buf = backend.alloc_shared(4)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = n_heads as u32;
+        *p.add(1) = head_dim as u32;
+        *(eps_buf.contents() as *mut f32) = eps;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(gamma_buf), 0);
+        encoder.set_buffer(2, Some(&dims_buf), 0);
+        encoder.set_buffer(3, Some(&eps_buf), 0);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 const SWIGLU_F32_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2545,6 +2614,293 @@ pub fn swiglu_f32(
         encoder.set_buffer(3, Some(&f_buf), 0);
         let tg_size = MTLSize::new(256, 1, 1);
         let grid = MTLSize::new(f as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+const KV_APPEND_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Append a single decode-step's K (or V) slice into the layer's KV
+// cache at the given absolute position. Layout of the cache is
+// [n_kv, max_seq, head_dim] row-major. Layout of src is
+// [n_kv, head_dim] (one row per kv head).
+kernel void kv_append_f32(
+    device const float* src  [[buffer(0)]],   // [n_kv * head_dim]
+    device float* dst        [[buffer(1)]],   // [n_kv * max_seq * head_dim]
+    constant uint3& dims     [[buffer(2)]],   // (n_kv, head_dim, position)
+    constant uint& max_seq   [[buffer(3)]],
+    uint gid                 [[thread_position_in_grid]]
+) {
+    uint n_kv     = dims.x;
+    uint head_dim = dims.y;
+    uint position = dims.z;
+    uint total    = n_kv * head_dim;
+    if (gid >= total) return;
+    uint kvh = gid / head_dim;
+    uint dd  = gid % head_dim;
+    uint dst_off = kvh * max_seq * head_dim + position * head_dim + dd;
+    dst[dst_off] = src[gid];
+}
+"#;
+
+/// Copy a decode-step K (or V) slice into the layer's KV cache at the
+/// given absolute sequence position. Pure GPU — no drain needed.
+pub fn kv_append_f32(
+    backend: &MetalBackend,
+    src_buf: &Buffer,
+    dst_cache_buf: &Buffer,
+    n_kv: usize,
+    head_dim: usize,
+    position: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline("kv_append_f32", KV_APPEND_F32_SHADER, "kv_append_f32")?;
+    let dims_buf = backend.alloc_shared(12)?;
+    let max_seq_buf = backend.alloc_shared(4)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = n_kv as u32;
+        *p.add(1) = head_dim as u32;
+        *p.add(2) = position as u32;
+        *(max_seq_buf.contents() as *mut u32) = max_seq as u32;
+    }
+    let total = n_kv * head_dim;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src_buf), 0);
+        encoder.set_buffer(1, Some(dst_cache_buf), 0);
+        encoder.set_buffer(2, Some(&dims_buf), 0);
+        encoder.set_buffer(3, Some(&max_seq_buf), 0);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(total as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+const ROPE_HALF_SPLIT_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Apply RoPE half-split convention to one [n_heads * head_dim] row,
+// in place. position is the row's absolute sequence index (used to
+// index into the precomputed cos/sin tables of shape
+// [max_seq, head_dim/2] row-major).
+//
+// Half-split: pair dim k with dim (k + head_dim/2). For k in 0..D/2:
+//   x'[k]      = x[k]      * cos(angle) - x[k + D/2] * sin(angle)
+//   x'[k+D/2]  = x[k+D/2]  * cos(angle) + x[k]       * sin(angle)
+// where angle = position * theta_k.
+kernel void rope_half_split_f32(
+    device float* x              [[buffer(0)]],   // [n_heads * head_dim]
+    device const float* cos_tab  [[buffer(1)]],   // [max_seq, head_dim/2]
+    device const float* sin_tab  [[buffer(2)]],
+    constant uint3& dims         [[buffer(3)]],   // (n_heads, head_dim, position)
+    uint gid                     [[thread_position_in_grid]]
+) {
+    uint n_heads  = dims.x;
+    uint head_dim = dims.y;
+    uint position = dims.z;
+    uint half_dim = head_dim / 2u;
+    uint total    = n_heads * half_dim;
+    if (gid >= total) return;
+
+    uint h = gid / half_dim;
+    uint k = gid % half_dim;
+    uint i0 = h * head_dim + k;
+    uint i1 = h * head_dim + k + half_dim;
+
+    uint tab_off = position * half_dim + k;
+    float c = cos_tab[tab_off];
+    float s = sin_tab[tab_off];
+    float x0 = x[i0];
+    float x1 = x[i1];
+    x[i0] = x0 * c - x1 * s;
+    x[i1] = x1 * c + x0 * s;
+}
+"#;
+
+/// Apply half-split RoPE in place on a single decode-step row of
+/// `x[n_heads * head_dim]` at the given absolute sequence position.
+/// The cos/sin tables are precomputed (see `rustorch_nn::rope::RoPE`).
+pub fn rope_half_split_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    cos_buf: &Buffer,
+    sin_buf: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    position: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "rope_half_split_f32",
+        ROPE_HALF_SPLIT_SHADER,
+        "rope_half_split_f32",
+    )?;
+    let dims_buf = backend.alloc_shared(12)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = n_heads as u32;
+        *p.add(1) = head_dim as u32;
+        *p.add(2) = position as u32;
+    }
+    let total = n_heads * (head_dim / 2);
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(cos_buf), 0);
+        encoder.set_buffer(2, Some(sin_buf), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(total as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+const GQA_DECODE_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// GQA decode attention for a single query position vs a kv-length cached
+// prefix. One threadgroup = one query head; the 32 threads of the inner
+// simdgroup cooperate on the kv_len reduction (softmax over scores +
+// weighted sum of V vectors).
+//
+// Inputs:
+//   q[n_heads, head_dim]
+//   k_cache[n_kv, max_seq, head_dim]   (only the first kv_len are read)
+//   v_cache[n_kv, max_seq, head_dim]
+//   out[n_heads, head_dim]
+//
+// Each query head q_h reads from kv head q_h / (n_heads / n_kv).
+//
+// We softmax-stable: max-shift then exp+sum.
+kernel void gqa_decode_f32(
+    device const float* q       [[buffer(0)]],
+    device const float* k_cache [[buffer(1)]],
+    device const float* v_cache [[buffer(2)]],
+    device float* out           [[buffer(3)]],
+    constant uint4& dims        [[buffer(4)]],   // (n_heads, n_kv, head_dim, kv_len)
+    constant uint& max_seq      [[buffer(5)]],
+    constant float& inv_sqrt_d  [[buffer(6)]],
+    threadgroup float* shared   [[threadgroup(0)]],
+    uint q_h                    [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]],
+    uint sg_size                [[threads_per_simdgroup]]
+) {
+    uint n_heads  = dims.x;
+    uint n_kv     = dims.y;
+    uint head_dim = dims.z;
+    uint kv_len   = dims.w;
+    if (q_h >= n_heads) return;
+    uint group_size = n_heads / n_kv;
+    uint kv_h = q_h / group_size;
+
+    // 1. Compute attention scores: score[p] = (q[q_h] dot k_cache[kv_h][p]) * inv_sqrt_d
+    //    Each thread handles a stride of positions p = tid, tid+32, ...
+    //    Then we softmax (max-shift) across positions cooperatively.
+
+    // Phase A: each thread computes its own scores into shared[].
+    // For kv_len up to ~1024 we fit comfortably; beyond that we'd need
+    // tiling. For Qwen3-14B context lengths in practice this is fine.
+    //
+    // Layout of shared: [kv_len] float scores.
+
+    device const float* q_h_ptr = q + q_h * head_dim;
+    device const float* k_h_base = k_cache + kv_h * max_seq * head_dim;
+
+    // Compute all scores; each thread writes a slice.
+    for (uint p = tid; p < kv_len; p += sg_size) {
+        device const float* k_p = k_h_base + p * head_dim;
+        float dot = 0.0;
+        for (uint d = 0; d < head_dim; ++d) {
+            dot += q_h_ptr[d] * k_p[d];
+        }
+        shared[p] = dot * inv_sqrt_d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase B: find max for stable softmax.
+    float local_max = -INFINITY;
+    for (uint p = tid; p < kv_len; p += sg_size) {
+        local_max = max(local_max, shared[p]);
+    }
+    float max_score = simd_max(local_max);
+
+    // Phase C: exp + accumulate sum.
+    float local_sum = 0.0;
+    for (uint p = tid; p < kv_len; p += sg_size) {
+        float e = exp(shared[p] - max_score);
+        shared[p] = e;
+        local_sum += e;
+    }
+    float sum = simd_sum(local_sum);
+    float inv_sum = 1.0 / sum;
+
+    // Phase D: weighted sum of V vectors. Each thread accumulates one
+    // dim of out. With sg_size=32 and head_dim=128 each thread handles
+    // 4 dims via stride loop.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const float* v_h_base = v_cache + kv_h * max_seq * head_dim;
+    device float* out_h = out + q_h * head_dim;
+    for (uint d = tid; d < head_dim; d += sg_size) {
+        float acc = 0.0;
+        for (uint p = 0; p < kv_len; ++p) {
+            acc += shared[p] * inv_sum * v_h_base[p * head_dim + d];
+        }
+        out_h[d] = acc;
+    }
+}
+"#;
+
+/// GQA attention for a single decode-step query (`q_seq = 1`) against
+/// the cached `kv_len` K/V positions. One threadgroup per query head;
+/// 32 threads inside cooperate on the kv-length reduction.
+///
+/// `shared_bytes` must be at least `kv_len * 4` (f32 score scratch).
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_decode_f32(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    k_cache: &Buffer,
+    v_cache: &Buffer,
+    out_buf: &Buffer,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    kv_len: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline("gqa_decode_f32", GQA_DECODE_F32_SHADER, "gqa_decode_f32")?;
+    let dims_buf = backend.alloc_shared(16)?;
+    let max_seq_buf = backend.alloc_shared(4)?;
+    let inv_sqrt_d_buf = backend.alloc_shared(4)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = n_heads as u32;
+        *p.add(1) = n_kv as u32;
+        *p.add(2) = head_dim as u32;
+        *p.add(3) = kv_len as u32;
+        *(max_seq_buf.contents() as *mut u32) = max_seq as u32;
+        *(inv_sqrt_d_buf.contents() as *mut f32) = 1.0 / (head_dim as f32).sqrt();
+    }
+    let shared_bytes = (kv_len * 4) as u64;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache), 0);
+        encoder.set_buffer(2, Some(v_cache), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_buffer(4, Some(&dims_buf), 0);
+        encoder.set_buffer(5, Some(&max_seq_buf), 0);
+        encoder.set_buffer(6, Some(&inv_sqrt_d_buf), 0);
+        encoder.set_threadgroup_memory_length(0, shared_bytes);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
     });
     Ok(())

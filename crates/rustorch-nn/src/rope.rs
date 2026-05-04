@@ -43,6 +43,19 @@ pub struct RoPE {
 }
 
 impl RoPE {
+    /// Expose the precomputed `cos[max_seq * head_dim/2]` table for
+    /// upload into a GPU buffer (needed by `rustorch-metal`'s RoPE
+    /// kernel — avoids re-running the trig at every forward pass).
+    pub fn cos_table(&self) -> &[f32] {
+        &self.cos
+    }
+    /// Companion to [`RoPE::cos_table`].
+    pub fn sin_table(&self) -> &[f32] {
+        &self.sin
+    }
+}
+
+impl RoPE {
     /// Build the cos/sin tables for `head_dim` and `max_seq` using
     /// the given `base` (typical: `10000.0`).
     ///

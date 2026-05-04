@@ -29,13 +29,12 @@ use rustorch_gguf::{GgmlType, GgufFile};
 use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::kernels::{
-    add_inplace_f32, rms_norm_f32, sgemv_q4_k_f32_into, sgemv_q6_k_f32_into, swiglu_f32,
+    add_inplace_f32, gqa_decode_f32, kv_append_f32, rms_norm_f32, rms_norm_per_head_f32,
+    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q6_k_f32_into, swiglu_f32,
 };
 
 use metal::Buffer;
 
-use rustorch_nn::gqa::gqa_forward_f32;
-use rustorch_nn::kv_cache::KVCache;
 use rustorch_nn::rope::RoPE;
 
 /// One projection's worth of weights, kept GPU-resident.
@@ -74,6 +73,8 @@ struct LayerWeights {
     w_down: MetalWeight,
     attn_q_norm: Option<Vec<f32>>,
     attn_k_norm: Option<Vec<f32>>,
+    attn_q_norm_buf: Option<Buffer>,
+    attn_k_norm_buf: Option<Buffer>,
 }
 
 struct ModelMetal {
@@ -84,6 +85,8 @@ struct ModelMetal {
     final_norm_buf: Buffer,
     lm_head: MetalWeight, // Q6_K usually
     rope: RoPE,
+    rope_cos_buf: Buffer, // [max_seq, head_dim/2] f32
+    rope_sin_buf: Buffer,
 }
 
 #[derive(Clone, Copy)]
@@ -171,18 +174,18 @@ fn forward_token(
     model: &ModelMetal,
     token_id: u32,
     position: usize,
-    cache: &mut KVCache,
     scratch: &mut Scratch,
 ) -> u32 {
     let cfg = model.cfg;
     let d = cfg.d;
     let f = cfg.f;
-    let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+    let _kv_dim = cfg.n_kv_heads * cfg.head_dim;
     let n_heads = cfg.n_heads;
     let n_kv = cfg.n_kv_heads;
     let head_dim = cfg.head_dim;
+    let max_seq = cfg.max_seq;
 
-    // Embed (CPU lookup, written into x_buf as residual stream).
+    // Embed (CPU lookup, written into xd_buf as residual stream).
     let off = (token_id as usize) * d;
     scratch.x.copy_from_slice(&model.token_emb[off..off + d]);
     unsafe {
@@ -190,7 +193,7 @@ fn forward_token(
     }
 
     for (li, layer) in model.layers.iter().enumerate() {
-        // 1. RMSNorm GPU (no sync — chained to next matmul).
+        // 1. RMSNorm GPU.
         rms_norm_f32(
             backend,
             &scratch.xd_buf,
@@ -201,7 +204,7 @@ fn forward_token(
         )
         .unwrap();
 
-        // 2. Q / K / V via Metal (3 separate sgemv).
+        // 2. Q / K / V matmul GPU.
         layer
             .w_q
             .matmul_into(backend, &scratch.h_buf, &scratch.q_buf);
@@ -211,90 +214,90 @@ fn forward_token(
         layer
             .w_v
             .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
-        // We need Q/K/V on CPU for RoPE+GQA, so drain here is unavoidable
-        // until we port RoPE+GQA to Metal too.
-        backend.drain();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.q_buf.contents() as *const f32,
-                scratch.q.as_mut_ptr(),
-                d,
-            );
-            std::ptr::copy_nonoverlapping(
-                scratch.k_buf.contents() as *const f32,
-                scratch.k.as_mut_ptr(),
-                kv_dim,
-            );
-            std::ptr::copy_nonoverlapping(
-                scratch.v_buf.contents() as *const f32,
-                scratch.v.as_mut_ptr(),
-                kv_dim,
-            );
-        }
 
-        // 3. QK-norm (CPU, optional).
-        if let Some(qn) = layer.attn_q_norm.as_deref() {
-            rms_norm_per_head(&mut scratch.q, qn, n_heads, head_dim, cfg.rms_eps);
-        }
-        if let Some(kn) = layer.attn_k_norm.as_deref() {
-            rms_norm_per_head(&mut scratch.k, kn, n_kv, head_dim, cfg.rms_eps);
-        }
-
-        // 4. RoPE (CPU).
-        model
-            .rope
-            .apply_inplace_half_split(&mut scratch.q, 1, n_heads, 1, position)
+        // 3. QK-norm BEFORE RoPE (Qwen3 HF reference order). All GPU.
+        if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
+            rms_norm_per_head_f32(
+                backend,
+                &scratch.q_buf,
+                qn_buf,
+                n_heads,
+                head_dim,
+                cfg.rms_eps,
+            )
             .unwrap();
-        model
-            .rope
-            .apply_inplace_half_split(&mut scratch.k, 1, n_kv, 1, position)
-            .unwrap();
+        }
+        if let Some(kn_buf) = layer.attn_k_norm_buf.as_ref() {
+            rms_norm_per_head_f32(backend, &scratch.k_buf, kn_buf, n_kv, head_dim, cfg.rms_eps)
+                .unwrap();
+        }
 
-        // 5. KV cache append + GQA (CPU).
-        cache.append(li, 1, &scratch.k, &scratch.v).unwrap();
+        // 4. RoPE GPU on Q and K (after QK norm).
+        rope_half_split_f32(
+            backend,
+            &scratch.q_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_heads,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        rope_half_split_f32(
+            backend,
+            &scratch.k_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_kv,
+            head_dim,
+            position,
+        )
+        .unwrap();
+
+        // 4. KV cache append — pure GPU kernel, no drain needed.
+        kv_append_f32(
+            backend,
+            &scratch.k_buf,
+            &scratch.k_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.v_buf,
+            &scratch.v_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+
+        // 5. GQA decode GPU.
         let kv_len = position + 1;
-        let max_seq = cache.max_seq();
-        let k_full = cache.k_buffer(li).unwrap();
-        let v_full = cache.v_buffer(li).unwrap();
-        let trim_len = n_kv * kv_len * head_dim;
-        for kvh in 0..n_kv {
-            let src = kvh * max_seq * head_dim;
-            let dst = kvh * kv_len * head_dim;
-            scratch.k_trim[dst..dst + kv_len * head_dim]
-                .copy_from_slice(&k_full[src..src + kv_len * head_dim]);
-            scratch.v_trim[dst..dst + kv_len * head_dim]
-                .copy_from_slice(&v_full[src..src + kv_len * head_dim]);
-        }
-        gqa_forward_f32(
-            &scratch.q,
-            &scratch.k_trim[..trim_len],
-            &scratch.v_trim[..trim_len],
-            &mut scratch.attn_out,
-            1,
+        gqa_decode_f32(
+            backend,
+            &scratch.q_buf,
+            &scratch.k_caches[li],
+            &scratch.v_caches[li],
+            &scratch.attn_buf,
             n_heads,
             n_kv,
-            1,
-            kv_len,
             head_dim,
+            kv_len,
+            max_seq,
         )
         .unwrap();
 
         // 6+7+8+9: O proj → residual_add → RMSNorm → gate/up → SwiGLU →
-        // down → residual_add. ALL GPU, chained without drain in between.
-        // The residual stream lives in xd_buf; CPU only sees it again at
-        // the next iteration's top of layer (which we don't actually need
-        // — the next iteration's first op is RMSNorm which reads xd_buf).
-        // Net: 1 drain per layer (after Q/K/V for RoPE/GQA) instead of 4.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.attn_out.as_ptr(),
-                scratch.h_buf.contents() as *mut f32,
-                d,
-            );
-        }
+        // down → residual_add. ALL GPU, chained without drain.
+        // attn_buf comes straight from the GQA kernel; no upload needed.
         layer
             .w_o
-            .matmul_into(backend, &scratch.h_buf, &scratch.o_buf);
+            .matmul_into(backend, &scratch.attn_buf, &scratch.o_buf);
         add_inplace_f32(backend, &scratch.xd_buf, &scratch.o_buf, d).unwrap();
         rms_norm_f32(
             backend,
@@ -374,10 +377,16 @@ struct Scratch {
     k_buf: Buffer,      // kv_dim-sized K output
     v_buf: Buffer,      // kv_dim-sized V output
     o_buf: Buffer,      // d-sized O proj output
+    attn_buf: Buffer,   // d-sized GQA output (input to O proj)
     gate_buf: Buffer,   // f-sized gate output
     up_buf: Buffer,     // f-sized up output
     fc2_buf: Buffer,    // d-sized down output
     logits_buf: Buffer, // vocab-sized lm_head output
+    /// Per-layer KV cache, GPU-resident. Each one is `[n_kv * max_seq * head_dim]`
+    /// f32. We append into specific positions via direct host-mapped writes
+    /// (alloc_shared makes them visible from CPU too — no kernel needed).
+    k_caches: Vec<Buffer>,
+    v_caches: Vec<Buffer>,
 }
 
 impl Scratch {
@@ -406,10 +415,17 @@ impl Scratch {
             k_buf: backend.alloc_shared(kv_dim * 4).unwrap(),
             v_buf: backend.alloc_shared(kv_dim * 4).unwrap(),
             o_buf: backend.alloc_shared(d * 4).unwrap(),
+            attn_buf: backend.alloc_shared(d * 4).unwrap(),
             gate_buf: backend.alloc_shared(f * 4).unwrap(),
             up_buf: backend.alloc_shared(f * 4).unwrap(),
             fc2_buf: backend.alloc_shared(d * 4).unwrap(),
             logits_buf: backend.alloc_shared(cfg.vocab * 4).unwrap(),
+            k_caches: (0..cfg.n_layers)
+                .map(|_| backend.alloc_shared(max_kv * 4).unwrap())
+                .collect(),
+            v_caches: (0..cfg.n_layers)
+                .map(|_| backend.alloc_shared(max_kv * 4).unwrap())
+                .collect(),
         }
     }
 }
@@ -486,6 +502,18 @@ fn load_model(backend: &MetalBackend, path: &str, max_seq: usize) -> ModelMetal 
             attn_k_norm: file
                 .tensor(&format!("blk.{i}.attn_k_norm.weight"))
                 .map(|t| rustorch_gguf::dequant_to_f32(t, file.tensor_bytes(t)).unwrap()),
+            attn_q_norm_buf: file
+                .tensor(&format!("blk.{i}.attn_q_norm.weight"))
+                .map(|t| {
+                    let v = rustorch_gguf::dequant_to_f32(t, file.tensor_bytes(t)).unwrap();
+                    alloc_metal_from_bytes(backend, bytemuck_cast(&v))
+                }),
+            attn_k_norm_buf: file
+                .tensor(&format!("blk.{i}.attn_k_norm.weight"))
+                .map(|t| {
+                    let v = rustorch_gguf::dequant_to_f32(t, file.tensor_bytes(t)).unwrap();
+                    alloc_metal_from_bytes(backend, bytemuck_cast(&v))
+                }),
         };
         layers.push(layer);
     }
@@ -496,6 +524,8 @@ fn load_model(backend: &MetalBackend, path: &str, max_seq: usize) -> ModelMetal 
     );
 
     let rope = RoPE::new(cfg.head_dim, cfg.max_seq, cfg.rope_theta);
+    let rope_cos_buf = alloc_metal_from_bytes(backend, bytemuck_cast(rope.cos_table()));
+    let rope_sin_buf = alloc_metal_from_bytes(backend, bytemuck_cast(rope.sin_table()));
     ModelMetal {
         cfg,
         layers,
@@ -504,6 +534,8 @@ fn load_model(backend: &MetalBackend, path: &str, max_seq: usize) -> ModelMetal 
         final_norm_buf,
         lm_head,
         rope,
+        rope_cos_buf,
+        rope_sin_buf,
     }
 }
 
@@ -564,21 +596,15 @@ fn main() -> ExitCode {
     );
 
     let model = load_model(backend, &path, max_seq);
-    let mut cache = KVCache::new(
-        model.cfg.n_layers,
-        1,
-        model.cfg.n_kv_heads,
-        model.cfg.head_dim,
-        max_seq,
-    );
     let mut scratch = Scratch::new(backend, &model.cfg);
 
     println!("\n→ prefill {} tokens", prompt_ids.len());
     let t_pre = Instant::now();
     let mut last = 0u32;
-    for (pos, &tok) in prompt_ids.iter().enumerate() {
-        last = forward_token(backend, &model, tok, pos, &mut cache, &mut scratch);
-        cache.advance(1).unwrap();
+    let mut cur_pos = 0usize;
+    for &tok in prompt_ids.iter() {
+        last = forward_token(backend, &model, tok, cur_pos, &mut scratch);
+        cur_pos += 1;
     }
     let prefill_d = t_pre.elapsed();
     println!(
@@ -591,9 +617,8 @@ fn main() -> ExitCode {
     let mut generated = vec![last];
     let t_dec = Instant::now();
     for _ in 1..n {
-        let pos = cache.current_len();
-        last = forward_token(backend, &model, last, pos, &mut cache, &mut scratch);
-        cache.advance(1).unwrap();
+        last = forward_token(backend, &model, last, cur_pos, &mut scratch);
+        cur_pos += 1;
         generated.push(last);
     }
     let decode_d = t_dec.elapsed();
