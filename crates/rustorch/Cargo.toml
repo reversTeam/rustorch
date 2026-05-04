@@ -66,6 +66,10 @@ rustorch-serde    = { workspace = true }
 # Used by examples/gpt2_inference_demo.rs to expose the
 # `Activation` enum for the fused Linear forward path.
 rustorch-fusion   = { workspace = true }
+# Direct access to cblas_sgemm (T51) — saves ~5 µs/call vs the
+# fused wrapper on M=1 sgemv shapes by skipping the shape +
+# activation epilogue checks.
+rustorch-cpu      = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

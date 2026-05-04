@@ -22,6 +22,13 @@ use rustorch_nn::rope::RoPE;
 use rustorch_nn::sampling::{sample_next, SamplingConfig};
 use std::time::Instant;
 
+// T51 NOTE: tested a direct cblas_sgemm wrapper to skip the
+// fused_matmul_bias_activation shape-check + epilogue path.
+// Result: SLOWER on M=1 K=N=256 (Q/K/V/O proj) because the
+// fused dispatcher routes those tiny shapes (98K FLOPs) to a
+// scalar 3-loop kernel at L1d-resident speed (~13 µs), while
+// cblas_sgemv takes ~20 µs (FFI dispatch overhead). Reverted.
+
 // Mini-Llama config.
 const NUM_LAYERS: usize = 4;
 const D_MODEL: usize = 256;
@@ -254,7 +261,8 @@ fn decode_step_raw(
             scratch.x[d] += scratch.o_out[d];
         }
 
-        // 8. RMSNorm + FFN (linear+relu+linear) + residual.
+        // 8. RMSNorm + FFN (linear+relu+linear) + residual. Keep
+        //    fused for fc1 since it folds the ReLU; raw for fc2.
         scratch.h.copy_from_slice(&scratch.x);
         rms_norm_inplace(&mut scratch.h, &block.rms_ffn);
         fused_matmul_bias_activation(
@@ -420,5 +428,180 @@ fn main() {
     println!();
 
     println!("  Final sequence ({} tokens): {:?}", output.len(), &output);
+    println!();
+
+    // ------------------ Per-stage profile ---------------------------
+    // Profile a single decode step at a fixed position to identify
+    // the dominant cost (matches the PyTorch bench's single-step
+    // measurement at context=32).
+    println!("=========================================================");
+    println!(" Per-stage profile (single step, context=32)");
+    println!("---------------------------------------------------------");
+    let mut profile_cache = KVCache::new(NUM_LAYERS, 1, N_KV_HEADS, HEAD_DIM, MAX_SEQ);
+    let mut profile_scratch = DecodeScratch::new();
+    // Pre-warm cache to position 32.
+    for pos in 0..32 {
+        decode_step_raw(
+            42,
+            pos,
+            &blocks,
+            &final_ln_w,
+            &lm_head_w,
+            &tok_emb_weight,
+            &rope,
+            &mut profile_cache,
+            &mut profile_scratch,
+        );
+        profile_cache.advance(1).unwrap();
+    }
+    // Measure one step many times for stable timings.
+    const PROFILE_ITERS: usize = 50;
+    let mut total_us = 0_u128;
+    let mut stage_us = [0_u128; 7]; // [embed, qkv, rope, gqa+trim, oproj+resid, ffn, lmhead]
+    for _ in 0..PROFILE_ITERS {
+        let t_total = Instant::now();
+        // Inline copy of decode_step_raw with per-stage timers.
+        embed_lookup(&tok_emb_weight, 42_usize, &mut profile_scratch.x);
+        for (layer_idx, block) in blocks.iter().enumerate() {
+            let t = Instant::now();
+            profile_scratch.h.copy_from_slice(&profile_scratch.x);
+            rms_norm_inplace(&mut profile_scratch.h, &block.rms_attn);
+            fused_matmul_bias_activation(
+                &profile_scratch.h,
+                &block.w_qkv,
+                None,
+                &mut profile_scratch.qkv,
+                1,
+                D_MODEL,
+                QKV_DIM,
+                Activation::None,
+            )
+            .unwrap();
+            stage_us[1] += t.elapsed().as_nanos();
+            let t = Instant::now();
+            let (q_slice, kv_slice) = profile_scratch.qkv.split_at_mut(D_MODEL);
+            let (k_slice, v_slice) = kv_slice.split_at_mut(KV_DIM);
+            rope.apply_inplace(q_slice, 1, N_HEADS, 1, 32).unwrap();
+            rope.apply_inplace(k_slice, 1, N_KV_HEADS, 1, 32).unwrap();
+            stage_us[2] += t.elapsed().as_nanos();
+            let t = Instant::now();
+            profile_cache
+                .append(layer_idx, 1, k_slice, v_slice)
+                .unwrap();
+            let kv_len = 33;
+            let k_full = profile_cache.k_buffer(layer_idx).unwrap();
+            let v_full = profile_cache.v_buffer(layer_idx).unwrap();
+            for kv_h in 0..N_KV_HEADS {
+                let src_off = kv_h * MAX_SEQ * HEAD_DIM;
+                let dst_off = kv_h * kv_len * HEAD_DIM;
+                profile_scratch.k_trim[dst_off..dst_off + kv_len * HEAD_DIM]
+                    .copy_from_slice(&k_full[src_off..src_off + kv_len * HEAD_DIM]);
+                profile_scratch.v_trim[dst_off..dst_off + kv_len * HEAD_DIM]
+                    .copy_from_slice(&v_full[src_off..src_off + kv_len * HEAD_DIM]);
+            }
+            let q_slice_ro = &profile_scratch.qkv[..D_MODEL];
+            gqa_forward_f32(
+                q_slice_ro,
+                &profile_scratch.k_trim[..N_KV_HEADS * kv_len * HEAD_DIM],
+                &profile_scratch.v_trim[..N_KV_HEADS * kv_len * HEAD_DIM],
+                &mut profile_scratch.attn_out,
+                1,
+                N_HEADS,
+                N_KV_HEADS,
+                1,
+                kv_len,
+                HEAD_DIM,
+            )
+            .unwrap();
+            stage_us[3] += t.elapsed().as_nanos();
+            let t = Instant::now();
+            fused_matmul_bias_activation(
+                &profile_scratch.attn_out,
+                &block.w_o,
+                None,
+                &mut profile_scratch.o_out,
+                1,
+                D_MODEL,
+                D_MODEL,
+                Activation::None,
+            )
+            .unwrap();
+            for d in 0..D_MODEL {
+                profile_scratch.x[d] += profile_scratch.o_out[d];
+            }
+            stage_us[4] += t.elapsed().as_nanos();
+            let t = Instant::now();
+            profile_scratch.h.copy_from_slice(&profile_scratch.x);
+            rms_norm_inplace(&mut profile_scratch.h, &block.rms_ffn);
+            fused_matmul_bias_activation(
+                &profile_scratch.h,
+                &block.w_fc1,
+                None,
+                &mut profile_scratch.fc1_out,
+                1,
+                D_MODEL,
+                D_FF,
+                Activation::Relu,
+            )
+            .unwrap();
+            fused_matmul_bias_activation(
+                &profile_scratch.fc1_out,
+                &block.w_fc2,
+                None,
+                &mut profile_scratch.fc2_out,
+                1,
+                D_FF,
+                D_MODEL,
+                Activation::None,
+            )
+            .unwrap();
+            for d in 0..D_MODEL {
+                profile_scratch.x[d] += profile_scratch.fc2_out[d];
+            }
+            stage_us[5] += t.elapsed().as_nanos();
+        }
+        let t = Instant::now();
+        profile_scratch.h.copy_from_slice(&profile_scratch.x);
+        rms_norm_inplace(&mut profile_scratch.h, &final_ln_w);
+        fused_matmul_bias_activation(
+            &profile_scratch.h,
+            &lm_head_w,
+            None,
+            &mut profile_scratch.logits,
+            1,
+            D_MODEL,
+            VOCAB,
+            Activation::None,
+        )
+        .unwrap();
+        stage_us[6] += t.elapsed().as_nanos();
+        total_us += t_total.elapsed().as_micros();
+    }
+    let avg_us = total_us / PROFILE_ITERS as u128;
+    println!(
+        "  Single step at ctx=32 : {:>7.2} ms (avg over {} iters)",
+        avg_us as f64 / 1000.0,
+        PROFILE_ITERS
+    );
+    println!("  Per-stage breakdown (avg per step, ns):");
+    let stages = [
+        "",
+        "QKV proj (×4 layers)",
+        "RoPE (×4)",
+        "KV trim+GQA (×4)",
+        "O proj+residual (×4)",
+        "FFN (×4)",
+        "Final LN+LM head",
+    ];
+    for i in 1..7 {
+        let avg_ns = stage_us[i] / PROFILE_ITERS as u128;
+        println!(
+            "    {:<28}: {:>8} ns ({:.2}% of step)",
+            stages[i],
+            avg_ns,
+            100.0 * avg_ns as f64 / (avg_us * 1000) as f64
+        );
+    }
+    println!("=========================================================");
     println!();
 }

@@ -178,53 +178,95 @@ pub fn gqa_forward_f32(
 
     // Decode path: naive per-head attention. Each query head reads
     // from its mapped KV head; we softmax over `seq_kv` positions
-    // and accumulate into `out`. Parallel over (batch * n_heads).
-    use rayon::prelude::*;
+    // and accumulate into `out`.
+    //
+    // T50 — for tiny query shapes (seq_q == 1, the autoregressive
+    // decode case) the rayon scheduler overhead (~20 us per task
+    // dispatch) dominates the actual ~1 us per-head work, costing
+    // us 47 % of decode-step time. Switch to a tight single-thread
+    // loop in that regime; for prefill / cross-attention with
+    // larger seq_q we keep the parallel path.
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    if seq_q == 1 {
+        for bh_idx in 0..(batch * n_heads) {
+            let out_block = &mut out[bh_idx * seq_q * head_dim..(bh_idx + 1) * seq_q * head_dim];
+            decode_attn_row(
+                bh_idx, q, k, v, out_block, batch, n_heads, n_kv_heads, seq_q, seq_kv, head_dim,
+                scale, group_size,
+            );
+        }
+        return Ok(());
+    }
+    use rayon::prelude::*;
     out.par_chunks_mut(seq_q * head_dim)
         .enumerate()
         .for_each(|(bh_idx, out_block)| {
-            let b = bh_idx / n_heads;
-            let h = bh_idx % n_heads;
-            let kv_h = h / group_size;
-            let q_off = b * n_heads * seq_q * head_dim + h * seq_q * head_dim;
-            let kv_off = b * n_kv_heads * seq_kv * head_dim + kv_h * seq_kv * head_dim;
-            let q_block = &q[q_off..q_off + seq_q * head_dim];
-            let k_block = &k[kv_off..kv_off + seq_kv * head_dim];
-            let v_block = &v[kv_off..kv_off + seq_kv * head_dim];
-            let mut scores = vec![0.0_f32; seq_kv];
-            for q_pos in 0..seq_q {
-                let q_row = &q_block[q_pos * head_dim..(q_pos + 1) * head_dim];
-                for k_pos in 0..seq_kv {
-                    let k_row = &k_block[k_pos * head_dim..(k_pos + 1) * head_dim];
-                    let mut acc = 0.0_f32;
-                    for d in 0..head_dim {
-                        acc += q_row[d] * k_row[d];
-                    }
-                    scores[k_pos] = acc * scale;
-                }
-                let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum_exp = 0.0_f32;
-                for s in scores.iter_mut() {
-                    *s = (*s - max_s).exp();
-                    sum_exp += *s;
-                }
-                let inv_sum = 1.0 / sum_exp;
-                for s in scores.iter_mut() {
-                    *s *= inv_sum;
-                }
-                let out_row = &mut out_block[q_pos * head_dim..(q_pos + 1) * head_dim];
-                out_row.fill(0.0);
-                for k_pos in 0..seq_kv {
-                    let v_row = &v_block[k_pos * head_dim..(k_pos + 1) * head_dim];
-                    let w = scores[k_pos];
-                    for d in 0..head_dim {
-                        out_row[d] += w * v_row[d];
-                    }
-                }
-            }
+            decode_attn_row(
+                bh_idx, q, k, v, out_block, batch, n_heads, n_kv_heads, seq_q, seq_kv, head_dim,
+                scale, group_size,
+            );
         });
     Ok(())
+}
+
+/// Inner per-(batch, head) attention kernel shared between the
+/// rayon-parallel prefill / cross-attention path and the tight
+/// single-thread decode (S=1) path.
+#[allow(clippy::too_many_arguments)]
+fn decode_attn_row(
+    bh_idx: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out_block: &mut [f32],
+    _batch: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    seq_q: usize,
+    seq_kv: usize,
+    head_dim: usize,
+    scale: f32,
+    group_size: usize,
+) {
+    let b = bh_idx / n_heads;
+    let h = bh_idx % n_heads;
+    let kv_h = h / group_size;
+    let q_off = b * n_heads * seq_q * head_dim + h * seq_q * head_dim;
+    let kv_off = b * n_kv_heads * seq_kv * head_dim + kv_h * seq_kv * head_dim;
+    let q_block = &q[q_off..q_off + seq_q * head_dim];
+    let k_block = &k[kv_off..kv_off + seq_kv * head_dim];
+    let v_block = &v[kv_off..kv_off + seq_kv * head_dim];
+    let mut scores = vec![0.0_f32; seq_kv];
+    for q_pos in 0..seq_q {
+        let q_row = &q_block[q_pos * head_dim..(q_pos + 1) * head_dim];
+        for k_pos in 0..seq_kv {
+            let k_row = &k_block[k_pos * head_dim..(k_pos + 1) * head_dim];
+            let mut acc = 0.0_f32;
+            for d in 0..head_dim {
+                acc += q_row[d] * k_row[d];
+            }
+            scores[k_pos] = acc * scale;
+        }
+        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_exp = 0.0_f32;
+        for s in scores.iter_mut() {
+            *s = (*s - max_s).exp();
+            sum_exp += *s;
+        }
+        let inv_sum = 1.0 / sum_exp;
+        for s in scores.iter_mut() {
+            *s *= inv_sum;
+        }
+        let out_row = &mut out_block[q_pos * head_dim..(q_pos + 1) * head_dim];
+        out_row.fill(0.0);
+        for k_pos in 0..seq_kv {
+            let v_row = &v_block[k_pos * head_dim..(k_pos + 1) * head_dim];
+            let w = scores[k_pos];
+            for d in 0..head_dim {
+                out_row[d] += w * v_row[d];
+            }
+        }
+    }
 }
 
 #[cfg(test)]
