@@ -350,6 +350,13 @@ impl LlamaModel {
         }
         let mut last_token = *prompt_ids.last().unwrap() as i64;
         let mut new_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens);
+        // Reset profile before the autoregressive loop so prefill doesn't
+        // pollute the per-token cost estimates (prefill is sequential
+        // single-token decodes today, same hot path, but we want the
+        // dump to reflect steady-state generation cost).
+        if profile::enabled() {
+            profile::reset();
+        }
         for _ in 0..max_new_tokens {
             let pos = cache.current_len();
             self.decode_step(last_token, pos, &mut cache, &mut scratch);
@@ -358,6 +365,9 @@ impl LlamaModel {
             output.push(next as u32);
             new_tokens.push(next as u32);
             last_token = next as i64;
+        }
+        if profile::enabled() {
+            profile::dump();
         }
         new_tokens
     }
@@ -420,6 +430,7 @@ impl LlamaModel {
         // Embed.
         let off = (token_id as usize) * d;
         scratch.x[..d].copy_from_slice(&self.token_emb[off..off + d]);
+        let prof = profile::enabled();
 
         // Optional residual-stream tracing — set RUSTORCH_DEBUG_TRACE=1
         // to dump the L2 norm and first-8 values of scratch.x at each
@@ -457,25 +468,29 @@ impl LlamaModel {
         for (layer_idx, block) in self.blocks.iter().enumerate() {
             // 1. RMSNorm + Q/K/V proj.
             scratch.h[..d].copy_from_slice(&scratch.x[..d]);
-            rms_norm_inplace(&mut scratch.h[..d], &block.rms_attn, cfg.rms_norm_eps);
+            profile::time(prof, 0, || {
+                rms_norm_inplace(&mut scratch.h[..d], &block.rms_attn, cfg.rms_norm_eps);
+            });
             if trace && layer_idx == 0 {
                 dump(&format!("L{layer_idx} attn_h_post_rms"), &scratch.h[..d]);
             }
-            sgemv_dispatch(&scratch.h[..d], &block.w_q, &mut scratch.q[..d], d, d);
-            sgemv_dispatch(
-                &scratch.h[..d],
-                &block.w_k,
-                &mut scratch.k[..kv_dim],
-                d,
-                kv_dim,
-            );
-            sgemv_dispatch(
-                &scratch.h[..d],
-                &block.w_v,
-                &mut scratch.v[..kv_dim],
-                d,
-                kv_dim,
-            );
+            profile::time(prof, 1, || {
+                sgemv_dispatch(&scratch.h[..d], &block.w_q, &mut scratch.q[..d], d, d);
+                sgemv_dispatch(
+                    &scratch.h[..d],
+                    &block.w_k,
+                    &mut scratch.k[..kv_dim],
+                    d,
+                    kv_dim,
+                );
+                sgemv_dispatch(
+                    &scratch.h[..d],
+                    &block.w_v,
+                    &mut scratch.v[..kv_dim],
+                    d,
+                    kv_dim,
+                );
+            });
             if trace && layer_idx == 0 {
                 dump(&format!("L{layer_idx} q_pre_norm"), &scratch.q[..d]);
                 dump(&format!("L{layer_idx} k_pre_norm"), &scratch.k[..kv_dim]);
@@ -489,20 +504,28 @@ impl LlamaModel {
             let qk_norm_disabled = std::env::var("RUSTORCH_DEBUG_DISABLE_QK_NORM")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            if !qk_norm_disabled {
-                if let Some(qn) = block.q_norm.as_deref() {
-                    rms_norm_per_head(&mut scratch.q[..d], qn, n_heads, head_dim, cfg.rms_norm_eps);
+            profile::time(prof, 2, || {
+                if !qk_norm_disabled {
+                    if let Some(qn) = block.q_norm.as_deref() {
+                        rms_norm_per_head(
+                            &mut scratch.q[..d],
+                            qn,
+                            n_heads,
+                            head_dim,
+                            cfg.rms_norm_eps,
+                        );
+                    }
+                    if let Some(kn) = block.k_norm.as_deref() {
+                        rms_norm_per_head(
+                            &mut scratch.k[..kv_dim],
+                            kn,
+                            n_kv,
+                            head_dim,
+                            cfg.rms_norm_eps,
+                        );
+                    }
                 }
-                if let Some(kn) = block.k_norm.as_deref() {
-                    rms_norm_per_head(
-                        &mut scratch.k[..kv_dim],
-                        kn,
-                        n_kv,
-                        head_dim,
-                        cfg.rms_norm_eps,
-                    );
-                }
-            }
+            });
 
             // 2b. RoPE on Q and K.
             //
@@ -513,68 +536,77 @@ impl LlamaModel {
             let rope_interleaved = std::env::var("RUSTORCH_DEBUG_ROPE_INTERLEAVED")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            if rope_interleaved {
-                self.rope
-                    .apply_inplace(&mut scratch.q[..d], 1, n_heads, 1, position)
-                    .unwrap();
-                self.rope
-                    .apply_inplace(&mut scratch.k[..kv_dim], 1, n_kv, 1, position)
-                    .unwrap();
-            } else {
-                self.rope
-                    .apply_inplace_half_split(&mut scratch.q[..d], 1, n_heads, 1, position)
-                    .unwrap();
-                self.rope
-                    .apply_inplace_half_split(&mut scratch.k[..kv_dim], 1, n_kv, 1, position)
-                    .unwrap();
-            }
+            profile::time(prof, 3, || {
+                if rope_interleaved {
+                    self.rope
+                        .apply_inplace(&mut scratch.q[..d], 1, n_heads, 1, position)
+                        .unwrap();
+                    self.rope
+                        .apply_inplace(&mut scratch.k[..kv_dim], 1, n_kv, 1, position)
+                        .unwrap();
+                } else {
+                    self.rope
+                        .apply_inplace_half_split(&mut scratch.q[..d], 1, n_heads, 1, position)
+                        .unwrap();
+                    self.rope
+                        .apply_inplace_half_split(&mut scratch.k[..kv_dim], 1, n_kv, 1, position)
+                        .unwrap();
+                }
+            });
 
             // 3. KV-cache append.
-            cache
-                .append(layer_idx, 1, &scratch.k[..kv_dim], &scratch.v[..kv_dim])
-                .unwrap();
-
-            // 4. Trim cache prefix and run GQA decode.
             let kv_len = position + 1;
-            let max_seq = cache.max_seq();
-            let k_full = cache.k_buffer(layer_idx).unwrap();
-            let v_full = cache.v_buffer(layer_idx).unwrap();
-            let trim_len = n_kv * kv_len * head_dim;
-            for kv_h in 0..n_kv {
-                let src_off = kv_h * max_seq * head_dim;
-                let dst_off = kv_h * kv_len * head_dim;
-                scratch.k_trim[dst_off..dst_off + kv_len * head_dim]
-                    .copy_from_slice(&k_full[src_off..src_off + kv_len * head_dim]);
-                scratch.v_trim[dst_off..dst_off + kv_len * head_dim]
-                    .copy_from_slice(&v_full[src_off..src_off + kv_len * head_dim]);
-            }
-            gqa_forward_f32(
-                &scratch.q[..d],
-                &scratch.k_trim[..trim_len],
-                &scratch.v_trim[..trim_len],
-                &mut scratch.attn_out[..d],
-                1,
-                n_heads,
-                n_kv,
-                1,
-                kv_len,
-                head_dim,
-            )
-            .unwrap();
+            let trim_len = profile::time(prof, 4, || {
+                cache
+                    .append(layer_idx, 1, &scratch.k[..kv_dim], &scratch.v[..kv_dim])
+                    .unwrap();
+                let max_seq = cache.max_seq();
+                let k_full = cache.k_buffer(layer_idx).unwrap();
+                let v_full = cache.v_buffer(layer_idx).unwrap();
+                let trim_len = n_kv * kv_len * head_dim;
+                for kv_h in 0..n_kv {
+                    let src_off = kv_h * max_seq * head_dim;
+                    let dst_off = kv_h * kv_len * head_dim;
+                    scratch.k_trim[dst_off..dst_off + kv_len * head_dim]
+                        .copy_from_slice(&k_full[src_off..src_off + kv_len * head_dim]);
+                    scratch.v_trim[dst_off..dst_off + kv_len * head_dim]
+                        .copy_from_slice(&v_full[src_off..src_off + kv_len * head_dim]);
+                }
+                trim_len
+            });
+
+            // 4. GQA decode.
+            profile::time(prof, 5, || {
+                gqa_forward_f32(
+                    &scratch.q[..d],
+                    &scratch.k_trim[..trim_len],
+                    &scratch.v_trim[..trim_len],
+                    &mut scratch.attn_out[..d],
+                    1,
+                    n_heads,
+                    n_kv,
+                    1,
+                    kv_len,
+                    head_dim,
+                )
+                .unwrap();
+            });
 
             // 5. O proj + residual.
-            sgemv_dispatch(
-                &scratch.attn_out[..d],
-                &block.w_o,
-                &mut scratch.o_out[..d],
-                d,
-                d,
-            );
+            profile::time(prof, 6, || {
+                sgemv_dispatch(
+                    &scratch.attn_out[..d],
+                    &block.w_o,
+                    &mut scratch.o_out[..d],
+                    d,
+                    d,
+                );
+                for i in 0..d {
+                    scratch.x[i] += scratch.o_out[i];
+                }
+            });
             if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} o_out"), &scratch.o_out[..d]);
-            }
-            for i in 0..d {
-                scratch.x[i] += scratch.o_out[i];
             }
             if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} after_attn_res"), &scratch.x[..d]);
@@ -610,26 +642,30 @@ impl LlamaModel {
             let force_l0_gamma = std::env::var("RUSTORCH_DEBUG_FORCE_FFN_NORM_FROM_L0")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            if force_l0_gamma && layer_idx > 0 {
-                rms_norm_inplace(
-                    &mut scratch.h[..d],
-                    &self.blocks[0].rms_ffn,
-                    cfg.rms_norm_eps,
-                );
-            } else {
-                rms_norm_inplace(&mut scratch.h[..d], &block.rms_ffn, cfg.rms_norm_eps);
-            }
+            profile::time(prof, 7, || {
+                if force_l0_gamma && layer_idx > 0 {
+                    rms_norm_inplace(
+                        &mut scratch.h[..d],
+                        &self.blocks[0].rms_ffn,
+                        cfg.rms_norm_eps,
+                    );
+                } else {
+                    rms_norm_inplace(&mut scratch.h[..d], &block.rms_ffn, cfg.rms_norm_eps);
+                }
+            });
             if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} ffn_h_post_rms"), &scratch.h[..d]);
             }
-            sgemv_dispatch(
-                &scratch.h[..d],
-                &block.w_gate,
-                &mut scratch.gate_out[..f],
-                d,
-                f,
-            );
-            sgemv_dispatch(&scratch.h[..d], &block.w_up, &mut scratch.up_out[..f], d, f);
+            profile::time(prof, 8, || {
+                sgemv_dispatch(
+                    &scratch.h[..d],
+                    &block.w_gate,
+                    &mut scratch.gate_out[..f],
+                    d,
+                    f,
+                );
+                sgemv_dispatch(&scratch.h[..d], &block.w_up, &mut scratch.up_out[..f], d, f);
+            });
             if trace && layer_idx <= 4 {
                 dump(
                     &format!("L{layer_idx} gate_pre_silu"),
@@ -638,27 +674,33 @@ impl LlamaModel {
                 dump(&format!("L{layer_idx} up"), &scratch.up_out[..f]);
             }
             // SwiGLU: silu(gate) * up — element-wise.
-            for i in 0..f {
-                let g = scratch.gate_out[i];
-                let s = g / (1.0 + (-g).exp()); // silu(x) = x * sigmoid(x)
-                scratch.gate_out[i] = s * scratch.up_out[i];
-            }
+            profile::time(prof, 9, || {
+                for i in 0..f {
+                    let g = scratch.gate_out[i];
+                    let s = g / (1.0 + (-g).exp()); // silu(x) = x * sigmoid(x)
+                    scratch.gate_out[i] = s * scratch.up_out[i];
+                }
+            });
             if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} swiglu_out"), &scratch.gate_out[..f]);
             }
-            sgemv_dispatch(
-                &scratch.gate_out[..f],
-                &block.w_down,
-                &mut scratch.fc2_out[..d],
-                f,
-                d,
-            );
+            profile::time(prof, 10, || {
+                sgemv_dispatch(
+                    &scratch.gate_out[..f],
+                    &block.w_down,
+                    &mut scratch.fc2_out[..d],
+                    f,
+                    d,
+                );
+            });
             if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} fc2_out"), &scratch.fc2_out[..d]);
             }
-            for i in 0..d {
-                scratch.x[i] += scratch.fc2_out[i];
-            }
+            profile::time(prof, 11, || {
+                for i in 0..d {
+                    scratch.x[i] += scratch.fc2_out[i];
+                }
+            });
             if trace && (layer_idx <= 4 || layer_idx + 1 == self.blocks.len()) {
                 dump(&format!("L{layer_idx} after_ffn_res"), &scratch.x[..d]);
             }
@@ -670,14 +712,19 @@ impl LlamaModel {
 
         // 7. Final RMSNorm + LM head.
         scratch.h[..d].copy_from_slice(&scratch.x[..d]);
-        rms_norm_inplace(&mut scratch.h[..d], &self.final_norm, cfg.rms_norm_eps);
-        sgemv_dispatch(
-            &scratch.h[..d],
-            &self.lm_head,
-            &mut scratch.logits[..cfg.vocab_size],
-            d,
-            cfg.vocab_size,
-        );
+        profile::time(prof, 12, || {
+            rms_norm_inplace(&mut scratch.h[..d], &self.final_norm, cfg.rms_norm_eps);
+        });
+        profile::time(prof, 13, || {
+            sgemv_dispatch(
+                &scratch.h[..d],
+                &self.lm_head,
+                &mut scratch.logits[..cfg.vocab_size],
+                d,
+                cfg.vocab_size,
+            );
+        });
+        profile::record_step();
     }
 }
 
@@ -815,6 +862,116 @@ fn transpose_2d(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
         }
     }
     dst
+}
+
+// ---------------------------------------------------------------------------
+// In-process profiler — toggle with `RUSTORCH_PROFILE=1`. Accumulates per-
+// phase wall-clock time over all decode_step calls; dumped via
+// `LlamaModel::dump_profile()` (called automatically by `generate` when
+// the env var is set).
+// ---------------------------------------------------------------------------
+
+mod profile {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    pub const N_PHASES: usize = 14;
+    pub const PHASE_NAMES: [&str; N_PHASES] = [
+        "rmsnorm_attn",    // 0
+        "qkv_proj",        // 1  (q + k + v projections)
+        "qk_norm",         // 2
+        "rope",            // 3
+        "kv_cache_trim",   // 4  (append + per-head trim copy)
+        "attention_gqa",   // 5
+        "o_proj_residual", // 6
+        "rmsnorm_ffn",     // 7
+        "gate_up_proj",    // 8
+        "swiglu",          // 9
+        "down_proj",       //10
+        "ffn_residual",    //11
+        "final_norm",      //12
+        "lm_head",         //13
+    ];
+
+    static NS: [AtomicU64; N_PHASES] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static STEPS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn enabled() -> bool {
+        std::env::var("RUSTORCH_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// Run `f`, accumulate its wall-clock time into phase `idx`. The
+    /// `enabled` check is hoisted out by the caller so we don't pay
+    /// an env-var lookup per phase per layer per token.
+    #[inline(always)]
+    pub fn time<R>(enabled: bool, idx: usize, f: impl FnOnce() -> R) -> R {
+        if enabled {
+            let t = Instant::now();
+            let r = f();
+            NS[idx].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            r
+        } else {
+            f()
+        }
+    }
+
+    pub fn record_step() {
+        STEPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn reset() {
+        for a in NS.iter() {
+            a.store(0, Ordering::Relaxed);
+        }
+        STEPS.store(0, Ordering::Relaxed);
+    }
+
+    pub fn dump() {
+        let steps = STEPS.load(Ordering::Relaxed).max(1);
+        let total: u64 = NS.iter().map(|a| a.load(Ordering::Relaxed)).sum();
+        eprintln!();
+        eprintln!(
+            "══════ DECODE PROFILE ({steps} decode_step calls, total {:.2} ms) ══════",
+            total as f64 / 1e6
+        );
+        eprintln!(
+            "  {:<18}  {:>10}  {:>9}  {:>7}",
+            "phase", "total (ms)", "per-tok", "% of total"
+        );
+        let mut order: Vec<usize> = (0..N_PHASES).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(NS[i].load(Ordering::Relaxed)));
+        for i in order {
+            let ns = NS[i].load(Ordering::Relaxed);
+            if ns == 0 {
+                continue;
+            }
+            let pct = 100.0 * ns as f64 / total as f64;
+            let ms = ns as f64 / 1e6;
+            let per_tok = ms / steps as f64;
+            eprintln!(
+                "  {:<18}  {:>10.2}  {:>7.3}ms  {:>6.1}%",
+                PHASE_NAMES[i], ms, per_tok, pct
+            );
+        }
+        eprintln!();
+    }
 }
 
 #[cfg(test)]
