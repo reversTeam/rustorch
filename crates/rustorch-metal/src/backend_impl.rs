@@ -17,7 +17,10 @@
 
 use crate::backend::MetalBackend;
 use crate::error::MetalError;
-use crate::kernels::{add_f32, matmul_simdgroup_f32};
+use crate::kernels::{
+    abs_f32, add_f32, div_f32, exp_f32, log_f32, matmul_simdgroup_f32, mean_f32, mul_f32, neg_f32,
+    relu_f32, sigmoid_f32, silu_f32, sqrt_f32, sub_f32, sum_f32, tanh_f32,
+};
 use crate::transfer::tensor_to_cpu;
 use rustorch_core::tensor::device::Device;
 use rustorch_core::tensor::tensor_impl::Tensor;
@@ -71,6 +74,59 @@ fn to_gpu(
     Ok(MetalStorage::standalone(buffer, bytes))
 }
 
+/// Wrap a fresh Metal `Buffer` (returned by a kernel) into a Tensor
+/// with `Storage::Metal` natively — no host trip. Mirrors
+/// `finish_wgpu_op` in rustorch-wgpu.
+fn finish_metal_op(
+    out: metal::Buffer,
+    shape: Vec<usize>,
+    dtype: rustorch_core::tensor::dtype::Dtype,
+) -> Tensor {
+    let n_bytes = shape.iter().product::<usize>() * 4;
+    let core = rustorch_core::tensor::storage::MetalStorage::standalone(out, n_bytes);
+    Tensor::from_metal_storage(core, shape, dtype)
+}
+
+/// Run a native binary Metal kernel: upload (or reuse) lhs+rhs,
+/// dispatch, return Tensor with Storage::Metal. **Caller MUST have
+/// already verified `lhs.shape() == rhs.shape()`** — broadcasting
+/// goes through the CPU fallback path inside each Backend impl.
+fn binary_native<F>(
+    backend: &MetalBackend,
+    op_name: &'static str,
+    lhs: &Tensor,
+    rhs: &Tensor,
+    kernel: F,
+) -> Result<Tensor, BackendError>
+where
+    F: FnOnce(
+        &MetalBackend,
+        &metal::Buffer,
+        &metal::Buffer,
+        usize,
+    ) -> Result<metal::Buffer, MetalError>,
+{
+    let l = to_gpu(backend, lhs).map_err(|e| metal_err(op_name, e))?;
+    let r = to_gpu(backend, rhs).map_err(|e| metal_err(op_name, e))?;
+    let out = kernel(backend, &l, &r, lhs.numel()).map_err(|e| metal_err(op_name, e))?;
+    Ok(finish_metal_op(out, lhs.shape().to_vec(), lhs.dtype()))
+}
+
+/// Run a native unary Metal kernel.
+fn unary_native<F>(
+    backend: &MetalBackend,
+    op_name: &'static str,
+    src: &Tensor,
+    kernel: F,
+) -> Result<Tensor, BackendError>
+where
+    F: FnOnce(&MetalBackend, &metal::Buffer, usize) -> Result<metal::Buffer, MetalError>,
+{
+    let s = to_gpu(backend, src).map_err(|e| metal_err(op_name, e))?;
+    let out = kernel(backend, &s, src.numel()).map_err(|e| metal_err(op_name, e))?;
+    Ok(finish_metal_op(out, src.shape().to_vec(), src.dtype()))
+}
+
 impl Backend for MetalBackend {
     fn name(&self) -> &'static str {
         "metal"
@@ -81,19 +137,9 @@ impl Backend for MetalBackend {
     /// Element-wise add via the native Metal `add_f32` kernel.
     fn add(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
         if lhs.shape() != rhs.shape() {
-            // Shape broadcasting not yet implemented in the native
-            // kernel — fall through to CPU which handles it.
             return cpu_backend().add(&host(lhs)?, &host(rhs)?).map(tag_metal);
         }
-        let l = to_gpu(self, lhs).map_err(|e| metal_err("add", e))?;
-        let r = to_gpu(self, rhs).map_err(|e| metal_err("add", e))?;
-        let out = add_f32(self, &l, &r, lhs.numel()).map_err(|e| metal_err("add", e))?;
-        let core = rustorch_core::tensor::storage::MetalStorage::standalone(out, lhs.numel() * 4);
-        Ok(Tensor::from_metal_storage(
-            core,
-            lhs.shape().to_vec(),
-            lhs.dtype(),
-        ))
+        binary_native(self, "add", lhs, rhs, add_f32)
     }
 
     /// `lhs @ rhs` via `simdgroup_matrix<float, 8, 8>` — the
@@ -138,37 +184,50 @@ impl Backend for MetalBackend {
     // Task J commits replace these with native Metal kernels.
 
     fn sub(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().sub(&host(lhs)?, &host(rhs)?).map(tag_metal)
+        if lhs.shape() != rhs.shape() {
+            return cpu_backend().sub(&host(lhs)?, &host(rhs)?).map(tag_metal);
+        }
+        binary_native(self, "sub", lhs, rhs, sub_f32)
     }
     fn mul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().mul(&host(lhs)?, &host(rhs)?).map(tag_metal)
+        if lhs.shape() != rhs.shape() {
+            return cpu_backend().mul(&host(lhs)?, &host(rhs)?).map(tag_metal);
+        }
+        binary_native(self, "mul", lhs, rhs, mul_f32)
     }
     fn div(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().div(&host(lhs)?, &host(rhs)?).map(tag_metal)
+        if lhs.shape() != rhs.shape() {
+            return cpu_backend().div(&host(lhs)?, &host(rhs)?).map(tag_metal);
+        }
+        binary_native(self, "div", lhs, rhs, div_f32)
     }
     fn neg(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().neg(&host(src)?).map(tag_metal)
+        unary_native(self, "neg", src, neg_f32)
     }
     fn relu(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().relu(&host(src)?).map(tag_metal)
+        unary_native(self, "relu", src, relu_f32)
     }
     fn eq(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
         cpu_backend().eq(&host(lhs)?, &host(rhs)?).map(tag_metal)
     }
     fn sigmoid(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().sigmoid(&host(src)?).map(tag_metal)
+        unary_native(self, "sigmoid", src, sigmoid_f32)
     }
     fn tanh(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().tanh(&host(src)?).map(tag_metal)
+        unary_native(self, "tanh", src, tanh_f32)
     }
     fn silu(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().silu(&host(src)?).map(tag_metal)
+        unary_native(self, "silu", src, silu_f32)
     }
     fn sum(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().sum(&host(src)?).map(tag_metal)
+        let s = to_gpu(self, src).map_err(|e| metal_err("sum", e))?;
+        let out = sum_f32(self, &s, src.numel()).map_err(|e| metal_err("sum", e))?;
+        Ok(finish_metal_op(out, vec![1], src.dtype()))
     }
     fn mean(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().mean(&host(src)?).map(tag_metal)
+        let s = to_gpu(self, src).map_err(|e| metal_err("mean", e))?;
+        let out = mean_f32(self, &s, src.numel()).map_err(|e| metal_err("mean", e))?;
+        Ok(finish_metal_op(out, vec![1], src.dtype()))
     }
     fn add_bias(&self, x: &Tensor, bias: &Tensor) -> Result<Tensor, BackendError> {
         cpu_backend()
@@ -203,16 +262,16 @@ impl Backend for MetalBackend {
             .map(tag_metal)
     }
     fn abs(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().abs(&host(src)?).map(tag_metal)
+        unary_native(self, "abs", src, abs_f32)
     }
     fn sqrt(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().sqrt(&host(src)?).map(tag_metal)
+        unary_native(self, "sqrt", src, sqrt_f32)
     }
     fn exp(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().exp(&host(src)?).map(tag_metal)
+        unary_native(self, "exp", src, exp_f32)
     }
     fn log(&self, src: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend().log(&host(src)?).map(tag_metal)
+        unary_native(self, "log", src, log_f32)
     }
     fn pow_scalar(&self, src: &Tensor, exponent: f64) -> Result<Tensor, BackendError> {
         cpu_backend()
@@ -240,9 +299,16 @@ impl Backend for MetalBackend {
         target: &Tensor,
         reduction: rustorch_cpu::backend::Reduction,
     ) -> Result<Tensor, BackendError> {
-        cpu_backend()
-            .mse_loss(&host(input)?, &host(target)?, reduction)
-            .map(tag_metal)
+        // Native composition stays on GPU end-to-end: sub → mul → reduce.
+        // Mirror of the WGSL mse_loss native composition.
+        use rustorch_cpu::backend::Reduction;
+        let diff = self.sub(input, target)?;
+        let sq = self.mul(&diff, &diff)?;
+        match reduction {
+            Reduction::Mean => self.mean(&sq),
+            Reduction::Sum => self.sum(&sq),
+            Reduction::None => Ok(sq),
+        }
     }
     fn cross_entropy(
         &self,

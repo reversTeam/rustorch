@@ -179,7 +179,7 @@ pub fn fused_adamw_step(
     encoder.dispatch_threads(grid, tg);
     encoder.end_encoding();
     cmd_buffer.commit();
-    cmd_buffer.wait_until_completed();
+    // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
 
     Ok(param_out)
 }

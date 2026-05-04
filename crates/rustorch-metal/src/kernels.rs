@@ -80,9 +80,383 @@ pub fn add_f32(
     encoder.dispatch_threads(grid, tg);
     encoder.end_encoding();
     cmd_buffer.commit();
-    cmd_buffer.wait_until_completed();
+    // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
 
     Ok(out)
+}
+
+// ----------------------------------------------------------------------
+// Generic element-wise binary / unary / reduction kernels.
+// Each picks an op via the `op_kind` constant rather than spinning up
+// a separate compute pipeline per operation — keeps pipeline-cache
+// pressure bounded.
+// ----------------------------------------------------------------------
+
+/// Element-wise binary kernel selector. Match the `BIN_*` constants
+/// in [`BIN_SHADER`].
+#[allow(dead_code)]
+const BIN_KIND_ADD: u32 = 0;
+const BIN_KIND_SUB: u32 = 1;
+const BIN_KIND_MUL: u32 = 2;
+const BIN_KIND_DIV: u32 = 3;
+
+const BIN_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct BinParams {
+    uint n;
+    uint op_kind;
+};
+
+kernel void binary_f32(
+    constant BinParams& params [[buffer(0)]],
+    device const float* lhs    [[buffer(1)]],
+    device const float* rhs    [[buffer(2)]],
+    device       float* out    [[buffer(3)]],
+    uint                gid    [[thread_position_in_grid]]
+) {
+    if (gid >= params.n) { return; }
+    float a = lhs[gid];
+    float b = rhs[gid];
+    float r;
+    if (params.op_kind == 0u)      { r = a + b; }
+    else if (params.op_kind == 1u) { r = a - b; }
+    else if (params.op_kind == 2u) { r = a * b; }
+    else                            { r = a / b; }
+    out[gid] = r;
+}
+"#;
+
+/// Element-wise unary kernel selector. Match the `UN_*` constants
+/// in [`UN_SHADER`].
+const UN_KIND_NEG: u32 = 0;
+const UN_KIND_RELU: u32 = 1;
+const UN_KIND_SIGMOID: u32 = 2;
+const UN_KIND_TANH: u32 = 3;
+const UN_KIND_SILU: u32 = 4;
+const UN_KIND_ABS: u32 = 5;
+const UN_KIND_SQRT: u32 = 6;
+const UN_KIND_EXP: u32 = 7;
+const UN_KIND_LOG: u32 = 8;
+
+const UN_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct UnParams {
+    uint n;
+    uint op_kind;
+};
+
+kernel void unary_f32(
+    constant UnParams& params [[buffer(0)]],
+    device const float* src    [[buffer(1)]],
+    device       float* out    [[buffer(2)]],
+    uint                gid    [[thread_position_in_grid]]
+) {
+    if (gid >= params.n) { return; }
+    float x = src[gid];
+    float r;
+    if (params.op_kind == 0u)      { r = -x; }
+    else if (params.op_kind == 1u) { r = max(0.0f, x); }
+    else if (params.op_kind == 2u) { r = 1.0f / (1.0f + exp(-x)); }
+    else if (params.op_kind == 3u) { r = tanh(x); }
+    else if (params.op_kind == 4u) { r = x / (1.0f + exp(-x)); }      // SiLU = x * sigmoid(x)
+    else if (params.op_kind == 5u) { r = fabs(x); }
+    else if (params.op_kind == 6u) { r = sqrt(x); }
+    else if (params.op_kind == 7u) { r = exp(x); }
+    else                            { r = log(x); }
+    out[gid] = r;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct BinUnParams {
+    n: u32,
+    op_kind: u32,
+}
+unsafe impl bytemuck::Zeroable for BinUnParams {}
+unsafe impl bytemuck::Pod for BinUnParams {}
+
+/// Dispatch a generic binary op. `op_kind` is one of the `BIN_KIND_*`
+/// constants; `lhs` and `rhs` must be F32 buffers of `n` elements each.
+fn dispatch_binary(
+    backend: &MetalBackend,
+    op_kind: u32,
+    op_name: &'static str,
+    lhs: &Buffer,
+    rhs: &Buffer,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    let n_bytes = n * 4;
+    let pipeline = backend.pipeline(op_name, BIN_SHADER, "binary_f32")?;
+    let out = backend.alloc_shared(n_bytes)?;
+    let params = BinUnParams {
+        n: n as u32,
+        op_kind,
+    };
+    let params_buf = backend.alloc_shared(core::mem::size_of::<BinUnParams>())?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let dst = params_buf.contents() as *mut BinUnParams;
+        *dst = params;
+    }
+    let cmd_buffer = backend.queue.new_command_buffer();
+    let encoder = cmd_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&params_buf), 0);
+    encoder.set_buffer(1, Some(lhs), 0);
+    encoder.set_buffer(2, Some(rhs), 0);
+    encoder.set_buffer(3, Some(&out), 0);
+    let max_threads = pipeline.max_total_threads_per_threadgroup();
+    let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+    let grid = MTLSize::new(n as u64, 1, 1);
+    encoder.dispatch_threads(grid, tg);
+    encoder.end_encoding();
+    cmd_buffer.commit();
+    // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
+    Ok(out)
+}
+
+/// Dispatch a generic unary op.
+fn dispatch_unary(
+    backend: &MetalBackend,
+    op_kind: u32,
+    op_name: &'static str,
+    src: &Buffer,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    let n_bytes = n * 4;
+    let pipeline = backend.pipeline(op_name, UN_SHADER, "unary_f32")?;
+    let out = backend.alloc_shared(n_bytes)?;
+    let params = BinUnParams {
+        n: n as u32,
+        op_kind,
+    };
+    let params_buf = backend.alloc_shared(core::mem::size_of::<BinUnParams>())?;
+    unsafe {
+        let dst = params_buf.contents() as *mut BinUnParams;
+        *dst = params;
+    }
+    let cmd_buffer = backend.queue.new_command_buffer();
+    let encoder = cmd_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&params_buf), 0);
+    encoder.set_buffer(1, Some(src), 0);
+    encoder.set_buffer(2, Some(&out), 0);
+    let max_threads = pipeline.max_total_threads_per_threadgroup();
+    let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+    let grid = MTLSize::new(n as u64, 1, 1);
+    encoder.dispatch_threads(grid, tg);
+    encoder.end_encoding();
+    cmd_buffer.commit();
+    // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
+    Ok(out)
+}
+
+/// Element-wise sub: `out = lhs - rhs`.
+pub fn sub_f32(b: &MetalBackend, l: &Buffer, r: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_binary(b, BIN_KIND_SUB, "sub_f32", l, r, n)
+}
+/// Element-wise mul: `out = lhs * rhs`.
+pub fn mul_f32(b: &MetalBackend, l: &Buffer, r: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_binary(b, BIN_KIND_MUL, "mul_f32", l, r, n)
+}
+/// Element-wise div: `out = lhs / rhs`.
+pub fn div_f32(b: &MetalBackend, l: &Buffer, r: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_binary(b, BIN_KIND_DIV, "div_f32", l, r, n)
+}
+/// Element-wise neg: `out = -src`.
+pub fn neg_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_unary(b, UN_KIND_NEG, "neg_f32", s, n)
+}
+/// Element-wise relu: `out = max(0, src)`.
+pub fn relu_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_unary(b, UN_KIND_RELU, "relu_f32", s, n)
+}
+/// Element-wise sigmoid.
+pub fn sigmoid_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_unary(b, UN_KIND_SIGMOID, "sigmoid_f32", s, n)
+}
+/// Element-wise tanh.
+pub fn tanh_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_unary(b, UN_KIND_TANH, "tanh_f32", s, n)
+}
+/// Element-wise silu: `out = src / (1 + exp(-src))`.
+pub fn silu_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_unary(b, UN_KIND_SILU, "silu_f32", s, n)
+}
+/// Element-wise abs.
+pub fn abs_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_unary(b, UN_KIND_ABS, "abs_f32", s, n)
+}
+/// Element-wise sqrt.
+pub fn sqrt_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_unary(b, UN_KIND_SQRT, "sqrt_f32", s, n)
+}
+/// Element-wise exp.
+pub fn exp_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_unary(b, UN_KIND_EXP, "exp_f32", s, n)
+}
+/// Element-wise log.
+pub fn log_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    dispatch_unary(b, UN_KIND_LOG, "log_f32", s, n)
+}
+
+// ----------------------------------------------------------------------
+// Full-tensor reductions (sum / mean → scalar [1]).
+// ----------------------------------------------------------------------
+
+const REDUCE_KIND_SUM: u32 = 0;
+const REDUCE_KIND_MEAN: u32 = 1;
+
+/// Two-stage reduction shader. Stage 1: each threadgroup of 256
+/// threads reduces a 256-stride chunk to a single partial via
+/// `simd_sum` + threadgroup memory. Stage 2: 1-thread cleanup over
+/// the partials. Numerical stability isn't paramount here — used
+/// for MSE loss reduction where the magnitudes are bounded.
+const REDUCE_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ReduceParams {
+    uint n;
+    uint kind;       // 0 = sum, 1 = mean
+};
+
+kernel void reduce_partial_f32(
+    constant ReduceParams& params [[buffer(0)]],
+    device const float*    src    [[buffer(1)]],
+    device       float*    out    [[buffer(2)]],
+    uint  tg_pos [[threadgroup_position_in_grid]],
+    uint  lid    [[thread_index_in_threadgroup]],
+    uint  tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float scratch[256];
+    uint stride = tg_size;
+    uint base = tg_pos * stride * 1u;  // each TG covers `stride` elements
+
+    float acc = 0.0f;
+    uint idx = base + lid;
+    if (idx < params.n) {
+        acc = src[idx];
+    }
+    scratch[lid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction within the threadgroup.
+    for (uint s = stride / 2u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            scratch[lid] += scratch[lid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) {
+        out[tg_pos] = scratch[0];
+    }
+}
+
+kernel void reduce_finalise_f32(
+    constant ReduceParams& params   [[buffer(0)]],
+    device const float*    partials [[buffer(1)]],
+    device       float*    out      [[buffer(2)]],
+    constant     uint&     n_partials [[buffer(3)]],
+    uint                   gid      [[thread_position_in_grid]]
+) {
+    if (gid != 0u) { return; }
+    float acc = 0.0f;
+    for (uint i = 0u; i < n_partials; i = i + 1u) {
+        acc += partials[i];
+    }
+    if (params.kind == 1u) {  // mean
+        acc = acc / float(params.n);
+    }
+    out[0] = acc;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct ReduceParams {
+    n: u32,
+    kind: u32,
+}
+unsafe impl bytemuck::Zeroable for ReduceParams {}
+unsafe impl bytemuck::Pod for ReduceParams {}
+
+/// Reduce `src` to a scalar `[1]` buffer. `kind` = 0 for sum,
+/// 1 for mean. Two-pass: 256-stride partial reduction, then
+/// single-thread cleanup.
+fn reduce_full(
+    backend: &MetalBackend,
+    src: &Buffer,
+    n: usize,
+    kind: u32,
+    op_name_partial: &'static str,
+    op_name_final: &'static str,
+) -> Result<Buffer, MetalError> {
+    let pipeline_partial =
+        backend.pipeline(op_name_partial, REDUCE_SHADER, "reduce_partial_f32")?;
+    let pipeline_final = backend.pipeline(op_name_final, REDUCE_SHADER, "reduce_finalise_f32")?;
+
+    let stride = 256u64;
+    let n_partials = (n as u64).div_ceil(stride);
+    let partials = backend.alloc_shared((n_partials as usize) * 4)?;
+
+    let params = ReduceParams { n: n as u32, kind };
+    let params_buf = backend.alloc_shared(core::mem::size_of::<ReduceParams>())?;
+    unsafe {
+        let dst = params_buf.contents() as *mut ReduceParams;
+        *dst = params;
+    }
+
+    // Stage 1: reduce_partial into `partials`.
+    let cmd1 = backend.queue.new_command_buffer();
+    let enc1 = cmd1.new_compute_command_encoder();
+    enc1.set_compute_pipeline_state(&pipeline_partial);
+    enc1.set_buffer(0, Some(&params_buf), 0);
+    enc1.set_buffer(1, Some(src), 0);
+    enc1.set_buffer(2, Some(&partials), 0);
+    let tg = MTLSize::new(stride, 1, 1);
+    let grid = MTLSize::new(n_partials * stride, 1, 1);
+    enc1.dispatch_threads(grid, tg);
+    enc1.end_encoding();
+    cmd1.commit();
+    // wait removed — see kernels.rs comment.
+
+    // Stage 2: single-thread finalisation.
+    let out = backend.alloc_shared(4)?;
+    let n_partials_buf = backend.alloc_shared(4)?;
+    unsafe {
+        let p = n_partials_buf.contents() as *mut u32;
+        *p = n_partials as u32;
+    }
+    let cmd2 = backend.queue.new_command_buffer();
+    let enc2 = cmd2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&pipeline_final);
+    enc2.set_buffer(0, Some(&params_buf), 0);
+    enc2.set_buffer(1, Some(&partials), 0);
+    enc2.set_buffer(2, Some(&out), 0);
+    enc2.set_buffer(3, Some(&n_partials_buf), 0);
+    let tg2 = MTLSize::new(1, 1, 1);
+    let grid2 = MTLSize::new(1, 1, 1);
+    enc2.dispatch_threads(grid2, tg2);
+    enc2.end_encoding();
+    cmd2.commit();
+    // wait removed.
+
+    Ok(out)
+}
+
+/// Full-tensor sum reduction `src → [1]`.
+pub fn sum_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    reduce_full(b, s, n, REDUCE_KIND_SUM, "sum_partial", "sum_final")
+}
+/// Full-tensor mean reduction `src → [1]`.
+pub fn mean_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalError> {
+    reduce_full(b, s, n, REDUCE_KIND_MEAN, "mean_partial", "mean_final")
 }
 
 /// `C = A @ B` matmul using Apple's `simdgroup_matrix<float, 8, 8>`
@@ -195,7 +569,7 @@ pub fn matmul_simdgroup_f32(
     encoder.dispatch_threads(grid, threadgroup_size);
     encoder.end_encoding();
     cmd_buffer.commit();
-    cmd_buffer.wait_until_completed();
+    // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
 
     Ok(out)
 }
@@ -260,6 +634,8 @@ mod tests {
         }
 
         let out = matmul_simdgroup_f32(backend, &a_buf, &b_buf, m, k, n).expect("dispatch");
+        // Kernel dispatch is async post-commit; drain before host read.
+        backend.drain();
         // SAFETY: shared-storage output buffer, valid for m*n*4 bytes.
         let got: Vec<f32> = unsafe {
             let p = out.contents() as *const f32;
@@ -311,6 +687,7 @@ mod tests {
         }
 
         let out = add_f32(backend, &lhs_buf, &rhs_buf, n).expect("dispatch");
+        backend.drain();
 
         // SAFETY: shared-storage output buffer, valid for n*4 bytes.
         let got: Vec<f32> = unsafe {

@@ -119,6 +119,19 @@ impl MetalBackend {
         self.supports_metal3
     }
 
+    /// Wait for every previously-committed command buffer to finish.
+    /// Required before reading any GPU buffer from the host —
+    /// kernel-dispatch helpers don't `wait_until_completed` per call
+    /// (that was the dominant overhead in the cpu_vs_metal_train
+    /// bench), so callers that want to read from CPU must first
+    /// drain the queue. `transfer::tensor_to_cpu` does this
+    /// automatically.
+    pub fn drain(&self) {
+        let cb = self.queue.new_command_buffer();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
     /// Allocate a fresh GPU buffer of `byte_len` bytes with the
     /// `MTLStorageModeShared` storage mode — unified memory on Apple
     /// Silicon, so the buffer is mapped to host address space without

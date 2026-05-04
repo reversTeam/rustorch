@@ -15,8 +15,16 @@ pub fn tensor_to_cpu(t: &Tensor) -> Result<Tensor, MetalError> {
     match t.storage() {
         Storage::Cpu(_) => Ok(t.clone()),
         Storage::Metal(metal_storage) => {
-            let _backend = metal_backend();
+            let backend = metal_backend();
             let n = t.numel();
+            // Drain the queue: any kernel writes to this buffer that
+            // were committed but haven't completed (we removed
+            // `wait_until_completed` from intermediate dispatches for
+            // perf) MUST finish before the host reads. Submit an
+            // empty command buffer + wait — synchronisation point.
+            let drain = backend.queue.new_command_buffer();
+            drain.commit();
+            drain.wait_until_completed();
             // SAFETY: shared-storage buffer; `contents()` is host-mapped.
             let data: Vec<f32> = unsafe {
                 let p = metal_storage.contents() as *const f32;
