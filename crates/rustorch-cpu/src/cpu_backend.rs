@@ -1502,16 +1502,64 @@ fn dispatch_binary(
 /// scalar loop is faster. Calibrated empirically on Apple M4 Max P-core.
 const GEMM_DISPATCH_MIN: usize = 32;
 
-/// f32 matmul dispatch: SIMD `gemm` crate (faer-rs ecosystem) above
-/// [`GEMM_DISPATCH_MIN`], scalar fallback otherwise.
+/// f32 matmul dispatch.
 ///
-/// Pure Rust state-of-the-art: `gemm` 0.18, NEON+AVX-512 explicit
-/// vectorization, ~70-80% Intel MKL on M4 Max NEON. Plan P3.X T2-new.
-/// Baseline before this change: 924 ms on 1024³ f32 (3.16 GF/s).
+/// Priority order:
+/// 1. **macOS**: Apple `Accelerate.framework` `cblas_sgemm` — routes
+///    through AMX tile units automatically on Apple Silicon, typically
+///    5-10× faster than pure-Rust `gemm`-rs on the same hardware. This
+///    is the canonical CPU matmul path on macOS (PyTorch CPU since 2.3+
+///    uses the same backend).
+/// 2. **Other platforms**: pure-Rust `gemm` 0.18 (faer-rs ecosystem),
+///    NEON+AVX-512 explicit vectorization, ~70-80% Intel MKL on x86.
+/// 3. **wasm32**: scalar [`matmul_naive`] fallback (no SIMD intrinsics
+///    available).
 ///
-/// On wasm32 the `gemm` crate is unavailable (NEON/AVX intrinsics), so
-/// the wasm32 path always uses the scalar [`matmul_naive`] kernel.
-#[cfg(not(target_arch = "wasm32"))]
+/// Below [`GEMM_DISPATCH_MIN`], the scalar fallback is used regardless
+/// of platform: BLAS setup overhead exceeds compute for tiny shapes.
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+fn matmul_dispatch_f32(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Tensor, BackendError> {
+    if m < GEMM_DISPATCH_MIN || n < GEMM_DISPATCH_MIN || k < GEMM_DISPATCH_MIN {
+        return matmul_naive::<f32>(lhs, rhs, m, k, n);
+    }
+    let lhs_buf: Vec<f32> = lhs
+        .iter_elements::<f32>()
+        .ok_or(BackendError::DtypeMismatch {
+            op: "matmul",
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        })?
+        .collect();
+    let rhs_buf: Vec<f32> = rhs
+        .iter_elements::<f32>()
+        .ok_or(BackendError::DtypeMismatch {
+            op: "matmul",
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        })?
+        .collect();
+    let mut out_buf: Vec<f32> = vec![0.0_f32; m * n];
+
+    // SAFETY: buffers are exactly m*k, k*n, m*n long in f32 and live for
+    // the duration of the call. `cblas_sgemm` is the canonical row-major
+    // f32 GEMM ABI; the wrapper validates lengths in debug builds.
+    unsafe {
+        crate::accelerate::sgemm_row_major(m, k, n, &lhs_buf, &rhs_buf, &mut out_buf);
+    }
+
+    Tensor::from_vec_typed::<f32, _>(vec![m, n], out_buf).map_err(|_| BackendError::OutOfMemory {
+        bytes: m * n * core::mem::size_of::<f32>(),
+    })
+}
+
+/// f32 matmul dispatch (non-macOS): pure-Rust `gemm`-rs.
+#[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
 fn matmul_dispatch_f32(
     lhs: &Tensor,
     rhs: &Tensor,
