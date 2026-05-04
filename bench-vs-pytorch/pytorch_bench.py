@@ -103,6 +103,89 @@ def bench_attention_naive(b, h, n, d):
     }
 
 
+def bench_layernorm(batch, seq, d):
+    ln = torch.nn.LayerNorm(d)
+    for p in ln.parameters():
+        p.requires_grad_(False)
+    g = torch.Generator().manual_seed(0xC1A0)
+    x = torch.empty(batch, seq, d).uniform_(-1.0, 1.0, generator=g)
+
+    def step():
+        with torch.no_grad():
+            return ln(x)
+
+    med, p99 = time_fn(step)
+    return {"op": "layernorm", "shape": f"B={batch} S={seq} D={d}", "median_ns": med, "p99_ns": p99}
+
+
+def bench_rmsnorm(batch, seq, d):
+    # PyTorch >= 2.4 has nn.RMSNorm; otherwise emulate with the canonical
+    # formula for parity.
+    rms = getattr(torch.nn, "RMSNorm", None)
+    if rms is not None:
+        layer = rms(d)
+        for p in layer.parameters():
+            p.requires_grad_(False)
+    else:
+        layer = None
+    g = torch.Generator().manual_seed(0xC1A1)
+    x = torch.empty(batch, seq, d).uniform_(-1.0, 1.0, generator=g)
+    if layer is not None:
+        def step():
+            with torch.no_grad():
+                return layer(x)
+    else:
+        gamma = torch.ones(d)
+        def step():
+            with torch.no_grad():
+                rms_x = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+                return x * rms_x * gamma
+    med, p99 = time_fn(step)
+    return {"op": "rmsnorm", "shape": f"B={batch} S={seq} D={d}", "median_ns": med, "p99_ns": p99}
+
+
+def bench_linear(rows, in_dim, out_dim):
+    fc = torch.nn.Linear(in_dim, out_dim)
+    for p in fc.parameters():
+        p.requires_grad_(False)
+    g = torch.Generator().manual_seed(0xC1A2)
+    x = torch.empty(rows, in_dim).uniform_(-1.0, 1.0, generator=g)
+
+    def step():
+        with torch.no_grad():
+            return fc(x)
+
+    med, p99 = time_fn(step)
+    return {"op": "linear", "shape": f"[{rows},{in_dim}]->[{rows},{out_dim}]", "median_ns": med, "p99_ns": p99}
+
+
+def bench_relu_isolated(batch, seq, dim):
+    g = torch.Generator().manual_seed(0xC1A3)
+    x = torch.empty(batch, seq, dim).uniform_(-1.0, 1.0, generator=g)
+
+    def step():
+        with torch.no_grad():
+            return torch.relu(x)
+
+    med, p99 = time_fn(step)
+    return {"op": "relu", "shape": f"B={batch} S={seq} F={dim}", "median_ns": med, "p99_ns": p99}
+
+
+def bench_embedding(num_embeds, embed_dim, batch):
+    emb = torch.nn.Embedding(num_embeds, embed_dim)
+    for p in emb.parameters():
+        p.requires_grad_(False)
+    g = torch.Generator().manual_seed(0xC1A4)
+    idx = torch.randint(0, num_embeds, (batch,), generator=g)
+
+    def step():
+        with torch.no_grad():
+            return emb(idx)
+
+    med, p99 = time_fn(step)
+    return {"op": "embedding", "shape": f"vocab={num_embeds} dim={embed_dim} b={batch}", "median_ns": med, "p99_ns": p99}
+
+
 def bench_transformer_block(batch, seq, d_model, n_heads, d_ff):
     """GPT-2-style transformer block forward (no_grad inference).
 
@@ -181,6 +264,12 @@ def run(num_threads, device_label="cpu"):
     results.append(bench_transformer_block(2, 128, 256, 4, 1024))
     # T21 — full-scale GPT-2 small block (real production shape).
     results.append(bench_transformer_block(1, 512, 768, 12, 3072))
+    # T25 — coverage expansion: isolated transformer ops.
+    results.append(bench_layernorm(1, 512, 768))
+    results.append(bench_rmsnorm(1, 1024, 4096))
+    results.append(bench_linear(512, 768, 768))
+    results.append(bench_relu_isolated(1, 512, 3072))
+    results.append(bench_embedding(50257, 768, 128))
     return {
         "framework": "pytorch",
         "device": device_label,

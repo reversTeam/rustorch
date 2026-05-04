@@ -356,6 +356,96 @@ fn bench_transformer_block_breakdown(c: &mut Criterion) {
     group.finish();
 }
 
+/// T25 — coverage expansion: bench every primary transformer op
+/// in isolation. Each op is paired with the PyTorch equivalent in
+/// pytorch_bench.py so we can spot behind-PT shapes that the
+/// composite block bench may hide.
+fn bench_transformer_ops(c: &mut Criterion) {
+    use rustorch_autograd::{no_grad, ops, Variable};
+    use rustorch_nn::{Embedding, LayerNorm, Linear, Module, RMSNorm};
+
+    let mut group = c.benchmark_group("transformer_ops");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(3));
+
+    // LayerNorm @ GPT-2 small shape: [1, 512, 768]
+    {
+        let ln = LayerNorm::new(768);
+        let x_data = det(0xC1A0, 1 * 512 * 768);
+        let x_t = Tensor::from_vec(vec![1usize, 512, 768], x_data).unwrap();
+        group.bench_function("layernorm_B1S512D768", |bb| {
+            bb.iter(|| {
+                no_grad(|| {
+                    let x = Variable::new(x_t.clone());
+                    hint_black_box(ln.forward(&x).unwrap())
+                })
+            });
+        });
+    }
+
+    // RMSNorm @ Llama-7B shape: [1, 1024, 4096]
+    {
+        let rms = RMSNorm::new(4096);
+        let x_data = det(0xC1A1, 1 * 1024 * 4096);
+        let x_t = Tensor::from_vec(vec![1usize, 1024, 4096], x_data).unwrap();
+        group.bench_function("rmsnorm_B1S1024D4096", |bb| {
+            bb.iter(|| {
+                no_grad(|| {
+                    let x = Variable::new(x_t.clone());
+                    hint_black_box(rms.forward(&x).unwrap())
+                })
+            });
+        });
+    }
+
+    // Linear @ GPT-2 small projection shape: [512, 768] -> [512, 768]
+    {
+        let fc = Linear::new(768, 768);
+        let x_data = det(0xC1A2, 512 * 768);
+        let x_t = Tensor::from_vec(vec![512usize, 768], x_data).unwrap();
+        group.bench_function("linear_512x768x768", |bb| {
+            bb.iter(|| {
+                no_grad(|| {
+                    let x = Variable::new(x_t.clone());
+                    hint_black_box(fc.forward(&x).unwrap())
+                })
+            });
+        });
+    }
+
+    // ReLU activation @ FFN intermediate shape: [1, 512, 3072]
+    {
+        let x_data = det(0xC1A3, 1 * 512 * 3072);
+        let x_t = Tensor::from_vec(vec![1usize, 512, 3072], x_data).unwrap();
+        group.bench_function("relu_B1S512F3072", |bb| {
+            bb.iter(|| {
+                no_grad(|| {
+                    let x = Variable::new(x_t.clone());
+                    hint_black_box(ops::relu(&x).unwrap())
+                })
+            });
+        });
+    }
+
+    // Embedding lookup @ GPT-2 vocab: vocab=50257, embed=768, batch=128
+    {
+        let emb = Embedding::with_seed(50257, 768, 0xC1A4);
+        let mut idx_data: Vec<i64> = Vec::with_capacity(128);
+        let mut s: u64 = 1;
+        for _ in 0..128 {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            idx_data.push(((s >> 32) as i64).rem_euclid(50257));
+        }
+        let idx_t = Tensor::from_vec_typed::<i64, _>([128usize], idx_data).unwrap();
+        group.bench_function("embedding_lookup_b128_v50k_d768", |bb| {
+            bb.iter(|| no_grad(|| hint_black_box(emb.forward_indices(&idx_t).unwrap())));
+        });
+    }
+
+    group.finish();
+}
+
 /// GPT-2-style transformer block forward (no_grad inference).
 ///
 /// Layout:
@@ -451,5 +541,6 @@ criterion_group! {
         bench_transformer_block,
         bench_transformer_block_gpt2_small,
         bench_transformer_block_breakdown,
+        bench_transformer_ops,
 }
 criterion_main!(benches);

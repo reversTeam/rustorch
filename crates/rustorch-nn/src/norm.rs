@@ -55,6 +55,26 @@ impl RMSNorm {
 
 impl Module for RMSNorm {
     fn forward(&self, input: &Variable) -> Result<Variable, ModuleError> {
+        // T27 — fast path: same `no_grad + dense f32 contig` pattern
+        // as LayerNorm (T18). The 5-op autograd composition (mul,
+        // mean_dim, add, sqrt, div, mul) was ~178× slower than
+        // PyTorch's nn.RMSNorm on a Llama-7B-shape input — fused
+        // single-pass kernel collapses it.
+        let x_t = input.tensor();
+        let g_t = self.gamma.tensor();
+        if !is_grad_enabled()
+            && x_t.dtype() == Dtype::F32
+            && g_t.dtype() == Dtype::F32
+            && x_t.is_contiguous()
+            && g_t.is_contiguous()
+            && x_t.ndim() >= 1
+            && x_t.shape()[x_t.ndim() - 1] == self.normalized_size
+            && g_t.numel() == self.normalized_size
+        {
+            let out = rms_norm_forward_f32_fused(&x_t, &g_t, self.eps)?;
+            return Ok(Variable::new(out));
+        }
+
         // Reduce dim = last axis of input.
         let last_dim = input.tensor().ndim() - 1;
         // x²
@@ -284,6 +304,67 @@ fn layer_norm_forward_f32_fused(
 
     Tensor::from_vec(shape, out_data).map_err(|e| ModuleError::Backend {
         op: "LayerNorm::forward(fused)",
+        message: format!("{e:?}"),
+    })
+}
+
+/// T27 — fused single-pass RMSNorm forward (f32 contiguous, last
+/// axis). RMSNorm is `y = x / sqrt(mean(x²) + eps) * gamma`.
+fn rms_norm_forward_f32_fused(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor, ModuleError> {
+    let shape = x.shape().to_vec();
+    let d = *shape.last().unwrap();
+    let outer: usize = shape.iter().take(shape.len() - 1).product();
+    let n = outer * d;
+
+    let x_slice = x.as_slice::<f32>().expect("checked F32 contiguous");
+    let g_slice = gamma.as_slice::<f32>().expect("checked F32 contiguous");
+
+    let mut out_data = vec![0.0_f32; n];
+    let inv_d = 1.0_f32 / (d as f32);
+
+    let process_row = |x_row: &[f32], out_row: &mut [f32]| {
+        // Single pass for the second moment; then a vectorisable
+        // pass for the normalise + scale.
+        let mut sum_sq = 0.0_f32;
+        for &v in x_row.iter() {
+            sum_sq += v * v;
+        }
+        let mean_sq = sum_sq * inv_d;
+        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+        for i in 0..d {
+            out_row[i] = x_row[i] * inv_rms * g_slice[i];
+        }
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    const PARALLEL_OUTER_MIN: usize = 64;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if outer >= PARALLEL_OUTER_MIN {
+        use rayon::prelude::*;
+        out_data
+            .par_chunks_mut(d)
+            .zip(x_slice.par_chunks(d))
+            .for_each(|(out_row, x_row)| process_row(x_row, out_row));
+    } else {
+        for o in 0..outer {
+            process_row(
+                &x_slice[o * d..(o + 1) * d],
+                &mut out_data[o * d..(o + 1) * d],
+            );
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    for o in 0..outer {
+        process_row(
+            &x_slice[o * d..(o + 1) * d],
+            &mut out_data[o * d..(o + 1) * d],
+        );
+    }
+
+    Tensor::from_vec(shape, out_data).map_err(|e| ModuleError::Backend {
+        op: "RMSNorm::forward(fused)",
         message: format!("{e:?}"),
     })
 }
