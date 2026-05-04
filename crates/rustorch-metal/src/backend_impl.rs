@@ -18,8 +18,9 @@
 use crate::backend::MetalBackend;
 use crate::error::MetalError;
 use crate::kernels::{
-    abs_f32, add_f32, div_f32, exp_f32, log_f32, matmul_simdgroup_f32, mean_f32, mul_f32, neg_f32,
-    relu_f32, sigmoid_f32, silu_f32, sqrt_f32, sub_f32, sum_f32, tanh_f32,
+    abs_f32, add_f32, div_f32, exp_f32, log_f32, matmul_simdgroup_f32, mean_dim_2d_f32, mean_f32,
+    mul_f32, neg_f32, relu_f32, sigmoid_f32, silu_f32, sqrt_f32, sub_f32, sum_dim_2d_f32, sum_f32,
+    tanh_f32, transpose2d_f32,
 };
 use crate::transfer::tensor_to_cpu;
 use rustorch_core::tensor::device::Device;
@@ -110,6 +111,47 @@ where
     let r = to_gpu(backend, rhs).map_err(|e| metal_err(op_name, e))?;
     let out = kernel(backend, &l, &r, lhs.numel()).map_err(|e| metal_err(op_name, e))?;
     Ok(finish_metal_op(out, lhs.shape().to_vec(), lhs.dtype()))
+}
+
+/// Native Metal fast path for `sum_dim` / `mean_dim` on 2D inputs
+/// with a single reduction axis. Returns `None` for shapes/axes the
+/// 2D kernel doesn't yet handle (3D+ tensors, multi-axis reductions)
+/// so the caller can CPU-fallback.
+fn sum_or_mean_dim_2d(
+    backend: &MetalBackend,
+    src: &Tensor,
+    dims: &[usize],
+    keepdim: bool,
+    is_mean: bool,
+) -> Result<Option<Tensor>, BackendError> {
+    let shape = src.shape();
+    if shape.len() != 2 || dims.len() != 1 {
+        return Ok(None);
+    }
+    let (d0, d1) = (shape[0], shape[1]);
+    let axis = dims[0];
+    if axis > 1 {
+        return Ok(None);
+    }
+    let op_name = if is_mean { "mean_dim" } else { "sum_dim" };
+    let s = to_gpu(backend, src).map_err(|e| metal_err(op_name, e))?;
+    let out = if is_mean {
+        mean_dim_2d_f32(backend, &s, d0, d1, axis).map_err(|e| metal_err(op_name, e))?
+    } else {
+        sum_dim_2d_f32(backend, &s, d0, d1, axis).map_err(|e| metal_err(op_name, e))?
+    };
+    let out_shape = if axis == 0 {
+        if keepdim {
+            vec![1, d1]
+        } else {
+            vec![d1]
+        }
+    } else if keepdim {
+        vec![d0, 1]
+    } else {
+        vec![d0]
+    };
+    Ok(Some(finish_metal_op(out, out_shape, src.dtype())))
 }
 
 /// Run a native unary Metal kernel.
@@ -238,6 +280,12 @@ impl Backend for MetalBackend {
         cpu_backend().reshape(&host(src)?, shape).map(tag_metal)
     }
     fn sum_dim(&self, src: &Tensor, dims: &[usize], keepdim: bool) -> Result<Tensor, BackendError> {
+        // Native Metal fast path: 2D input + single axis (the common
+        // unbroadcast_to / add_bias-grad case in the autograd backward
+        // chain). Falls back to CPU for higher ranks / multi-axis.
+        if let Some(out) = sum_or_mean_dim_2d(self, src, dims, keepdim, false)? {
+            return Ok(out);
+        }
         cpu_backend()
             .sum_dim(&host(src)?, dims, keepdim)
             .map(tag_metal)
@@ -248,6 +296,9 @@ impl Backend for MetalBackend {
         dims: &[usize],
         keepdim: bool,
     ) -> Result<Tensor, BackendError> {
+        if let Some(out) = sum_or_mean_dim_2d(self, src, dims, keepdim, true)? {
+            return Ok(out);
+        }
         cpu_backend()
             .mean_dim(&host(src)?, dims, keepdim)
             .map(tag_metal)
@@ -288,6 +339,17 @@ impl Backend for MetalBackend {
         cpu_backend().log_softmax(&host(src)?, dim).map(tag_metal)
     }
     fn transpose(&self, src: &Tensor, d0: usize, d1: usize) -> Result<Tensor, BackendError> {
+        // Native Metal 2D transpose for the (0, 1) / (1, 0) common
+        // case (matmul backward, attention QKV permutation). Higher
+        // ranks fall through to CPU until the kernel is generalised.
+        let shape = src.shape();
+        if shape.len() == 2 && ((d0 == 0 && d1 == 1) || (d0 == 1 && d1 == 0)) {
+            let m = shape[0];
+            let n = shape[1];
+            let s = to_gpu(self, src).map_err(|e| metal_err("transpose", e))?;
+            let out = transpose2d_f32(self, &s, m, n).map_err(|e| metal_err("transpose", e))?;
+            return Ok(finish_metal_op(out, vec![n, m], src.dtype()));
+        }
         cpu_backend().transpose(&host(src)?, d0, d1).map(tag_metal)
     }
     fn bmm(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {

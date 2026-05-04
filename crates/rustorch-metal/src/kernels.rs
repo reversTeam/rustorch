@@ -459,6 +459,226 @@ pub fn mean_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalE
     reduce_full(b, s, n, REDUCE_KIND_MEAN, "mean_partial", "mean_final")
 }
 
+// ----------------------------------------------------------------------
+// 2D axis reductions: `[d0, d1]` → `[d1]` (axis 0) or `[d0]` (axis 1).
+//
+// Used by `AddBackward::unbroadcast_to` for `add_bias([B,N], [N])`
+// gradients (axis 0 reduction). Each output element is the sum/mean
+// over a row or column of the input tile.
+// ----------------------------------------------------------------------
+
+/// Two-axis-aware reduction kernel. Each thread computes one output
+/// scalar by walking the reduced axis. For typical autograd shapes
+/// (e.g. [64, 1024] → [1024] reducing axis 0) this is bandwidth-bound
+/// rather than compute-bound; trading thread-coarsening for code
+/// simplicity is fine.
+const REDUCE_DIM_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ReduceDimParams {
+    uint d0;
+    uint d1;
+    uint axis;       // 0 → reduce d0 → output [d1]; 1 → reduce d1 → output [d0]
+    uint kind;       // 0 = sum, 1 = mean
+};
+
+kernel void reduce_dim_2d_f32(
+    constant ReduceDimParams& params [[buffer(0)]],
+    device const float*       src    [[buffer(1)]],
+    device       float*       out    [[buffer(2)]],
+    uint                      gid    [[thread_position_in_grid]]
+) {
+    if (params.axis == 0u) {
+        // Reduce axis 0: each thread handles one column j ∈ [0, d1).
+        if (gid >= params.d1) { return; }
+        float acc = 0.0f;
+        for (uint i = 0u; i < params.d0; i = i + 1u) {
+            acc += src[i * params.d1 + gid];
+        }
+        if (params.kind == 1u) { acc = acc / float(params.d0); }
+        out[gid] = acc;
+    } else {
+        // Reduce axis 1: each thread handles one row i ∈ [0, d0).
+        if (gid >= params.d0) { return; }
+        float acc = 0.0f;
+        for (uint j = 0u; j < params.d1; j = j + 1u) {
+            acc += src[gid * params.d1 + j];
+        }
+        if (params.kind == 1u) { acc = acc / float(params.d1); }
+        out[gid] = acc;
+    }
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct ReduceDimParams {
+    d0: u32,
+    d1: u32,
+    axis: u32,
+    kind: u32,
+}
+unsafe impl bytemuck::Zeroable for ReduceDimParams {}
+unsafe impl bytemuck::Pod for ReduceDimParams {}
+
+fn reduce_dim_2d(
+    backend: &MetalBackend,
+    src: &Buffer,
+    d0: usize,
+    d1: usize,
+    axis: usize,
+    kind: u32,
+    op_name: &'static str,
+) -> Result<Buffer, MetalError> {
+    if axis > 1 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "reduce_dim_2d: axis {axis} out of range for 2D input"
+        )));
+    }
+    let out_n = if axis == 0 { d1 } else { d0 };
+    let pipeline = backend.pipeline(op_name, REDUCE_DIM_SHADER, "reduce_dim_2d_f32")?;
+    let out = backend.alloc_shared(out_n * 4)?;
+    let params = ReduceDimParams {
+        d0: d0 as u32,
+        d1: d1 as u32,
+        axis: axis as u32,
+        kind,
+    };
+    let params_buf = backend.alloc_shared(core::mem::size_of::<ReduceDimParams>())?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let dst = params_buf.contents() as *mut ReduceDimParams;
+        *dst = params;
+    }
+    let cmd = backend.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&params_buf), 0);
+    enc.set_buffer(1, Some(src), 0);
+    enc.set_buffer(2, Some(&out), 0);
+    let max_threads = pipeline.max_total_threads_per_threadgroup();
+    let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+    let grid = MTLSize::new(out_n as u64, 1, 1);
+    enc.dispatch_threads(grid, tg);
+    enc.end_encoding();
+    cmd.commit();
+    Ok(out)
+}
+
+/// Reduce-sum a 2D tensor along `axis` (0 or 1).
+pub fn sum_dim_2d_f32(
+    b: &MetalBackend,
+    s: &Buffer,
+    d0: usize,
+    d1: usize,
+    axis: usize,
+) -> Result<Buffer, MetalError> {
+    reduce_dim_2d(b, s, d0, d1, axis, REDUCE_KIND_SUM, "sum_dim_2d")
+}
+
+/// Reduce-mean a 2D tensor along `axis` (0 or 1).
+pub fn mean_dim_2d_f32(
+    b: &MetalBackend,
+    s: &Buffer,
+    d0: usize,
+    d1: usize,
+    axis: usize,
+) -> Result<Buffer, MetalError> {
+    reduce_dim_2d(b, s, d0, d1, axis, REDUCE_KIND_MEAN, "mean_dim_2d")
+}
+
+// ----------------------------------------------------------------------
+// 2D transpose `[m, n]` → `[n, m]`.
+// Used by MatMulBackward (gradient via X^T @ G) and attention QKV
+// permutation. Tile-shared-memory pattern for coalesced reads + writes.
+// ----------------------------------------------------------------------
+
+const TRANSPOSE_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint TILE = 16u;
+
+struct TransposeParams {
+    uint m;
+    uint n;
+};
+
+kernel void transpose2d_f32(
+    constant TransposeParams& params [[buffer(0)]],
+    device const float*       src    [[buffer(1)]],
+    device       float*       out    [[buffer(2)]],
+    uint2                     gid    [[thread_position_in_grid]],
+    uint2                     lid    [[thread_position_in_threadgroup]]
+) {
+    threadgroup float tile[16][17];  // +1 padding to avoid bank conflicts
+
+    uint m = params.m;
+    uint n = params.n;
+
+    // Read [m, n] → tile, write tile^T → [n, m].
+    uint src_row = gid.y;
+    uint src_col = gid.x;
+    if (src_row < m && src_col < n) {
+        tile[lid.y][lid.x] = src[src_row * n + src_col];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint dst_row = (gid.x / TILE) * TILE + lid.y;
+    uint dst_col = (gid.y / TILE) * TILE + lid.x;
+    if (dst_row < n && dst_col < m) {
+        out[dst_row * m + dst_col] = tile[lid.x][lid.y];
+    }
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct TransposeParams {
+    m: u32,
+    n: u32,
+}
+unsafe impl bytemuck::Zeroable for TransposeParams {}
+unsafe impl bytemuck::Pod for TransposeParams {}
+
+/// 2D transpose `[m, n]` → `[n, m]`.
+pub fn transpose2d_f32(
+    backend: &MetalBackend,
+    src: &Buffer,
+    m: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    let pipeline = backend.pipeline("transpose2d_f32", TRANSPOSE_SHADER, "transpose2d_f32")?;
+    let out = backend.alloc_shared(m * n * 4)?;
+    let params = TransposeParams {
+        m: m as u32,
+        n: n as u32,
+    };
+    let params_buf = backend.alloc_shared(core::mem::size_of::<TransposeParams>())?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let dst = params_buf.contents() as *mut TransposeParams;
+        *dst = params;
+    }
+    let cmd = backend.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&params_buf), 0);
+    enc.set_buffer(1, Some(src), 0);
+    enc.set_buffer(2, Some(&out), 0);
+    let tg = MTLSize::new(16, 16, 1);
+    // dispatch_threadgroups instead of dispatch_threads so we can pad
+    // up to whole tiles cleanly.
+    let groups_x = (n as u64).div_ceil(16);
+    let groups_y = (m as u64).div_ceil(16);
+    let grid = MTLSize::new(groups_x * 16, groups_y * 16, 1);
+    enc.dispatch_threads(grid, tg);
+    enc.end_encoding();
+    cmd.commit();
+    Ok(out)
+}
+
 /// `C = A @ B` matmul using Apple's `simdgroup_matrix<float, 8, 8>`
 /// (Metal 3 family). One simdgroup (32 threads) computes one 8×8
 /// output tile by iterating `K` in chunks of 8.
