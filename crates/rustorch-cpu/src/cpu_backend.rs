@@ -116,6 +116,134 @@ impl Backend for CpuBackend {
         }
     }
 
+    /// Transpose-aware matmul fast path. On macOS we forward the
+    /// `transpose_a` / `transpose_b` flags directly to `cblas_sgemm`'s
+    /// `transa` / `transb` arguments, skipping the materialised
+    /// transpose buffer + the second matmul pass that the default
+    /// trait impl would emit. In `MatMulBackward` this saves two
+    /// 4 MB transposes + their re-materialisation as Vec<f32> per
+    /// training step.
+    ///
+    /// Falls back to the default `transpose + matmul` for non-rank-2,
+    /// non-f32, or wasm32 builds (where Accelerate isn't linked).
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+    fn matmul_with_transposes(
+        &self,
+        lhs: &Tensor,
+        rhs: &Tensor,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<Tensor, BackendError> {
+        // Only the f32 + rank-2 path goes through Accelerate — other
+        // dtypes fall back to the default `transpose + matmul` impl.
+        if lhs.dtype() != Dtype::F32
+            || rhs.dtype() != Dtype::F32
+            || lhs.ndim() != 2
+            || rhs.ndim() != 2
+        {
+            // Default impl: transpose + matmul.
+            let lhs_eff = if transpose_a {
+                self.transpose(lhs, 0, 1)?
+            } else {
+                lhs.clone()
+            };
+            let rhs_eff = if transpose_b {
+                self.transpose(rhs, 0, 1)?
+            } else {
+                rhs.clone()
+            };
+            return self.matmul(&lhs_eff, &rhs_eff);
+        }
+        let l_shape = lhs.shape();
+        let r_shape = rhs.shape();
+        // Effective dimensions after the implicit transpose:
+        //   transpose_a:  A is [K, M], output rows = M = A.shape[1]
+        //   transpose_b:  B is [N, K], output cols = N = B.shape[0]
+        let (m, k_lhs) = if transpose_a {
+            (l_shape[1], l_shape[0])
+        } else {
+            (l_shape[0], l_shape[1])
+        };
+        let (k_rhs, n) = if transpose_b {
+            (r_shape[1], r_shape[0])
+        } else {
+            (r_shape[0], r_shape[1])
+        };
+        if k_lhs != k_rhs {
+            return Err(BackendError::ShapeMismatch {
+                op: "matmul_with_transposes",
+                lhs: l_shape.to_vec(),
+                rhs: r_shape.to_vec(),
+            });
+        }
+        let k = k_lhs;
+        if m < GEMM_DISPATCH_MIN || n < GEMM_DISPATCH_MIN || k < GEMM_DISPATCH_MIN {
+            // Tiny shapes: fall back to default (transpose + matmul) so
+            // the scalar `matmul_naive` path stays consistent.
+            let lhs_eff = if transpose_a {
+                self.transpose(lhs, 0, 1)?
+            } else {
+                lhs.clone()
+            };
+            let rhs_eff = if transpose_b {
+                self.transpose(rhs, 0, 1)?
+            } else {
+                rhs.clone()
+            };
+            return self.matmul(&lhs_eff, &rhs_eff);
+        }
+
+        let lhs_slice = lhs.as_slice::<f32>().ok_or(BackendError::DtypeMismatch {
+            op: "matmul_with_transposes",
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        })?;
+        let rhs_slice = rhs.as_slice::<f32>().ok_or(BackendError::DtypeMismatch {
+            op: "matmul_with_transposes",
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        })?;
+        let mut out_buf: Vec<f32> = vec![0.0_f32; m * n];
+
+        // SAFETY: input slices are exactly the right size for their
+        // (un-transposed) shape; out_buf is m*n; transpose flags are
+        // honoured via the cblas transa/transb arguments.
+        unsafe {
+            crate::accelerate::cblas_sgemm(
+                crate::accelerate::CBLAS_ROW_MAJOR,
+                if transpose_a {
+                    crate::accelerate::CBLAS_TRANS
+                } else {
+                    crate::accelerate::CBLAS_NO_TRANS
+                },
+                if transpose_b {
+                    crate::accelerate::CBLAS_TRANS
+                } else {
+                    crate::accelerate::CBLAS_NO_TRANS
+                },
+                m as std::os::raw::c_int,
+                n as std::os::raw::c_int,
+                k as std::os::raw::c_int,
+                1.0,
+                lhs_slice.as_ptr(),
+                // lda is the leading dim of A in storage order (un-transposed):
+                //   transpose_a == false: A is [m, k] row-major → lda = k
+                //   transpose_a == true:  A is [k, m] row-major → lda = m
+                if transpose_a { m } else { k } as std::os::raw::c_int,
+                rhs_slice.as_ptr(),
+                if transpose_b { k } else { n } as std::os::raw::c_int,
+                0.0,
+                out_buf.as_mut_ptr(),
+                n as std::os::raw::c_int,
+            );
+        }
+        Tensor::from_vec_typed::<f32, _>(vec![m, n], out_buf).map_err(|_| {
+            BackendError::OutOfMemory {
+                bytes: m * n * core::mem::size_of::<f32>(),
+            }
+        })
+    }
+
     fn sum(&self, src: &Tensor) -> Result<Tensor, BackendError> {
         match src.dtype() {
             Dtype::F32 => sum_kernel::<f32>(src, 0.0_f32, |a, b| a + b),
@@ -1528,30 +1656,56 @@ fn matmul_dispatch_f32(
     if m < GEMM_DISPATCH_MIN || n < GEMM_DISPATCH_MIN || k < GEMM_DISPATCH_MIN {
         return matmul_naive::<f32>(lhs, rhs, m, k, n);
     }
-    let lhs_buf: Vec<f32> = lhs
-        .iter_elements::<f32>()
-        .ok_or(BackendError::DtypeMismatch {
-            op: "matmul",
-            lhs: lhs.dtype(),
-            rhs: rhs.dtype(),
-        })?
-        .collect();
-    let rhs_buf: Vec<f32> = rhs
-        .iter_elements::<f32>()
-        .ok_or(BackendError::DtypeMismatch {
-            op: "matmul",
-            lhs: lhs.dtype(),
-            rhs: rhs.dtype(),
-        })?
-        .collect();
+    // Fast path: borrow contiguous tensor data directly. The
+    // `as_slice::<f32>()` call returns `Some` only when the tensor is
+    // contiguous + f32 + offset 0 — exactly the conditions cblas_sgemm
+    // needs. Avoids ~8 MB of `iter_elements().collect()` allocations
+    // per matmul (3× per training step) and the corresponding heap
+    // pressure.
+    let lhs_owned: Option<Vec<f32>>;
+    let rhs_owned: Option<Vec<f32>>;
+    let lhs_slice: &[f32] = if let Some(s) = lhs.as_slice::<f32>() {
+        lhs_owned = None;
+        s
+    } else {
+        // Non-contiguous (transpose view, etc.) — materialise once.
+        lhs_owned = Some(
+            lhs.iter_elements::<f32>()
+                .ok_or(BackendError::DtypeMismatch {
+                    op: "matmul",
+                    lhs: lhs.dtype(),
+                    rhs: rhs.dtype(),
+                })?
+                .collect(),
+        );
+        lhs_owned.as_deref().unwrap()
+    };
+    let rhs_slice: &[f32] = if let Some(s) = rhs.as_slice::<f32>() {
+        rhs_owned = None;
+        s
+    } else {
+        rhs_owned = Some(
+            rhs.iter_elements::<f32>()
+                .ok_or(BackendError::DtypeMismatch {
+                    op: "matmul",
+                    lhs: lhs.dtype(),
+                    rhs: rhs.dtype(),
+                })?
+                .collect(),
+        );
+        rhs_owned.as_deref().unwrap()
+    };
     let mut out_buf: Vec<f32> = vec![0.0_f32; m * n];
 
-    // SAFETY: buffers are exactly m*k, k*n, m*n long in f32 and live for
-    // the duration of the call. `cblas_sgemm` is the canonical row-major
-    // f32 GEMM ABI; the wrapper validates lengths in debug builds.
+    // SAFETY: input slices have length ≥ m*k / k*n verified by Tensor's
+    // contiguity invariant; out_buf is exactly m*n. `cblas_sgemm` is the
+    // canonical row-major f32 GEMM ABI; the wrapper validates lengths
+    // in debug builds.
     unsafe {
-        crate::accelerate::sgemm_row_major(m, k, n, &lhs_buf, &rhs_buf, &mut out_buf);
+        crate::accelerate::sgemm_row_major(m, k, n, lhs_slice, rhs_slice, &mut out_buf);
     }
+    drop(lhs_owned);
+    drop(rhs_owned);
 
     Tensor::from_vec_typed::<f32, _>(vec![m, n], out_buf).map_err(|_| BackendError::OutOfMemory {
         bytes: m * n * core::mem::size_of::<f32>(),
