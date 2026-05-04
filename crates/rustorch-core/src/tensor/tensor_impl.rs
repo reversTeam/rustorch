@@ -94,7 +94,19 @@ impl Tensor {
         }
         let elem_size = core::mem::size_of::<T>();
         let byte_len = expected * elem_size;
-        let mut storage = Storage::cpu_zeroed(byte_len)?;
+        // T39 — uninit-allocate the storage and overwrite every byte
+        // via copy_nonoverlapping. The previous `cpu_zeroed` zeroed
+        // the buffer first then copied — pure waste of DRAM
+        // bandwidth (on a 1.5 MB LayerNorm output the zero pass
+        // alone costs ~19 µs on M-series). The unconditional copy
+        // below initialises every byte before any reader sees the
+        // storage, so an uninit buffer is sound.
+        // SAFETY: cpu_uninit returns a buffer with unspecified
+        // contents; we overwrite ALL byte_len bytes via the
+        // copy_nonoverlapping below before any other code can
+        // observe the storage. For byte_len == 0 cpu_uninit returns
+        // a sentinel and the copy is skipped.
+        let mut storage = unsafe { Storage::cpu_uninit(byte_len)? };
         if byte_len > 0 {
             // SAFETY: storage was just allocated; we are unique owner.
             let dst = storage
