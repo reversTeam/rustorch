@@ -22,6 +22,9 @@ gemm = { version = "0.18", default-features = false, features = ["rayon"] }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest  = { workspace = true }
+# Used by `bench_parallel_sgemm` example to probe dual-AMX
+# parallelism on Apple M-series via rayon::join.
+rayon     = { workspace = true }
 
 [[bench]]
 name    = "fused_matmul_bench"

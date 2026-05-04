@@ -38,6 +38,11 @@ objc      = "0.2"
 core-graphics-types = "0.1"
 foreign-types = "0.5"
 
+[dev-dependencies]
+# Pulled in only by `bench_llm_shapes` example to compare Metal
+# matmul against the Apple Accelerate AMX path used by `rustorch-llm`.
+rustorch-fusion = { workspace = true }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
