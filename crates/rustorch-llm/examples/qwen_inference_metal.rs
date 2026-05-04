@@ -30,7 +30,8 @@ use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::kernels::{
     add_inplace_f32, gqa_decode_f32, kv_append_f32, rms_norm_f32, rms_norm_per_head_f32,
-    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_simdcoop_into, sgemv_q6_k_f32_into,
+    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_pair_into,
+    sgemv_q4_k_f32_simdcoop_into, sgemv_q4_k_f32_triple_into, sgemv_q6_k_f32_into,
     sgemv_q6_k_f32_simdcoop_into, swiglu_f32,
 };
 
@@ -225,15 +226,54 @@ fn forward_token(
         .unwrap();
 
         // 2. Q / K / V matmul GPU.
-        layer
-            .w_q
-            .matmul_into(backend, &scratch.h_buf, &scratch.q_buf);
-        layer
-            .w_k
-            .matmul_into(backend, &scratch.h_buf, &scratch.k_buf);
-        layer
-            .w_v
-            .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        //
+        // In Qwen3 Q4_K_M the dtype mix is asymmetric:
+        //   attn_q, attn_k -> Q4_K  (144 B / super-block)
+        //   attn_v         -> Q6_K  (210 B / super-block)
+        //
+        // The Q4_K triple kernel can't fuse a Q6_K row (different
+        // block layout) — feeding V's Q6_K bytes through the Q4_K
+        // shader scrambles V completely (T80 collapse seen in tests:
+        // tokens go to 0). So we fuse Q+K via pair_into (one
+        // dispatch) and dispatch V separately. Net: 2 kernels per
+        // attention layer instead of 3 — still a clear win over the
+        // pre-T80 split path.
+        if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
+            // Symmetric Q4_K_S variant or any quant where V is Q4_K:
+            // the original triple fuse is correct.
+            sgemv_q4_k_f32_triple_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &layer.w_k.buffer,
+                &layer.w_v.buffer,
+                &scratch.q_buf,
+                &scratch.k_buf,
+                &scratch.v_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+                layer.w_k.n,
+                layer.w_v.n,
+            )
+            .unwrap();
+        } else {
+            // Asymmetric Q4_K_M variant: Q+K Q4_K fused, V Q6_K solo.
+            sgemv_q4_k_f32_pair_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &layer.w_k.buffer,
+                &scratch.q_buf,
+                &scratch.k_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+                layer.w_k.n,
+            )
+            .unwrap();
+            layer
+                .w_v
+                .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        }
 
         // 3. QK-norm BEFORE RoPE (Qwen3 HF reference order). All GPU.
         if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
@@ -328,12 +368,19 @@ fn forward_token(
             cfg.rms_eps,
         )
         .unwrap();
-        layer
-            .w_gate
-            .matmul_into(backend, &scratch.h_buf, &scratch.gate_buf);
-        layer
-            .w_up
-            .matmul_into(backend, &scratch.h_buf, &scratch.up_buf);
+        // gate + up fused into one dispatch.
+        sgemv_q4_k_f32_pair_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_gate.buffer,
+            &layer.w_up.buffer,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            layer.w_gate.k,
+            layer.w_gate.n,
+            layer.w_up.n,
+        )
+        .unwrap();
         swiglu_f32(
             backend,
             &scratch.gate_buf,
