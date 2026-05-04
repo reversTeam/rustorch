@@ -3021,6 +3021,8 @@ version = "0.0.1"
 dependencies = [
  "rustorch-core",
  "rustorch-cpu",
+ "rustorch-optim",
+ "rustorch-wgpu",
  "thiserror 1.0.69",
  "tracing",
 ]

@@ -1476,6 +1476,7 @@ impl Node for TransposeBackward {
 
 /// `src.transpose(d0, d1)` (autograd-aware, contiguous output).
 pub fn transpose(src: &Variable, d0: usize, d1: usize) -> Result<Variable, BackwardError> {
+    let dev = src.device();
     let out_view = src
         .tensor()
         .transpose(d0, d1)
@@ -1483,7 +1484,9 @@ pub fn transpose(src: &Variable, d0: usize, d1: usize) -> Result<Variable, Backw
             op: "transpose",
             message: format!("{e}"),
         })?;
-    let out = out_view.contiguous();
+    // `.contiguous()` may strip the device tag (it materialises through the
+    // CPU layout). Preserve it explicitly so autograd dispatch stays consistent.
+    let out = out_view.contiguous().with_device(dev);
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(TransposeBackward {
@@ -1770,7 +1773,14 @@ pub fn reshape(src: &Variable, shape: Vec<usize>) -> Result<Variable, BackwardEr
             ),
         });
     }
-    let data = src_t
+    let device = src.device();
+    // Pull the data via a CPU view, build the reshaped tensor, then re-tag
+    // it with the source device so autograd dispatch keeps routing to the
+    // right backend.
+    let src_cpu = src_t
+        .clone()
+        .with_device(rustorch_core::tensor::device::Device::Cpu);
+    let data = src_cpu
         .as_slice::<f32>()
         .ok_or_else(|| BackwardError::Backend {
             op: "reshape",
@@ -1780,6 +1790,7 @@ pub fn reshape(src: &Variable, shape: Vec<usize>) -> Result<Variable, BackwardEr
         op: "reshape",
         message: format!("{e}"),
     })?;
+    let out = out.with_device(device);
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(ReshapeBackward {
@@ -1913,14 +1924,16 @@ pub fn l2_normalize_with_eps(
     }
     let n_reduced = in_shape[dim];
     // square = x * x
+    let dev = src.tensor().device();
     let square = mul(src, src)?;
     // mean over the reduced dim (keepdim=true)
     let mean_sq = mean_dim(&square, &[dim])?;
-    // sum_sq = mean_sq * N  (restore sum from mean; N is a constant scalar)
-    let n_scalar = Variable::new(Tensor::scalar(n_reduced as f32));
+    // sum_sq = mean_sq * N  (restore sum from mean; N is a constant scalar
+    // placed on the same device so autograd dispatch matches).
+    let n_scalar = Variable::new(Tensor::scalar(n_reduced as f32).with_device(dev));
     let sum_sq = mul(&mean_sq, &n_scalar)?;
-    // norm_sq = sum_sq + eps
-    let eps_scalar = Variable::new(Tensor::scalar(eps));
+    // norm_sq = sum_sq + eps  (eps on the same device too)
+    let eps_scalar = Variable::new(Tensor::scalar(eps).with_device(dev));
     let norm_sq = add(&sum_sq, &eps_scalar)?;
     // norm = sqrt(norm_sq)
     let norm = sqrt(&norm_sq)?;

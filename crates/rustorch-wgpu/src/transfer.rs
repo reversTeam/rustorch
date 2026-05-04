@@ -102,30 +102,36 @@ pub async fn to_cpu_async(
     #[cfg(target_arch = "wasm32")]
     let map_result = {
         // On wasm32 we use a poll-based oneshot built on a shared
-        // Cell<Option<Result>>. Avoids pulling `futures-channel` into
+        // Mutex<Option<Result>>. Avoids pulling `futures-channel` into
         // the dep tree just for this one path. The browser drives
         // the wgpu poll loop on its own.
-        use std::cell::RefCell;
-        use std::rc::Rc;
+        //
+        // Why Arc<Mutex<…>> rather than Rc<RefCell<…>>: enabling
+        // wgpu's `fragile-send-sync-non-atomic-wasm` feature (needed to
+        // wrap `wgpu::Device` in `Arc` on wasm32) makes `map_async`'s
+        // closure require `Send`. Wasm32 is single-threaded, so the
+        // Mutex never actually contends — the cost is just one atomic
+        // CAS per take/insert.
+        use std::sync::{Arc, Mutex};
         use std::task::{Context, Poll, Waker};
-        let slot: Rc<RefCell<Option<Result<(), wgpu::BufferAsyncError>>>> =
-            Rc::new(RefCell::new(None));
-        let waker_cell: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+        let slot: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
+            Arc::new(Mutex::new(None));
+        let waker_cell: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
         {
             let slot = slot.clone();
             let waker_cell = waker_cell.clone();
             buffer_slice.map_async(wgpu::MapMode::Read, move |r| {
-                *slot.borrow_mut() = Some(r);
-                if let Some(w) = waker_cell.borrow_mut().take() {
+                *slot.lock().unwrap() = Some(r);
+                if let Some(w) = waker_cell.lock().unwrap().take() {
                     w.wake();
                 }
             });
         }
         std::future::poll_fn(|cx: &mut Context<'_>| -> Poll<Result<(), WgpuError>> {
-            if let Some(r) = slot.borrow_mut().take() {
+            if let Some(r) = slot.lock().unwrap().take() {
                 Poll::Ready(r.map_err(|e| WgpuError::MapFailure(e.to_string())))
             } else {
-                *waker_cell.borrow_mut() = Some(cx.waker().clone());
+                *waker_cell.lock().unwrap() = Some(cx.waker().clone());
                 Poll::Pending
             }
         })

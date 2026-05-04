@@ -60,8 +60,8 @@ impl Module for RMSNorm {
         let x_sq = ops::mul(input, input)?;
         // mean over last axis (keepdim=true)
         let mean_x_sq = ops::mean_dim(&x_sq, &[last_dim])?;
-        // mean + eps  (eps as broadcastable scalar Variable)
-        let eps_var = Variable::new(Tensor::scalar(self.eps));
+        // mean + eps  (eps as broadcastable scalar Variable on the same device).
+        let eps_var = Variable::new(Tensor::scalar(self.eps).with_device(input.tensor().device()));
         let rms_sq = ops::add(&mean_x_sq, &eps_var)?;
         // sqrt
         let rms = ops::sqrt(&rms_sq)?;
@@ -136,8 +136,8 @@ impl Module for LayerNorm {
         let centered_sq = ops::mul(&centered, &centered)?;
         // var = mean of centered²
         let var = ops::mean_dim(&centered_sq, &[last_dim])?;
-        // var + eps
-        let eps_var = Variable::new(Tensor::scalar(self.eps));
+        // var + eps  (eps placed on input's device for autograd dispatch)
+        let eps_var = Variable::new(Tensor::scalar(self.eps).with_device(input.tensor().device()));
         let var_eps = ops::add(&var, &eps_var)?;
         // std = sqrt(var + eps)
         let std = ops::sqrt(&var_eps)?;

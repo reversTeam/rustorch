@@ -47,7 +47,10 @@ pub fn scaled_dot_product_attention(
     let k_t = ops::transpose(k, 1, 2)?;
     // Scores: Q @ K.T / sqrt(d) → [B, T, T]
     let raw_scores = ops::bmm(q, &k_t)?;
-    let inv_scale = Variable::new(Tensor::scalar(1.0_f32 / d.sqrt()));
+    // Place the scalar on the same device as the queries so the multiply
+    // doesn't trigger a device-mismatch panic when running on Wgpu/CUDA.
+    let inv_scale =
+        Variable::new(Tensor::scalar(1.0_f32 / d.sqrt()).with_device(q.tensor().device()));
     let scores = ops::mul(&raw_scores, &inv_scale)?;
     // Softmax over the LAST dim (each query attends to all keys).
     let attn = ops::softmax(&scores, 2)?;
@@ -326,7 +329,13 @@ impl MultiHeadAttention {
         let k_t = ops::transpose(&k, 1, 2)?;
         // 4. Scores = (Q @ K^T) / sqrt(head_dim) → [B*H, T_q, T_kv]
         let raw = ops::bmm(&q, &k_t)?;
-        let inv_scale = Variable::new(Tensor::scalar(1.0_f32 / (self.head_dim as f32).sqrt()));
+        // Place the scalar on the same device as the queries so that the
+        // multiplication doesn't trigger a device-mismatch panic when the
+        // model lives on Wgpu/CUDA. Cf. autograd dispatch P3.Y.
+        let inv_scale = Variable::new(
+            Tensor::scalar(1.0_f32 / (self.head_dim as f32).sqrt())
+                .with_device(q.tensor().device()),
+        );
         let scores = ops::mul(&raw, &inv_scale)?;
         // 5. Optional additive mask (broadcast over the leading B*H dim)
         let scores = if let Some(m) = attn_mask {

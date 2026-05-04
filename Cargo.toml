@@ -135,7 +135,13 @@ js-sys       = "0.3"
 # - wasm32          → webgpu (added implicitly by wgpu when target_family=wasm)
 # `default` already includes wgsl + metal + dx12 + webgpu. We add
 # `vulkan-portability` so Linux runners pick up the Vulkan backend too.
-wgpu         = { version = "22.1", features = ["vulkan-portability"] }
+# `fragile-send-sync-non-atomic-wasm` is required for wgpu 22 to build
+# on wasm32: by default `wgpu::Device` / `Queue` are `!Send + !Sync` on
+# the browser backend, but `WgpuBackend` wraps them in `Arc<…>` which
+# requires `Send + Sync`. The feature is a no-op on native (where the
+# types are `Send + Sync` already) and is the standard wgpu workaround
+# for "single-threaded JS, no real cross-thread sharing" wasm builds.
+wgpu         = { version = "22.1", features = ["vulkan-portability", "fragile-send-sync-non-atomic-wasm"] }
 pollster     = "0.3"
 
 # Dev-only — benchmarks, property tests, concurrent-correctness tests.
