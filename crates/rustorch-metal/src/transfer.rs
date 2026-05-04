@@ -17,14 +17,20 @@ pub fn tensor_to_cpu(t: &Tensor) -> Result<Tensor, MetalError> {
         Storage::Metal(metal_storage) => {
             let backend = metal_backend();
             let n = t.numel();
-            // Drain the queue: any kernel writes to this buffer that
-            // were committed but haven't completed (we removed
-            // `wait_until_completed` from intermediate dispatches for
-            // perf) MUST finish before the host reads. Submit an
-            // empty command buffer + wait — synchronisation point.
-            let drain = backend.queue.new_command_buffer();
-            drain.commit();
-            drain.wait_until_completed();
+            // Drain the **pending shared command buffer**: every kernel
+            // dispatch built up via `with_encoder` is queued on a single
+            // command buffer that is only committed when explicitly
+            // drained. Without this commit the host read sees whatever
+            // was in the buffer before the kernel write (typically 0
+            // for a freshly-allocated MTLStorageModeShared buffer or
+            // stale contents for a pool-recycled one).
+            //
+            // Earlier this routine submitted an empty command buffer to
+            // the queue and waited — that flushed the *queue* but
+            // never committed the pending buffer holding the kernel
+            // work, so reads of any tensor whose producing kernel was
+            // still pending returned garbage.
+            backend.drain();
             // SAFETY: shared-storage buffer; `contents()` is host-mapped.
             let data: Vec<f32> = unsafe {
                 let p = metal_storage.contents() as *const f32;
