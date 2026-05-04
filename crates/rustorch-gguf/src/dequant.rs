@@ -327,10 +327,20 @@ fn dequant_q6_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
                 let q3 = ((ql_h[l] >> 4) as i32) | (((qhh >> 4) & 0x03) as i32) << 4;
                 let q4 = ((ql_h[l + 32] >> 4) as i32) | (((qhh >> 6) & 0x03) as i32) << 4;
 
-                let s1 = d * sc_h[l / 16] as i32 as f32;
-                let s2 = d * sc_h[2 + l / 16] as i32 as f32;
-                let s3 = d * sc_h[4 + l / 16] as i32 as f32;
-                let s4 = d * sc_h[6 + l / 16] as i32 as f32;
+                // CRITICAL: Q6_K scales are stored as int8_t (signed).
+                // Reading as u8 then casting `as i32` zero-extends, which
+                // gives 0..255 instead of -128..127. Cast through `i8`
+                // first to sign-extend correctly. Without this, ~50% of
+                // the dequantized values have flipped magnitude (the
+                // ones whose scale byte has bit 7 set), and matmuls on
+                // Q6_K weights (e.g. attn_v in K_M quantization) produce
+                // garbage that subtly amplifies through the residual
+                // stream and collapses the model output to a single
+                // token by layer ~3.
+                let s1 = d * (sc_h[l / 16] as i8) as i32 as f32;
+                let s2 = d * (sc_h[2 + l / 16] as i8) as i32 as f32;
+                let s3 = d * (sc_h[4 + l / 16] as i8) as i32 as f32;
+                let s4 = d * (sc_h[6 + l / 16] as i8) as i32 as f32;
 
                 out_h[l] = s1 * (q1 - 32) as f32;
                 out_h[l + 32] = s2 * (q2 - 32) as f32;
@@ -425,6 +435,57 @@ mod tests {
         dequant_q6_k(&buf, &mut out).unwrap();
         for v in &out {
             assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn dequant_q6_k_negative_scales_sign_extend() {
+        // REGRESSION TEST for the sign-extension bug in Q6_K dequant.
+        //
+        // Q6_K scales are stored as int8_t (signed), but they live in a
+        // `&[u8]` buffer. Casting `u8 as i32` zero-extends, giving 0..255
+        // instead of -128..127. The fix is to cast through `i8` first.
+        //
+        // This test triggers the bug by setting all scales to -1 (= 0xFF
+        // in u8) and all weights to q6=33 (so q6-32 = 1). The expected
+        // dequantized value is `d * scale * (q6 - 32) = 1.0 * (-1) * 1
+        // = -1.0` for every weight.
+        //
+        // With the bug (zero-extend): output would be `1.0 * 255 * 1 =
+        // +255.0` — wildly wrong both in magnitude (×255) and sign.
+        //
+        // Without this fix, real Qwen3 / Llama Q4_K_M GGUFs (which use
+        // Q6_K for half the FFN/attention V weights) collapse to a single
+        // garbage token by layer ~3 due to ~50% of Q6_K weights having a
+        // negative scale byte that gets misread as a large positive.
+        let mut buf = vec![0u8; Q6_K_BYTES];
+        // ql: low nibble = 1, high nibble = 1 → both q6 nibbles contribute 1.
+        for v in buf.iter_mut().take(128) {
+            *v = 0x11;
+        }
+        // qh: each byte = 0b10_10_10_10 = 0xAA → all four 2-bit fields = 2.
+        // Combined with low=1 high=2: q6 = 1 | (2 << 4) = 33.
+        for v in buf.iter_mut().take(192).skip(128) {
+            *v = 0xAA;
+        }
+        // scales: all = -1 (i8) = 0xFF (u8).
+        for v in buf.iter_mut().take(208).skip(192) {
+            *v = 0xFF;
+        }
+        // d = f16(1.0).
+        let dh = f16::from_f32(1.0).to_le_bytes();
+        buf[208] = dh[0];
+        buf[209] = dh[1];
+
+        let mut out = vec![0f32; QK_K];
+        dequant_q6_k(&buf, &mut out).unwrap();
+
+        for (i, v) in out.iter().enumerate() {
+            assert!(
+                (v - (-1.0_f32)).abs() < 1e-3,
+                "weight {i}: expected -1.0 (signed scale), got {v} \
+                 — Q6_K scales are int8_t and must be sign-extended",
+            );
         }
     }
 
