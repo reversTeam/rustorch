@@ -104,8 +104,8 @@ pub fn linear_to_offset(linear: usize, shape: &[usize], strides: &[isize], base:
 /// layout. The output is always contiguous.
 pub fn map_unary<T, U, F>(src: &Tensor, op_name: &'static str, f: F) -> Result<Tensor, BackendError>
 where
-    T: Element,
-    U: Element,
+    T: Element + Send + Sync,
+    U: Element + Send + Sync,
     F: Fn(T) -> U + Sync + Send,
 {
     if src.dtype() != T::DTYPE {
@@ -117,6 +117,56 @@ where
     }
     let n = src.numel();
     let shape = src.shape().to_vec();
+
+    // Fast path: contiguous offset-0 input → direct-index parallel loop,
+    // no per-element stride math. Covers the hot cases (relu/sigmoid
+    // /etc. on activations).
+    if src.is_contiguous() && src.storage_offset() == 0 {
+        use rayon::prelude::*;
+
+        const PARALLEL_UNARY_THRESHOLD: usize = 16_384;
+        const CHUNK: usize = 8_192;
+
+        // SAFETY: dtype matches; storage holds at least numel*size_of::<T>().
+        let raw: &[T] = unsafe { src.storage().as_slice::<T>() };
+        let raw_slice = &raw[..n];
+
+        // Allocate uninitialised storage and treat it as MaybeUninit
+        // until every slot has been written by the kernel below. This
+        // skips the zero-fill that `vec![U::default(); n]` would emit.
+        let mut out: Vec<core::mem::MaybeUninit<U>> = Vec::with_capacity(n);
+        // SAFETY: capacity is exactly n; the loop below writes every
+        // element before any read. The `Vec` is then reinterpreted as
+        // `Vec<U>` via `from_raw_parts`.
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            out.set_len(n);
+        }
+
+        if n < PARALLEL_UNARY_THRESHOLD {
+            for i in 0..n {
+                out[i].write(f(raw_slice[i]));
+            }
+        } else {
+            out.par_chunks_mut(CHUNK)
+                .zip(raw_slice.par_chunks(CHUNK))
+                .for_each(|(out_chunk, in_chunk)| {
+                    for i in 0..out_chunk.len() {
+                        out_chunk[i].write(f(in_chunk[i]));
+                    }
+                });
+        }
+        // SAFETY: every slot written above. Transmute Vec<MaybeUninit<U>>
+        // → Vec<U> by reusing the same allocation pointer.
+        let out: Vec<U> = unsafe {
+            let mut o = core::mem::ManuallyDrop::new(out);
+            Vec::from_raw_parts(o.as_mut_ptr() as *mut U, n, o.capacity())
+        };
+        return Tensor::from_vec_typed::<U, _>(shape, out).map_err(|_| BackendError::OutOfMemory {
+            bytes: n * core::mem::size_of::<U>(),
+        });
+    }
+
     let strides = src.strides().to_vec();
     let offset = src.storage_offset();
 
@@ -141,8 +191,8 @@ pub fn map_binary<T, U, F>(
     f: F,
 ) -> Result<Tensor, BackendError>
 where
-    T: Element,
-    U: Element,
+    T: Element + Send + Sync,
+    U: Element + Send + Sync,
     F: Fn(T, T) -> U + Sync + Send,
 {
     if lhs.dtype() != T::DTYPE {
@@ -152,6 +202,26 @@ where
             rhs: T::DTYPE,
         });
     }
+    if rhs.dtype() != T::DTYPE {
+        return Err(BackendError::DtypeMismatch {
+            op: op_name,
+            lhs: lhs.dtype(),
+            rhs: rhs.dtype(),
+        });
+    }
+    // Fast path: same-shape contiguous F32 inputs hit a parallel
+    // direct-index loop with no per-element stride math. Covers the
+    // hot cases in autograd (add/sub/mul of same-shape activations &
+    // gradients) — the most common training-loop element-wise ops.
+    if lhs.shape() == rhs.shape()
+        && lhs.is_contiguous()
+        && rhs.is_contiguous()
+        && lhs.storage_offset() == 0
+        && rhs.storage_offset() == 0
+    {
+        return map_binary_contiguous_parallel::<T, U, F>(lhs, rhs, f);
+    }
+
     let plan = BinaryOpPlan::build(lhs, rhs, op_name)?;
     let n = plan.numel();
     let out_shape: Vec<usize> = plan.out_shape.as_slice().to_vec();
@@ -171,6 +241,70 @@ where
     })
 }
 
+/// Parallel fast path for same-shape contiguous binary ops. Skips the
+/// `BinaryOpPlan::build` + per-element `linear_to_offset` math and
+/// drives the kernel through `rayon::par_chunks` for elements above
+/// `PARALLEL_BINARY_THRESHOLD`. Below the threshold a single-threaded
+/// chunked loop avoids the rayon dispatch tax.
+fn map_binary_contiguous_parallel<T, U, F>(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    f: F,
+) -> Result<Tensor, BackendError>
+where
+    T: Element + Send + Sync,
+    U: Element + Send + Sync,
+    F: Fn(T, T) -> U + Sync + Send,
+{
+    use rayon::prelude::*;
+
+    /// Below this many elements we stay sequential.
+    const PARALLEL_BINARY_THRESHOLD: usize = 16_384;
+    /// Chunk size for rayon work-stealing.
+    const CHUNK: usize = 8_192;
+
+    let n = lhs.numel();
+    let shape = lhs.shape().to_vec();
+
+    // SAFETY: contiguity + dtype + offset 0 verified by caller.
+    let lhs_raw: &[T] = unsafe { lhs.storage().as_slice::<T>() };
+    let rhs_raw: &[T] = unsafe { rhs.storage().as_slice::<T>() };
+    let lhs_slice = &lhs_raw[..n];
+    let rhs_slice = &rhs_raw[..n];
+
+    let mut out: Vec<core::mem::MaybeUninit<U>> = Vec::with_capacity(n);
+    // SAFETY: capacity is exactly n; every slot is written before read
+    // by the loop below.
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        out.set_len(n);
+    }
+
+    if n < PARALLEL_BINARY_THRESHOLD {
+        for i in 0..n {
+            out[i].write(f(lhs_slice[i], rhs_slice[i]));
+        }
+    } else {
+        out.par_chunks_mut(CHUNK)
+            .zip(lhs_slice.par_chunks(CHUNK))
+            .zip(rhs_slice.par_chunks(CHUNK))
+            .for_each(|((out_chunk, l_chunk), r_chunk)| {
+                for i in 0..out_chunk.len() {
+                    out_chunk[i].write(f(l_chunk[i], r_chunk[i]));
+                }
+            });
+    }
+    // SAFETY: every slot written. Reinterpret Vec<MaybeUninit<U>> → Vec<U>.
+    let out: Vec<U> = unsafe {
+        let mut o = core::mem::ManuallyDrop::new(out);
+        Vec::from_raw_parts(o.as_mut_ptr() as *mut U, n, o.capacity())
+    };
+
+    Tensor::from_vec_typed::<U, _>(shape, out).map_err(|_| BackendError::OutOfMemory {
+        bytes: n * core::mem::size_of::<U>(),
+    })
+}
+
 /// Convenience: same dtype + same dtype out (most binary ops).
 pub fn map_binary_same<T, F>(
     lhs: &Tensor,
@@ -179,7 +313,7 @@ pub fn map_binary_same<T, F>(
     f: F,
 ) -> Result<Tensor, BackendError>
 where
-    T: Element,
+    T: Element + Send + Sync,
     F: Fn(T, T) -> T + Sync + Send,
 {
     map_binary::<T, T, _>(lhs, rhs, op_name, f)
@@ -192,7 +326,7 @@ pub fn map_unary_same<T, F>(
     f: F,
 ) -> Result<Tensor, BackendError>
 where
-    T: Element,
+    T: Element + Send + Sync,
     F: Fn(T) -> T + Sync + Send,
 {
     map_unary::<T, T, _>(src, op_name, f)
