@@ -740,7 +740,14 @@ pub fn transpose2d_f32(
     Ok(out)
 }
 
-/// **Wide thread-coarsened matmul (16 sg, 2×8 layout)** — same
+// Fused linear (matmul + bias) was attempted but Apple's
+// simdgroup_matrix API has no "add row vector" op so the fusion
+// requires a per-thread post-process with simdgroup_barrier, which
+// is non-trivial and didn't show meaningful gain over the separate
+// matmul + add_bias_f32 path (already on-device, ~30-50 µs cost).
+// Left as a follow-up if/when we replace simdgroup_matrix with a
+// hand-written tile loop where bias add is trivial to inline.
+
 /// 4-output-per-sg pattern as the 8-sg kernel below, but with 16
 /// simdgroups arranged as 2 rows × 8 cols. Each "row" of 8 sg
 /// covers 8 output rows × 256 cols (same as the 8-sg kernel); the
