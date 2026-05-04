@@ -36,11 +36,15 @@
 pub mod dequant;
 pub mod metadata;
 pub mod reader;
+/// Direct sgemv on Q4_K-quantised weights — bypasses the f32
+/// dequantisation cache miss for the LLM decode hot path.
+pub mod sgemv_q4k;
 pub mod tensor;
 
-pub use dequant::{dequant_to_f32, dequantize_block_chunk, num_elements};
+pub use dequant::{dequant_to_f32, dequantize_block_chunk, num_elements, DequantError};
 pub use metadata::{MetaArray, MetaValue, MetaValueType};
 pub use reader::{GgufError, GgufFile};
+pub use sgemv_q4k::sgemv_q4_k;
 pub use tensor::{GgmlType, TensorInfo};
 
 /// GGUF magic bytes (`b"GGUF"` little-endian as a u32 = `0x46554747`).

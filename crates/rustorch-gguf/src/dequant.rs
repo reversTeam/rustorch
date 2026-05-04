@@ -55,8 +55,10 @@ pub enum DequantError {
 const Q8_0_BS: usize = 32;
 const Q8_0_BYTES: usize = 2 + 32;
 
-const QK_K: usize = 256;
-const Q4_K_BYTES: usize = 2 + 2 + 12 + 128;
+/// Q4_K / Q6_K super-block size — 256 weights per block.
+pub const QK_K: usize = 256;
+/// Wire-format size of one Q4_K super-block (144 bytes: 2 d + 2 dmin + 12 scales + 128 nibbles).
+pub const Q4_K_BYTES: usize = 2 + 2 + 12 + 128;
 const Q6_K_BYTES: usize = 128 + 64 + 16 + 2;
 
 /// Total number of f32 elements produced for a tensor of given shape.
@@ -200,7 +202,10 @@ fn unpack_q4_k_sc_m(scales: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
     (sc, m)
 }
 
-fn dequant_q4_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
+/// Dequantise one Q4_K super-block (256 weights from 144 bytes) into
+/// `dst`. Public so the direct-Q4_K matmul path
+/// (`crate::sgemv_q4k`) can call it block-by-block.
+pub fn dequant_q4_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
     if dst.len() % QK_K != 0 {
         return Err(DequantError::OutputSize {
             expected: dst.len() / QK_K * QK_K,
