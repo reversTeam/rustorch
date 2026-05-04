@@ -740,6 +740,125 @@ pub fn transpose2d_f32(
     Ok(out)
 }
 
+// ----------------------------------------------------------------------
+// Scalar-broadcast binary ops: `out = lhs op scalar` — each thread
+// applies a single op_kind with a constant rhs scalar. Used by
+// autograd backward paths that scale by a Tensor::scalar (e.g.
+// MseBackward `g = diff * (2 / n)`). Without this, those calls
+// would hit the CPU-fallback shape-mismatch path in MetalBackend's
+// generic mul/add/sub/div — costing a download + CPU compute +
+// upload per backward step.
+// ----------------------------------------------------------------------
+
+const BIN_SCALAR_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct BinScalarParams {
+    uint  n;
+    uint  op_kind;
+    float scalar;
+};
+
+kernel void binary_scalar_f32(
+    constant BinScalarParams& params [[buffer(0)]],
+    device const float*       src    [[buffer(1)]],
+    device       float*       out    [[buffer(2)]],
+    uint                      gid    [[thread_position_in_grid]]
+) {
+    if (gid >= params.n) { return; }
+    float a = src[gid];
+    float b = params.scalar;
+    float r;
+    if (params.op_kind == 0u)      { r = a + b; }
+    else if (params.op_kind == 1u) { r = a - b; }
+    else if (params.op_kind == 2u) { r = a * b; }
+    else                            { r = a / b; }
+    out[gid] = r;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct BinScalarParams {
+    n: u32,
+    op_kind: u32,
+    scalar: f32,
+}
+unsafe impl bytemuck::Zeroable for BinScalarParams {}
+unsafe impl bytemuck::Pod for BinScalarParams {}
+
+fn dispatch_binary_scalar(
+    backend: &MetalBackend,
+    op_kind: u32,
+    op_name: &'static str,
+    src: &Buffer,
+    scalar: f32,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    let pipeline = backend.pipeline(op_name, BIN_SCALAR_SHADER, "binary_scalar_f32")?;
+    let out = backend.alloc_shared(n * 4)?;
+    let params = BinScalarParams {
+        n: n as u32,
+        op_kind,
+        scalar,
+    };
+    let params_buf = backend.alloc_shared(core::mem::size_of::<BinScalarParams>())?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let dst = params_buf.contents() as *mut BinScalarParams;
+        *dst = params;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(src), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(out)
+}
+
+/// Element-wise add by a scalar: `out = src + scalar`.
+pub fn add_scalar_f32(
+    b: &MetalBackend,
+    s: &Buffer,
+    scalar: f32,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    dispatch_binary_scalar(b, 0, "add_scalar_f32", s, scalar, n)
+}
+/// Element-wise sub by a scalar: `out = src - scalar`.
+pub fn sub_scalar_f32(
+    b: &MetalBackend,
+    s: &Buffer,
+    scalar: f32,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    dispatch_binary_scalar(b, 1, "sub_scalar_f32", s, scalar, n)
+}
+/// Element-wise mul by a scalar: `out = src * scalar`.
+pub fn mul_scalar_f32(
+    b: &MetalBackend,
+    s: &Buffer,
+    scalar: f32,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    dispatch_binary_scalar(b, 2, "mul_scalar_f32", s, scalar, n)
+}
+/// Element-wise div by a scalar: `out = src / scalar`.
+pub fn div_scalar_f32(
+    b: &MetalBackend,
+    s: &Buffer,
+    scalar: f32,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    dispatch_binary_scalar(b, 3, "div_scalar_f32", s, scalar, n)
+}
+
 // Fused linear (matmul + bias) was attempted but Apple's
 // simdgroup_matrix API has no "add row vector" op so the fusion
 // requires a per-thread post-process with simdgroup_barrier, which

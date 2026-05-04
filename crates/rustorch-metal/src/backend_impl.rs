@@ -18,11 +18,11 @@
 use crate::backend::MetalBackend;
 use crate::error::MetalError;
 use crate::kernels::{
-    abs_f32, add_bias_f32, add_f32, div_f32, exp_f32, log_f32, matmul_simdgroup_f32,
-    matmul_simdgroup_f32_coarsened, matmul_simdgroup_f32_coarsened_wide,
+    abs_f32, add_bias_f32, add_f32, add_scalar_f32, div_f32, div_scalar_f32, exp_f32, log_f32,
+    matmul_simdgroup_f32, matmul_simdgroup_f32_coarsened, matmul_simdgroup_f32_coarsened_wide,
     matmul_simdgroup_f32_multisg, matmul_simdgroup_f32_via_bf16, mean_dim_2d_f32, mean_f32,
-    mul_f32, neg_f32, relu_f32, sigmoid_f32, silu_f32, sqrt_f32, sub_f32, sum_dim_2d_f32, sum_f32,
-    tanh_f32, transpose2d_f32,
+    mul_f32, mul_scalar_f32, neg_f32, relu_f32, sigmoid_f32, silu_f32, sqrt_f32, sub_f32,
+    sub_scalar_f32, sum_dim_2d_f32, sum_f32, tanh_f32, transpose2d_f32,
 };
 use crate::transfer::tensor_to_cpu;
 use rustorch_core::tensor::device::Device;
@@ -156,6 +156,57 @@ fn sum_or_mean_dim_2d(
     Ok(Some(finish_metal_op(out, out_shape, src.dtype())))
 }
 
+/// Detect the "rhs is a 0-dim or numel-1 scalar" pattern and dispatch
+/// the corresponding `*_scalar_f32` kernel. Returns `None` when the
+/// shapes don't match a scalar-broadcast (caller should CPU-fallback).
+///
+/// Eliminates the hidden round-trip in autograd backward paths that
+/// produce `Tensor::scalar(...)` and call `mul(x_metal, scalar_cpu)`
+/// (e.g. MseBackward computes `g = diff * (2 / n)` this way).
+fn scalar_broadcast_native<F>(
+    backend: &MetalBackend,
+    lhs: &Tensor,
+    rhs: &Tensor,
+    op_name: &'static str,
+    kernel: F,
+) -> Result<Option<Tensor>, BackendError>
+where
+    F: FnOnce(&MetalBackend, &metal::Buffer, f32, usize) -> Result<metal::Buffer, MetalError>,
+{
+    // Only handle the "rhs is the scalar" case for now (most common
+    // in autograd: `tensor * scale_constant`). Symmetric op (lhs
+    // scalar) would need swapped operands, doable as follow-up.
+    if rhs.numel() != 1 || lhs.numel() == 1 {
+        return Ok(None);
+    }
+    let scalar = if rhs.storage().is_cpu() {
+        rhs.as_slice::<f32>().ok_or_else(|| {
+            metal_err(
+                op_name,
+                MetalError::ShapeMismatch("scalar must be contiguous F32".to_string()),
+            )
+        })?[0]
+    } else {
+        // Scalar lives on Metal — read its single value via tensor_to_cpu.
+        // Cheap (4 bytes) but synchronous; only triggers if the autograd
+        // path produces a Metal-resident scalar (rare in practice).
+        let host_t = host(rhs)?;
+        host_t.as_slice::<f32>().ok_or_else(|| {
+            metal_err(
+                op_name,
+                MetalError::ShapeMismatch("scalar download produced non-CPU storage".to_string()),
+            )
+        })?[0]
+    };
+    let lhs_buf = to_gpu(backend, lhs).map_err(|e| metal_err(op_name, e))?;
+    let out = kernel(backend, &lhs_buf, scalar, lhs.numel()).map_err(|e| metal_err(op_name, e))?;
+    Ok(Some(finish_metal_op(
+        out,
+        lhs.shape().to_vec(),
+        lhs.dtype(),
+    )))
+}
+
 /// Run a native unary Metal kernel.
 fn unary_native<F>(
     backend: &MetalBackend,
@@ -180,10 +231,13 @@ impl Backend for MetalBackend {
 
     /// Element-wise add via the native Metal `add_f32` kernel.
     fn add(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        if lhs.shape() != rhs.shape() {
-            return cpu_backend().add(&host(lhs)?, &host(rhs)?).map(tag_metal);
+        if lhs.shape() == rhs.shape() {
+            return binary_native(self, "add", lhs, rhs, add_f32);
         }
-        binary_native(self, "add", lhs, rhs, add_f32)
+        if let Some(tensor) = scalar_broadcast_native(self, lhs, rhs, "add", add_scalar_f32)? {
+            return Ok(tensor);
+        }
+        cpu_backend().add(&host(lhs)?, &host(rhs)?).map(tag_metal)
     }
 
     /// `lhs @ rhs` via `simdgroup_matrix<float, 8, 8>` — the
@@ -247,22 +301,31 @@ impl Backend for MetalBackend {
     // Task J commits replace these with native Metal kernels.
 
     fn sub(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        if lhs.shape() != rhs.shape() {
-            return cpu_backend().sub(&host(lhs)?, &host(rhs)?).map(tag_metal);
+        if lhs.shape() == rhs.shape() {
+            return binary_native(self, "sub", lhs, rhs, sub_f32);
         }
-        binary_native(self, "sub", lhs, rhs, sub_f32)
+        if let Some(tensor) = scalar_broadcast_native(self, lhs, rhs, "sub", sub_scalar_f32)? {
+            return Ok(tensor);
+        }
+        cpu_backend().sub(&host(lhs)?, &host(rhs)?).map(tag_metal)
     }
     fn mul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        if lhs.shape() != rhs.shape() {
-            return cpu_backend().mul(&host(lhs)?, &host(rhs)?).map(tag_metal);
+        if lhs.shape() == rhs.shape() {
+            return binary_native(self, "mul", lhs, rhs, mul_f32);
         }
-        binary_native(self, "mul", lhs, rhs, mul_f32)
+        if let Some(tensor) = scalar_broadcast_native(self, lhs, rhs, "mul", mul_scalar_f32)? {
+            return Ok(tensor);
+        }
+        cpu_backend().mul(&host(lhs)?, &host(rhs)?).map(tag_metal)
     }
     fn div(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
-        if lhs.shape() != rhs.shape() {
-            return cpu_backend().div(&host(lhs)?, &host(rhs)?).map(tag_metal);
+        if lhs.shape() == rhs.shape() {
+            return binary_native(self, "div", lhs, rhs, div_f32);
         }
-        binary_native(self, "div", lhs, rhs, div_f32)
+        if let Some(tensor) = scalar_broadcast_native(self, lhs, rhs, "div", div_scalar_f32)? {
+            return Ok(tensor);
+        }
+        cpu_backend().div(&host(lhs)?, &host(rhs)?).map(tag_metal)
     }
     fn neg(&self, src: &Tensor) -> Result<Tensor, BackendError> {
         unary_native(self, "neg", src, neg_f32)
