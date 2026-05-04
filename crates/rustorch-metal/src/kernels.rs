@@ -2366,6 +2366,123 @@ pub fn sgemv_q4_k_f32(
     Ok(out)
 }
 
+// =============================================================================
+// sgemv_q6_k_f32 — direct Q6_K sgemv on Metal. Same fused-dequant-on-the-fly
+// pattern as sgemv_q4_k_f32 but for Q6_K weights (6-bit, 256 weights / 210
+// bytes). Used by `rustorch-llm` for `down_proj` and `lm_head` in Q4_K_M
+// Qwen3 GGUFs (Q4_K_M is a mixed-precision quant: Q4_K for most, Q6_K for
+// the perplexity-critical projections).
+//
+// CRITICAL: Q6_K scales are stored as `int8_t` (signed). The shader must
+// reinterpret them via `(device const char*)` to get sign-extension —
+// reading them as `uchar` and casting to int gives values in 0..255 instead
+// of -128..127 and silently corrupts ~50% of the dequantised weights (this
+// is the same class of bug as T63 fix on the CPU dequant path).
+// =============================================================================
+
+const SGEMV_Q6_K_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q6K_BYTES = 210u;
+constant uint Q6K_WEIGHTS = 256u;
+
+kernel void sgemv_q6_k_f32(
+    device const float* x       [[buffer(0)]],   // [K]
+    device const uchar* w_q6k   [[buffer(1)]],   // [N, K] Q6_K row-major
+    device float* y             [[buffer(2)]],   // [N]
+    constant uint2& dims        [[buffer(3)]],   // (K, N)
+    uint gid                    [[thread_position_in_grid]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint n_idx = gid;
+    if (n_idx >= N) return;
+
+    uint blocks_per_row = K / Q6K_WEIGHTS;
+    uint row_off = n_idx * blocks_per_row * Q6K_BYTES;
+
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < blocks_per_row; ++blk) {
+        device const uchar* block = w_q6k + row_off + blk * Q6K_BYTES;
+        device const uchar* ql = block;                  // 128 bytes
+        device const uchar* qh = block + 128;            // 64 bytes
+        device const char*  sc = (device const char*)(block + 192); // SIGNED int8 (T63!)
+        ushort d_bits = ((ushort)block[209] << 8) | (ushort)block[208];
+        float d = float(as_type<half>(d_bits));
+
+        // Two halves of 128 weights each.
+        for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+            device const uchar* ql_h = ql + half_idx * 64u;
+            device const uchar* qh_h = qh + half_idx * 32u;
+            device const char*  sc_h = sc + half_idx * 8;
+            uint x_h_off = blk * Q6K_WEIGHTS + half_idx * 128u;
+
+            for (uint l = 0; l < 32u; ++l) {
+                uchar qhh = qh_h[l];
+                int q1 = (int)(ql_h[l]      & 0x0F) | ((int)((qhh >> 0) & 0x03) << 4);
+                int q2 = (int)(ql_h[l + 32] & 0x0F) | ((int)((qhh >> 2) & 0x03) << 4);
+                int q3 = (int)(ql_h[l]      >> 4)   | ((int)((qhh >> 4) & 0x03) << 4);
+                int q4 = (int)(ql_h[l + 32] >> 4)   | ((int)((qhh >> 6) & 0x03) << 4);
+                // Sub-block scales (signed int8). l/16 picks sub-block 0
+                // (l<16) or 1 (l>=16); +0/+2/+4/+6 select the matching
+                // q1..q4 weight position within the half.
+                float s1 = d * float(sc_h[l / 16]);
+                float s2 = d * float(sc_h[2 + l / 16]);
+                float s3 = d * float(sc_h[4 + l / 16]);
+                float s4 = d * float(sc_h[6 + l / 16]);
+                acc += x[x_h_off + l]      * (s1 * float(q1 - 32));
+                acc += x[x_h_off + l + 32] * (s2 * float(q2 - 32));
+                acc += x[x_h_off + l + 64] * (s3 * float(q3 - 32));
+                acc += x[x_h_off + l + 96] * (s4 * float(q4 - 32));
+            }
+        }
+    }
+
+    y[n_idx] = acc;
+}
+"#;
+
+/// Direct Q6_K sgemv on Metal — companion to [`sgemv_q4_k_f32`].
+pub fn sgemv_q6_k_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q6k_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_f32 needs MTLGPUFamily::Metal3 (M3+, A17 Pro+)".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_f32 needs K>=1, N>=1, K%256==0: got K={k}, N={n}"
+        )));
+    }
+    let pipeline = backend.pipeline("sgemv_q6_k_f32", SGEMV_Q6_K_F32_SHADER, "sgemv_q6_k_f32")?;
+    let out = backend.alloc_shared(n * 4)?;
+    let dims_buf = backend.alloc_shared(8)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = k as u32;
+        *p.add(1) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_buf), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let threadgroup_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, threadgroup_size);
+    });
+    Ok(out)
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;

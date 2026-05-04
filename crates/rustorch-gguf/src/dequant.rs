@@ -59,7 +59,8 @@ const Q8_0_BYTES: usize = 2 + 32;
 pub const QK_K: usize = 256;
 /// Wire-format size of one Q4_K super-block (144 bytes: 2 d + 2 dmin + 12 scales + 128 nibbles).
 pub const Q4_K_BYTES: usize = 2 + 2 + 12 + 128;
-const Q6_K_BYTES: usize = 128 + 64 + 16 + 2;
+/// Wire-format size of one Q6_K super-block (210 bytes: 128 ql + 64 qh + 16 i8 scales + 2 d_f16).
+pub const Q6_K_BYTES: usize = 128 + 64 + 16 + 2;
 
 /// Total number of f32 elements produced for a tensor of given shape.
 pub fn num_elements(t: &TensorInfo) -> usize {
