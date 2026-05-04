@@ -512,7 +512,15 @@ impl Tensor {
             // Below that, the inline monomorphic loop wins.
             #[cfg(target_os = "macos")]
             {
-                const VDSP_MIN: usize = 64 * 1024;
+                // T22 — calibrated 2026-05-04 on M4 Max P-cores.
+                // vDSP_vadd carries ~250 ns FFI overhead (indirect
+                // call + Accelerate runtime dispatch). The inline
+                // monomorphic loop at ~30 GB/s wins below 4 K
+                // elements; vDSP saturates ~85 GB/s above.
+                //   1 K elements: inline 245 ns, vDSP 495 ns
+                //   4 K elements: inline ~ vDSP (crossover)
+                //  10 K elements: inline 3.5 µs, vDSP 1.5 µs
+                const VDSP_MIN: usize = 4 * 1024;
                 if self.numel() >= VDSP_MIN {
                     return add_f32_vdsp_inplace(self, other);
                 }
@@ -535,7 +543,8 @@ impl Tensor {
         {
             #[cfg(target_os = "macos")]
             {
-                const VDSP_MIN: usize = 64 * 1024;
+                // T22 — same 4K crossover as add_; see add_ comment.
+                const VDSP_MIN: usize = 4 * 1024;
                 if self.numel() >= VDSP_MIN {
                     return sub_f32_vdsp_inplace(self, other);
                 }
@@ -560,7 +569,8 @@ impl Tensor {
         {
             #[cfg(target_os = "macos")]
             {
-                const VDSP_MIN: usize = 64 * 1024;
+                // T22 — same 4K crossover as add_; see add_ comment.
+                const VDSP_MIN: usize = 4 * 1024;
                 if self.numel() >= VDSP_MIN {
                     return mul_f32_vdsp_inplace(self, other);
                 }
