@@ -398,6 +398,15 @@ impl Backend for CpuBackend {
     }
 
     fn relu(&self, src: &Tensor) -> Result<Tensor, BackendError> {
+        // T28 — monomorphic f32 dense fast path. The generic
+        // `map_unary_same` carries an `impl Fn(T) -> T` closure
+        // which LLVM cannot reliably hoist on aarch64; result was
+        // 1.67x slower than PyTorch on `[1, 512, 3072]` activations.
+        // Hardcoding `max(0.0)` collapses to a tight `fmax.4s` NEON
+        // loop with prefetch.
+        if src.dtype() == Dtype::F32 && src.is_contiguous() && src.storage_offset() == 0 {
+            return relu_f32_dense(src);
+        }
         match src.dtype() {
             Dtype::F32 => map_unary_same::<f32, _>(src, "relu", |x| x.max(0.0)),
             Dtype::F64 => map_unary_same::<f64, _>(src, "relu", |x| x.max(0.0)),
@@ -2096,6 +2105,66 @@ fn matmul_dispatch_f64(
     n: usize,
 ) -> Result<Tensor, BackendError> {
     matmul_naive::<f64>(lhs, rhs, m, k, n)
+}
+
+/// T28 — Monomorphic f32 dense ReLU. Bypasses the closure-barrier of
+/// the generic `map_unary` so LLVM emits a tight `fmax.4s` NEON
+/// loop. Above 16K elements we shard via rayon (matches the
+/// existing threshold in `map_unary`).
+fn relu_f32_dense(src: &Tensor) -> Result<Tensor, BackendError> {
+    let n = src.numel();
+    let shape = src.shape().to_vec();
+    // SAFETY: dtype + contig + offset checked by caller.
+    let raw: &[f32] = unsafe { src.storage().as_slice::<f32>() };
+    let raw_slice = &raw[..n];
+
+    // Uninitialised output buffer; the loop overwrites every cell.
+    let mut out_storage: Vec<core::mem::MaybeUninit<f32>> = Vec::with_capacity(n);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        out_storage.set_len(n);
+    }
+    let mut out_buf: Vec<f32> = unsafe {
+        let (ptr, len, cap) = (
+            out_storage.as_mut_ptr() as *mut f32,
+            out_storage.len(),
+            out_storage.capacity(),
+        );
+        core::mem::forget(out_storage);
+        Vec::from_raw_parts(ptr, len, cap)
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        const PARALLEL_THRESHOLD: usize = 16_384;
+        const CHUNK: usize = 8_192;
+        if n >= PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            out_buf
+                .par_chunks_mut(CHUNK)
+                .zip(raw_slice.par_chunks(CHUNK))
+                .for_each(|(out_chunk, in_chunk)| {
+                    for (o, &v) in out_chunk.iter_mut().zip(in_chunk.iter()) {
+                        *o = v.max(0.0);
+                    }
+                });
+            return Tensor::from_vec_typed::<f32, _>(shape, out_buf).map_err(|_| {
+                BackendError::OutOfMemory {
+                    bytes: n * core::mem::size_of::<f32>(),
+                }
+            });
+        }
+    }
+
+    // Single-thread tight loop. `*o = v.max(0.0)` collapses to a
+    // single `fmax.4s` NEON op (4 lanes × f32) without the closure
+    // barrier of the generic `map_unary`.
+    for (o, &v) in out_buf.iter_mut().zip(raw_slice.iter()) {
+        *o = v.max(0.0);
+    }
+    Tensor::from_vec_typed::<f32, _>(shape, out_buf).map_err(|_| BackendError::OutOfMemory {
+        bytes: n * core::mem::size_of::<f32>(),
+    })
 }
 
 /// Generic naïve `O(M*K*N)` matmul. Walks contiguous-or-not via
