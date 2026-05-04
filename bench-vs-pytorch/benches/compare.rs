@@ -228,6 +228,142 @@ fn bench_elementwise_add(c: &mut Criterion) {
     group.finish();
 }
 
+/// Per-stage breakdown of the GPT-2 transformer block — reveals
+/// where the 8× end-to-end gap vs PyTorch concentrates.
+fn bench_transformer_block_breakdown(c: &mut Criterion) {
+    use rustorch_autograd::{no_grad, ops, Variable};
+    use rustorch_nn::{LayerNorm, Linear, Module, MultiHeadAttention};
+
+    let batch = 2_usize;
+    let seq = 128_usize;
+    let d_model = 256_usize;
+    let n_heads = 4_usize;
+    let d_ff = 1024_usize;
+
+    let ln1 = LayerNorm::new(d_model);
+    let mha = MultiHeadAttention::new(d_model, n_heads);
+    let ln2 = LayerNorm::new(d_model);
+    let fc1 = Linear::new(d_model, d_ff);
+    let fc2 = Linear::new(d_ff, d_model);
+
+    let x_data = det(0xC1A0, batch * seq * d_model);
+    let x_tensor = Tensor::from_vec(vec![batch, seq, d_model], x_data).unwrap();
+
+    let mut group = c.benchmark_group("transformer_block_stage");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(3));
+
+    group.bench_function("layernorm", |bb| {
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(x_tensor.clone());
+                hint_black_box(ln1.forward(&x).unwrap())
+            })
+        });
+    });
+    group.bench_function("mha_self", |bb| {
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(x_tensor.clone());
+                hint_black_box(mha.forward(&x, &x, &x, None).unwrap())
+            })
+        });
+    });
+    group.bench_function("fc1_relu_fc2", |bb| {
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(x_tensor.clone());
+                let h = fc1.forward(&x).unwrap();
+                let h = ops::relu(&h).unwrap();
+                hint_black_box(fc2.forward(&h).unwrap())
+            })
+        });
+    });
+    group.bench_function("residual_add", |bb| {
+        let y_tensor = x_tensor.clone();
+        bb.iter(|| {
+            no_grad(|| {
+                let x = Variable::new(x_tensor.clone());
+                let y = Variable::new(y_tensor.clone());
+                hint_black_box(ops::add(&x, &y).unwrap())
+            })
+        });
+    });
+    let _ = (&ln2,); // keep ln2 alive for the linker
+    group.finish();
+}
+
+/// GPT-2-style transformer block forward (no_grad inference).
+///
+/// Layout:
+///   x = ln1(x)
+///   x = x + mha(x, x, x)          // attention sub-block (self-attention)
+///   x = ln2(x)
+///   x = x + fc2(relu(fc1(x)))     // FFN sub-block
+///
+/// Shape (matches GPT-2-small reduced for fast iteration):
+///   batch=2, seq=128, d_model=256, n_heads=4, d_ff=1024
+///
+/// **Note**: ReLU is used instead of GELU (PyTorch reference also
+/// uses ReLU for fair comparison). RusTorch lacks `ops::gelu` in
+/// the autograd path as of this commit — TODO for a future task.
+///
+/// This is the metric that decides whether the perf sprint actually
+/// translates to faster transformer inference vs PyTorch — micro
+/// kernel wins are pointless if the end-to-end block is slower.
+fn bench_transformer_block(c: &mut Criterion) {
+    use rustorch_autograd::{no_grad, ops, Variable};
+    use rustorch_nn::{LayerNorm, Linear, Module, MultiHeadAttention};
+
+    let batch = 2_usize;
+    let seq = 128_usize;
+    let d_model = 256_usize;
+    let n_heads = 4_usize;
+    let d_ff = 1024_usize;
+
+    let ln1 = LayerNorm::new(d_model);
+    let mha = MultiHeadAttention::new(d_model, n_heads);
+    let ln2 = LayerNorm::new(d_model);
+    let fc1 = Linear::new(d_model, d_ff);
+    let fc2 = Linear::new(d_ff, d_model);
+
+    // Pre-build the input outside the loop — we measure forward,
+    // not allocation.
+    let x_data = det(0xC1A0, batch * seq * d_model);
+    let x_tensor = Tensor::from_vec(vec![batch, seq, d_model], x_data).unwrap();
+
+    let mut group = c.benchmark_group("transformer_block_forward");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(800));
+    group.measurement_time(std::time::Duration::from_secs(5));
+    group.bench_function(
+        BenchmarkId::from_parameter(format!(
+            "B{}S{}D{}H{}F{}",
+            batch, seq, d_model, n_heads, d_ff
+        )),
+        |bb| {
+            bb.iter(|| {
+                no_grad(|| {
+                    let x = Variable::new(x_tensor.clone());
+                    // Attention sub-block: ln1 -> mha(self) -> residual.
+                    let h = ln1.forward(&x).unwrap();
+                    let h = mha.forward(&h, &h, &h, None).unwrap();
+                    let x = ops::add(&x, &h).unwrap();
+                    // FFN sub-block: ln2 -> fc1 -> relu -> fc2 -> residual.
+                    let h = ln2.forward(&x).unwrap();
+                    let h = fc1.forward(&h).unwrap();
+                    let h = ops::relu(&h).unwrap();
+                    let h = fc2.forward(&h).unwrap();
+                    let out = ops::add(&x, &h).unwrap();
+                    hint_black_box(out)
+                })
+            });
+        },
+    );
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -241,5 +377,7 @@ criterion_group! {
         bench_softmax,
         bench_flash_attention,
         bench_elementwise_add,
+        bench_transformer_block,
+        bench_transformer_block_breakdown,
 }
 criterion_main!(benches);

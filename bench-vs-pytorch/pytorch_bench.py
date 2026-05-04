@@ -103,6 +103,54 @@ def bench_attention_naive(b, h, n, d):
     }
 
 
+def bench_transformer_block(batch, seq, d_model, n_heads, d_ff):
+    """GPT-2-style transformer block forward (no_grad inference).
+
+    Layout matches the Rust bench `bench_transformer_block`:
+        x = ln1(x)
+        x = x + mha(x, x, x)         # self-attention
+        x = ln2(x)
+        x = x + fc2(relu(fc1(x)))    # FFN
+
+    ReLU is used (not GELU) for parity with the RusTorch bench until
+    `ops::gelu` lands in autograd.
+    """
+    ln1 = torch.nn.LayerNorm(d_model)
+    # MHA: PyTorch's MultiheadAttention defaults to (seq, batch, dim) ordering;
+    # we use batch_first=True to match the RusTorch [batch, seq, dim] layout.
+    mha = torch.nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+    ln2 = torch.nn.LayerNorm(d_model)
+    fc1 = torch.nn.Linear(d_model, d_ff)
+    fc2 = torch.nn.Linear(d_ff, d_model)
+    # Switch every parameter to requires_grad=False so PyTorch
+    # short-circuits autograd construction (matches Rust no_grad).
+    for m in [ln1, mha, ln2, fc1, fc2]:
+        for p in m.parameters():
+            p.requires_grad_(False)
+    g = torch.Generator().manual_seed(0xC1A0)
+    x = torch.empty(batch, seq, d_model).uniform_(-1.0, 1.0, generator=g)
+
+    def step():
+        with torch.no_grad():
+            h = ln1(x)
+            h, _ = mha(h, h, h, need_weights=False)
+            y = x + h
+            h = ln2(y)
+            h = fc1(h)
+            h = torch.relu(h)
+            h = fc2(h)
+            out = y + h
+            return out
+
+    med, p99 = time_fn(step)
+    return {
+        "op": "transformer_block_forward",
+        "shape": f"B={batch} S={seq} D={d_model} H={n_heads} F={d_ff}",
+        "median_ns": med,
+        "p99_ns": p99,
+    }
+
+
 def bench_elementwise_add(n):
     a = make(0xA1, n)
     b = make(0xB2, n)
@@ -127,6 +175,10 @@ def run(num_threads, device_label="cpu"):
         results.append(bench_attention_naive(*shape))
     for n in [1_000, 10_000, 100_000, 1_000_000, 10_000_000]:
         results.append(bench_elementwise_add(n))
+    # End-to-end transformer block forward (T17): the metric that
+    # decides whether the perf sprint translates to faster transformer
+    # inference vs PyTorch.
+    results.append(bench_transformer_block(2, 128, 256, 4, 1024))
     return {
         "framework": "pytorch",
         "device": device_label,
