@@ -38,17 +38,18 @@ const PROMPT_LEN: usize = 16;
 const MAX_NEW_TOKENS: usize = 64;
 
 /// Per-block weights stored as raw f32 buffers — no Tensor/Variable
-/// wrap. `linear_d_d`, `linear_d_kv`, `linear_d_ff`, `linear_ff_d`
-/// shapes follow the Llama convention (no bias).
+/// wrap. T49: Q/K/V projections are merged into a single
+/// `w_qkv` matrix [D, D + 2*KV_DIM] so one sgemm produces the
+/// concatenated output, saving 2 cBLAS FFI calls per layer plus
+/// improving cache locality.
 struct LlamaBlock {
     rms_attn: Vec<f32>, // [D]
-    w_q: Vec<f32>,      // [D, D]
-    w_k: Vec<f32>,      // [D, KV_DIM]
-    w_v: Vec<f32>,      // [D, KV_DIM]
-    w_o: Vec<f32>,      // [D, D]
-    rms_ffn: Vec<f32>,  // [D]
-    w_fc1: Vec<f32>,    // [D, F]
-    w_fc2: Vec<f32>,    // [F, D]
+    /// Concatenated [W_Q | W_K | W_V] of shape [D, D + 2*KV_DIM].
+    w_qkv: Vec<f32>,
+    w_o: Vec<f32>,     // [D, D]
+    rms_ffn: Vec<f32>, // [D]
+    w_fc1: Vec<f32>,   // [D, F]
+    w_fc2: Vec<f32>,   // [F, D]
 }
 
 /// Deterministic LCG noise scaled to `[-bound, bound]`.
@@ -64,16 +65,39 @@ fn lcg_init(n: usize, seed: u64, bound: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Combined Q/K/V output dim. T49 fused-QKV layout.
+const QKV_DIM: usize = D_MODEL + 2 * KV_DIM; // 256 + 64 + 64 = 384
+
 impl LlamaBlock {
     fn new(layer_idx: usize) -> Self {
         let bound_d = 1.0 / (D_MODEL as f32).sqrt();
         let bound_f = 1.0 / (D_FF as f32).sqrt();
         let seed_base = (layer_idx as u64) * 0xDEADBEEF + 1;
+        // T49: build W_QKV as a single contiguous [D, QKV_DIM]
+        // matrix so one fused matmul produces concatenated outputs.
+        // The layout (row-major) is: for each input row d in 0..D,
+        //   first D output cols hold W_Q row,
+        //   next KV_DIM cols hold W_K row,
+        //   last KV_DIM cols hold W_V row.
+        let w_q_init = lcg_init(D_MODEL * D_MODEL, seed_base + 1, bound_d);
+        let w_k_init = lcg_init(D_MODEL * KV_DIM, seed_base + 2, bound_d);
+        let w_v_init = lcg_init(D_MODEL * KV_DIM, seed_base + 3, bound_d);
+        let mut w_qkv = vec![0.0_f32; D_MODEL * QKV_DIM];
+        for d in 0..D_MODEL {
+            let dst_row = d * QKV_DIM;
+            // W_Q [D, D]: row d → cols [0, D)
+            w_qkv[dst_row..dst_row + D_MODEL]
+                .copy_from_slice(&w_q_init[d * D_MODEL..(d + 1) * D_MODEL]);
+            // W_K [D, KV_DIM]: row d → cols [D, D + KV_DIM)
+            w_qkv[dst_row + D_MODEL..dst_row + D_MODEL + KV_DIM]
+                .copy_from_slice(&w_k_init[d * KV_DIM..(d + 1) * KV_DIM]);
+            // W_V [D, KV_DIM]: row d → cols [D + KV_DIM, QKV_DIM)
+            w_qkv[dst_row + D_MODEL + KV_DIM..dst_row + QKV_DIM]
+                .copy_from_slice(&w_v_init[d * KV_DIM..(d + 1) * KV_DIM]);
+        }
         LlamaBlock {
             rms_attn: vec![1.0_f32; D_MODEL],
-            w_q: lcg_init(D_MODEL * D_MODEL, seed_base + 1, bound_d),
-            w_k: lcg_init(D_MODEL * KV_DIM, seed_base + 2, bound_d),
-            w_v: lcg_init(D_MODEL * KV_DIM, seed_base + 3, bound_d),
+            w_qkv,
             w_o: lcg_init(D_MODEL * D_MODEL, seed_base + 4, bound_d),
             rms_ffn: vec![1.0_f32; D_MODEL],
             w_fc1: lcg_init(D_MODEL * D_FF, seed_base + 5, bound_d),
@@ -101,9 +125,7 @@ fn rms_norm_inplace(x: &mut [f32], gamma: &[f32]) {
 struct DecodeScratch {
     x: Vec<f32>,        // [D]
     h: Vec<f32>,        // [D]
-    q: Vec<f32>,        // [D]
-    k: Vec<f32>,        // [KV_DIM]
-    v: Vec<f32>,        // [KV_DIM]
+    qkv: Vec<f32>,      // [QKV_DIM] — fused Q|K|V output (T49)
     attn_out: Vec<f32>, // [D]
     o_out: Vec<f32>,    // [D]
     fc1_out: Vec<f32>,  // [F]
@@ -118,9 +140,7 @@ impl DecodeScratch {
         DecodeScratch {
             x: vec![0.0_f32; D_MODEL],
             h: vec![0.0_f32; D_MODEL],
-            q: vec![0.0_f32; D_MODEL],
-            k: vec![0.0_f32; KV_DIM],
-            v: vec![0.0_f32; KV_DIM],
+            qkv: vec![0.0_f32; QKV_DIM],
             attn_out: vec![0.0_f32; D_MODEL],
             o_out: vec![0.0_f32; D_MODEL],
             fc1_out: vec![0.0_f32; D_FF],
@@ -160,49 +180,33 @@ fn decode_step_raw(
         scratch.h.copy_from_slice(&scratch.x);
         rms_norm_inplace(&mut scratch.h, &block.rms_attn);
 
-        // 2. Q/K/V projections via fused matmul (M=1, K=D, N varies).
+        // 2. T49 — fused Q/K/V projection: one sgemm produces
+        //    `[D + 2*KV_DIM]` concatenated outputs, saving 2 cBLAS
+        //    FFI calls + improving cache locality on the weight
+        //    matrix (single contiguous load instead of three).
         fused_matmul_bias_activation(
             &scratch.h,
-            &block.w_q,
+            &block.w_qkv,
             None,
-            &mut scratch.q,
+            &mut scratch.qkv,
             1,
             D_MODEL,
-            D_MODEL,
+            QKV_DIM,
             Activation::None,
         )
         .unwrap();
-        fused_matmul_bias_activation(
-            &scratch.h,
-            &block.w_k,
-            None,
-            &mut scratch.k,
-            1,
-            D_MODEL,
-            KV_DIM,
-            Activation::None,
-        )
-        .unwrap();
-        fused_matmul_bias_activation(
-            &scratch.h,
-            &block.w_v,
-            None,
-            &mut scratch.v,
-            1,
-            D_MODEL,
-            KV_DIM,
-            Activation::None,
-        )
-        .unwrap();
+        // Split scratch.qkv into Q [D], K [KV_DIM], V [KV_DIM].
+        let (q_slice, kv_slice) = scratch.qkv.split_at_mut(D_MODEL);
+        let (k_slice, v_slice) = kv_slice.split_at_mut(KV_DIM);
 
         // 3. RoPE on Q (n_heads heads) and K (n_kv_heads heads).
-        rope.apply_inplace(&mut scratch.q, 1, N_HEADS, 1, position)
+        rope.apply_inplace(q_slice, 1, N_HEADS, 1, position)
             .unwrap();
-        rope.apply_inplace(&mut scratch.k, 1, N_KV_HEADS, 1, position)
+        rope.apply_inplace(k_slice, 1, N_KV_HEADS, 1, position)
             .unwrap();
 
         // 4. Append to KV-cache.
-        cache.append(layer_idx, 1, &scratch.k, &scratch.v).unwrap();
+        cache.append(layer_idx, 1, k_slice, v_slice).unwrap();
 
         // 5. Build trimmed [N_KV_HEADS, kv_len, HEAD_DIM] from cache.
         let kv_len = position + 1;
@@ -218,8 +222,10 @@ fn decode_step_raw(
         }
 
         // 6. GQA forward: q [1, H, 1, hd] over k/v [1, KV, kv_len, hd].
+        // We borrow Q from the QKV split slice (still in `scratch.qkv`).
+        let q_slice_ro = &scratch.qkv[..D_MODEL];
         gqa_forward_f32(
-            &scratch.q,
+            q_slice_ro,
             &scratch.k_trim[..N_KV_HEADS * kv_len * HEAD_DIM],
             &scratch.v_trim[..N_KV_HEADS * kv_len * HEAD_DIM],
             &mut scratch.attn_out,
