@@ -1809,6 +1809,14 @@ fn matmul_dispatch_f32(
     if m < GEMM_DISPATCH_MIN || n < GEMM_DISPATCH_MIN || k < GEMM_DISPATCH_MIN {
         return matmul_naive::<f32>(lhs, rhs, m, k, n);
     }
+    // T24 NOTE: tested faer-rs `gemm` crate as a small-matmul fast
+    // path (m*n*k < ~16 M FLOPS) under the hypothesis that cBLAS
+    // dispatch overhead dominated below 256³. Result: gemm-rs was
+    // 3-6× SLOWER than cBLAS on every shape we measured (64²/128²/256²),
+    // so we kept the cBLAS path. The remaining 1.5-2.5× gap to
+    // PyTorch on small matmul comes from elsewhere (possibly Apple
+    // BNNS, AMX private symbols, or a small-shape micro-kernel in
+    // PyTorch ATen) — investigation continues in T25+.
     // Fast path: borrow contiguous tensor data directly. The
     // `as_slice::<f32>()` call returns `Some` only when the tensor is
     // contiguous + f32 + offset 0 — exactly the conditions cblas_sgemm
@@ -1900,23 +1908,71 @@ fn matmul_dispatch_f32(
     if m < GEMM_DISPATCH_MIN || n < GEMM_DISPATCH_MIN || k < GEMM_DISPATCH_MIN {
         return matmul_naive::<f32>(lhs, rhs, m, k, n);
     }
-    let lhs_buf: Vec<f32> = lhs
-        .iter_elements::<f32>()
-        .ok_or(BackendError::DtypeMismatch {
-            op: "matmul",
-            lhs: lhs.dtype(),
-            rhs: rhs.dtype(),
-        })?
-        .collect();
-    let rhs_buf: Vec<f32> = rhs
-        .iter_elements::<f32>()
-        .ok_or(BackendError::DtypeMismatch {
-            op: "matmul",
-            lhs: lhs.dtype(),
-            rhs: rhs.dtype(),
-        })?
-        .collect();
-    let mut out_buf: Vec<f32> = vec![0.0_f32; m * n];
+    matmul_dispatch_f32_via_gemm_rs(lhs, rhs, m, k, n)
+}
+
+/// f32 matmul via the faer-rs `gemm` crate. Non-macOS only since
+/// T24 measured it 3-6× slower than cBLAS Accelerate on M-series
+/// Macs. Kept as the canonical path on non-macOS where cBLAS isn't
+/// linked.
+#[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
+fn matmul_dispatch_f32_via_gemm_rs(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Tensor, BackendError> {
+    // Borrow contiguous slices when possible (matches the macOS cBLAS
+    // path) — only fall back to the iter_elements collect when the
+    // tensor is non-contiguous (transpose view, etc.).
+    let lhs_owned: Option<Vec<f32>>;
+    let rhs_owned: Option<Vec<f32>>;
+    let lhs_slice: &[f32] = if let Some(s) = lhs.as_slice::<f32>() {
+        lhs_owned = None;
+        s
+    } else {
+        lhs_owned = Some(
+            lhs.iter_elements::<f32>()
+                .ok_or(BackendError::DtypeMismatch {
+                    op: "matmul",
+                    lhs: lhs.dtype(),
+                    rhs: rhs.dtype(),
+                })?
+                .collect(),
+        );
+        lhs_owned.as_deref().unwrap()
+    };
+    let rhs_slice: &[f32] = if let Some(s) = rhs.as_slice::<f32>() {
+        rhs_owned = None;
+        s
+    } else {
+        rhs_owned = Some(
+            rhs.iter_elements::<f32>()
+                .ok_or(BackendError::DtypeMismatch {
+                    op: "matmul",
+                    lhs: lhs.dtype(),
+                    rhs: rhs.dtype(),
+                })?
+                .collect(),
+        );
+        rhs_owned.as_deref().unwrap()
+    };
+    // T11 — uninitialised output buffer; gemm with beta=0 overwrites
+    // every cell.
+    let mut out_storage: Vec<core::mem::MaybeUninit<f32>> = Vec::with_capacity(m * n);
+    unsafe {
+        out_storage.set_len(m * n);
+    }
+    let mut out_buf: Vec<f32> = unsafe {
+        let (ptr, len, cap) = (
+            out_storage.as_mut_ptr() as *mut f32,
+            out_storage.len(),
+            out_storage.capacity(),
+        );
+        core::mem::forget(out_storage);
+        Vec::from_raw_parts(ptr, len, cap)
+    };
 
     // Row-major [m, k] @ [k, n] -> [m, n]:
     //   strides for the gemm crate (in elements, not bytes):
@@ -1935,10 +1991,10 @@ fn matmul_dispatch_f32(
             1,
             n as isize,
             false,
-            lhs_buf.as_ptr(),
+            lhs_slice.as_ptr(),
             1,
             k as isize,
-            rhs_buf.as_ptr(),
+            rhs_slice.as_ptr(),
             1,
             n as isize,
             0.0_f32,
@@ -1949,6 +2005,8 @@ fn matmul_dispatch_f32(
             gemm::Parallelism::Rayon(0),
         );
     }
+    drop(lhs_owned);
+    drop(rhs_owned);
 
     Tensor::from_vec_typed::<f32, _>(vec![m, n], out_buf).map_err(|_| BackendError::OutOfMemory {
         bytes: m * n * core::mem::size_of::<f32>(),
