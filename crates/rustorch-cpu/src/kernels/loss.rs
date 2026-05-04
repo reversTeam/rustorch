@@ -230,6 +230,21 @@ pub fn bce_with_logits(
 // -------------------- helpers --------------------
 
 fn mse_f32(input: &Tensor, target: &Tensor, reduction: Reduction) -> Result<Tensor, BackendError> {
+    // Fast path: Mean / Sum on contiguous offset-0 inputs go through a
+    // single rayon-parallel `(a-b)²` sum — no intermediate `per`
+    // tensor allocation. Avoids 3 × 256 KB allocations for the
+    // canonical [B=64, N=1024] bench shape and folds the sub + mul +
+    // reduce chain into one cache-friendly pass.
+    if matches!(reduction, Reduction::Mean | Reduction::Sum)
+        && input.is_contiguous()
+        && target.is_contiguous()
+        && input.storage_offset() == 0
+        && target.storage_offset() == 0
+    {
+        if let (Some(xs), Some(ts)) = (input.as_slice::<f32>(), target.as_slice::<f32>()) {
+            return mse_f32_fused(xs, ts, reduction);
+        }
+    }
     let xs: Vec<f32> = input.iter_elements::<f32>().expect("dtype").collect();
     let ts: Vec<f32> = target.iter_elements::<f32>().expect("dtype").collect();
     let per: Vec<f32> = xs
@@ -242,6 +257,53 @@ fn mse_f32(input: &Tensor, target: &Tensor, reduction: Reduction) -> Result<Tens
             .map_err(|_| BackendError::OutOfMemory { bytes: 0 }),
         _ => reduce_per_sample_f32(per, reduction),
     }
+}
+
+/// Fused parallel `(a - b)² .sum() [/ n]` over flat contiguous slices.
+/// Avoids the three intermediate buffers (`per`, `xs.collect`, `ts.collect`)
+/// that the legacy path allocated. Returns a `[1]` scalar tensor.
+fn mse_f32_fused(xs: &[f32], ts: &[f32], reduction: Reduction) -> Result<Tensor, BackendError> {
+    use rayon::prelude::*;
+
+    debug_assert_eq!(xs.len(), ts.len());
+    let n = xs.len();
+
+    /// Below this many elements we stay sequential — rayon dispatch
+    /// overhead exceeds the work.
+    const PARALLEL_THRESHOLD: usize = 16_384;
+    /// Chunk size for rayon's work-stealer. Each chunk does a local
+    /// f32 accumulate; the outer driver reduces the per-chunk partials
+    /// into the final scalar.
+    const CHUNK: usize = 8_192;
+
+    let total: f32 = if n < PARALLEL_THRESHOLD {
+        let mut acc = 0.0f32;
+        for i in 0..n {
+            let d = xs[i] - ts[i];
+            acc += d * d;
+        }
+        acc
+    } else {
+        xs.par_chunks(CHUNK)
+            .zip(ts.par_chunks(CHUNK))
+            .map(|(x_chunk, t_chunk)| {
+                let mut acc = 0.0f32;
+                for i in 0..x_chunk.len() {
+                    let d = x_chunk[i] - t_chunk[i];
+                    acc += d * d;
+                }
+                acc
+            })
+            .sum()
+    };
+
+    let val = match reduction {
+        Reduction::Mean => total / n as f32,
+        Reduction::Sum => total,
+        Reduction::None => unreachable!("None handled by caller"),
+    };
+    Tensor::from_vec_typed::<f32, _>(vec![1usize], vec![val])
+        .map_err(|_| BackendError::OutOfMemory { bytes: 4 })
 }
 
 fn mse_f64(input: &Tensor, target: &Tensor, reduction: Reduction) -> Result<Tensor, BackendError> {
