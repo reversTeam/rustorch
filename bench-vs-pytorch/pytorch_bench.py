@@ -186,6 +186,106 @@ def bench_embedding(num_embeds, embed_dim, batch):
     return {"op": "embedding", "shape": f"vocab={num_embeds} dim={embed_dim} b={batch}", "median_ns": med, "p99_ns": p99}
 
 
+def bench_llama_decode_step(num_layers, d_model, n_heads, n_kv_heads, d_ff, vocab,
+                             max_seq, current_len):
+    """One decode step (S=1) through a mini-Llama (RMSNorm + GQA +
+    RoPE + FFN no_bias). Models the per-token cost of LLM serving
+    after prefill on a `current_len`-token prefix.
+    """
+    head_dim = d_model // n_heads
+    kv_dim = n_kv_heads * head_dim
+    group_size = n_heads // n_kv_heads
+
+    # RoPE tables.
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    pos = torch.arange(max_seq).float()
+    rope_sinusoid = torch.einsum("i,j->ij", pos, inv_freq)
+    rope_cos = rope_sinusoid.cos()
+    rope_sin = rope_sinusoid.sin()
+
+    def apply_rope(x, position):
+        # x: [B, H, 1, head_dim]
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        c = rope_cos[position]
+        s = rope_sin[position]
+        out_even = x_even * c - x_odd * s
+        out_odd = x_even * s + x_odd * c
+        return torch.stack([out_even, out_odd], dim=-1).flatten(-2)
+
+    # Build layers.
+    blocks = []
+    for _ in range(num_layers):
+        ln_attn_w = torch.empty(d_model).normal_(mean=1.0, std=0.02)
+        q_proj = torch.nn.Linear(d_model, d_model, bias=False)
+        k_proj = torch.nn.Linear(d_model, kv_dim, bias=False)
+        v_proj = torch.nn.Linear(d_model, kv_dim, bias=False)
+        o_proj = torch.nn.Linear(d_model, d_model, bias=False)
+        ln_ffn_w = torch.empty(d_model).normal_(mean=1.0, std=0.02)
+        fc1 = torch.nn.Linear(d_model, d_ff, bias=False)
+        fc2 = torch.nn.Linear(d_ff, d_model, bias=False)
+        for m in [q_proj, k_proj, v_proj, o_proj, fc1, fc2]:
+            for p in m.parameters():
+                p.requires_grad_(False)
+        blocks.append((ln_attn_w, q_proj, k_proj, v_proj, o_proj, ln_ffn_w, fc1, fc2))
+    final_ln_w = torch.empty(d_model).normal_(mean=1.0, std=0.02)
+    lm_head = torch.nn.Linear(d_model, vocab, bias=False)
+    tok_emb = torch.nn.Embedding(vocab, d_model)
+    for m in [lm_head, tok_emb]:
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+    # Pre-allocate KV cache filled with random data (modeling the
+    # state after prefill of `current_len` tokens).
+    cache_k = [torch.empty(1, n_kv_heads, max_seq, head_dim).normal_() for _ in range(num_layers)]
+    cache_v = [torch.empty(1, n_kv_heads, max_seq, head_dim).normal_() for _ in range(num_layers)]
+
+    def rms_norm(x, w, eps=1e-6):
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        return x * rms * w
+
+    new_token = torch.tensor([42], dtype=torch.long)
+
+    def step():
+        with torch.no_grad():
+            x = tok_emb(new_token).reshape(1, 1, d_model)
+            for layer_idx, (ln1_w, qp, kp, vp, op, ln2_w, fc1, fc2) in enumerate(blocks):
+                h = rms_norm(x, ln1_w)
+                q = qp(h).reshape(1, 1, n_heads, head_dim).transpose(1, 2)  # [1, H, 1, d]
+                k = kp(h).reshape(1, 1, n_kv_heads, head_dim).transpose(1, 2)  # [1, KV, 1, d]
+                v = vp(h).reshape(1, 1, n_kv_heads, head_dim).transpose(1, 2)
+                q = apply_rope(q, current_len)
+                k = apply_rope(k, current_len)
+                # Append to cache (here we just write at the right slot).
+                cache_k[layer_idx][:, :, current_len:current_len + 1, :] = k
+                cache_v[layer_idx][:, :, current_len:current_len + 1, :] = v
+                # Read prefix [..current_len + 1].
+                k_prefix = cache_k[layer_idx][:, :, : current_len + 1, :]
+                v_prefix = cache_v[layer_idx][:, :, : current_len + 1, :]
+                # Repeat KV to n_heads (GQA).
+                k_rep = k_prefix.repeat_interleave(group_size, dim=1)
+                v_rep = v_prefix.repeat_interleave(group_size, dim=1)
+                attn = torch.nn.functional.scaled_dot_product_attention(q, k_rep, v_rep)
+                attn = attn.transpose(1, 2).reshape(1, 1, d_model)
+                attn = op(attn)
+                x = x + attn
+                h = rms_norm(x, ln2_w)
+                h = fc1(h)
+                h = torch.relu(h)
+                h = fc2(h)
+                x = x + h
+            x = rms_norm(x, final_ln_w)
+            return lm_head(x)
+
+    med, p99 = time_fn(step)
+    return {
+        "op": "llama_decode_step",
+        "shape": f"L={num_layers} D={d_model} H={n_heads} KV={n_kv_heads} F={d_ff} V={vocab} ctx={current_len}",
+        "median_ns": med,
+        "p99_ns": p99,
+    }
+
+
 def bench_gqa(batch, n_heads, n_kv_heads, seq_q, seq_kv, head_dim):
     """Grouped Query Attention. Q has `n_heads` heads but K/V share
     `n_kv_heads` (Qwen / Llama 3 architecture). PyTorch's
