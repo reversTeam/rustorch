@@ -122,7 +122,9 @@ impl Variable {
     /// **P3.Z Task A**: when the wgpu feature is on and the gradient
     /// lives on the GPU, this auto-materialises to host so optimisers
     /// (Adam / AdamW / SGD / ...) can read its bytes via
-    /// `.as_slice::<f32>()`. Removed once Task O FusedAdamW lands.
+    /// `.as_slice::<f32>()`. Optimisers that have a GPU-native path
+    /// (e.g. AdamW with the `wgpu` feature on `rustorch-optim`)
+    /// bypass this download via [`Variable::raw_grad`].
     pub fn grad(&self) -> Option<Tensor> {
         let g = self.grad.lock().unwrap().clone()?;
         #[cfg(feature = "wgpu")]
@@ -134,6 +136,16 @@ impl Variable {
             }
         }
         Some(g)
+    }
+
+    /// Raw gradient without host auto-materialisation — preserves the
+    /// underlying `Storage::Wgpu` (or other GPU variant) so callers
+    /// that have a GPU-native fast path can extract the device buffer
+    /// via `Tensor::as_wgpu_storage()` and dispatch a kernel directly.
+    /// Returns `None` if the gradient hasn't been computed yet (same
+    /// as [`Variable::grad`]).
+    pub fn raw_grad(&self) -> Option<Tensor> {
+        self.grad.lock().unwrap().clone()
     }
 
     /// Reset the accumulated gradient to `None`.

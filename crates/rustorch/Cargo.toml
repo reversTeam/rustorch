@@ -32,7 +32,7 @@ mlir        = []
 # P3.Y plan, Phase E/F — wgpu (Metal/Vulkan/DX12/WebGPU) training dispatch.
 # Pulls rustorch-autograd's `wgpu` feature which transitively brings the
 # rustorch-wgpu backend in. Default OFF to keep CPU-only builds light.
-wgpu        = ["rustorch-autograd/wgpu"]
+wgpu        = ["rustorch-autograd/wgpu", "rustorch-optim/wgpu"]
 
 [[example]]
 name = "mnist_wgpu"

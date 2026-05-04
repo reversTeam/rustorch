@@ -74,13 +74,13 @@ pub trait Optimizer {
 /// Helper: write a fresh `Vec<f32>` into the parameter's shared
 /// `data` slot. Used by SGD and the final update step of Adam/AdamW.
 ///
-/// **P3.Y plan, Phase D**: preserves the parameter's device tag so
-/// optimisers don't silently demote a Wgpu param to Cpu after each
-/// `step()`. With Storage Option B, the optimiser math runs on the
-/// CPU shadow (extracted via `param.tensor().as_slice::<f32>()`) and
-/// the result is re-tagged with the original device, so subsequent
-/// autograd ops keep dispatching to the same backend (e.g. forward
-/// pass after `optimizer.step()` continues on Wgpu).
+/// **P3.Z Task A**: keeps the parameter as CPU storage tagged with
+/// its original device. The next forward pass's `to_gpu` upload is
+/// fast (just `write_buffer`), so eagerly uploading here would cost
+/// MORE (forces `data_snapshot` to download on the next step).
+/// `Storage::Wgpu`-resident parameters arrive only when an upstream
+/// op produces them — Task O FusedAdamW will operate on those
+/// directly without involving this CPU helper.
 pub(crate) fn write_param_data(param: &Variable, new_data: Vec<f32>) {
     let device = param.device();
     let shape = param.tensor().shape().to_vec();

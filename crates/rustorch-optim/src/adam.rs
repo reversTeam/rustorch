@@ -29,6 +29,15 @@ pub struct Adam {
     step_t: usize,
     m: Vec<Option<Vec<f32>>>,
     v: Vec<Option<Vec<f32>>>,
+    /// Per-parameter GPU `m` state (allocated lazily on the first GPU
+    /// step). When present, the WGSL FusedAdamW kernel is used in
+    /// place of the CPU loop for that parameter — single dispatch,
+    /// zero host trip. P3.Z Task A perf path.
+    #[cfg(feature = "wgpu")]
+    m_gpu: Vec<Option<rustorch_wgpu::storage::WgpuStorage>>,
+    /// Per-parameter GPU `v` state (lazily allocated, see [`Self::m_gpu`]).
+    #[cfg(feature = "wgpu")]
+    v_gpu: Vec<Option<rustorch_wgpu::storage::WgpuStorage>>,
 }
 
 impl Adam {
@@ -45,6 +54,10 @@ impl Adam {
             step_t: 0,
             m: vec![None; n],
             v: vec![None; n],
+            #[cfg(feature = "wgpu")]
+            m_gpu: (0..n).map(|_| None).collect(),
+            #[cfg(feature = "wgpu")]
+            v_gpu: (0..n).map(|_| None).collect(),
         }
     }
 
@@ -158,13 +171,161 @@ impl AdamW {
     }
 }
 
+#[cfg(feature = "wgpu")]
+impl Adam {
+    /// Try to run a fused AdamW step entirely on GPU memory.
+    ///
+    /// Returns `true` when the step was dispatched on GPU (caller
+    /// should `continue` to the next param), `false` when the param
+    /// or grad isn't on Wgpu storage and the caller must fall back
+    /// to the CPU path. Only handles the **decoupled-WD** variant
+    /// (i.e. `AdamW`) — classical Adam's coupled WD takes the CPU
+    /// path because the kernel doesn't yet branch for it.
+    ///
+    /// Lazily allocates the per-parameter `m_gpu` / `v_gpu` zero
+    /// buffers on the first GPU step. State persists across steps
+    /// inside the kernel-mutated buffers — no upload, no download.
+    fn try_step_wgpu(&mut self, i: usize, _bc1: f32, _bc2: f32) -> bool {
+        use rustorch_core::tensor::device::Device;
+        use rustorch_wgpu::backend_singleton::wgpu_backend;
+        use rustorch_wgpu::fused_adamw::{allocate_zeros, fused_adamw_step, AdamWStepParams};
+        use rustorch_wgpu::transfer::to_gpu;
+
+        let param = self.params[i].clone();
+        let param_tensor = param.tensor();
+
+        // Only run on Wgpu-targeted params. Tensors flagged
+        // Device::Cpu skip the GPU path entirely.
+        if param_tensor.device() != Device::Wgpu {
+            return false;
+        }
+        let backend = wgpu_backend();
+
+        // First-step bridge: a parameter tagged Wgpu may still hold
+        // its initial CPU storage (typical pattern is
+        // `Tensor::from_vec(...).with_device(Wgpu)` for weight init).
+        // Upload it once here so subsequent steps reuse the GPU
+        // buffer for free.
+        let param_storage = match param_tensor.as_wgpu_storage() {
+            Some(s) => s.clone(),
+            None => match to_gpu(backend, &param_tensor) {
+                Ok(uploaded) => {
+                    let core_handle = uploaded.buffer.clone();
+                    let promoted = rustorch_core::tensor::tensor_impl::Tensor::from_wgpu_storage(
+                        core_handle.clone(),
+                        param_tensor.shape().to_vec(),
+                        param_tensor.dtype(),
+                    );
+                    param.set_data(promoted);
+                    core_handle
+                },
+                Err(_) => return false,
+            },
+        };
+
+        // Fetch the raw gradient (no auto-materialise); skip if absent
+        // or if it lives on the host (the kernel needs both buffers
+        // on the same device).
+        let grad_tensor = match param.raw_grad() {
+            Some(g) => g,
+            None => return true, // No gradient ⇒ nothing to do, but counts as "handled".
+        };
+        let grad_storage = match grad_tensor.as_wgpu_storage() {
+            Some(s) => s.clone(),
+            None => match to_gpu(backend, &grad_tensor) {
+                Ok(uploaded) => uploaded.buffer.clone(),
+                Err(_) => return false,
+            },
+        };
+
+        let n = param_tensor.numel();
+        let backend = wgpu_backend();
+
+        // Lazy-init m / v on GPU. Once allocated, the same buffers
+        // are reused every step — the kernel mutates them in-place,
+        // so state survives across calls without any copy.
+        if self.m_gpu[i].is_none() {
+            let m = match allocate_zeros(backend, n) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            self.m_gpu[i] = Some(m);
+        }
+        if self.v_gpu[i].is_none() {
+            let v = match allocate_zeros(backend, n) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            self.v_gpu[i] = Some(v);
+        }
+
+        let m = self.m_gpu[i].as_ref().expect("m_gpu just allocated above");
+        let v = self.v_gpu[i].as_ref().expect("v_gpu just allocated above");
+
+        let core = rustorch_wgpu::storage::WgpuStorage {
+            buffer: param_storage,
+            dtype: param_tensor.dtype(),
+            numel: n,
+        };
+        let core_grad = rustorch_wgpu::storage::WgpuStorage {
+            buffer: grad_storage,
+            dtype: grad_tensor.dtype(),
+            numel: grad_tensor.numel(),
+        };
+
+        let step_params = AdamWStepParams {
+            lr: self.lr,
+            beta1: self.betas.0,
+            beta2: self.betas.1,
+            eps: self.eps,
+            weight_decay: self.weight_decay,
+            t: self.step_t as u32,
+        };
+        let new_param = match fused_adamw_step(backend, &core, &core_grad, m, v, step_params) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        // Wrap the freshly-allocated GPU buffer back into a Tensor
+        // with `Storage::Wgpu(...)` so the next forward pass's
+        // `to_gpu` takes the fast path (clone Arc, no upload).
+        let shape = param_tensor.shape().to_vec();
+        let dtype = param_tensor.dtype();
+        let new_tensor = rustorch_core::tensor::tensor_impl::Tensor::from_wgpu_storage(
+            new_param.buffer,
+            shape,
+            dtype,
+        );
+        param.set_data(new_tensor);
+        true
+    }
+}
+
 impl Optimizer for Adam {
     fn step(&mut self) {
         self.step_t += 1;
         let t = self.step_t as f32;
         let bc1 = 1.0 - self.betas.0.powf(t);
         let bc2 = 1.0 - self.betas.1.powf(t);
-        for (i, param) in self.params.iter().enumerate() {
+
+        // Snapshot the indices of params we're iterating before the
+        // borrow checker complains about `self.params.iter()` aliasing
+        // `&mut self.m_gpu` etc. The expensive work is per-param so
+        // the index-based loop has the same shape as the original.
+        let n_params = self.params.len();
+        for i in 0..n_params {
+            // P3.Z Task A GPU fast path: when wgpu feature is on AND
+            // both `param` and `grad` live on `Storage::Wgpu`, dispatch
+            // a single WGSL kernel that computes the entire AdamW step
+            // in-place on GPU memory — no host trip, no CPU compute.
+            #[cfg(feature = "wgpu")]
+            {
+                if self.decoupled_wd && self.try_step_wgpu(i, bc1, bc2) {
+                    continue;
+                }
+            }
+
+            let param = &self.params[i];
             let grad = match param.grad() {
                 Some(g) => g,
                 None => continue,

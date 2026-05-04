@@ -14,9 +14,19 @@ categories.workspace = true
 rustorch-core     = { workspace = true }
 rustorch-autograd = { workspace = true }
 rustorch-cpu      = { workspace = true }
+# Optional wgpu re-upload path (P3.Z Task A): when on, optimisers
+# upload the updated parameter directly into a Storage::Wgpu buffer
+# (skipping the next step's `to_gpu` round trip). Without this
+# feature optimisers stay strictly CPU-side, which works but pays
+# the host<->device round trip at every step.
+rustorch-wgpu     = { workspace = true, optional = true }
 half              = { workspace = true }
 num-traits        = { workspace = true }
 thiserror         = { workspace = true }
+
+[features]
+default = []
+wgpu = ["dep:rustorch-wgpu", "rustorch-autograd/wgpu"]
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

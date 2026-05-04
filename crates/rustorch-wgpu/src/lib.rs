@@ -31,6 +31,7 @@ pub mod elementwise;
 pub mod error;
 pub mod flash_attn;
 pub mod fused;
+pub mod fused_adamw;
 pub mod layernorm;
 pub mod mapped_upload;
 pub mod matmul;
