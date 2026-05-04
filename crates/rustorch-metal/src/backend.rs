@@ -27,6 +27,13 @@ pub struct MetalBackend {
     /// pays the compile, subsequent calls hit the cache. Same pattern
     /// as `rustorch_wgpu::cache::PipelineCache` but for Metal pipelines.
     pipeline_cache: Arc<Mutex<HashMap<&'static str, Arc<ComputePipelineState>>>>,
+    /// **commitAndContinue** pending command buffer. Kernels append
+    /// their compute encoders to this buffer instead of committing
+    /// per-call; the buffer is committed + waited on `drain()` (called
+    /// by `transfer::tensor_to_cpu` before host reads). Collapses
+    /// the per-kernel encoder/commit overhead (~50-200 µs each) into
+    /// one batch per training step.
+    pending_cmd_buffer: Arc<Mutex<Option<metal::CommandBuffer>>>,
     /// Adapter name from `device.name()` (e.g. "Apple M4 Max").
     adapter_name: String,
     /// `true` if the device reports `supportsFamily(MTLGPUFamilyMetal3)`
@@ -55,9 +62,30 @@ impl MetalBackend {
             device: Arc::new(device),
             queue: Arc::new(queue),
             pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
+            pending_cmd_buffer: Arc::new(Mutex::new(None)),
             adapter_name,
             supports_metal3,
         })
+    }
+
+    /// Run `f` against a compute encoder on the **shared pending
+    /// command buffer**, lazily creating one if none is pending.
+    /// The encoder is ended cleanly after `f` returns; the buffer
+    /// itself is NOT committed — it accumulates more encoders from
+    /// subsequent kernels and is flushed by [`drain`](Self::drain).
+    ///
+    /// commitAndContinue pattern: collapses the per-kernel
+    /// `command_buffer + commit + new_command_buffer` overhead
+    /// (~50-200 µs each) into a single commit per training step.
+    pub fn with_encoder<F: FnOnce(&metal::ComputeCommandEncoderRef)>(&self, f: F) {
+        let mut guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
+        if guard.is_none() {
+            *guard = Some(self.queue.new_command_buffer().to_owned());
+        }
+        let cb = guard.as_ref().expect("just created");
+        let encoder = cb.new_compute_command_encoder();
+        f(encoder);
+        encoder.end_encoding();
     }
 
     /// Compile or look up a compute pipeline state by kernel name.
@@ -119,17 +147,24 @@ impl MetalBackend {
         self.supports_metal3
     }
 
-    /// Wait for every previously-committed command buffer to finish.
-    /// Required before reading any GPU buffer from the host —
-    /// kernel-dispatch helpers don't `wait_until_completed` per call
-    /// (that was the dominant overhead in the cpu_vs_metal_train
-    /// bench), so callers that want to read from CPU must first
-    /// drain the queue. `transfer::tensor_to_cpu` does this
-    /// automatically.
+    /// Commit the **pending shared command buffer** (built up via
+    /// [`with_encoder`](Self::with_encoder)) and wait for the GPU
+    /// to finish. Called by `transfer::tensor_to_cpu` before host
+    /// reads. After draining, the next [`with_encoder`] call
+    /// lazily creates a fresh command buffer.
     pub fn drain(&self) {
-        let cb = self.queue.new_command_buffer();
-        cb.commit();
-        cb.wait_until_completed();
+        let mut guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
+        if let Some(cb) = guard.take() {
+            cb.commit();
+            cb.wait_until_completed();
+        } else {
+            // No pending work — synthesise an empty submit so callers
+            // that drain "just in case" still get the post-condition
+            // "every previously-issued kernel has completed".
+            let cb = self.queue.new_command_buffer();
+            cb.commit();
+            cb.wait_until_completed();
+        }
     }
 
     /// Allocate a fresh GPU buffer of `byte_len` bytes with the

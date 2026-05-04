@@ -36,7 +36,7 @@ wgpu        = ["rustorch-autograd/wgpu", "rustorch-optim/wgpu"]
 # P3.Z Task J — Apple Metal direct backend. macOS-only at runtime;
 # the dep chain is target-gated so non-macOS builds with feature
 # `metal` are no-ops.
-metal       = ["rustorch-autograd/metal", "rustorch-optim/metal"]
+metal       = ["rustorch-autograd/metal", "rustorch-optim/metal", "dep:rustorch-metal"]
 
 [[example]]
 name = "mnist_wgpu"
@@ -54,6 +54,9 @@ required-features = ["metal"]
 rustorch-core     = { workspace = true }
 rustorch-cpu      = { workspace = true }
 rustorch-autograd = { workspace = true }
+# Optional rustorch-metal direct backend (P3.Z Task J). macOS-only at
+# runtime; the dep is target-gated below.
+rustorch-metal    = { workspace = true, optional = true }
 rustorch-nn       = { workspace = true }
 rustorch-optim    = { workspace = true }
 rustorch-data     = { workspace = true }

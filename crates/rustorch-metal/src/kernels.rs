@@ -64,22 +64,20 @@ pub fn add_f32(
         *p = n as u32;
     }
 
-    let cmd_buffer = backend.queue.new_command_buffer();
-    let encoder = cmd_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(lhs), 0);
-    encoder.set_buffer(1, Some(rhs), 0);
-    encoder.set_buffer(2, Some(&out), 0);
-    encoder.set_buffer(3, Some(&n_buf), 0);
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(lhs), 0);
+        encoder.set_buffer(1, Some(rhs), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&n_buf), 0);
 
-    // Threadgroup of 256 threads, grid sized to cover all N elements.
-    let tg_size = MTLSize::new(256, 1, 1);
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
-    let tg = MTLSize::new(tg_size.width.min(max_threads), 1, 1);
-    let grid = MTLSize::new(n as u64, 1, 1);
-    encoder.dispatch_threads(grid, tg);
-    encoder.end_encoding();
-    cmd_buffer.commit();
+        // Threadgroup of 256 threads, grid sized to cover all N elements.
+        let tg_size = MTLSize::new(256, 1, 1);
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(tg_size.width.min(max_threads), 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
     // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
 
     Ok(out)
@@ -203,19 +201,17 @@ fn dispatch_binary(
         let dst = params_buf.contents() as *mut BinUnParams;
         *dst = params;
     }
-    let cmd_buffer = backend.queue.new_command_buffer();
-    let encoder = cmd_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(&params_buf), 0);
-    encoder.set_buffer(1, Some(lhs), 0);
-    encoder.set_buffer(2, Some(rhs), 0);
-    encoder.set_buffer(3, Some(&out), 0);
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
-    let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
-    let grid = MTLSize::new(n as u64, 1, 1);
-    encoder.dispatch_threads(grid, tg);
-    encoder.end_encoding();
-    cmd_buffer.commit();
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(lhs), 0);
+        encoder.set_buffer(2, Some(rhs), 0);
+        encoder.set_buffer(3, Some(&out), 0);
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
     // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
     Ok(out)
 }
@@ -240,18 +236,16 @@ fn dispatch_unary(
         let dst = params_buf.contents() as *mut BinUnParams;
         *dst = params;
     }
-    let cmd_buffer = backend.queue.new_command_buffer();
-    let encoder = cmd_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(&params_buf), 0);
-    encoder.set_buffer(1, Some(src), 0);
-    encoder.set_buffer(2, Some(&out), 0);
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
-    let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
-    let grid = MTLSize::new(n as u64, 1, 1);
-    encoder.dispatch_threads(grid, tg);
-    encoder.end_encoding();
-    cmd_buffer.commit();
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(src), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
     // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
     Ok(out)
 }
@@ -413,17 +407,15 @@ fn reduce_full(
     }
 
     // Stage 1: reduce_partial into `partials`.
-    let cmd1 = backend.queue.new_command_buffer();
-    let enc1 = cmd1.new_compute_command_encoder();
-    enc1.set_compute_pipeline_state(&pipeline_partial);
-    enc1.set_buffer(0, Some(&params_buf), 0);
-    enc1.set_buffer(1, Some(src), 0);
-    enc1.set_buffer(2, Some(&partials), 0);
-    let tg = MTLSize::new(stride, 1, 1);
-    let grid = MTLSize::new(n_partials * stride, 1, 1);
-    enc1.dispatch_threads(grid, tg);
-    enc1.end_encoding();
-    cmd1.commit();
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline_partial);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(src), 0);
+        encoder.set_buffer(2, Some(&partials), 0);
+        let tg = MTLSize::new(stride, 1, 1);
+        let grid = MTLSize::new(n_partials * stride, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
     // wait removed — see kernels.rs comment.
 
     // Stage 2: single-thread finalisation.
@@ -433,18 +425,16 @@ fn reduce_full(
         let p = n_partials_buf.contents() as *mut u32;
         *p = n_partials as u32;
     }
-    let cmd2 = backend.queue.new_command_buffer();
-    let enc2 = cmd2.new_compute_command_encoder();
-    enc2.set_compute_pipeline_state(&pipeline_final);
-    enc2.set_buffer(0, Some(&params_buf), 0);
-    enc2.set_buffer(1, Some(&partials), 0);
-    enc2.set_buffer(2, Some(&out), 0);
-    enc2.set_buffer(3, Some(&n_partials_buf), 0);
-    let tg2 = MTLSize::new(1, 1, 1);
-    let grid2 = MTLSize::new(1, 1, 1);
-    enc2.dispatch_threads(grid2, tg2);
-    enc2.end_encoding();
-    cmd2.commit();
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline_final);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(&partials), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&n_partials_buf), 0);
+        let tg2 = MTLSize::new(1, 1, 1);
+        let grid2 = MTLSize::new(1, 1, 1);
+        encoder.dispatch_threads(grid2, tg2);
+    });
     // wait removed.
 
     Ok(out)
@@ -551,18 +541,16 @@ fn reduce_dim_2d(
         let dst = params_buf.contents() as *mut ReduceDimParams;
         *dst = params;
     }
-    let cmd = backend.queue.new_command_buffer();
-    let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(&params_buf), 0);
-    enc.set_buffer(1, Some(src), 0);
-    enc.set_buffer(2, Some(&out), 0);
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
-    let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
-    let grid = MTLSize::new(out_n as u64, 1, 1);
-    enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    cmd.commit();
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(src), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+        let grid = MTLSize::new(out_n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
     Ok(out)
 }
 
@@ -661,21 +649,19 @@ pub fn transpose2d_f32(
         let dst = params_buf.contents() as *mut TransposeParams;
         *dst = params;
     }
-    let cmd = backend.queue.new_command_buffer();
-    let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(&params_buf), 0);
-    enc.set_buffer(1, Some(src), 0);
-    enc.set_buffer(2, Some(&out), 0);
-    let tg = MTLSize::new(16, 16, 1);
-    // dispatch_threadgroups instead of dispatch_threads so we can pad
-    // up to whole tiles cleanly.
-    let groups_x = (n as u64).div_ceil(16);
-    let groups_y = (m as u64).div_ceil(16);
-    let grid = MTLSize::new(groups_x * 16, groups_y * 16, 1);
-    enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    cmd.commit();
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(src), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        let tg = MTLSize::new(16, 16, 1);
+        // dispatch_threadgroups instead of dispatch_threads so we can pad
+        // up to whole tiles cleanly.
+        let groups_x = (n as u64).div_ceil(16);
+        let groups_y = (m as u64).div_ceil(16);
+        let grid = MTLSize::new(groups_x * 16, groups_y * 16, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
     Ok(out)
 }
 
@@ -761,21 +747,19 @@ pub fn matmul_simdgroup_f32_multisg(
         *p.add(1) = k as u32;
         *p.add(2) = n as u32;
     }
-    let cmd_buffer = backend.queue.new_command_buffer();
-    let encoder = cmd_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(a), 0);
-    encoder.set_buffer(1, Some(b), 0);
-    encoder.set_buffer(2, Some(&out), 0);
-    encoder.set_buffer(3, Some(&dims_buf), 0);
-    // 256 threads per threadgroup = 8 simdgroups.
-    let tg = MTLSize::new(256, 1, 1);
-    let n_tiles_x = (n / 64) as u64;
-    let n_tiles_y = (m / 8) as u64;
-    let grid = MTLSize::new(n_tiles_x * 256, n_tiles_y, 1);
-    encoder.dispatch_threads(grid, tg);
-    encoder.end_encoding();
-    cmd_buffer.commit();
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a), 0);
+        encoder.set_buffer(1, Some(b), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        // 256 threads per threadgroup = 8 simdgroups.
+        let tg = MTLSize::new(256, 1, 1);
+        let n_tiles_x = (n / 64) as u64;
+        let n_tiles_y = (m / 8) as u64;
+        let grid = MTLSize::new(n_tiles_x * 256, n_tiles_y, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
     Ok(out)
 }
 
@@ -873,22 +857,20 @@ pub fn matmul_simdgroup_f32(
         *p.add(2) = n as u32;
     }
 
-    let cmd_buffer = backend.queue.new_command_buffer();
-    let encoder = cmd_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(a), 0);
-    encoder.set_buffer(1, Some(b), 0);
-    encoder.set_buffer(2, Some(&out), 0);
-    encoder.set_buffer(3, Some(&dims_buf), 0);
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a), 0);
+        encoder.set_buffer(1, Some(b), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
 
-    // Each threadgroup = 1 simdgroup = 32 threads → 1 output 8×8 tile.
-    let threadgroup_size = MTLSize::new(32, 1, 1);
-    let n_tiles_x = (n / 8) as u64;
-    let n_tiles_y = (m / 8) as u64;
-    let grid = MTLSize::new(n_tiles_x * 32, n_tiles_y, 1);
-    encoder.dispatch_threads(grid, threadgroup_size);
-    encoder.end_encoding();
-    cmd_buffer.commit();
+        // Each threadgroup = 1 simdgroup = 32 threads → 1 output 8×8 tile.
+        let threadgroup_size = MTLSize::new(32, 1, 1);
+        let n_tiles_x = (n / 8) as u64;
+        let n_tiles_y = (m / 8) as u64;
+        let grid = MTLSize::new(n_tiles_x * 32, n_tiles_y, 1);
+        encoder.dispatch_threads(grid, threadgroup_size);
+    });
     // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
 
     Ok(out)

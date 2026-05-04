@@ -163,22 +163,20 @@ pub fn fused_adamw_step(
         *dst = uniform;
     }
 
-    let cmd_buffer = backend.queue.new_command_buffer();
-    let encoder = cmd_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(&uniform_buf), 0);
-    encoder.set_buffer(1, Some(param_in), 0);
-    encoder.set_buffer(2, Some(grad), 0);
-    encoder.set_buffer(3, Some(m), 0);
-    encoder.set_buffer(4, Some(v), 0);
-    encoder.set_buffer(5, Some(&param_out), 0);
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&uniform_buf), 0);
+        encoder.set_buffer(1, Some(param_in), 0);
+        encoder.set_buffer(2, Some(grad), 0);
+        encoder.set_buffer(3, Some(m), 0);
+        encoder.set_buffer(4, Some(v), 0);
+        encoder.set_buffer(5, Some(&param_out), 0);
 
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
-    let tg = MTLSize::new(TG_SIZE.min(max_threads), 1, 1);
-    let grid = MTLSize::new(n as u64, 1, 1);
-    encoder.dispatch_threads(grid, tg);
-    encoder.end_encoding();
-    cmd_buffer.commit();
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(TG_SIZE.min(max_threads), 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
     // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
 
     Ok(param_out)

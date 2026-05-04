@@ -66,6 +66,15 @@ fn main() {
             backward(&loss, None).expect("backward");
             opt.step();
         }
+        // Honest timing: ensure the GPU has finished executing every
+        // kernel committed during the loop before we stop the clock.
+        // Without this drain, commitAndContinue can defer GPU work
+        // past `t0.elapsed()` and we'd be measuring CPU-side kernel
+        // ENCODING rather than actual completion.
+        if device == Device::Metal {
+            #[cfg(target_os = "macos")]
+            rustorch_metal::backend_singleton::metal_backend().drain();
+        }
         t0.elapsed()
     }
 
