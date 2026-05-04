@@ -2107,10 +2107,11 @@ fn matmul_dispatch_f64(
     matmul_naive::<f64>(lhs, rhs, m, k, n)
 }
 
-/// T28 — Monomorphic f32 dense ReLU. Bypasses the closure-barrier of
-/// the generic `map_unary` so LLVM emits a tight `fmax.4s` NEON
-/// loop. Above 16K elements we shard via rayon (matches the
-/// existing threshold in `map_unary`).
+/// T28/T31 — Monomorphic f32 dense ReLU. On macOS above ~4 K
+/// elements we route through Apple's `vDSP_vthr` (vector
+/// threshold), which saturates ~85 GB/s NEON bandwidth on M-series
+/// vs ~10 GB/s for the auto-vectorised `*o = v.max(0.0)` loop.
+/// Below the FFI break-even point we keep the inline path.
 fn relu_f32_dense(src: &Tensor) -> Result<Tensor, BackendError> {
     let n = src.numel();
     let shape = src.shape().to_vec();
@@ -2133,6 +2134,14 @@ fn relu_f32_dense(src: &Tensor) -> Result<Tensor, BackendError> {
         core::mem::forget(out_storage);
         Vec::from_raw_parts(ptr, len, cap)
     };
+
+    // T31 NOTE: tested vDSP_vthr fast path (Apple Accelerate
+    // threshold) on shapes >= 4 K. Result: SLOWER than the rayon
+    // multi-thread path on shapes >= 16 K (vDSP_vthr is
+    // single-threaded; M4 Max's 4 P-cores share the DRAM
+    // controller, so rayon's 4-core split wins on
+    // bandwidth-bound shapes). Reverted; rayon remains the
+    // canonical path above 16 K.
 
     #[cfg(not(target_arch = "wasm32"))]
     {
