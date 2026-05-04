@@ -315,6 +315,23 @@ impl MultiHeadAttention {
             });
         }
 
+        // T34 — degenerate S=1 self-attention fast path. When the
+        // sequence has length 1, `softmax(Q · K^T)` over a single
+        // position trivially equals 1.0, so the attention output is
+        // exactly V. Q and K projections are computed for nothing.
+        // We skip them entirely and only compute V_proj followed by
+        // O_proj — saving ~75 % of the MHA work on S=1 (the
+        // single-token decode hot path).
+        if !is_grad_enabled()
+            && attn_mask.is_none()
+            && t_q == 1
+            && t_kv == 1
+            && q.tensor().dtype() == Dtype::F32
+        {
+            let v_proj = self.v_proj.forward(v)?;
+            return self.o_proj.forward(&v_proj);
+        }
+
         // 1. Project Q, K, V — Linear is rank-N capable so [B, T, D] → [B, T, D].
         let q = self.q_proj.forward(q)?;
         let k = self.k_proj.forward(k)?;
