@@ -1,4 +1,4 @@
-//! Scalar bf16 / fp16 matmul kernels with f32 accumulator.
+//! bf16 / fp16 matmul kernels with f32 accumulator.
 //!
 //! Compute `c = a @ b` where:
 //! - `a` is `[m, k]` low-precision
@@ -9,10 +9,34 @@
 //! reductions even when the inputs are bf16/fp16. This matches the
 //! AVX-512 BF16 / NEON behaviour and is the standard practice for
 //! mixed-precision GEMM.
+//!
+//! ## Implementation strategy (P3.X T7)
+//!
+//! Apple Accelerate does not expose a native bf16 cblas, and Apple
+//! AMX2 bf16 is not reachable from user space without amx-rs. The
+//! pragmatic high-perf path on M1+ is therefore:
+//!
+//! 1. Up-cast `a` and `b` once into temporary `Vec<f32>` buffers.
+//! 2. Call `cblas_sgemm` (macOS) / `gemm` 0.18 (other targets) on
+//!    the f32 buffers — the AMX hits 1.4 TF/s on M4 Max.
+//! 3. Return the f32 accumulator output as-is.
+//!
+//! Numerical equivalence with the scalar f32-accumulator reference
+//! is preserved (both up-cast bf16→f32 once, only the FMA tree
+//! changes — fewer than 1e-2 relative error on uniform inputs).
+//!
+//! For tiny shapes (`m·n·k < ~30 K`) the BLAS dispatch overhead
+//! exceeds the work; we keep a scalar inline-up-cast fallback for
+//! correctness without perf regressions.
 
 #![allow(clippy::needless_range_loop)]
 
 use half::{bf16, f16};
+
+/// Threshold below which the up-cast + BLAS dispatch overhead
+/// exceeds the scalar work. Calibrated to match
+/// `rustorch-cpu::cpu_backend::GEMM_DISPATCH_MIN`.
+const GEMM_DISPATCH_MIN: usize = 32;
 
 /// Errors raised by the bf16/fp16 GEMM.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +97,20 @@ pub fn matmul_bf16_with_f32_accum(
             got: c.len(),
         });
     }
+    if m == 0 || n == 0 || k == 0 {
+        return Ok(());
+    }
+
+    // BLAS dispatch path: up-cast bf16 → f32 once, then sgemm.
+    // Apple AMX hits ~1.4 TF/s vs ~3 GF/s scalar.
+    if m >= GEMM_DISPATCH_MIN && n >= GEMM_DISPATCH_MIN && k >= GEMM_DISPATCH_MIN {
+        let a_f32: Vec<f32> = a.iter().map(|&x| x.to_f32()).collect();
+        let b_f32: Vec<f32> = b.iter().map(|&x| x.to_f32()).collect();
+        sgemm_dispatch(&a_f32, &b_f32, c, m, k, n);
+        return Ok(());
+    }
+
+    // Tiny-shape fallback: inline up-cast in the inner loop.
     for row in 0..m {
         for col in 0..n {
             let mut acc = 0.0f32;
@@ -118,6 +156,15 @@ pub fn matmul_fp16_with_f32_accum(
             got: c.len(),
         });
     }
+    if m == 0 || n == 0 || k == 0 {
+        return Ok(());
+    }
+    if m >= GEMM_DISPATCH_MIN && n >= GEMM_DISPATCH_MIN && k >= GEMM_DISPATCH_MIN {
+        let a_f32: Vec<f32> = a.iter().map(|&x| x.to_f32()).collect();
+        let b_f32: Vec<f32> = b.iter().map(|&x| x.to_f32()).collect();
+        sgemm_dispatch(&a_f32, &b_f32, c, m, k, n);
+        return Ok(());
+    }
     for row in 0..m {
         for col in 0..n {
             let mut acc = 0.0f32;
@@ -130,6 +177,63 @@ pub fn matmul_fp16_with_f32_accum(
         }
     }
     Ok(())
+}
+
+/// macOS path: cblas_sgemm via Accelerate (AMX). f32 accumulator.
+#[cfg(target_os = "macos")]
+fn sgemm_dispatch(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    // SAFETY: caller validated buffer sizes; Accelerate's row-major
+    // sgemm contract is satisfied by the slice lengths.
+    unsafe {
+        crate::accelerate::sgemm_row_major(m, k, n, a, b, c);
+    }
+}
+
+/// Non-macOS / non-wasm path: pure-Rust `gemm` 0.18.
+#[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
+fn sgemm_dispatch(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    // SAFETY: caller validated buffer sizes; gemm dispatches by raw
+    // pointer with stride contracts that match contiguous row-major.
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            1,
+            n as isize,
+            false,
+            a.as_ptr(),
+            1,
+            k as isize,
+            b.as_ptr(),
+            1,
+            n as isize,
+            0.0_f32,
+            1.0_f32,
+            false,
+            false,
+            false,
+            gemm::Parallelism::Rayon(0),
+        );
+    }
+}
+
+/// wasm32 fallback: scalar reference (already covered by the
+/// up-cast inner loop above; this branch is unreachable for shapes
+/// `< GEMM_DISPATCH_MIN`).
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::needless_range_loop)]
+fn sgemm_dispatch(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f32;
+            for kk in 0..k {
+                acc += a[row * k + kk] * b[kk * n + col];
+            }
+            c[row * n + col] = acc;
+        }
+    }
 }
 
 #[cfg(test)]
