@@ -247,28 +247,73 @@ fn layer_norm_forward_f32_fused(
 
     let inv_d = 1.0_f32 / (d as f32);
 
-    // Inner row kernel — extracted into a closure so we can route
-    // it through rayon for big batches.
+    // T29 — explicit NEON intrinsics row kernel. The naive
+    // auto-vectorised loop bottlenecked at ~1.2 GB/s effective vs
+    // PyTorch's ~2 GB/s on the same shape; manual `vld1q_f32` /
+    // `vfmaq_f32` chains give LLVM the right register pressure and
+    // unrolling hints. Falls back to scalar on non-aarch64.
     let process_row = |x_row: &[f32], out_row: &mut [f32]| {
-        // Pass 1: row mean & second moment.
-        let mut sum = 0.0_f32;
-        let mut sum_sq = 0.0_f32;
-        for &v in x_row.iter() {
-            sum += v;
-            sum_sq += v * v;
-        }
-        let mean = sum * inv_d;
-        // var = E[x²] - E[x]²; clamped to 0 to absorb floating-point
-        // noise on near-constant rows where the two terms cancel
-        // below ulp.
-        let var = (sum_sq * inv_d - mean * mean).max(0.0);
-        let inv_std = 1.0 / (var + eps).sqrt();
+        #[cfg(target_arch = "aarch64")]
+        {
+            use core::arch::aarch64::*;
+            // Pass 1 — accumulate sum and sum_sq via 4-lane NEON.
+            unsafe {
+                let mut sum_v = vdupq_n_f32(0.0);
+                let mut sum_sq_v = vdupq_n_f32(0.0);
+                let chunks = d / 4;
+                let tail_start = chunks * 4;
+                for i in 0..chunks {
+                    let v = vld1q_f32(x_row.as_ptr().add(i * 4));
+                    sum_v = vaddq_f32(sum_v, v);
+                    sum_sq_v = vfmaq_f32(sum_sq_v, v, v);
+                }
+                let mut sum = vaddvq_f32(sum_v);
+                let mut sum_sq = vaddvq_f32(sum_sq_v);
+                for &v in x_row[tail_start..].iter() {
+                    sum += v;
+                    sum_sq += v * v;
+                }
 
-        // Pass 2: normalise + scale + bias. LLVM lowers this to a
-        // tight `fmadd.4s` loop over 4-element NEON lanes (or AVX2
-        // FMA on x86_64 with target-cpu=native).
-        for i in 0..d {
-            out_row[i] = (x_row[i] - mean) * inv_std * g_slice[i] + b_slice[i];
+                let mean = sum * inv_d;
+                let var = (sum_sq * inv_d - mean * mean).max(0.0);
+                let inv_std = 1.0 / (var + eps).sqrt();
+
+                // Pass 2 — normalise + scale + bias via 2 fmaq per
+                // 4-lane chunk:
+                //   z = (x - mean) * inv_std         (one vmla per chunk)
+                //   y = z * gamma + beta             (one vfma per chunk)
+                let neg_mean_inv_std = vdupq_n_f32(-mean * inv_std);
+                let inv_std_v = vdupq_n_f32(inv_std);
+                for i in 0..chunks {
+                    let x = vld1q_f32(x_row.as_ptr().add(i * 4));
+                    // z = x * inv_std + (-mean * inv_std) =
+                    //     (x - mean) * inv_std
+                    let z = vfmaq_f32(neg_mean_inv_std, x, inv_std_v);
+                    let g = vld1q_f32(g_slice.as_ptr().add(i * 4));
+                    let b = vld1q_f32(b_slice.as_ptr().add(i * 4));
+                    // y = z * gamma + beta
+                    let y = vfmaq_f32(b, z, g);
+                    vst1q_f32(out_row.as_mut_ptr().add(i * 4), y);
+                }
+                for i in tail_start..d {
+                    out_row[i] = (x_row[i] - mean) * inv_std * g_slice[i] + b_slice[i];
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut sum = 0.0_f32;
+            let mut sum_sq = 0.0_f32;
+            for &v in x_row.iter() {
+                sum += v;
+                sum_sq += v * v;
+            }
+            let mean = sum * inv_d;
+            let var = (sum_sq * inv_d - mean * mean).max(0.0);
+            let inv_std = 1.0 / (var + eps).sqrt();
+            for i in 0..d {
+                out_row[i] = (x_row[i] - mean) * inv_std * g_slice[i] + b_slice[i];
+            }
         }
     };
 
@@ -322,17 +367,51 @@ fn rms_norm_forward_f32_fused(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Te
     let mut out_data = vec![0.0_f32; n];
     let inv_d = 1.0_f32 / (d as f32);
 
+    // T29 — NEON intrinsics row kernel (same pattern as LayerNorm).
     let process_row = |x_row: &[f32], out_row: &mut [f32]| {
-        // Single pass for the second moment; then a vectorisable
-        // pass for the normalise + scale.
-        let mut sum_sq = 0.0_f32;
-        for &v in x_row.iter() {
-            sum_sq += v * v;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use core::arch::aarch64::*;
+            unsafe {
+                let mut sum_sq_v = vdupq_n_f32(0.0);
+                let chunks = d / 4;
+                let tail_start = chunks * 4;
+                for i in 0..chunks {
+                    let v = vld1q_f32(x_row.as_ptr().add(i * 4));
+                    sum_sq_v = vfmaq_f32(sum_sq_v, v, v);
+                }
+                let mut sum_sq = vaddvq_f32(sum_sq_v);
+                for &v in x_row[tail_start..].iter() {
+                    sum_sq += v * v;
+                }
+                let mean_sq = sum_sq * inv_d;
+                let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+                let inv_rms_v = vdupq_n_f32(inv_rms);
+                let zero = vdupq_n_f32(0.0);
+                for i in 0..chunks {
+                    let x = vld1q_f32(x_row.as_ptr().add(i * 4));
+                    let g = vld1q_f32(g_slice.as_ptr().add(i * 4));
+                    // y = x * inv_rms * gamma, expressed as fma(0, x*inv_rms, gamma)
+                    let z = vmulq_f32(x, inv_rms_v);
+                    let y = vfmaq_f32(zero, z, g);
+                    vst1q_f32(out_row.as_mut_ptr().add(i * 4), y);
+                }
+                for i in tail_start..d {
+                    out_row[i] = x_row[i] * inv_rms * g_slice[i];
+                }
+            }
         }
-        let mean_sq = sum_sq * inv_d;
-        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
-        for i in 0..d {
-            out_row[i] = x_row[i] * inv_rms * g_slice[i];
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut sum_sq = 0.0_f32;
+            for &v in x_row.iter() {
+                sum_sq += v * v;
+            }
+            let mean_sq = sum_sq * inv_d;
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            for i in 0..d {
+                out_row[i] = x_row[i] * inv_rms * g_slice[i];
+            }
         }
     };
 
