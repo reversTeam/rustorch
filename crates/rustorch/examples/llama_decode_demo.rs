@@ -29,6 +29,74 @@ use std::time::Instant;
 // scalar 3-loop kernel at L1d-resident speed (~13 µs), while
 // cblas_sgemv takes ~20 µs (FFI dispatch overhead). Reverted.
 
+/// T52 — custom row-major friendly sgemv for M=1.
+///
+/// The default `fused_matmul_bias_activation` scalar kernel is
+///   for col in 0..N: for k in 0..K: acc += x[k] * W[k*N + col]
+/// — which strides W by `N` on every inner iteration, defeating
+/// the L1d prefetcher (256 KB weight, 256 cols × 256 k accesses
+/// each ~1 cache line apart in DRAM).
+///
+/// This kernel rotates the loop order to outer-k / inner-n:
+///   y.fill(0); for k in 0..K: for n in 0..N: y[n] += x[k] * W[k*N + n]
+/// Each k iteration scans `W[k*N..(k+1)*N]` *contiguously*,
+/// streaming the weight matrix exactly once and letting LLVM
+/// emit `fmla.4s` over the inner `n` loop. Brings DRAM bandwidth
+/// utilisation close to peak.
+#[inline(always)]
+fn sgemv_m1_rowmajor(x: &[f32], w: &[f32], y: &mut [f32], k: usize, n: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(w.len(), k * n);
+    debug_assert_eq!(y.len(), n);
+    y.fill(0.0);
+    for kk in 0..k {
+        let xk = x[kk];
+        let w_row = &w[kk * n..(kk + 1) * n];
+        for nn in 0..n {
+            y[nn] += xk * w_row[nn];
+        }
+    }
+}
+
+/// T52 — sgemv with fused ReLU epilogue (for FC1).
+#[inline(always)]
+fn sgemv_m1_rowmajor_relu(x: &[f32], w: &[f32], y: &mut [f32], k: usize, n: usize) {
+    sgemv_m1_rowmajor(x, w, y, k, n);
+    for v in y.iter_mut() {
+        if *v < 0.0 {
+            *v = 0.0;
+        }
+    }
+}
+
+/// T53 — hybrid sgemv dispatcher. The custom row-major kernel is
+/// optimal for small shapes (Q/K/V/O proj where K=N=256 fits L2),
+/// but loses to cBLAS sgemv on larger shapes (FFN K=256 N=1024,
+/// LM head K=256 N=4096) where the BLAS micro-kernel is ~10×
+/// faster. Threshold 200 K FLOPs (= roughly the FFN crossover on
+/// M-series).
+#[inline]
+fn sgemv_m1_dispatch(
+    x: &[f32],
+    w: &[f32],
+    y: &mut [f32],
+    k: usize,
+    n: usize,
+    activation: Activation,
+) {
+    let flops = k * n;
+    if flops >= 200_000 {
+        // Large path: route to cBLAS via the fused dispatcher.
+        fused_matmul_bias_activation(x, w, None, y, 1, k, n, activation).unwrap();
+    } else {
+        // Small path: row-major sgemv kernel.
+        match activation {
+            Activation::Relu => sgemv_m1_rowmajor_relu(x, w, y, k, n),
+            _ => sgemv_m1_rowmajor(x, w, y, k, n),
+        }
+    }
+}
+
 // Mini-Llama config.
 const NUM_LAYERS: usize = 4;
 const D_MODEL: usize = 256;
@@ -187,21 +255,17 @@ fn decode_step_raw(
         scratch.h.copy_from_slice(&scratch.x);
         rms_norm_inplace(&mut scratch.h, &block.rms_attn);
 
-        // 2. T49 — fused Q/K/V projection: one sgemm produces
-        //    `[D + 2*KV_DIM]` concatenated outputs, saving 2 cBLAS
-        //    FFI calls + improving cache locality on the weight
-        //    matrix (single contiguous load instead of three).
-        fused_matmul_bias_activation(
+        // 2. T52 — fused Q/K/V projection via the row-major sgemv
+        //    kernel. One contiguous scan over W_QKV (D × QKV_DIM
+        //    = 384 KB) at peak DRAM bandwidth.
+        sgemv_m1_dispatch(
             &scratch.h,
             &block.w_qkv,
-            None,
             &mut scratch.qkv,
-            1,
             D_MODEL,
             QKV_DIM,
             Activation::None,
-        )
-        .unwrap();
+        );
         // Split scratch.qkv into Q [D], K [KV_DIM], V [KV_DIM].
         let (q_slice, kv_slice) = scratch.qkv.split_at_mut(D_MODEL);
         let (k_slice, v_slice) = kv_slice.split_at_mut(KV_DIM);
@@ -245,48 +309,38 @@ fn decode_step_raw(
         )
         .unwrap();
 
-        // 7. O proj + residual add.
-        fused_matmul_bias_activation(
+        // 7. O proj + residual add (T53 hybrid sgemv).
+        sgemv_m1_dispatch(
             &scratch.attn_out,
             &block.w_o,
-            None,
             &mut scratch.o_out,
-            1,
             D_MODEL,
             D_MODEL,
             Activation::None,
-        )
-        .unwrap();
+        );
         for d in 0..D_MODEL {
             scratch.x[d] += scratch.o_out[d];
         }
 
-        // 8. RMSNorm + FFN (linear+relu+linear) + residual. Keep
-        //    fused for fc1 since it folds the ReLU; raw for fc2.
+        // 8. RMSNorm + FFN (linear+relu+linear) + residual.
         scratch.h.copy_from_slice(&scratch.x);
         rms_norm_inplace(&mut scratch.h, &block.rms_ffn);
-        fused_matmul_bias_activation(
+        sgemv_m1_dispatch(
             &scratch.h,
             &block.w_fc1,
-            None,
             &mut scratch.fc1_out,
-            1,
             D_MODEL,
             D_FF,
             Activation::Relu,
-        )
-        .unwrap();
-        fused_matmul_bias_activation(
+        );
+        sgemv_m1_dispatch(
             &scratch.fc1_out,
             &block.w_fc2,
-            None,
             &mut scratch.fc2_out,
-            1,
             D_FF,
             D_MODEL,
             Activation::None,
-        )
-        .unwrap();
+        );
         for d in 0..D_MODEL {
             scratch.x[d] += scratch.fc2_out[d];
         }
@@ -295,17 +349,14 @@ fn decode_step_raw(
     // 9. Final RMSNorm + LM head.
     scratch.h.copy_from_slice(&scratch.x);
     rms_norm_inplace(&mut scratch.h, final_ln_w);
-    fused_matmul_bias_activation(
+    sgemv_m1_dispatch(
         &scratch.h,
         lm_head_w,
-        None,
         &mut scratch.logits,
-        1,
         D_MODEL,
         VOCAB,
         Activation::None,
-    )
-    .unwrap();
+    );
 }
 
 fn main() {
@@ -466,17 +517,14 @@ fn main() {
             let t = Instant::now();
             profile_scratch.h.copy_from_slice(&profile_scratch.x);
             rms_norm_inplace(&mut profile_scratch.h, &block.rms_attn);
-            fused_matmul_bias_activation(
+            sgemv_m1_dispatch(
                 &profile_scratch.h,
                 &block.w_qkv,
-                None,
                 &mut profile_scratch.qkv,
-                1,
                 D_MODEL,
                 QKV_DIM,
                 Activation::None,
-            )
-            .unwrap();
+            );
             stage_us[1] += t.elapsed().as_nanos();
             let t = Instant::now();
             let (q_slice, kv_slice) = profile_scratch.qkv.split_at_mut(D_MODEL);
@@ -515,17 +563,14 @@ fn main() {
             .unwrap();
             stage_us[3] += t.elapsed().as_nanos();
             let t = Instant::now();
-            fused_matmul_bias_activation(
+            sgemv_m1_dispatch(
                 &profile_scratch.attn_out,
                 &block.w_o,
-                None,
                 &mut profile_scratch.o_out,
-                1,
                 D_MODEL,
                 D_MODEL,
                 Activation::None,
-            )
-            .unwrap();
+            );
             for d in 0..D_MODEL {
                 profile_scratch.x[d] += profile_scratch.o_out[d];
             }
@@ -533,28 +578,22 @@ fn main() {
             let t = Instant::now();
             profile_scratch.h.copy_from_slice(&profile_scratch.x);
             rms_norm_inplace(&mut profile_scratch.h, &block.rms_ffn);
-            fused_matmul_bias_activation(
+            sgemv_m1_dispatch(
                 &profile_scratch.h,
                 &block.w_fc1,
-                None,
                 &mut profile_scratch.fc1_out,
-                1,
                 D_MODEL,
                 D_FF,
                 Activation::Relu,
-            )
-            .unwrap();
-            fused_matmul_bias_activation(
+            );
+            sgemv_m1_dispatch(
                 &profile_scratch.fc1_out,
                 &block.w_fc2,
-                None,
                 &mut profile_scratch.fc2_out,
-                1,
                 D_FF,
                 D_MODEL,
                 Activation::None,
-            )
-            .unwrap();
+            );
             for d in 0..D_MODEL {
                 profile_scratch.x[d] += profile_scratch.fc2_out[d];
             }
@@ -563,17 +602,14 @@ fn main() {
         let t = Instant::now();
         profile_scratch.h.copy_from_slice(&profile_scratch.x);
         rms_norm_inplace(&mut profile_scratch.h, &final_ln_w);
-        fused_matmul_bias_activation(
+        sgemv_m1_dispatch(
             &profile_scratch.h,
             &lm_head_w,
-            None,
             &mut profile_scratch.logits,
-            1,
             D_MODEL,
             VOCAB,
             Activation::None,
-        )
-        .unwrap();
+        );
         stage_us[6] += t.elapsed().as_nanos();
         total_us += t_total.elapsed().as_micros();
     }
