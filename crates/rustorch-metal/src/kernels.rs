@@ -2436,6 +2436,162 @@ pub fn sgemv_q4_k_f32(
 }
 
 // =============================================================================
+// LLM building-block kernels (RMSNorm, SwiGLU, in-place add) — small but
+// reused 3-6 times per layer in `rustorch-llm`. Chaining these on the GPU
+// instead of the CPU eliminates the CPU<->GPU sync points between matmul
+// calls, which is the dominant overhead in T74's MVP wiring.
+// =============================================================================
+
+const RMS_NORM_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// One simdgroup (32 threads) cooperates on one row of x[d]. Each thread
+// stride-loops over k=tid..d step 32, accumulates squared values into a
+// per-thread partial sum, then we use simd_sum to reduce to a single
+// scalar replicated across the simdgroup. Each thread then writes its
+// stride of normalised+scaled values.
+kernel void rms_norm_f32(
+    device const float* x     [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    device float* y           [[buffer(2)]],
+    constant uint& d          [[buffer(3)]],
+    constant float& eps       [[buffer(4)]],
+    uint tid                  [[thread_position_in_threadgroup]],
+    uint sg_size              [[threads_per_simdgroup]]
+) {
+    float partial = 0.0;
+    for (uint i = tid; i < d; i += sg_size) {
+        float v = x[i];
+        partial += v * v;
+    }
+    float total = simd_sum(partial);
+    float inv_rms = 1.0 / sqrt(total / float(d) + eps);
+    for (uint i = tid; i < d; i += sg_size) {
+        y[i] = x[i] * inv_rms * gamma[i];
+    }
+}
+"#;
+
+/// Single-row RMSNorm on Metal. Dispatch is one simdgroup (32 threads),
+/// stride-looped across `d`. Output written into `y_buf` (caller-allocated).
+pub fn rms_norm_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    gamma_buf: &Buffer,
+    y_buf: &Buffer,
+    d: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline("rms_norm_f32", RMS_NORM_F32_SHADER, "rms_norm_f32")?;
+    let d_buf = backend.alloc_shared(4)?;
+    let eps_buf = backend.alloc_shared(4)?;
+    unsafe {
+        *(d_buf.contents() as *mut u32) = d as u32;
+        *(eps_buf.contents() as *mut f32) = eps;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(gamma_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_buffer(3, Some(&d_buf), 0);
+        encoder.set_buffer(4, Some(&eps_buf), 0);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+const SWIGLU_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Element-wise SwiGLU: y[i] = silu(gate[i]) * up[i] where
+// silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
+kernel void swiglu_f32(
+    device const float* gate [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    device float* y          [[buffer(2)]],
+    constant uint& f         [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= f) return;
+    float g = gate[gid];
+    float s = g / (1.0 + exp(-g));
+    y[gid] = s * up[gid];
+}
+"#;
+
+/// In-place SwiGLU: writes `silu(gate) * up` into `y_buf`.
+pub fn swiglu_f32(
+    backend: &MetalBackend,
+    gate_buf: &Buffer,
+    up_buf: &Buffer,
+    y_buf: &Buffer,
+    f: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline("swiglu_f32", SWIGLU_F32_SHADER, "swiglu_f32")?;
+    let f_buf = backend.alloc_shared(4)?;
+    unsafe {
+        *(f_buf.contents() as *mut u32) = f as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(gate_buf), 0);
+        encoder.set_buffer(1, Some(up_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_buffer(3, Some(&f_buf), 0);
+        let tg_size = MTLSize::new(256, 1, 1);
+        let grid = MTLSize::new(f as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+const ADD_INPLACE_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// In-place residual add: x[i] += y[i].
+kernel void add_inplace_f32(
+    device float* x       [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    constant uint& d      [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= d) return;
+    x[gid] += y[gid];
+}
+"#;
+
+/// `x_buf += y_buf` element-wise on Metal.
+pub fn add_inplace_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    y_buf: &Buffer,
+    d: usize,
+) -> Result<(), MetalError> {
+    let pipeline =
+        backend.pipeline("add_inplace_f32", ADD_INPLACE_F32_SHADER, "add_inplace_f32")?;
+    let d_buf = backend.alloc_shared(4)?;
+    unsafe {
+        *(d_buf.contents() as *mut u32) = d as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(y_buf), 0);
+        encoder.set_buffer(2, Some(&d_buf), 0);
+        let tg_size = MTLSize::new(256, 1, 1);
+        let grid = MTLSize::new(d as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // sgemv_q6_k_f32 — direct Q6_K sgemv on Metal. Same fused-dequant-on-the-fly
 // pattern as sgemv_q4_k_f32 but for Q6_K weights (6-bit, 256 weights / 210
 // bytes). Used by `rustorch-llm` for `down_proj` and `lm_head` in Q4_K_M

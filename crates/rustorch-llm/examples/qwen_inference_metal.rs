@@ -17,6 +17,9 @@
 //!       --n 50
 
 #![cfg(target_os = "macos")]
+#![allow(dead_code)] // some scratch buffers are kept around for the
+                     // CPU fallback path that's swapped in/out across
+                     // commits as we port more ops to Metal kernels.
 
 use std::env;
 use std::process::ExitCode;
@@ -25,7 +28,9 @@ use std::time::Instant;
 use rustorch_gguf::{GgmlType, GgufFile};
 use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
-use rustorch_metal::kernels::{sgemv_q4_k_f32_into, sgemv_q6_k_f32_into};
+use rustorch_metal::kernels::{
+    add_inplace_f32, rms_norm_f32, sgemv_q4_k_f32_into, sgemv_q6_k_f32_into, swiglu_f32,
+};
 
 use metal::Buffer;
 
@@ -56,12 +61,14 @@ impl MetalWeight {
 }
 
 struct LayerWeights {
-    attn_norm: Vec<f32>, // [d]
+    attn_norm: Vec<f32>,   // [d] CPU copy (for QK norm fallback)
+    attn_norm_buf: Buffer, // GPU copy
     w_q: MetalWeight,
     w_k: MetalWeight,
     w_v: MetalWeight,
     w_o: MetalWeight,
     ffn_norm: Vec<f32>,
+    ffn_norm_buf: Buffer,
     w_gate: MetalWeight,
     w_up: MetalWeight,
     w_down: MetalWeight,
@@ -74,6 +81,7 @@ struct ModelMetal {
     layers: Vec<LayerWeights>,
     token_emb: Vec<f32>, // [V, D] — kept f32 for cheap lookup
     final_norm: Vec<f32>,
+    final_norm_buf: Buffer,
     lm_head: MetalWeight, // Q6_K usually
     rope: RoPE,
 }
@@ -174,33 +182,37 @@ fn forward_token(
     let n_kv = cfg.n_kv_heads;
     let head_dim = cfg.head_dim;
 
-    // Embed (CPU lookup).
+    // Embed (CPU lookup, written into x_buf as residual stream).
     let off = (token_id as usize) * d;
     scratch.x.copy_from_slice(&model.token_emb[off..off + d]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(scratch.x.as_ptr(), scratch.xd_buf.contents() as *mut f32, d);
+    }
 
     for (li, layer) in model.layers.iter().enumerate() {
-        // 1. RMSNorm (CPU).
-        scratch.h.copy_from_slice(&scratch.x);
-        rms_norm(&mut scratch.h, &layer.attn_norm, cfg.rms_eps);
+        // 1. RMSNorm GPU (no sync — chained to next matmul).
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.attn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
 
-        // 2. Q / K / V via Metal (3 separate sgemv since they're not fused
-        //    in this MVP — fusion can come later).
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.h.as_ptr(),
-                scratch.xd_buf.contents() as *mut f32,
-                d,
-            );
-        }
+        // 2. Q / K / V via Metal (3 separate sgemv).
         layer
             .w_q
-            .matmul_into(backend, &scratch.xd_buf, &scratch.q_buf);
+            .matmul_into(backend, &scratch.h_buf, &scratch.q_buf);
         layer
             .w_k
-            .matmul_into(backend, &scratch.xd_buf, &scratch.k_buf);
+            .matmul_into(backend, &scratch.h_buf, &scratch.k_buf);
         layer
             .w_v
-            .matmul_into(backend, &scratch.xd_buf, &scratch.v_buf);
+            .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        // We need Q/K/V on CPU for RoPE+GQA, so drain here is unavoidable
+        // until we port RoPE+GQA to Metal too.
         backend.drain();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -267,104 +279,66 @@ fn forward_token(
         )
         .unwrap();
 
-        // 6. O proj via Metal + residual (CPU).
+        // 6+7+8+9: O proj → residual_add → RMSNorm → gate/up → SwiGLU →
+        // down → residual_add. ALL GPU, chained without drain in between.
+        // The residual stream lives in xd_buf; CPU only sees it again at
+        // the next iteration's top of layer (which we don't actually need
+        // — the next iteration's first op is RMSNorm which reads xd_buf).
+        // Net: 1 drain per layer (after Q/K/V for RoPE/GQA) instead of 4.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 scratch.attn_out.as_ptr(),
-                scratch.xd_buf.contents() as *mut f32,
+                scratch.h_buf.contents() as *mut f32,
                 d,
             );
         }
         layer
             .w_o
-            .matmul_into(backend, &scratch.xd_buf, &scratch.o_buf);
-        backend.drain();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.o_buf.contents() as *const f32,
-                scratch.o_out.as_mut_ptr(),
-                d,
-            );
-        }
-        for i in 0..d {
-            scratch.x[i] += scratch.o_out[i];
-        }
-
-        // 7. RMSNorm + gate, up via Metal (CPU norm).
-        scratch.h.copy_from_slice(&scratch.x);
-        rms_norm(&mut scratch.h, &layer.ffn_norm, cfg.rms_eps);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.h.as_ptr(),
-                scratch.xd_buf.contents() as *mut f32,
-                d,
-            );
-        }
+            .matmul_into(backend, &scratch.h_buf, &scratch.o_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.o_buf, d).unwrap();
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.ffn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
         layer
             .w_gate
-            .matmul_into(backend, &scratch.xd_buf, &scratch.gate_buf);
+            .matmul_into(backend, &scratch.h_buf, &scratch.gate_buf);
         layer
             .w_up
-            .matmul_into(backend, &scratch.xd_buf, &scratch.up_buf);
-        backend.drain();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.gate_buf.contents() as *const f32,
-                scratch.gate_out.as_mut_ptr(),
-                f,
-            );
-            std::ptr::copy_nonoverlapping(
-                scratch.up_buf.contents() as *const f32,
-                scratch.up_out.as_mut_ptr(),
-                f,
-            );
-        }
-
-        // 8. SwiGLU (CPU).
-        for i in 0..f {
-            let g = scratch.gate_out[i];
-            let s = g / (1.0 + (-g).exp());
-            scratch.gate_out[i] = s * scratch.up_out[i];
-        }
-
-        // 9. Down proj via Metal + residual (uses persistent fd_buf, no
-        //    per-layer alloc — was the biggest single cost in MVP).
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.gate_out.as_ptr(),
-                scratch.fd_buf.contents() as *mut f32,
-                f,
-            );
-        }
+            .matmul_into(backend, &scratch.h_buf, &scratch.up_buf);
+        swiglu_f32(
+            backend,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            &scratch.fd_buf,
+            f,
+        )
+        .unwrap();
         layer
             .w_down
             .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
-        backend.drain();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.fc2_buf.contents() as *const f32,
-                scratch.fc2_out.as_mut_ptr(),
-                d,
-            );
-        }
-        for i in 0..d {
-            scratch.x[i] += scratch.fc2_out[i];
-        }
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
     }
 
-    // Final RMSNorm + LM head.
-    scratch.h.copy_from_slice(&scratch.x);
-    rms_norm(&mut scratch.h, &model.final_norm, cfg.rms_eps);
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            scratch.h.as_ptr(),
-            scratch.xd_buf.contents() as *mut f32,
-            cfg.d,
-        );
-    }
+    // Final RMSNorm GPU + LM head GPU. Residual stream is in xd_buf;
+    // we run RMSNorm into h_buf, then lm_head into logits_buf.
+    rms_norm_f32(
+        backend,
+        &scratch.xd_buf,
+        &model.final_norm_buf,
+        &scratch.h_buf,
+        cfg.d,
+        cfg.rms_eps,
+    )
+    .unwrap();
     model
         .lm_head
-        .matmul_into(backend, &scratch.xd_buf, &scratch.logits_buf);
+        .matmul_into(backend, &scratch.h_buf, &scratch.logits_buf);
     backend.drain();
     let mut logits = vec![0.0_f32; cfg.vocab];
     unsafe {
@@ -393,7 +367,8 @@ struct Scratch {
     // Persistent GPU buffers — pre-allocated once, reused every layer
     // every token. Eliminates the per-call MTLBuffer alloc cost
     // (~10-50µs each) which was 6 allocs × 40 layers = 240/token.
-    xd_buf: Buffer,     // d-sized input (residual / norm output)
+    xd_buf: Buffer,     // d-sized residual stream (lives across all layers)
+    h_buf: Buffer,      // d-sized norm output / matmul input
     fd_buf: Buffer,     // f-sized input (swiglu output → down)
     q_buf: Buffer,      // d-sized Q output
     k_buf: Buffer,      // kv_dim-sized K output
@@ -425,6 +400,7 @@ impl Scratch {
             k_trim: vec![0.0; max_kv],
             v_trim: vec![0.0; max_kv],
             xd_buf: backend.alloc_shared(d * 4).unwrap(),
+            h_buf: backend.alloc_shared(d * 4).unwrap(),
             fd_buf: backend.alloc_shared(f * 4).unwrap(),
             q_buf: backend.alloc_shared(d * 4).unwrap(),
             k_buf: backend.alloc_shared(kv_dim * 4).unwrap(),
@@ -477,6 +453,7 @@ fn load_model(backend: &MetalBackend, path: &str, max_seq: usize) -> ModelMetal 
 
     let token_emb = load_f32(&file, "token_embd.weight");
     let final_norm = load_f32(&file, "output_norm.weight");
+    let final_norm_buf = alloc_metal_from_bytes(backend, bytemuck_cast(&final_norm));
     let lm_head_name = if file.tensor("output.weight").is_some() {
         "output.weight"
     } else {
@@ -487,13 +464,19 @@ fn load_model(backend: &MetalBackend, path: &str, max_seq: usize) -> ModelMetal 
     let t_load = Instant::now();
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
+        let attn_norm = load_f32(&file, &format!("blk.{i}.attn_norm.weight"));
+        let ffn_norm = load_f32(&file, &format!("blk.{i}.ffn_norm.weight"));
+        let attn_norm_buf = alloc_metal_from_bytes(backend, bytemuck_cast(&attn_norm));
+        let ffn_norm_buf = alloc_metal_from_bytes(backend, bytemuck_cast(&ffn_norm));
         let layer = LayerWeights {
-            attn_norm: load_f32(&file, &format!("blk.{i}.attn_norm.weight")),
+            attn_norm,
+            attn_norm_buf,
             w_q: load_metal_weight(backend, &file, &format!("blk.{i}.attn_q.weight")),
             w_k: load_metal_weight(backend, &file, &format!("blk.{i}.attn_k.weight")),
             w_v: load_metal_weight(backend, &file, &format!("blk.{i}.attn_v.weight")),
             w_o: load_metal_weight(backend, &file, &format!("blk.{i}.attn_output.weight")),
-            ffn_norm: load_f32(&file, &format!("blk.{i}.ffn_norm.weight")),
+            ffn_norm,
+            ffn_norm_buf,
             w_gate: load_metal_weight(backend, &file, &format!("blk.{i}.ffn_gate.weight")),
             w_up: load_metal_weight(backend, &file, &format!("blk.{i}.ffn_up.weight")),
             w_down: load_metal_weight(backend, &file, &format!("blk.{i}.ffn_down.weight")),
@@ -518,9 +501,15 @@ fn load_model(backend: &MetalBackend, path: &str, max_seq: usize) -> ModelMetal 
         layers,
         token_emb,
         final_norm,
+        final_norm_buf,
         lm_head,
         rope,
     }
+}
+
+/// Reinterpret a `&[f32]` as a `&[u8]` for upload into a shared MTLBuffer.
+fn bytemuck_cast(v: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 fn main() -> ExitCode {
