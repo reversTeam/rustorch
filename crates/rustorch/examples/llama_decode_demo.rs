@@ -97,20 +97,31 @@ fn sgemv_m1_dispatch(
     }
 }
 
-// Mini-Llama config.
+// Llama-7B-style config (reduced layer count to fit demo time
+// budget on M4 Max). T54 — validate that the per-step speedup
+// holds at production-scale dimensions.
+//
+// Real Llama-3-8B: D=4096, H=32, KV=8, F=14336, V=128256, L=32.
+// Real Qwen2.5-7B: D=3584, H=28, KV=4, F=18944, V=152064, L=28.
+//
+// We use D=4096 / H=32 / KV=8 / F=11008 (Llama-2-7B FFN) /
+// V=32000 / L=4 to keep the demo's runtime tractable while
+// stressing the same kernel hot path that Qwen 32B will exercise
+// in production (large Q/K/V/O proj → cBLAS, large FFN/LM head →
+// also cBLAS).
 const NUM_LAYERS: usize = 4;
-const D_MODEL: usize = 256;
-const N_HEADS: usize = 8;
-const N_KV_HEADS: usize = 2; // 4-to-1 GQA ratio (Qwen-style)
-const HEAD_DIM: usize = D_MODEL / N_HEADS; // 32
-const KV_DIM: usize = N_KV_HEADS * HEAD_DIM; // 64
-const D_FF: usize = 1024;
-const VOCAB: usize = 4096;
+const D_MODEL: usize = 4096;
+const N_HEADS: usize = 32;
+const N_KV_HEADS: usize = 8; // 4-to-1 GQA ratio (Llama 3 / Qwen)
+const HEAD_DIM: usize = D_MODEL / N_HEADS; // 128
+const KV_DIM: usize = N_KV_HEADS * HEAD_DIM; // 1024
+const D_FF: usize = 11008;
+const VOCAB: usize = 32000;
 const MAX_SEQ: usize = 128;
 const RMS_EPS: f32 = 1e-6;
 
-const PROMPT_LEN: usize = 16;
-const MAX_NEW_TOKENS: usize = 64;
+const PROMPT_LEN: usize = 8;
+const MAX_NEW_TOKENS: usize = 16;
 
 /// Per-block weights stored as raw f32 buffers — no Tensor/Variable
 /// wrap. T49: Q/K/V projections are merged into a single
