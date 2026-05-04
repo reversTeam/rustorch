@@ -665,6 +665,122 @@ pub fn transpose2d_f32(
     Ok(out)
 }
 
+/// **Thread-coarsened multi-simdgroup matmul** — each simdgroup
+/// computes 4 output 8×8 tiles in the N direction, sharing the same
+/// 8×K row of A across the 4 operations. The load-once / use-many
+/// pattern increases compute-to-memory ratio by 4× vs the single-tile
+/// kernel, making it the highest-throughput f32 matmul we have.
+///
+/// Layout
+/// - Workgroup: 8 simdgroups × 32 threads = 256 threads
+/// - Per simdgroup: 4 output tiles in N, each 8×8 → 8×32 region
+/// - Workgroup output tile: 8 rows × (8 sg × 32) = 8×256
+/// - Constraints: M divisible by 8, K divisible by 8, N divisible by 256
+const MATMUL_SIMDGROUP_F32_COARSENED_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint COL_PER_SG = 4u;  // 4 output 8×8 tiles per simdgroup in N direction
+
+kernel void matmul_simdgroup_f32_coarsened(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device       float* c       [[buffer(2)]],
+    constant     uint3& dims    [[buffer(3)]],
+    uint2 tg_pos                [[threadgroup_position_in_grid]],
+    uint  sg_idx                [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint K = dims.y;
+    uint N = dims.z;
+
+    // Workgroup arrangement: 8 sg in N direction, each sg covering
+    // 4 × 8 = 32 cols. Workgroup col base = tg_pos.x * 256.
+    uint row_tile = tg_pos.y * 8u;
+    uint col_base = tg_pos.x * 256u + sg_idx * 32u;
+    if (row_tile >= M || col_base >= N) { return; }
+
+    simdgroup_matrix<float, 8, 8> mat_a;
+    simdgroup_matrix<float, 8, 8> mat_b0;
+    simdgroup_matrix<float, 8, 8> mat_b1;
+    simdgroup_matrix<float, 8, 8> mat_b2;
+    simdgroup_matrix<float, 8, 8> mat_b3;
+    simdgroup_matrix<float, 8, 8> mat_c0 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c1 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c2 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c3 = simdgroup_matrix<float, 8, 8>(0);
+
+    for (uint k = 0u; k < K; k += 8u) {
+        // ONE load of mat_a per K-iter, reused 4× across the 4 fma's.
+        simdgroup_load(mat_a, a + row_tile * K + k, K);
+        // Four mat_b tiles spanning [col_base, col_base + 32).
+        simdgroup_load(mat_b0, b + k * N + col_base + 0u, N);
+        simdgroup_load(mat_b1, b + k * N + col_base + 8u, N);
+        simdgroup_load(mat_b2, b + k * N + col_base + 16u, N);
+        simdgroup_load(mat_b3, b + k * N + col_base + 24u, N);
+        simdgroup_multiply_accumulate(mat_c0, mat_a, mat_b0, mat_c0);
+        simdgroup_multiply_accumulate(mat_c1, mat_a, mat_b1, mat_c1);
+        simdgroup_multiply_accumulate(mat_c2, mat_a, mat_b2, mat_c2);
+        simdgroup_multiply_accumulate(mat_c3, mat_a, mat_b3, mat_c3);
+    }
+
+    simdgroup_store(mat_c0, c + row_tile * N + col_base + 0u, N);
+    simdgroup_store(mat_c1, c + row_tile * N + col_base + 8u, N);
+    simdgroup_store(mat_c2, c + row_tile * N + col_base + 16u, N);
+    simdgroup_store(mat_c3, c + row_tile * N + col_base + 24u, N);
+}
+"#;
+
+/// `C = A @ B` via the thread-coarsened matmul kernel. Highest f32
+/// throughput; requires `m%8==0`, `k%8==0`, `n%256==0`.
+pub fn matmul_simdgroup_f32_coarsened(
+    backend: &MetalBackend,
+    a: &Buffer,
+    b: &Buffer,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "matmul_simdgroup_f32_coarsened needs Metal3".to_string(),
+        ));
+    }
+    if m % 8 != 0 || k % 8 != 0 || n % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "matmul_simdgroup_f32_coarsened needs m%8==0, k%8==0, n%256==0: got m={m}, k={k}, n={n}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "matmul_simdgroup_f32_coarsened",
+        MATMUL_SIMDGROUP_F32_COARSENED_SHADER,
+        "matmul_simdgroup_f32_coarsened",
+    )?;
+    let out = backend.alloc_shared(m * n * 4)?;
+    let dims_buf = backend.alloc_shared(16)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = m as u32;
+        *p.add(1) = k as u32;
+        *p.add(2) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a), 0);
+        encoder.set_buffer(1, Some(b), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let tg = MTLSize::new(256, 1, 1);
+        let n_tiles_x = (n / 256) as u64;
+        let n_tiles_y = (m / 8) as u64;
+        let grid = MTLSize::new(n_tiles_x * 256, n_tiles_y, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(out)
+}
+
 /// **bf16 multi-simdgroup matmul** — uses
 /// `simdgroup_matrix<bfloat, 8, 8>` (Apple tensor cores at 1.5-2×
 /// the throughput of `<float, 8, 8>` on M3+/M4). Inputs and outputs

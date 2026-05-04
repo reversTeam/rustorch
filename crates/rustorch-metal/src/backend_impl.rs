@@ -19,9 +19,9 @@ use crate::backend::MetalBackend;
 use crate::error::MetalError;
 use crate::kernels::{
     abs_f32, add_f32, div_f32, exp_f32, log_f32, matmul_simdgroup_f32,
-    matmul_simdgroup_f32_multisg, matmul_simdgroup_f32_via_bf16, mean_dim_2d_f32, mean_f32,
-    mul_f32, neg_f32, relu_f32, sigmoid_f32, silu_f32, sqrt_f32, sub_f32, sum_dim_2d_f32, sum_f32,
-    tanh_f32, transpose2d_f32,
+    matmul_simdgroup_f32_coarsened, matmul_simdgroup_f32_multisg, matmul_simdgroup_f32_via_bf16,
+    mean_dim_2d_f32, mean_f32, mul_f32, neg_f32, relu_f32, sigmoid_f32, silu_f32, sqrt_f32,
+    sub_f32, sum_dim_2d_f32, sum_f32, tanh_f32, transpose2d_f32,
 };
 use crate::transfer::tensor_to_cpu;
 use rustorch_core::tensor::device::Device;
@@ -214,13 +214,18 @@ impl Backend for MetalBackend {
         }
         let l = to_gpu(self, lhs).map_err(|e| metal_err("matmul", e))?;
         let r = to_gpu(self, rhs).map_err(|e| metal_err("matmul", e))?;
-        // Multi-simdgroup f32 when n%64==0; single-sg f32 otherwise.
-        // bf16 path (matmul_simdgroup_f32_via_bf16) is implemented
-        // and ready, but the f32→bf16 cast overhead currently
-        // exceeds the bf16 speedup at the bench's small M=64 shape.
-        // Re-enable when we can amortise the casts (e.g. by storing
-        // params in bf16 across steps, mixed-precision pattern).
-        let out = if n % 64 == 0 {
+        // Pick the highest-throughput kernel that fits the shape:
+        // - coarsened (4 outputs/sg, single mat_a load): n%256==0
+        // - multi-sg (1 output/sg, 8 sg/wg):              n%64==0
+        // - single-sg (1 output/sg, 1 sg/wg):             n%8==0 fallback
+        // bf16 path is ready (matmul_simdgroup_f32_via_bf16) but the
+        // cast overhead exceeds the bf16 speedup at the bench's
+        // small M=64 shape. Re-enable when params are stored in bf16
+        // across steps (mixed-precision Phase 4).
+        let out = if n % 256 == 0 {
+            matmul_simdgroup_f32_coarsened(self, &l, &r, m, k1, n)
+                .map_err(|e| metal_err("matmul", e))?
+        } else if n % 64 == 0 {
             matmul_simdgroup_f32_multisg(self, &l, &r, m, k1, n)
                 .map_err(|e| metal_err("matmul", e))?
         } else {
