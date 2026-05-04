@@ -57,6 +57,7 @@ pub mod checkpointed;
 pub mod container;
 pub mod conv;
 pub mod embedding;
+pub mod gqa;
 pub mod hooks;
 pub mod init;
 pub mod kv_cache;

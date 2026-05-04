@@ -266,6 +266,48 @@ fn bench_lm_head(c: &mut Criterion) {
     group.finish();
 }
 
+/// T45 — Grouped Query Attention bench. Validates that our GQA
+/// kernel beats the PyTorch ATen equivalent (manual implementation
+/// since nn.MultiheadAttention doesn't expose GQA natively).
+fn bench_gqa(c: &mut Criterion) {
+    use rustorch_nn::gqa::gqa_forward_f32;
+
+    // Qwen3-32B-style ratio: 32 query heads, 8 KV heads. Reduced
+    // dim for tractable iter time.
+    let batch = 1_usize;
+    let n_heads = 8_usize;
+    let n_kv_heads = 2_usize;
+    let seq_q = 128_usize;
+    let seq_kv = 128_usize;
+    let head_dim = 64_usize;
+
+    let q = det(0xC0DE, batch * n_heads * seq_q * head_dim);
+    let k = det(0xBEEF, batch * n_kv_heads * seq_kv * head_dim);
+    let v = det(0xF00D, batch * n_kv_heads * seq_kv * head_dim);
+    let mut out = vec![0.0_f32; batch * n_heads * seq_q * head_dim];
+
+    let mut group = c.benchmark_group("gqa_forward");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.bench_function(
+        BenchmarkId::from_parameter(format!(
+            "B{}H{}KV{}S{}D{}",
+            batch, n_heads, n_kv_heads, seq_q, head_dim
+        )),
+        |bb| {
+            bb.iter(|| {
+                gqa_forward_f32(
+                    &q, &k, &v, &mut out, batch, n_heads, n_kv_heads, seq_q, seq_kv, head_dim,
+                )
+                .unwrap();
+                hint_black_box(&out);
+            });
+        },
+    );
+    group.finish();
+}
+
 /// T44 — RoPE bench (Rotary Position Embeddings). On every LLM
 /// forward this is applied to Q and K just before attention; for
 /// long contexts the throughput matters. Validates that our T42
@@ -937,5 +979,6 @@ criterion_group! {
         bench_linear_S1_micro,
         bench_rope,
         bench_sampling,
+        bench_gqa,
 }
 criterion_main!(benches);

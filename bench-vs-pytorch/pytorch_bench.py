@@ -186,6 +186,36 @@ def bench_embedding(num_embeds, embed_dim, batch):
     return {"op": "embedding", "shape": f"vocab={num_embeds} dim={embed_dim} b={batch}", "median_ns": med, "p99_ns": p99}
 
 
+def bench_gqa(batch, n_heads, n_kv_heads, seq_q, seq_kv, head_dim):
+    """Grouped Query Attention. Q has `n_heads` heads but K/V share
+    `n_kv_heads` (Qwen / Llama 3 architecture). PyTorch's
+    nn.MultiheadAttention doesn't expose GQA directly, so we
+    implement the canonical ATen pattern manually:
+        repeat K, V `group_size` times along the head dim, then run
+        scaled_dot_product_attention.
+    """
+    g = torch.Generator().manual_seed(0xC0DE)
+    q = torch.empty(batch, n_heads, seq_q, head_dim).uniform_(-1.0, 1.0, generator=g)
+    k = torch.empty(batch, n_kv_heads, seq_kv, head_dim).uniform_(-1.0, 1.0, generator=g)
+    v = torch.empty(batch, n_kv_heads, seq_kv, head_dim).uniform_(-1.0, 1.0, generator=g)
+    group_size = n_heads // n_kv_heads
+
+    def step():
+        with torch.no_grad():
+            # Standard GQA: repeat K, V to match query head count.
+            k_rep = k.repeat_interleave(group_size, dim=1)
+            v_rep = v.repeat_interleave(group_size, dim=1)
+            return torch.nn.functional.scaled_dot_product_attention(q, k_rep, v_rep)
+
+    med, p99 = time_fn(step)
+    return {
+        "op": "gqa_forward",
+        "shape": f"B={batch} H={n_heads} KV={n_kv_heads} S={seq_q} D={head_dim}",
+        "median_ns": med,
+        "p99_ns": p99,
+    }
+
+
 def bench_rope(batch, n_heads, seq, head_dim):
     """RoPE — Rotary Position Embeddings. Applied to Q and K every
     transformer layer of every LLM (Llama / Qwen / Mistral / Phi).
