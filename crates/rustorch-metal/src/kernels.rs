@@ -2627,18 +2627,13 @@ pub fn sgemv_q4_k_f32_simdcoop_into(
         SGEMV_Q4_K_F32_SIMDCOOP_SHADER,
         "sgemv_q4_k_f32_simdcoop",
     )?;
-    let dims_buf = backend.alloc_shared(8)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = k as u32;
-        *p.add(1) = n as u32;
-    }
+    let dims = [k as u32, n as u32]; // T82 push-constants
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(w_q4k_buf), 0);
         encoder.set_buffer(2, Some(out_buf), 0);
-        encoder.set_buffer(3, Some(&dims_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
         let tg_size = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32 * n as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -2746,18 +2741,13 @@ pub fn sgemv_q6_k_f32_simdcoop_into(
         SGEMV_Q6_K_F32_SIMDCOOP_SHADER,
         "sgemv_q6_k_f32_simdcoop",
     )?;
-    let dims_buf = backend.alloc_shared(8)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = k as u32;
-        *p.add(1) = n as u32;
-    }
+    let dims = [k as u32, n as u32]; // T82
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(w_q6k_buf), 0);
         encoder.set_buffer(2, Some(out_buf), 0);
-        encoder.set_buffer(3, Some(&dims_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
         let tg_size = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32 * n as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -2913,14 +2903,7 @@ pub fn sgemv_q4_k_f32_triple_into(
         SGEMV_Q4_K_F32_TRIPLE_SHADER,
         "sgemv_q4_k_f32_triple",
     )?;
-    let dims_buf = backend.alloc_shared(16)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = k as u32;
-        *p.add(1) = n_q as u32;
-        *p.add(2) = n_k as u32;
-        *p.add(3) = n_v as u32;
-    }
+    let dims = [k as u32, n_q as u32, n_k as u32, n_v as u32]; // T82
     let total = n_q + n_k + n_v;
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
@@ -2931,7 +2914,7 @@ pub fn sgemv_q4_k_f32_triple_into(
         encoder.set_buffer(4, Some(out_q), 0);
         encoder.set_buffer(5, Some(out_k), 0);
         encoder.set_buffer(6, Some(out_v), 0);
-        encoder.set_buffer(7, Some(&dims_buf), 0);
+        encoder.set_bytes(7, 16, dims.as_ptr() as *const std::ffi::c_void);
         let tg_size = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new(total as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -3107,14 +3090,7 @@ pub fn sgemv_q4_k_f32_triple_simdcoop_into(
         SGEMV_Q4_K_F32_TRIPLE_SIMDCOOP_SHADER,
         "sgemv_q4_k_f32_triple_simdcoop",
     )?;
-    let dims_buf = backend.alloc_shared(16)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = k as u32;
-        *p.add(1) = n_q as u32;
-        *p.add(2) = n_k as u32;
-        *p.add(3) = n_v as u32;
-    }
+    let dims = [k as u32, n_q as u32, n_k as u32, n_v as u32]; // T82
     let total = n_q + n_k + n_v;
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
@@ -3125,7 +3101,7 @@ pub fn sgemv_q4_k_f32_triple_simdcoop_into(
         encoder.set_buffer(4, Some(out_q), 0);
         encoder.set_buffer(5, Some(out_k), 0);
         encoder.set_buffer(6, Some(out_v), 0);
-        encoder.set_buffer(7, Some(&dims_buf), 0);
+        encoder.set_bytes(7, 16, dims.as_ptr() as *const std::ffi::c_void);
         let tg_size = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32 * total as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -3174,18 +3150,15 @@ pub fn sgemv_q4_k_f32_into(
         )));
     }
     let pipeline = backend.pipeline("sgemv_q4_k_f32", SGEMV_Q4_K_F32_SHADER, "sgemv_q4_k_f32")?;
-    let dims_buf = backend.alloc_shared(8)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = k as u32;
-        *p.add(1) = n as u32;
-    }
+    // T82: dims passed via set_bytes (push constants) instead of an
+    // MTLBuffer — saves one alloc_shared per dispatch on the hot path.
+    let dims = [k as u32, n as u32];
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(w_q4k_buf), 0);
         encoder.set_buffer(2, Some(out_buf), 0);
-        encoder.set_buffer(3, Some(&dims_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
         let threadgroup_size = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new(n as u64, 1, 1);
         encoder.dispatch_threads(grid, threadgroup_size);
@@ -3288,19 +3261,14 @@ pub fn rms_norm_f32(
     eps: f32,
 ) -> Result<(), MetalError> {
     let pipeline = backend.pipeline("rms_norm_f32", RMS_NORM_F32_SHADER, "rms_norm_f32")?;
-    let d_buf = backend.alloc_shared(4)?;
-    let eps_buf = backend.alloc_shared(4)?;
-    unsafe {
-        *(d_buf.contents() as *mut u32) = d as u32;
-        *(eps_buf.contents() as *mut f32) = eps;
-    }
+    let d_u = d as u32; // T82
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(gamma_buf), 0);
         encoder.set_buffer(2, Some(y_buf), 0);
-        encoder.set_buffer(3, Some(&d_buf), 0);
-        encoder.set_buffer(4, Some(&eps_buf), 0);
+        encoder.set_bytes(3, 4, &d_u as *const u32 as *const std::ffi::c_void);
+        encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
         let tg_size = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -3356,20 +3324,13 @@ pub fn rms_norm_per_head_f32(
         RMS_NORM_PER_HEAD_F32_SHADER,
         "rms_norm_per_head_f32",
     )?;
-    let dims_buf = backend.alloc_shared(8)?;
-    let eps_buf = backend.alloc_shared(4)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = n_heads as u32;
-        *p.add(1) = head_dim as u32;
-        *(eps_buf.contents() as *mut f32) = eps;
-    }
+    let dims = [n_heads as u32, head_dim as u32]; // T82
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(gamma_buf), 0);
-        encoder.set_buffer(2, Some(&dims_buf), 0);
-        encoder.set_buffer(3, Some(&eps_buf), 0);
+        encoder.set_bytes(2, 8, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(3, 4, &eps as *const f32 as *const std::ffi::c_void);
         let tg_size = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -3406,16 +3367,13 @@ pub fn swiglu_f32(
     f: usize,
 ) -> Result<(), MetalError> {
     let pipeline = backend.pipeline("swiglu_f32", SWIGLU_F32_SHADER, "swiglu_f32")?;
-    let f_buf = backend.alloc_shared(4)?;
-    unsafe {
-        *(f_buf.contents() as *mut u32) = f as u32;
-    }
+    let f_u = f as u32; // T82
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(gate_buf), 0);
         encoder.set_buffer(1, Some(up_buf), 0);
         encoder.set_buffer(2, Some(y_buf), 0);
-        encoder.set_buffer(3, Some(&f_buf), 0);
+        encoder.set_bytes(3, 4, &f_u as *const u32 as *const std::ffi::c_void);
         let tg_size = MTLSize::new(256, 1, 1);
         let grid = MTLSize::new(f as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -3462,22 +3420,15 @@ pub fn kv_append_f32(
     max_seq: usize,
 ) -> Result<(), MetalError> {
     let pipeline = backend.pipeline("kv_append_f32", KV_APPEND_F32_SHADER, "kv_append_f32")?;
-    let dims_buf = backend.alloc_shared(12)?;
-    let max_seq_buf = backend.alloc_shared(4)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = n_kv as u32;
-        *p.add(1) = head_dim as u32;
-        *p.add(2) = position as u32;
-        *(max_seq_buf.contents() as *mut u32) = max_seq as u32;
-    }
+    let dims = [n_kv as u32, head_dim as u32, position as u32]; // T82
+    let ms = max_seq as u32;
     let total = n_kv * head_dim;
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(src_buf), 0);
         encoder.set_buffer(1, Some(dst_cache_buf), 0);
-        encoder.set_buffer(2, Some(&dims_buf), 0);
-        encoder.set_buffer(3, Some(&max_seq_buf), 0);
+        encoder.set_bytes(2, 12, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(3, 4, &ms as *const u32 as *const std::ffi::c_void);
         let tg_size = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new(total as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -3544,20 +3495,14 @@ pub fn rope_half_split_f32(
         ROPE_HALF_SPLIT_SHADER,
         "rope_half_split_f32",
     )?;
-    let dims_buf = backend.alloc_shared(12)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = n_heads as u32;
-        *p.add(1) = head_dim as u32;
-        *p.add(2) = position as u32;
-    }
+    let dims = [n_heads as u32, head_dim as u32, position as u32]; // T82
     let total = n_heads * (head_dim / 2);
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(cos_buf), 0);
         encoder.set_buffer(2, Some(sin_buf), 0);
-        encoder.set_buffer(3, Some(&dims_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
         let tg_size = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new(total as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -3680,18 +3625,9 @@ pub fn gqa_decode_f32(
     max_seq: usize,
 ) -> Result<(), MetalError> {
     let pipeline = backend.pipeline("gqa_decode_f32", GQA_DECODE_F32_SHADER, "gqa_decode_f32")?;
-    let dims_buf = backend.alloc_shared(16)?;
-    let max_seq_buf = backend.alloc_shared(4)?;
-    let inv_sqrt_d_buf = backend.alloc_shared(4)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = n_heads as u32;
-        *p.add(1) = n_kv as u32;
-        *p.add(2) = head_dim as u32;
-        *p.add(3) = kv_len as u32;
-        *(max_seq_buf.contents() as *mut u32) = max_seq as u32;
-        *(inv_sqrt_d_buf.contents() as *mut f32) = 1.0 / (head_dim as f32).sqrt();
-    }
+    let dims = [n_heads as u32, n_kv as u32, head_dim as u32, kv_len as u32]; // T82
+    let ms = max_seq as u32;
+    let inv_sqrt_d: f32 = 1.0 / (head_dim as f32).sqrt();
     let shared_bytes = (kv_len * 4) as u64;
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
@@ -3699,9 +3635,9 @@ pub fn gqa_decode_f32(
         encoder.set_buffer(1, Some(k_cache), 0);
         encoder.set_buffer(2, Some(v_cache), 0);
         encoder.set_buffer(3, Some(out_buf), 0);
-        encoder.set_buffer(4, Some(&dims_buf), 0);
-        encoder.set_buffer(5, Some(&max_seq_buf), 0);
-        encoder.set_buffer(6, Some(&inv_sqrt_d_buf), 0);
+        encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &ms as *const u32 as *const std::ffi::c_void);
+        encoder.set_bytes(6, 4, &inv_sqrt_d as *const f32 as *const std::ffi::c_void);
         encoder.set_threadgroup_memory_length(0, shared_bytes);
         let tg_size = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
@@ -3735,15 +3671,12 @@ pub fn add_inplace_f32(
 ) -> Result<(), MetalError> {
     let pipeline =
         backend.pipeline("add_inplace_f32", ADD_INPLACE_F32_SHADER, "add_inplace_f32")?;
-    let d_buf = backend.alloc_shared(4)?;
-    unsafe {
-        *(d_buf.contents() as *mut u32) = d as u32;
-    }
+    let d_u = d as u32; // T82
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(y_buf), 0);
-        encoder.set_buffer(2, Some(&d_buf), 0);
+        encoder.set_bytes(2, 4, &d_u as *const u32 as *const std::ffi::c_void);
         let tg_size = MTLSize::new(256, 1, 1);
         let grid = MTLSize::new(d as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -3991,18 +3924,13 @@ pub fn sgemv_q6_k_f32_into(
         )));
     }
     let pipeline = backend.pipeline("sgemv_q6_k_f32", SGEMV_Q6_K_F32_SHADER, "sgemv_q6_k_f32")?;
-    let dims_buf = backend.alloc_shared(8)?;
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = k as u32;
-        *p.add(1) = n as u32;
-    }
+    let dims = [k as u32, n as u32]; // T82
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(w_q6k_buf), 0);
         encoder.set_buffer(2, Some(out_buf), 0);
-        encoder.set_buffer(3, Some(&dims_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
         let threadgroup_size = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new(n as u64, 1, 1);
         encoder.dispatch_threads(grid, threadgroup_size);
