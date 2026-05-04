@@ -25,7 +25,7 @@ use std::time::Instant;
 use rustorch_gguf::{GgmlType, GgufFile};
 use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
-use rustorch_metal::kernels::{sgemv_q4_k_f32, sgemv_q6_k_f32};
+use rustorch_metal::kernels::{sgemv_q4_k_f32_into, sgemv_q6_k_f32_into};
 
 use metal::Buffer;
 
@@ -42,13 +42,16 @@ struct MetalWeight {
 }
 
 impl MetalWeight {
-    fn matmul(&self, backend: &MetalBackend, x_buf: &Buffer) -> Buffer {
-        let out = match self.dtype {
-            GgmlType::Q4_K => sgemv_q4_k_f32(backend, x_buf, &self.buffer, self.k, self.n).unwrap(),
-            GgmlType::Q6_K => sgemv_q6_k_f32(backend, x_buf, &self.buffer, self.k, self.n).unwrap(),
+    fn matmul_into(&self, backend: &MetalBackend, x_buf: &Buffer, out_buf: &Buffer) {
+        match self.dtype {
+            GgmlType::Q4_K => {
+                sgemv_q4_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
+            },
+            GgmlType::Q6_K => {
+                sgemv_q6_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
+            },
             _ => panic!("unsupported dtype: {:?}", self.dtype),
-        };
-        out
+        }
     }
 }
 
@@ -185,27 +188,33 @@ fn forward_token(
         unsafe {
             std::ptr::copy_nonoverlapping(
                 scratch.h.as_ptr(),
-                scratch.x_buf.contents() as *mut f32,
+                scratch.xd_buf.contents() as *mut f32,
                 d,
             );
         }
-        let q_out = layer.w_q.matmul(backend, &scratch.x_buf);
-        let k_out = layer.w_k.matmul(backend, &scratch.x_buf);
-        let v_out = layer.w_v.matmul(backend, &scratch.x_buf);
+        layer
+            .w_q
+            .matmul_into(backend, &scratch.xd_buf, &scratch.q_buf);
+        layer
+            .w_k
+            .matmul_into(backend, &scratch.xd_buf, &scratch.k_buf);
+        layer
+            .w_v
+            .matmul_into(backend, &scratch.xd_buf, &scratch.v_buf);
         backend.drain();
         unsafe {
             std::ptr::copy_nonoverlapping(
-                q_out.contents() as *const f32,
+                scratch.q_buf.contents() as *const f32,
                 scratch.q.as_mut_ptr(),
                 d,
             );
             std::ptr::copy_nonoverlapping(
-                k_out.contents() as *const f32,
+                scratch.k_buf.contents() as *const f32,
                 scratch.k.as_mut_ptr(),
                 kv_dim,
             );
             std::ptr::copy_nonoverlapping(
-                v_out.contents() as *const f32,
+                scratch.v_buf.contents() as *const f32,
                 scratch.v.as_mut_ptr(),
                 kv_dim,
             );
@@ -262,15 +271,17 @@ fn forward_token(
         unsafe {
             std::ptr::copy_nonoverlapping(
                 scratch.attn_out.as_ptr(),
-                scratch.x_buf.contents() as *mut f32,
+                scratch.xd_buf.contents() as *mut f32,
                 d,
             );
         }
-        let o_out = layer.w_o.matmul(backend, &scratch.x_buf);
+        layer
+            .w_o
+            .matmul_into(backend, &scratch.xd_buf, &scratch.o_buf);
         backend.drain();
         unsafe {
             std::ptr::copy_nonoverlapping(
-                o_out.contents() as *const f32,
+                scratch.o_buf.contents() as *const f32,
                 scratch.o_out.as_mut_ptr(),
                 d,
             );
@@ -285,21 +296,25 @@ fn forward_token(
         unsafe {
             std::ptr::copy_nonoverlapping(
                 scratch.h.as_ptr(),
-                scratch.x_buf.contents() as *mut f32,
+                scratch.xd_buf.contents() as *mut f32,
                 d,
             );
         }
-        let gate_out = layer.w_gate.matmul(backend, &scratch.x_buf);
-        let up_out = layer.w_up.matmul(backend, &scratch.x_buf);
+        layer
+            .w_gate
+            .matmul_into(backend, &scratch.xd_buf, &scratch.gate_buf);
+        layer
+            .w_up
+            .matmul_into(backend, &scratch.xd_buf, &scratch.up_buf);
         backend.drain();
         unsafe {
             std::ptr::copy_nonoverlapping(
-                gate_out.contents() as *const f32,
+                scratch.gate_buf.contents() as *const f32,
                 scratch.gate_out.as_mut_ptr(),
                 f,
             );
             std::ptr::copy_nonoverlapping(
-                up_out.contents() as *const f32,
+                scratch.up_buf.contents() as *const f32,
                 scratch.up_out.as_mut_ptr(),
                 f,
             );
@@ -312,20 +327,22 @@ fn forward_token(
             scratch.gate_out[i] = s * scratch.up_out[i];
         }
 
-        // 9. Down proj via Metal + residual.
-        let f_buf = backend.alloc_shared(f * 4).unwrap();
+        // 9. Down proj via Metal + residual (uses persistent fd_buf, no
+        //    per-layer alloc — was the biggest single cost in MVP).
         unsafe {
             std::ptr::copy_nonoverlapping(
                 scratch.gate_out.as_ptr(),
-                f_buf.contents() as *mut f32,
+                scratch.fd_buf.contents() as *mut f32,
                 f,
             );
         }
-        let down_out = layer.w_down.matmul(backend, &f_buf);
+        layer
+            .w_down
+            .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
         backend.drain();
         unsafe {
             std::ptr::copy_nonoverlapping(
-                down_out.contents() as *const f32,
+                scratch.fc2_buf.contents() as *const f32,
                 scratch.fc2_out.as_mut_ptr(),
                 d,
             );
@@ -341,16 +358,18 @@ fn forward_token(
     unsafe {
         std::ptr::copy_nonoverlapping(
             scratch.h.as_ptr(),
-            scratch.x_buf.contents() as *mut f32,
+            scratch.xd_buf.contents() as *mut f32,
             cfg.d,
         );
     }
-    let logits_out = model.lm_head.matmul(backend, &scratch.x_buf);
+    model
+        .lm_head
+        .matmul_into(backend, &scratch.xd_buf, &scratch.logits_buf);
     backend.drain();
     let mut logits = vec![0.0_f32; cfg.vocab];
     unsafe {
         std::ptr::copy_nonoverlapping(
-            logits_out.contents() as *const f32,
+            scratch.logits_buf.contents() as *const f32,
             logits.as_mut_ptr(),
             cfg.vocab,
         );
@@ -371,7 +390,19 @@ struct Scratch {
     fc2_out: Vec<f32>,
     k_trim: Vec<f32>,
     v_trim: Vec<f32>,
-    x_buf: Buffer,
+    // Persistent GPU buffers — pre-allocated once, reused every layer
+    // every token. Eliminates the per-call MTLBuffer alloc cost
+    // (~10-50µs each) which was 6 allocs × 40 layers = 240/token.
+    xd_buf: Buffer,     // d-sized input (residual / norm output)
+    fd_buf: Buffer,     // f-sized input (swiglu output → down)
+    q_buf: Buffer,      // d-sized Q output
+    k_buf: Buffer,      // kv_dim-sized K output
+    v_buf: Buffer,      // kv_dim-sized V output
+    o_buf: Buffer,      // d-sized O proj output
+    gate_buf: Buffer,   // f-sized gate output
+    up_buf: Buffer,     // f-sized up output
+    fc2_buf: Buffer,    // d-sized down output
+    logits_buf: Buffer, // vocab-sized lm_head output
 }
 
 impl Scratch {
@@ -393,7 +424,16 @@ impl Scratch {
             fc2_out: vec![0.0; d],
             k_trim: vec![0.0; max_kv],
             v_trim: vec![0.0; max_kv],
-            x_buf: backend.alloc_shared(d * 4).unwrap(),
+            xd_buf: backend.alloc_shared(d * 4).unwrap(),
+            fd_buf: backend.alloc_shared(f * 4).unwrap(),
+            q_buf: backend.alloc_shared(d * 4).unwrap(),
+            k_buf: backend.alloc_shared(kv_dim * 4).unwrap(),
+            v_buf: backend.alloc_shared(kv_dim * 4).unwrap(),
+            o_buf: backend.alloc_shared(d * 4).unwrap(),
+            gate_buf: backend.alloc_shared(f * 4).unwrap(),
+            up_buf: backend.alloc_shared(f * 4).unwrap(),
+            fc2_buf: backend.alloc_shared(d * 4).unwrap(),
+            logits_buf: backend.alloc_shared(cfg.vocab * 4).unwrap(),
         }
     }
 }

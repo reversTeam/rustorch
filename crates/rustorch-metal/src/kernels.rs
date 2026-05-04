@@ -2348,6 +2348,48 @@ kernel void sgemv_q4_k_f32(
 "#;
 
 /// Direct Q4_K sgemv on Metal — no f32 dequantisation buffer in DRAM.
+/// Variant that writes into a caller-provided output buffer to avoid
+/// the per-call 140KB allocation in the hot path. The caller must
+/// ensure `out_buf` has at least `n * 4` bytes capacity.
+pub fn sgemv_q4_k_f32_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32 needs MTLGPUFamily::Metal3 (M3+, A17 Pro+)".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32 needs K>=1, N>=1, K%256==0: got K={k}, N={n}"
+        )));
+    }
+    let pipeline = backend.pipeline("sgemv_q4_k_f32", SGEMV_Q4_K_F32_SHADER, "sgemv_q4_k_f32")?;
+    let dims_buf = backend.alloc_shared(8)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = k as u32;
+        *p.add(1) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let threadgroup_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, threadgroup_size);
+    });
+    Ok(())
+}
+
+/// Direct Q4_K sgemv on Metal — no f32 dequantisation buffer in DRAM.
 ///
 /// `x_buf`: f32 activation buffer of length K elements (K * 4 bytes).
 /// `w_q4k_buf`: raw Q4_K weight bytes laid out `[N, K]` row-major
@@ -2484,6 +2526,46 @@ kernel void sgemv_q6_k_f32(
     y[n_idx] = acc;
 }
 "#;
+
+/// Q6_K equivalent of [`sgemv_q4_k_f32_into`]. Writes into a caller-
+/// provided buffer to avoid the per-call allocation in the hot path.
+pub fn sgemv_q6_k_f32_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q6k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_f32 needs MTLGPUFamily::Metal3 (M3+, A17 Pro+)".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_f32 needs K>=1, N>=1, K%256==0: got K={k}, N={n}"
+        )));
+    }
+    let pipeline = backend.pipeline("sgemv_q6_k_f32", SGEMV_Q6_K_F32_SHADER, "sgemv_q6_k_f32")?;
+    let dims_buf = backend.alloc_shared(8)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = k as u32;
+        *p.add(1) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let threadgroup_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, threadgroup_size);
+    });
+    Ok(())
+}
 
 /// Direct Q6_K sgemv on Metal — companion to [`sgemv_q4_k_f32`].
 pub fn sgemv_q6_k_f32(
