@@ -21,12 +21,19 @@ rustorch-cpu      = { workspace = true }
 # the host<->device round trip at every step.
 rustorch-wgpu     = { workspace = true, optional = true }
 half              = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# P3.Z Task J Phase 3 — Apple Metal FusedAdamW dispatch (macOS only).
+rustorch-metal    = { workspace = true, optional = true }
 num-traits        = { workspace = true }
 thiserror         = { workspace = true }
 
 [features]
 default = []
-wgpu = ["dep:rustorch-wgpu", "rustorch-autograd/wgpu"]
+wgpu  = ["dep:rustorch-wgpu", "rustorch-autograd/wgpu"]
+# P3.Z Task J Phase 3 — Apple Metal FusedAdamW. Skips param/grad
+# host trips and runs the entire AdamW step in a single MTL dispatch.
+metal = ["dep:rustorch-metal", "rustorch-autograd/metal"]
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

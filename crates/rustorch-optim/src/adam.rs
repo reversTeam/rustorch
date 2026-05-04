@@ -38,6 +38,15 @@ pub struct Adam {
     /// Per-parameter GPU `v` state (lazily allocated, see [`Self::m_gpu`]).
     #[cfg(feature = "wgpu")]
     v_gpu: Vec<Option<rustorch_wgpu::storage::WgpuStorage>>,
+    /// Per-parameter Metal `m` state (lazily allocated). Populates the
+    /// FusedAdamW Metal kernel for params whose tensor lives on
+    /// `Storage::Metal` — same in-place mutate-across-steps pattern
+    /// as the WGSL version. P3.Z Task J Phase 3.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    m_metal: Vec<Option<rustorch_metal::Buffer>>,
+    /// Per-parameter Metal `v` state.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    v_metal: Vec<Option<rustorch_metal::Buffer>>,
 }
 
 impl Adam {
@@ -58,6 +67,10 @@ impl Adam {
             m_gpu: (0..n).map(|_| None).collect(),
             #[cfg(feature = "wgpu")]
             v_gpu: (0..n).map(|_| None).collect(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            m_metal: (0..n).map(|_| None).collect(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            v_metal: (0..n).map(|_| None).collect(),
         }
     }
 
@@ -301,6 +314,134 @@ impl Adam {
     }
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl Adam {
+    /// Try to run a fused AdamW step on Apple Metal direct.
+    /// Mirror of [`Self::try_step_wgpu`] for the rustorch-metal path.
+    /// Returns `true` on dispatch (caller should `continue`), `false`
+    /// when the param/grad isn't on Metal storage.
+    fn try_step_metal(&mut self, i: usize) -> bool {
+        use rustorch_core::tensor::device::Device;
+        use rustorch_metal::backend_singleton::metal_backend;
+        use rustorch_metal::fused_adamw::{allocate_zeros, fused_adamw_step, AdamWStepParams};
+
+        let param = self.params[i].clone();
+        let param_tensor = param.tensor();
+
+        if param_tensor.device() != Device::Metal {
+            return false;
+        }
+        let backend = metal_backend();
+
+        // First-step bridge: param tagged Metal but still in CPU
+        // storage. Upload via shared-mode buffer (essentially a memcpy
+        // on Apple Silicon thanks to unified memory).
+        let param_buf: rustorch_metal::Buffer = match param_tensor.as_metal_storage() {
+            Some(s) => (**s).clone(),
+            None => {
+                let n_bytes = param_tensor.numel() * 4;
+                let buf = match backend.alloc_shared(n_bytes) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                let data = match param_tensor.as_slice::<f32>() {
+                    Some(d) => d,
+                    None => return false,
+                };
+                // SAFETY: shared-storage buffer; pointer valid for n_bytes.
+                unsafe {
+                    let dst = buf.contents() as *mut f32;
+                    for (j, &v) in data.iter().enumerate() {
+                        *dst.add(j) = v;
+                    }
+                }
+                let core =
+                    rustorch_core::tensor::storage::MetalStorage::standalone(buf.clone(), n_bytes);
+                let promoted = rustorch_core::tensor::tensor_impl::Tensor::from_metal_storage(
+                    core,
+                    param_tensor.shape().to_vec(),
+                    param_tensor.dtype(),
+                );
+                param.set_data(promoted);
+                buf
+            },
+        };
+
+        // Get the gradient buffer (raw — no auto-materialise).
+        let grad_tensor = match param.raw_grad() {
+            Some(g) => g,
+            None => return true, // No gradient ⇒ nothing to do.
+        };
+        let grad_buf: rustorch_metal::Buffer = match grad_tensor.as_metal_storage() {
+            Some(s) => (**s).clone(),
+            None => {
+                // Gradient is on CPU storage (e.g. via auto-materialise
+                // from an upstream backward op). Upload before dispatch.
+                let n_bytes = grad_tensor.numel() * 4;
+                let buf = match backend.alloc_shared(n_bytes) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                let data = match grad_tensor.as_slice::<f32>() {
+                    Some(d) => d,
+                    None => return false,
+                };
+                // SAFETY: shared-storage buffer; pointer valid for n_bytes.
+                unsafe {
+                    let dst = buf.contents() as *mut f32;
+                    for (j, &v) in data.iter().enumerate() {
+                        *dst.add(j) = v;
+                    }
+                }
+                buf
+            },
+        };
+
+        let n = param_tensor.numel();
+
+        if self.m_metal[i].is_none() {
+            let m = match allocate_zeros(backend, n) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            self.m_metal[i] = Some(m);
+        }
+        if self.v_metal[i].is_none() {
+            let v = match allocate_zeros(backend, n) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            self.v_metal[i] = Some(v);
+        }
+        let m = self.m_metal[i].as_ref().expect("m_metal just allocated");
+        let v = self.v_metal[i].as_ref().expect("v_metal just allocated");
+
+        let step_params = AdamWStepParams {
+            lr: self.lr,
+            beta1: self.betas.0,
+            beta2: self.betas.1,
+            eps: self.eps,
+            weight_decay: self.weight_decay,
+            t: self.step_t as u32,
+        };
+        let new_param = match fused_adamw_step(backend, &param_buf, &grad_buf, m, v, n, step_params)
+        {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        let n_bytes = n * 4;
+        let core = rustorch_core::tensor::storage::MetalStorage::standalone(new_param, n_bytes);
+        let new_tensor = rustorch_core::tensor::tensor_impl::Tensor::from_metal_storage(
+            core,
+            param_tensor.shape().to_vec(),
+            param_tensor.dtype(),
+        );
+        param.set_data(new_tensor);
+        true
+    }
+}
+
 impl Optimizer for Adam {
     fn step(&mut self) {
         self.step_t += 1;
@@ -321,6 +462,13 @@ impl Optimizer for Adam {
             #[cfg(feature = "wgpu")]
             {
                 if self.decoupled_wd && self.try_step_wgpu(i, bc1, bc2) {
+                    continue;
+                }
+            }
+            // P3.Z Task J Phase 3 — same pattern for Apple Metal direct.
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                if self.decoupled_wd && self.try_step_metal(i) {
                     continue;
                 }
             }

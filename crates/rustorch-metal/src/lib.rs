@@ -52,6 +52,15 @@ pub mod backend_impl;
 #[cfg(target_os = "macos")]
 pub mod transfer;
 
+#[cfg(target_os = "macos")]
+pub mod fused_adamw;
+
+/// Re-export `metal::Buffer` so downstream crates (rustorch-optim
+/// FusedAdamW state, rustorch-autograd dispatch) can name the type
+/// without depending on the `metal` crate directly.
+#[cfg(target_os = "macos")]
+pub use metal::Buffer;
+
 /// Stub re-export so non-macOS targets can build code that
 /// references `rustorch_metal::error::MetalError` (the error type)
 /// even when no concrete backend is available.
