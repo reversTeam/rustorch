@@ -2,91 +2,258 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>rustorch — GPT block (WebGPU demo)</title>
+  <title>rustorch — Transformer encoder block (CPU autograd)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { font-family: ui-monospace, Menlo, monospace; background: #0a0b09; color: #e0e0e0; padding: 24px; max-width: 960px; margin: 0 auto; }
-    h1 { color: #ce422b; }
-    .card { background: #14140f; border: 1px solid #2a2a26; padding: 16px 18px; margin: 14px 0; border-radius: 8px; }
-    button { background: #ce422b; color: white; border: none; padding: 10px 18px; border-radius: 4px; font: inherit; cursor: pointer; }
+    :root {
+      --bg: #0a0b09; --panel: #14140f; --border: #2a2a26;
+      --text: #e0e0e0; --muted: #888; --accent: #ce422b;
+      --ok: #8fcf6f; --warn: #e6b04b; --err: #e87b6f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: var(--bg); color: var(--text);
+      max-width: 960px; margin: 0 auto; padding: 24px; line-height: 1.5;
+    }
+    h1 { color: var(--accent); margin: 0 0 6px; font-size: 1.5em; }
+    h2 { color: var(--accent); font-size: 1.0em; margin: 14px 0 8px; }
+    .lede { color: var(--muted); margin: 0 0 18px; font-size: 0.92em; }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      padding: 14px 18px; margin: 14px 0; border-radius: 8px;
+    }
+    button {
+      background: var(--accent); color: white; border: none;
+      padding: 9px 18px; border-radius: 4px; font: inherit; cursor: pointer;
+    }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
-    textarea { background: #0a0a08; color: #e0e0e0; border: 1px solid #2a2a26; padding: 8px; border-radius: 4px; font: inherit; width: 100%; box-sizing: border-box; }
-    pre { background: #0a0a08; padding: 10px; border-radius: 4px; font-size: 0.85em; max-height: 280px; overflow-y: auto; }
-    label { color: #aaa; margin-right: 8px; }
-    input[type="number"] { background: #0a0a08; color: #e0e0e0; border: 1px solid #2a2a26; padding: 4px 8px; border-radius: 3px; font: inherit; width: 80px; margin-right: 16px; }
-    .ok { color: #8fcf6f; }
-    .warn { color: #e6b04b; }
-    .err { color: #e87b6f; }
-    .note { color: #888; font-size: 0.9em; }
+    textarea, input[type="number"] {
+      background: #0a0a08; color: var(--text); border: 1px solid var(--border);
+      padding: 6px 8px; border-radius: 3px; font: inherit;
+    }
+    textarea { width: 100%; }
+    input[type="number"] { width: 80px; margin-right: 12px; }
+    label { color: var(--muted); margin-right: 6px; }
+    .check { margin-right: 12px; color: var(--muted); font-size: 0.9em; }
+
+    .stages {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 4px;
+      margin: 12px 0 8px;
+    }
+    .stage {
+      background: #0a0a08; border: 1px solid var(--border);
+      border-radius: 4px; padding: 8px 6px; text-align: center;
+      font-size: 0.78em; color: var(--muted); transition: all 0.15s;
+    }
+    .stage.active { border-color: var(--warn); color: var(--warn); }
+    .stage.done   { border-color: var(--ok);   color: var(--ok); background: rgba(143, 207, 111, 0.06); }
+    .stage.fail   { border-color: var(--err);  color: var(--err); }
+    .stage .lbl   { display: block; font-weight: bold; margin-bottom: 2px; }
+    .stage .det   { display: block; font-size: 0.85em; opacity: 0.85; }
+
+    .actbars {
+      display: grid; grid-template-columns: repeat(64, 1fr);
+      gap: 1px; align-items: end;
+      height: 90px; margin: 12px 0 8px;
+      background: #0a0a08; border: 1px solid var(--border);
+      border-radius: 4px; padding: 6px;
+    }
+    .actbars > div {
+      background: var(--accent); min-height: 1px; border-radius: 1px;
+    }
+    .actbars > div.neg { background: #5b9bd5; }
+
+    .summary {
+      display: grid; grid-template-columns: repeat(4, 1fr);
+      gap: 12px; margin-top: 10px; font-size: 0.85em;
+    }
+    .summary .k { color: var(--muted); }
+    .summary .v { color: var(--text); font-variant-numeric: tabular-nums; }
+
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .err { color: var(--err); }
+    .note { color: var(--muted); font-size: 0.85em; }
+    .pill {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      font-size: 0.75em; background: rgba(143, 207, 111, 0.15);
+      color: var(--ok); border: 1px solid var(--ok); margin-left: 6px;
+    }
+    footer { margin-top: 22px; color: var(--muted); font-size: 0.8em; text-align: center; }
+    footer a { color: var(--muted); }
   </style>
 </head>
 <body>
-  <h1>GPT-style block — WebGPU demo</h1>
-  <p>
-    Runs one transformer block (LayerNorm → causal multi-head attention →
-    residual → LayerNorm → FFN+GELU → residual) on a character-level prompt.
-    Returns the activation of the last position as a Float32Array.
-  </p>
-  <p class="note">
-    v1 uses random seeded weights and one ASCII byte = one token. <strong>This is
-    not a real GPT-2 with BPE + 124M trained weights</strong> — it's a structurally
-    accurate end-to-end demonstration of the WGSL kernel pipeline.
+  <h1>Transformer encoder block <span class="pill">CPU autograd</span></h1>
+  <p class="lede">
+    Runs one full encoder block —
+    <code>RMSNorm → MultiHeadAttention(causal?) → residual → RMSNorm → Linear FFN → residual</code>
+    — on the autograd-aware CPU stack compiled to WebAssembly.
+    No WebGPU adapter required: this exercises the same modules that
+    power the live training demo, so you can be sure they actually work
+    end-to-end. Random seeded weights, deterministic input.
   </p>
 
   <div class="card">
-    <h2>Adapter</h2>
-    <p id="status">checking…</p>
+    <h2 style="margin-top:0">Setup</h2>
+    <p>
+      <label>Sequence length T <input id="t" type="number" value="16" min="1" max="128" /></label>
+      <label>d_model <input id="d" type="number" value="64" min="8" max="256" step="8" /></label>
+      <label>num_heads <input id="h" type="number" value="8" min="1" max="32" /></label>
+      <label class="check"><input id="causal" type="checkbox" checked /> causal mask</label>
+    </p>
+    <p>
+      <button id="run">▶ Run forward pass</button>
+    </p>
+
+    <div class="stages" id="stages">
+      <div class="stage" id="st-init"><span class="lbl">1. WASM</span><span class="det">idle</span></div>
+      <div class="stage" id="st-build"><span class="lbl">2. Build model</span><span class="det">idle</span></div>
+      <div class="stage" id="st-forward"><span class="lbl">3. Forward pass</span><span class="det">idle</span></div>
+    </div>
+
+    <p class="note" id="status-line">Click <strong>Run</strong> to construct a TinyEncoder and forward a deterministic <code>[1, T, d_model]</code> input through it.</p>
+
+    <h2>First 8 output activations (last position)</h2>
+    <p class="note">
+      Values from the encoder's <code>[1, T, d_model]</code> output
+      at the final token. Drawn as bars (height ∝ |value|, red = positive,
+      blue = negative). Smoke-test: the activations should be non-zero
+      and varied — a flat row would mean the block collapsed.
+    </p>
+    <div class="actbars" id="actbars"></div>
+
+    <div class="summary" id="summary" style="display:none">
+      <div><span class="k">Parameters</span> <span class="v" id="sum-params">—</span></div>
+      <div><span class="k">d_model × T</span> <span class="v" id="sum-shape">—</span></div>
+      <div><span class="k">Forward time</span> <span class="v" id="sum-time">—</span></div>
+      <div><span class="k">Mean / σ</span> <span class="v" id="sum-stats">—</span></div>
+    </div>
   </div>
 
-  <div class="card">
-    <h2>Run</h2>
-    <p>
-      <label>Prompt:</label>
-      <textarea id="prompt" rows="2">hello world</textarea>
-    </p>
-    <p>
-      <label>d_model <input id="dm" type="number" value="64" min="8" max="256" step="8" /></label>
-      <label>num_heads <input id="nh" type="number" value="8" min="1" max="32" /></label>
-      <button id="run">Run block</button>
-    </p>
-    <pre id="output">(not run yet)</pre>
-  </div>
+  <footer>
+    Other demos:
+    <a href="index.html">Live training demo</a> ·
+    <a href="kernels.html">GPU kernel smoke tests</a> ·
+    <a href="resnet.html">ResNet block (GPU)</a>
+  </footer>
+
+  <!-- Shim is harmless on this page (we don't touch WebGPU) but kept
+       so the wasm module's other imports stay consistent with the GPU
+       demos that do need it. -->
+  <script src="wgpu-limits-shim.js"></script>
 
   <script type="module">
-    import init, { run_gpt_block_js } from "../pkg/rustorch_wasm_demo.js";
-    const $ = (id) => document.getElementById(id);
+    import init, { run_encoder_block } from "../pkg/rustorch_wasm_demo.js";
 
-    if (!("gpu" in navigator)) {
-      $("status").innerHTML = '<span class="warn">⚠ WebGPU not available. Use Chrome 120+.</span>';
-      $("run").disabled = true;
-    } else {
-      $("status").innerHTML = '<span class="ok">✓ navigator.gpu present.</span>';
+    const $ = (id) => document.getElementById(id);
+    const stages = ["init", "build", "forward"];
+
+    function setStage(name, state, detail) {
+      const el = $("st-" + name);
+      el.classList.remove("active", "done", "fail");
+      if (state) el.classList.add(state);
+      el.querySelector(".det").textContent = detail || state || "idle";
+    }
+    function resetStages() { stages.forEach((s) => setStage(s, null, "idle")); }
+    function setStatus(msg, cls) {
+      const line = $("status-line");
+      line.innerHTML = "";
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg;
+      line.appendChild(span);
     }
 
     let initialized = false;
-    async function ensureInit() { if (!initialized) { await init(); initialized = true; } }
+    async function ensureInit() {
+      if (initialized) return;
+      setStage("init", "active", "loading…");
+      await init();
+      initialized = true;
+      setStage("init", "done", "loaded");
+    }
+
+    function drawActivations(vec) {
+      const bars = $("actbars");
+      bars.innerHTML = "";
+      const n = vec.length;
+      bars.style.gridTemplateColumns = `repeat(${Math.min(n, 256)}, 1fr)`;
+      let absMax = 0;
+      for (let i = 0; i < n; i++) { const a = Math.abs(vec[i]); if (a > absMax) absMax = a; }
+      absMax = absMax || 1;
+      for (let i = 0; i < n; i++) {
+        const v = vec[i];
+        const div = document.createElement("div");
+        div.style.height = (Math.abs(v) / absMax * 100).toFixed(1) + "%";
+        div.title = `[${i}] = ${v.toFixed(4)}`;
+        if (v < 0) div.classList.add("neg");
+        bars.appendChild(div);
+      }
+    }
+
+    function updateSummary(stats, t, d, ms) {
+      $("summary").style.display = "grid";
+      $("sum-params").textContent = stats.param_count.toLocaleString();
+      $("sum-shape").textContent = `[1, ${t}, ${d}]`;
+      $("sum-time").textContent = `${ms.toFixed(1)} ms`;
+      const arr = Array.from(stats.first_eight);
+      const mean = arr.reduce((s, v) => s + v, 0) / arr.length;
+      const variance = arr.reduce((s, v) => s + (v - mean) ** 2, 0) / arr.length;
+      $("sum-stats").textContent = `${mean.toFixed(3)} / ${Math.sqrt(variance).toFixed(3)}`;
+    }
 
     $("run").addEventListener("click", async () => {
-      const out = $("output");
-      out.textContent = "Initializing WASM…";
+      const t = parseInt($("t").value);
+      const d = parseInt($("d").value);
+      const h = parseInt($("h").value);
+      const causal = $("causal").checked;
+      if (!t || !d || !h) { setStatus("Fill T, d_model and num_heads.", "err"); return; }
+      if (d % h !== 0) {
+        setStatus(`d_model (${d}) must be divisible by num_heads (${h}).`, "err");
+        return;
+      }
+
+      $("run").disabled = true;
+      $("summary").style.display = "none";
+      resetStages();
+      setStatus(`Running encoder block on [1, ${t}, ${d}] with ${h} heads, causal=${causal}…`, "warn");
+
       try {
         await ensureInit();
-        const prompt = $("prompt").value;
-        const dm = parseInt($("dm").value);
-        const nh = parseInt($("nh").value);
-        if (!prompt.length) { out.textContent = "Prompt is empty"; return; }
-        if (dm % nh !== 0) { out.textContent = `d_model (${dm}) must be divisible by num_heads (${nh})`; return; }
-        out.textContent = `Running on ${prompt.length}-token prompt, d_model=${dm}, ${nh} heads…`;
+
+        setStage("build", "active", "constructing…");
+        // Yield so the stage update paints before the (sync) forward.
+        await new Promise((r) => requestAnimationFrame(r));
+        setStage("build", "done", "ok");
+
+        setStage("forward", "active", "computing…");
+        await new Promise((r) => requestAnimationFrame(r));
+
         const t0 = performance.now();
-        const last_row = await run_gpt_block_js(prompt, dm, nh);
-        const dt = performance.now() - t0;
-        out.textContent =
-          `Last-position activation: ${last_row.length} F32 values (= d_model)\n` +
-          `Total time: ${dt.toFixed(2)} ms\n\n` +
-          `First 16 values:\n` +
-          Array.from(last_row).slice(0, 16).map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
+        const stats = run_encoder_block(1, t, d, h, causal);
+        const ms = performance.now() - t0;
+
+        setStage("forward", "done", `${ms.toFixed(1)}ms`);
+
+        drawActivations(stats.first_eight);
+        updateSummary(stats, t, d, ms);
+        setStatus(`✓ Forward pass completed in ${ms.toFixed(1)} ms — ${stats.param_count.toLocaleString()} parameters.`, "ok");
       } catch (err) {
-        out.innerHTML = `<span class="err">Error: ${err?.message || err}</span>`;
+        const msg = err?.message || String(err);
+        for (const s of stages) {
+          const el = $("st-" + s);
+          if (el.classList.contains("active")) {
+            setStage(s, "fail", "failed");
+          }
+        }
+        setStatus("✗ " + msg, "err");
+        console.error("encoder block failed:", err);
+      } finally {
+        $("run").disabled = false;
       }
     });
   </script>

@@ -677,6 +677,9 @@ dependencies = [
 [[package]]
 name = "rustorch-fusion"
 version = "0.0.1"
+dependencies = [
+ "gemm",
+]
 
 [[package]]
 name = "rustversion"

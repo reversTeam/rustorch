@@ -3160,6 +3160,7 @@ name = "rustorch-fusion"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "gemm",
  "proptest",
 ]
 
@@ -3220,6 +3221,7 @@ version = "0.0.1"
 dependencies = [
  "half",
  "num-traits",
+ "rayon",
  "rustorch-autograd",
  "rustorch-core",
  "rustorch-cpu",

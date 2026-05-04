@@ -651,6 +651,34 @@ where
     let lhs_raw: &mut [T] =
         unsafe { core::slice::from_raw_parts_mut(lhs_bytes_ptr as *mut T, lhs_typed_len) };
 
+    // Fast path: both sides are dense contiguous + same shape + zero
+    // offset → tight `i = 0..n` slice loop, no `strided_index` calls,
+    // LLVM auto-vectorises with NEON / AVX. This is the dominant path
+    // for `add_`, `sub_`, `mul_`, `div_` on freshly-allocated tensors
+    // (Linear forward, AdamW step, residual adds in transformer FFNs).
+    //
+    // Measured M4 Max post-T2.5 (P3.X): elementwise_add 10M takes
+    // 14.5 ms via the strided path vs ~1 ms via the contiguous fast
+    // path (auto-vectorised NEON FMA-equivalent). Without this branch
+    // we are 15× slower than PyTorch on bandwidth-bound ops; with it
+    // we approach memory-bandwidth ceiling on M4 Max (~120 GB/s).
+    if lhs_offset == 0
+        && rhs_offset == 0
+        && lhs_shape == *rhs.shape()
+        && lhs.is_contiguous()
+        && rhs.is_contiguous()
+        && lhs_raw.len() >= n
+        && rhs_raw.len() >= n
+    {
+        let lhs_dense = &mut lhs_raw[..n];
+        let rhs_dense = &rhs_raw[..n];
+        for (l, r) in lhs_dense.iter_mut().zip(rhs_dense.iter()) {
+            *l = op(*l, *r);
+        }
+        lhs.version().bump();
+        return Ok(lhs);
+    }
+
     for i in 0..n {
         let li = strided_index(i, &lhs_shape, &lhs_strides, lhs_offset);
         let ri = strided_index(i, &lhs_shape, &rhs_strides, rhs_offset);
@@ -687,6 +715,7 @@ fn unary_inplace_typed<'a, T: Element>(
     let shape = src.shape().to_vec();
     let strides = src.strides().to_vec();
     let offset = src.storage_offset();
+    let is_dense = offset == 0 && src.is_contiguous();
     let storage = src
         .storage_mut_for_inplace()
         .ok_or(TensorError::Aliased { op: op_name })?;
@@ -694,6 +723,18 @@ fn unary_inplace_typed<'a, T: Element>(
     // SAFETY: unique mutable borrow + dtype match.
     let raw: &mut [T] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut T, typed_len) };
+    // Fast path: dense contiguous in-place unary (relu, sigmoid_,
+    // tanh_, neg_, ...) — tight loop, auto-vectorised epilogue. Same
+    // motivation as `binary_inplace_typed`: avoids per-element
+    // `strided_index` modular divisions on the dominant path.
+    if is_dense && raw.len() >= n {
+        let dense = &mut raw[..n];
+        for cell in dense.iter_mut() {
+            *cell = op(*cell);
+        }
+        src.version().bump();
+        return Ok(src);
+    }
     for i in 0..n {
         let idx = strided_index(i, &shape, &strides, offset);
         raw[idx] = op(raw[idx]);

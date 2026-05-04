@@ -2,490 +2,578 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>rustorch — browser demo gallery</title>
+  <title>rustorch — live learning in your browser</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
+    :root {
+      --bg: #0a0b09;
+      --panel: #14140f;
+      --border: #2a2a26;
+      --text: #e0e0e0;
+      --muted: #888;
+      --accent: #ce422b;
+      --truth: #6fcf6f;
+      --pred:  #ff6b4a;
+      --data:  #5b9bd5;
+      --grid:  #1f1f1d;
+      --ok:    #8fcf6f;
+      --warn:  #e6b04b;
+    }
+    * { box-sizing: border-box; }
     body {
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      background: #0a0b09;
-      color: #e0e0e0;
-      padding: 24px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: var(--bg);
+      color: var(--text);
       max-width: 1080px;
       margin: 0 auto;
+      padding: 24px;
       line-height: 1.5;
     }
-    h1 { color: #ce422b; margin-bottom: 4px; }
-    h2 { color: #d8d8d8; font-size: 1.1em; margin-top: 0; }
-    h3 { color: #aaa; font-size: 0.95em; margin: 8px 0 4px; }
-    .lead { color: #aaa; margin-top: 0; }
-    .badge {
-      display: inline-block;
-      background: #2a2a26;
-      color: #aaa;
-      padding: 1px 8px;
-      border-radius: 10px;
-      font-size: 0.75em;
-      margin-right: 4px;
-    }
-    .badge.gpu  { background: #243; color: #8fcf6f; }
-    .badge.cpu  { background: #322; color: #e6b04b; }
-    .badge.train { background: #233; color: #6fb0ce; }
-    .pill {
-      display: inline-block;
-      background: #1a1c18;
-      border: 1px solid #2a2a26;
-      padding: 2px 8px;
-      border-radius: 12px;
-      font-size: 0.78em;
-      margin-right: 4px;
-      color: #bdbdbd;
-    }
-    .grid {
+    h1 { color: var(--accent); margin: 0 0 6px; font-size: 1.6em; }
+    h2 { color: var(--accent); font-size: 1.05em; margin: 14px 0 8px; }
+    .lede { color: var(--muted); margin: 0 0 20px; font-size: 0.95em; }
+
+    /* Two-column layout: plot on left, controls on right. */
+    .stage {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+      grid-template-columns: 1fr 240px;
       gap: 14px;
+      align-items: start;
     }
-    .card {
-      background: #14140f;
-      border: 1px solid #2a2a26;
-      padding: 16px 18px;
-      margin: 0;
+    @media (max-width: 800px) {
+      .stage { grid-template-columns: 1fr; }
+    }
+
+    .plots {
+      background: var(--panel);
+      border: 1px solid var(--border);
       border-radius: 8px;
-    }
-    .card.featured {
-      border-color: #4a3a36;
-      background: #181412;
-    }
-    .ok    { color: #8fcf6f; }
-    .warn  { color: #e6b04b; }
-    .err   { color: #e87b6f; }
-    pre {
-      white-space: pre-wrap;
-      word-break: break-all;
-      max-height: 220px;
-      overflow-y: auto;
-      background: #0a0a08;
       padding: 10px;
+    }
+    canvas, svg.loss {
+      display: block;
+      width: 100%;
+      background: #0a0a08;
       border-radius: 4px;
-      font-size: 0.82em;
-      margin: 8px 0 0;
     }
-    code {
-      background: #1a1c18;
-      padding: 1px 4px;
-      border-radius: 3px;
-      font-size: 0.92em;
+    canvas { height: 320px; }
+    svg.loss { height: 130px; margin-top: 10px; }
+
+    .legend {
+      display: flex;
+      gap: 14px;
+      font-size: 0.8em;
+      color: var(--muted);
+      margin: 6px 4px 0;
+      flex-wrap: wrap;
     }
-    pre code {
-      background: transparent;
-      padding: 0;
+    .swatch {
+      display: inline-block;
+      width: 22px;
+      height: 3px;
+      vertical-align: middle;
+      margin-right: 5px;
+    }
+    .dot {
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      vertical-align: middle;
+      margin-right: 5px;
+    }
+
+    .controls {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      font-size: 0.88em;
+    }
+    .controls label {
+      display: block;
+      color: var(--muted);
+      margin: 10px 0 4px;
+    }
+    .controls input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+    }
+    .val {
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
     }
     button {
-      background: #ce422b;
+      background: var(--accent);
       color: white;
       border: none;
-      padding: 8px 14px;
+      padding: 9px 14px;
       border-radius: 4px;
       font: inherit;
       cursor: pointer;
-      margin-right: 6px;
-      margin-top: 4px;
-      font-size: 0.88em;
-    }
-    button:hover:not(:disabled) { background: #e25036; }
-    button:disabled { opacity: 0.4; cursor: not-allowed; }
-    label { color: #aaa; margin-right: 6px; font-size: 0.85em; }
-    input[type="number"] {
-      background: #0a0a08;
-      color: #e0e0e0;
-      border: 1px solid #2a2a26;
-      padding: 3px 6px;
-      border-radius: 3px;
-      font: inherit;
-      width: 60px;
-      margin-right: 10px;
-      font-size: 0.85em;
-    }
-    input[type="checkbox"] { margin-right: 4px; }
-    table {
-      border-collapse: collapse;
-      margin-top: 10px;
       width: 100%;
+      margin-top: 6px;
+    }
+    button.secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px 12px;
+      margin: 12px 0;
       font-size: 0.85em;
     }
-    th, td {
-      padding: 4px 10px;
-      border-bottom: 1px solid #2a2a26;
-      text-align: left;
+    .stats .k { color: var(--muted); }
+    .stats .v { color: var(--text); font-variant-numeric: tabular-nums; text-align: right; }
+
+    .explain {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 18px;
+      margin-top: 18px;
+      font-size: 0.9em;
     }
-    th { color: #888; font-weight: normal; }
-    .num { text-align: right; font-variant-numeric: tabular-nums; }
-    .legend {
-      color: #888;
-      font-size: 0.85em;
-      margin-bottom: 16px;
+    .explain ol { margin: 6px 0 0 18px; padding: 0; }
+    .explain li { margin: 4px 0; color: var(--muted); }
+    .explain code { color: var(--text); background: #1a1a16; padding: 1px 4px; border-radius: 3px; }
+
+    footer {
+      margin-top: 22px;
+      color: var(--muted);
+      font-size: 0.8em;
+      text-align: center;
     }
-    .legend .badge { margin-right: 6px; }
-    a { color: #e6b04b; text-decoration: none; }
-    a:hover { text-decoration: underline; }
+    footer a { color: var(--muted); }
+    .ok   { color: var(--ok); }
+    .warn { color: var(--warn); }
   </style>
 </head>
 <body>
-  <h1>rustorch — browser demo gallery</h1>
-  <p class="lead">
-    Pure-Rust deep-learning library compiled to WebAssembly. Each card
-    below exercises a specific corner of the public API, from raw GPU
-    kernels (WebGPU) to autograd-aware training in the browser (CPU).
-  </p>
-  <p class="legend">
-    <span class="badge gpu">GPU</span> WebGPU compute path&nbsp;&nbsp;
-    <span class="badge cpu">CPU</span> autograd-aware path (no GPU required)&nbsp;&nbsp;
-    <span class="badge train">TRAIN</span> exercises forward + backward + grad processing
+  <h1>rustorch — live learning in your browser</h1>
+  <p class="lede">
+    A 2-layer neural network learning <code>y = sin(x)</code> from scratch,
+    one SGD step at a time. Pure CPU autograd compiled to WebAssembly —
+    no GPU required. Hit <strong>Run</strong> and watch the red curve
+    converge toward the green truth.
   </p>
 
-  <div class="card">
-    <h2>Runtime status</h2>
-    <p id="status">Checking…</p>
+  <div class="stage">
+    <div class="plots">
+      <canvas id="curve" width="900" height="320"></canvas>
+      <div class="legend">
+        <span><span class="dot" style="background:var(--data)"></span>Training data (noisy)</span>
+        <span><span class="swatch" style="background:var(--truth);border-top:2px dashed var(--truth);background-color:transparent"></span>Truth: <code>sin(x)</code></span>
+        <span><span class="swatch" style="background:var(--pred)"></span>Model prediction</span>
+      </div>
+
+      <svg class="loss" id="lossSvg" viewBox="0 0 900 130" preserveAspectRatio="none"></svg>
+      <div class="legend">
+        <span style="color:var(--muted)">↑ Mean-squared-error loss across SGD steps. Lower = better fit.</span>
+      </div>
+    </div>
+
+    <div class="controls">
+      <h2 style="margin-top:0">Setup</h2>
+
+      <div class="row"><label for="hidden">Hidden units</label><span class="val" id="hiddenV">32</span></div>
+      <input type="range" id="hidden" min="4" max="128" step="4" value="32" />
+
+      <div class="row"><label for="lr">Learning rate</label><span class="val" id="lrV">0.05</span></div>
+      <input type="range" id="lr" min="1" max="200" step="1" value="50" />
+
+      <div class="row"><label for="noise">Noise on targets</label><span class="val" id="noiseV">0.10</span></div>
+      <input type="range" id="noise" min="0" max="50" step="1" value="10" />
+
+      <h2>Live state</h2>
+      <div class="stats">
+        <span class="k">Step</span>           <span class="v" id="stepV">—</span>
+        <span class="k">Loss</span>           <span class="v" id="lossV">—</span>
+        <span class="k">Best loss</span>      <span class="v" id="bestV">—</span>
+        <span class="k">Params</span>         <span class="v" id="paramV">—</span>
+        <span class="k">Steps / sec</span>    <span class="v" id="rateV">—</span>
+      </div>
+
+      <button id="run">▶ Run</button>
+      <button id="reset" class="secondary">↻ Reset network</button>
+
+      <p style="font-size:0.78em;color:var(--muted);margin:14px 0 0">
+        Changing the sliders takes effect on the next <em>Reset</em>.
+        The learning rate is hot-applied during training.
+      </p>
+    </div>
   </div>
 
-  <div class="grid">
-
-    <!-- ============ Demo: GPU smoke test ============ -->
-    <div class="card">
-      <h2>GPU · Smoke test <span class="badge gpu">GPU</span></h2>
-      <p>
-        End-to-end <code>add → relu → softmax</code> on a <code>[B, K]</code>
-        tensor through the WGPU backend. Proves the WASM ↔ WebGPU bridge.
-      </p>
-      <p>
-        <span class="pill">rustorch-wgpu</span>
-        <span class="pill">add</span>
-        <span class="pill">relu</span>
-        <span class="pill">softmax</span>
-      </p>
-      <p>
-        <label>B <input id="smoke-b" type="number" value="2" min="1" max="64" /></label>
-        <label>K <input id="smoke-k" type="number" value="8" min="1" max="2048" /></label>
-        <button id="run-smoke">Run</button>
-      </p>
-      <pre id="smoke-output">(not run yet)</pre>
-    </div>
-
-    <!-- ============ Demo: GPU transformer block ============ -->
-    <div class="card">
-      <h2>GPU · Transformer block <span class="badge gpu">GPU</span></h2>
-      <p>
-        Self-attention block on the WGPU side: <code>matmul(Q, K, V)</code>
-        → naive attention → LayerNorm. All ops are raw GPU kernels.
-      </p>
-      <p>
-        <span class="pill">rustorch-wgpu</span>
-        <span class="pill">matmul</span>
-        <span class="pill">attention_naive</span>
-        <span class="pill">layernorm_rows</span>
-      </p>
-      <p>
-        <label>S <input id="block-s" type="number" value="32" min="1" max="512" /></label>
-        <label>D <input id="block-d" type="number" value="64" min="8" max="512" /></label>
-        <button id="run-block">Run</button>
-      </p>
-      <table id="block-table" style="display:none">
-        <thead><tr><th>phase</th><th class="num">ms</th></tr></thead>
-        <tbody>
-          <tr><td>upload</td><td class="num" id="t-up"></td></tr>
-          <tr><td>compute</td><td class="num" id="t-c"></td></tr>
-          <tr><td>readback</td><td class="num" id="t-r"></td></tr>
-          <tr><td><strong>total</strong></td><td class="num" id="t-tot"></td></tr>
-        </tbody>
-      </table>
-      <pre id="block-output">(not run yet)</pre>
-    </div>
-
-    <!-- ============ Demo: Autograd encoder ============ -->
-    <div class="card featured">
-      <h2>CPU · Transformer encoder <span class="badge cpu">CPU</span></h2>
-      <p>
-        Single-block encoder running <em>entirely</em> through the
-        autograd-aware <code>nn</code> stack — no GPU adapter needed. Combines:
-      </p>
-      <p>
-        <span class="pill">Linear (rank-N)</span>
-        <span class="pill">RMSNorm</span>
-        <span class="pill">SinusoidalPositionalEncoding</span>
-        <span class="pill">MultiHeadAttention</span>
-        <span class="pill">causal_mask</span>
-      </p>
-      <p>
-        <label>B <input id="enc-b" type="number" value="2" min="1" max="32" /></label>
-        <label>T <input id="enc-t" type="number" value="16" min="2" max="256" /></label>
-        <label>D <input id="enc-d" type="number" value="64" min="8" max="512" /></label>
-        <label>heads <input id="enc-h" type="number" value="4" min="1" max="32" /></label>
-        <label><input id="enc-causal" type="checkbox" checked /> causal mask</label>
-        <button id="run-encoder">Run</button>
-      </p>
-      <table id="enc-table" style="display:none">
-        <thead><tr><th>metric</th><th class="num">value</th></tr></thead>
-        <tbody>
-          <tr><td>parameters</td><td class="num" id="enc-pc"></td></tr>
-          <tr><td>compute</td><td class="num" id="enc-c"></td></tr>
-        </tbody>
-      </table>
-      <pre id="enc-output">(not run yet)</pre>
-    </div>
-
-    <!-- ============ Demo: CrossAttentionPool ============ -->
-    <div class="card featured">
-      <h2>CPU · CrossAttentionPool <span class="badge cpu">CPU</span></h2>
-      <p>
-        Pool a variable-length sequence <code>[B, T, D]</code> to a fixed-size
-        <code>[B, num_queries, D]</code> via cross-attention from a learnable
-        query bank — the pattern used by <strong>Perceiver, Q-Former (BLIP-2),
-        Set Transformer</strong>.
-      </p>
-      <p>
-        <span class="pill">CrossAttentionPool</span>
-        <span class="pill">RMSNorm</span>
-        <span class="pill">MultiHeadAttention</span>
-      </p>
-      <p>
-        <label>B <input id="pool-b" type="number" value="2" min="1" max="16" /></label>
-        <label>T <input id="pool-t" type="number" value="32" min="2" max="256" /></label>
-        <label>D <input id="pool-d" type="number" value="64" min="8" max="256" /></label>
-        <label>heads <input id="pool-h" type="number" value="4" min="1" max="16" /></label>
-        <label>queries <input id="pool-q" type="number" value="8" min="1" max="64" /></label>
-        <button id="run-pool">Run</button>
-      </p>
-      <table id="pool-table" style="display:none">
-        <thead><tr><th>metric</th><th class="num">value</th></tr></thead>
-        <tbody>
-          <tr><td>output shape</td><td class="num" id="pool-shape"></td></tr>
-          <tr><td>parameters</td><td class="num" id="pool-pc"></td></tr>
-          <tr><td>compute</td><td class="num" id="pool-c"></td></tr>
-        </tbody>
-      </table>
-      <pre id="pool-output">(not run yet)</pre>
-    </div>
-
-    <!-- ============ Demo: training step ============ -->
-    <div class="card featured">
-      <h2>Training · Forward + backward + clip <span class="badge train">TRAIN</span></h2>
-      <p>
-        One training step on a 2-layer MLP: forward through
-        <code>Linear → relu → Linear</code>, MSE loss, reverse-mode
-        autograd, then <code>clip_grad_norm_</code>. No optimizer step
-        is performed (smoke test of the gradient flow).
-      </p>
-      <p>
-        <span class="pill">Linear</span>
-        <span class="pill">relu</span>
-        <span class="pill">mse_loss</span>
-        <span class="pill">backward</span>
-        <span class="pill">clip_grad_norm_</span>
-      </p>
-      <p>
-        <label>batch <input id="tr-b" type="number" value="8" min="1" max="64" /></label>
-        <label>in <input id="tr-in" type="number" value="32" min="2" max="512" /></label>
-        <label>hidden <input id="tr-h" type="number" value="64" min="2" max="512" /></label>
-        <label>out <input id="tr-out" type="number" value="10" min="1" max="100" /></label>
-        <label>max_norm <input id="tr-mn" type="number" value="1.0" min="0.01" max="100" step="0.1" /></label>
-        <button id="run-train">Run</button>
-      </p>
-      <table id="tr-table" style="display:none">
-        <thead><tr><th>metric</th><th class="num">value</th></tr></thead>
-        <tbody>
-          <tr><td>parameters</td><td class="num" id="tr-pc"></td></tr>
-          <tr><td>loss (MSE)</td><td class="num" id="tr-loss"></td></tr>
-          <tr><td>grad norm (pre-clip)</td><td class="num" id="tr-gn"></td></tr>
-          <tr><td>clipped?</td><td class="num" id="tr-clipped"></td></tr>
-          <tr><td>forward</td><td class="num" id="tr-fwd"></td></tr>
-          <tr><td>backward</td><td class="num" id="tr-bwd"></td></tr>
-          <tr><td>clip</td><td class="num" id="tr-clip"></td></tr>
-        </tbody>
-      </table>
-    </div>
-
+  <div class="explain">
+    <h2 style="margin-top:0">What's happening, in 60 seconds</h2>
+    <ol>
+      <li>
+        We sample <strong>64 noisy points</strong> from <code>y = sin(x)</code> on
+        <code>[-π, π]</code> — those are the blue dots.
+      </li>
+      <li>
+        A tiny multilayer perceptron <code>Linear(1 → H) → ReLU → Linear(H → 1)</code>
+        starts with random weights — the red curve starts as a wiggly mess.
+      </li>
+      <li>
+        Each step computes the <strong>mean-squared error</strong> between its
+        prediction and the noisy targets, runs <strong>backpropagation</strong> through
+        rustorch's autograd tape, then takes one <strong>SGD update</strong>.
+      </li>
+      <li>
+        After a few hundred steps the red curve hugs the green truth — the
+        network has <strong>generalized past the noise</strong>. The loss curve
+        on the bottom chart traces the descent.
+      </li>
+      <li>
+        Crank <em>Hidden units</em> up to overfit; drop <em>Learning rate</em>
+        too low to watch the descent stall; pump <em>Noise</em> to see the
+        model find the underlying signal regardless.
+      </li>
+    </ol>
   </div>
 
-  <div class="card" style="margin-top:14px">
-    <h2>Build &amp; serve</h2>
-    <pre><code>./build.sh        # produces pkg/ next to web/
-python3 -m http.server 8080
-# open http://localhost:8080/web/ in Chrome 120+</code></pre>
-    <p style="color:#888; font-size:0.85em">
-      The CPU demos (encoder, pool, training) work in any browser with
-      WASM support — they don't depend on WebGPU.
-      The GPU demos require Chrome 120+ with WebGPU enabled.
-    </p>
-  </div>
+  <footer>
+    Other demos:
+    <a href="kernels.html">GPU kernel smoke tests</a> ·
+    <a href="gpt.html">GPT block</a> ·
+    <a href="resnet.html">ResNet block</a>
+    &nbsp;·&nbsp;
+    <a href="https://github.com/rustorch/rustorch">github.com/rustorch/rustorch</a>
+  </footer>
 
-  <p style="color:#666; font-size:0.85em; margin-top:24px">
-    Pages liées :
-    <a href="gpt.html">GPT block (raw WGPU)</a> ·
-    <a href="resnet.html">ResNet block (raw WGPU)</a>
-  </p>
-
-  <script>
-    // Compatibility shim — wgpu 22 (still pinned in this workspace) sends
-    // `maxInterStageShaderComponents` in the requestDevice descriptor.
-    // Chrome 130+ removed that limit from the WebGPU spec and now rejects
-    // any non-undefined value with `OperationError`. We monkey-patch the
-    // adapter's requestDevice once at page load to drop the offending
-    // field in place before the descriptor reaches the browser.
-    // Drop this when wgpu is bumped to a version that no longer emits
-    // the field.
-    (function () {
-      if (typeof GPUAdapter === "undefined" || !GPUAdapter.prototype) return;
-      const orig = GPUAdapter.prototype.requestDevice;
-      const STRIPPED = ["maxInterStageShaderComponents"];
-      GPUAdapter.prototype.requestDevice = function (descriptor) {
-        try {
-          if (descriptor && descriptor.requiredLimits) {
-            for (const k of STRIPPED) {
-              if (k in descriptor.requiredLimits) {
-                delete descriptor.requiredLimits[k];
-              }
-            }
-          }
-        } catch (_) { /* descriptor was a frozen WebIDL dict — let it go through unchanged */ }
-        return orig.call(this, descriptor);
-      };
-    })();
-  </script>
   <script type="module">
-    import init, {
-      run_demo,
-      run_attention_block,
-      run_encoder_block,
-      run_cross_attention_pool,
-      run_training_step,
-    } from "../pkg/rustorch_wasm_demo.js";
+    import init, { CurveFitter } from "../pkg/rustorch_wasm_demo.js";
 
+    // ----- DOM helpers --------------------------------------------------
     const $ = (id) => document.getElementById(id);
+    const canvas = $("curve");
+    const ctx = canvas.getContext("2d");
+    const svg = $("lossSvg");
 
-    function setStatus() {
-      const hasGpu = "gpu" in navigator;
-      if (!hasGpu) {
-        $("status").innerHTML =
-          '<span class="warn">⚠ WebGPU not available — GPU demos disabled. CPU demos still work.</span>';
-        $("run-smoke").disabled = true;
-        $("run-block").disabled = true;
+    // ----- Plot bounds in data units ------------------------------------
+    // Declared early because `drawCanvas` (called once during init,
+    // before the rest of the script body has finished executing) uses
+    // them via `dataToPixel` — keeping them at the top avoids the
+    // temporal-dead-zone ReferenceError that ate me alive.
+    const X_MIN = -Math.PI, X_MAX = Math.PI;
+    const Y_MIN = -1.8, Y_MAX = 1.8;
+
+    // The slider for `lr` carries integer values mapped logarithmically
+    // to a more useful range. Slider 1 → 0.001, slider 200 → 0.5.
+    const lrFromSlider = (s) => {
+      const t = (s - 1) / 199; // 0..1
+      return +(0.001 * Math.pow(500, t)).toFixed(4);
+    };
+    const noiseFromSlider = (s) => +(s / 100).toFixed(2);
+
+    // ----- Live state ---------------------------------------------------
+    let fit = null;
+    let running = false;
+    const losses = [];
+    let bestLoss = Infinity;
+    let lastTickStamp = 0;
+    let stepsSinceTick = 0;
+    let stepsPerSec = 0;
+    /** Latest model prediction as interleaved [x0, y0, x1, y1, ...]. */
+    let lastPred = null;
+    /** Cached training data refs (set on every reset). */
+    let trainX = null, trainY = null;
+
+    // ----- Init ---------------------------------------------------------
+    await init();
+    rebuildFitter();
+    drawCanvas();
+    drawLoss();
+    refreshStats();
+
+    // ----- Slider wiring ------------------------------------------------
+    function refreshSliderLabels() {
+      $("hiddenV").textContent = $("hidden").value;
+      $("lrV").textContent     = lrFromSlider(+$("lr").value).toFixed(3);
+      $("noiseV").textContent  = noiseFromSlider(+$("noise").value).toFixed(2);
+    }
+    $("hidden").addEventListener("input", refreshSliderLabels);
+    $("lr").addEventListener("input", () => {
+      refreshSliderLabels();
+      // Hot-apply learning rate to the running fitter.
+      if (fit) fit.setLr(lrFromSlider(+$("lr").value));
+    });
+    $("noise").addEventListener("input", refreshSliderLabels);
+    refreshSliderLabels();
+
+    $("run").addEventListener("click", () => {
+      if (running) {
+        running = false;
+        $("run").textContent = "▶ Run";
       } else {
-        $("status").innerHTML = '<span class="ok">✓ navigator.gpu present — all demos enabled.</span>';
+        running = true;
+        $("run").textContent = "⏸ Pause";
+        loop();
+      }
+    });
+    $("reset").addEventListener("click", () => {
+      running = false;
+      $("run").textContent = "▶ Run";
+      rebuildFitter();
+      drawCanvas();
+      drawLoss();
+      refreshStats();
+    });
+
+    // ----- Rebuild fitter from current slider values --------------------
+    function rebuildFitter() {
+      if (fit) fit.free();
+      const hidden = +$("hidden").value;
+      const lr     = lrFromSlider(+$("lr").value);
+      const noise  = noiseFromSlider(+$("noise").value);
+      fit = new CurveFitter(hidden, lr, 64, noise);
+      trainX = fit.trainX();
+      trainY = fit.trainY();
+      lastPred = fit.predict(150);
+      losses.length = 0;
+      bestLoss = Infinity;
+      stepsPerSec = 0;
+    }
+
+    // ----- Training loop ------------------------------------------------
+    async function loop() {
+      lastTickStamp = performance.now();
+      stepsSinceTick = 0;
+
+      while (running) {
+        // Run a small chunk of steps before yielding to the browser.
+        // 25 steps is fast enough to be smooth on any device while
+        // keeping per-frame redraw cost low.
+        for (let i = 0; i < 25 && running; i++) {
+          let loss;
+          try { loss = fit.step(); }
+          catch (e) {
+            running = false;
+            $("run").textContent = "▶ Run";
+            console.error("step failed:", e);
+            return;
+          }
+          losses.push(loss);
+          if (loss < bestLoss) bestLoss = loss;
+          stepsSinceTick++;
+        }
+
+        // Refresh prediction + UI.
+        lastPred = fit.predict(150);
+        drawCanvas();
+        drawLoss();
+
+        // Steps/sec: sliding window over ~500ms.
+        const now = performance.now();
+        const dt = now - lastTickStamp;
+        if (dt >= 500) {
+          stepsPerSec = Math.round((stepsSinceTick * 1000) / dt);
+          lastTickStamp = now;
+          stepsSinceTick = 0;
+        }
+        refreshStats();
+
+        // Yield to the browser so it can paint and accept input.
+        await new Promise((r) => requestAnimationFrame(r));
       }
     }
 
-    let initialized = false;
-    async function ensureInit() {
-      if (!initialized) {
-        await init();
-        initialized = true;
+    // ----- Stats panel --------------------------------------------------
+    function refreshStats() {
+      $("stepV").textContent  = fit ? fit.stepCount() : "—";
+      $("lossV").textContent  = losses.length
+        ? losses[losses.length - 1].toExponential(2)
+        : "—";
+      $("bestV").textContent  = isFinite(bestLoss) ? bestLoss.toExponential(2) : "—";
+      $("paramV").textContent = fit ? fit.paramCount() : "—";
+      $("rateV").textContent  = stepsPerSec > 0 ? stepsPerSec : "—";
+    }
+
+    // ----- Canvas: dataset / truth / prediction -------------------------
+    // (Plot bounds X_MIN/X_MAX/Y_MIN/Y_MAX are defined at the top of
+    // this module so the first `drawCanvas()` call during init can see
+    // them. Y range is generous to absorb noise and early-training
+    // crazy predictions without rescaling.)
+
+    function dataToPixel(x, y, W, H) {
+      const padL = 32, padR = 12, padT = 14, padB = 22;
+      const px = padL + ((x - X_MIN) / (X_MAX - X_MIN)) * (W - padL - padR);
+      const py = padT + ((Y_MAX - y) / (Y_MAX - Y_MIN)) * (H - padT - padB);
+      return [px, py];
+    }
+
+    function drawCanvas() {
+      // Resize to actual pixel size for crisp rendering on retina.
+      const cssW = canvas.clientWidth;
+      const cssH = canvas.clientHeight;
+      const dpr = window.devicePixelRatio || 1;
+      if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
+        canvas.width = cssW * dpr;
+        canvas.height = cssH * dpr;
+      }
+      const W = canvas.width, H = canvas.height;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+
+      // Grid + axes.
+      ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--grid").trim();
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      // Horizontal grid lines at y = -1, 0, 1.
+      [-1, 0, 1].forEach((y) => {
+        const [, py] = dataToPixel(0, y, W, H);
+        ctx.moveTo(0, py); ctx.lineTo(W, py);
+      });
+      // Vertical grid lines at x = -π, -π/2, 0, π/2, π.
+      [-Math.PI, -Math.PI/2, 0, Math.PI/2, Math.PI].forEach((x) => {
+        const [px] = dataToPixel(x, 0, W, H);
+        ctx.moveTo(px, 0); ctx.lineTo(px, H);
+      });
+      ctx.stroke();
+
+      // Axis labels.
+      ctx.fillStyle = "#666";
+      ctx.font = `${11 * dpr}px ui-monospace, monospace`;
+      const tickXs = [["-π", -Math.PI], ["0", 0], ["π", Math.PI]];
+      tickXs.forEach(([lbl, x]) => {
+        const [px, py] = dataToPixel(x, Y_MIN, W, H);
+        ctx.fillText(lbl, px - 4 * dpr, py + 14 * dpr);
+      });
+      [-1, 0, 1].forEach((y) => {
+        const [, py] = dataToPixel(X_MIN, y, W, H);
+        ctx.fillText(y.toFixed(0), 6 * dpr, py + 4 * dpr);
+      });
+
+      // Ground truth: dashed sin(x).
+      ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--truth").trim();
+      ctx.lineWidth = 1.5 * dpr;
+      ctx.setLineDash([6 * dpr, 4 * dpr]);
+      ctx.beginPath();
+      const N = 200;
+      for (let i = 0; i < N; i++) {
+        const x = X_MIN + (i / (N - 1)) * (X_MAX - X_MIN);
+        const y = Math.sin(x);
+        const [px, py] = dataToPixel(x, y, W, H);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Training data: blue dots.
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--data").trim();
+      for (let i = 0; i < trainX.length; i++) {
+        const [px, py] = dataToPixel(trainX[i], trainY[i], W, H);
+        ctx.beginPath();
+        ctx.arc(px, py, 2.5 * dpr, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+
+      // Model prediction: red line.
+      if (lastPred) {
+        ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--pred").trim();
+        ctx.lineWidth = 2.5 * dpr;
+        ctx.beginPath();
+        for (let i = 0; i < lastPred.length; i += 2) {
+          const x = lastPred[i], y = lastPred[i + 1];
+          const [px, py] = dataToPixel(x, y, W, H);
+          if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
       }
     }
 
-    async function withErr(outId, fn) {
-      const out = $(outId);
-      try { return await fn(out); }
-      catch (err) {
-        out.innerHTML = `<span class="err">Error: ${err?.message || err}</span>`;
-        throw err;
+    // ----- SVG: loss curve ---------------------------------------------
+    function drawLoss() {
+      const W = 900, H = 130;
+      const padL = 40, padR = 8, padT = 10, padB = 22;
+      svg.innerHTML = "";
+      if (losses.length < 2) {
+        const g = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        g.setAttribute("x", W / 2);
+        g.setAttribute("y", H / 2);
+        g.setAttribute("text-anchor", "middle");
+        g.setAttribute("fill", "#666");
+        g.setAttribute("font-family", "ui-monospace, monospace");
+        g.setAttribute("font-size", "12");
+        g.textContent = "Press Run to start training.";
+        svg.appendChild(g);
+        return;
       }
+      // Use a log Y axis — loss spans several orders of magnitude.
+      const epsilon = 1e-8;
+      const ys = losses.map((v) => Math.log10(Math.max(v, epsilon)));
+      const yMin = Math.min(...ys), yMax = Math.max(...ys);
+      const yPad = (yMax - yMin) * 0.05 || 0.5;
+      const yLo = yMin - yPad, yHi = yMax + yPad;
+
+      const N = losses.length;
+      const sx = (i) => padL + (i / (N - 1)) * (W - padL - padR);
+      const sy = (logV) => padT + ((yHi - logV) / (yHi - yLo)) * (H - padT - padB);
+
+      // Y grid: 3 horizontal lines.
+      const gridSvg = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      for (let k = 0; k <= 3; k++) {
+        const t = k / 3;
+        const yVal = yLo + t * (yHi - yLo);
+        const py = sy(yVal);
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", padL); line.setAttribute("x2", W - padR);
+        line.setAttribute("y1", py); line.setAttribute("y2", py);
+        line.setAttribute("stroke", "#1f1f1d");
+        line.setAttribute("stroke-width", "1");
+        gridSvg.appendChild(line);
+
+        const lbl = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        lbl.setAttribute("x", padL - 6);
+        lbl.setAttribute("y", py + 3);
+        lbl.setAttribute("text-anchor", "end");
+        lbl.setAttribute("fill", "#666");
+        lbl.setAttribute("font-family", "ui-monospace, monospace");
+        lbl.setAttribute("font-size", "10");
+        lbl.textContent = "10^" + yVal.toFixed(1);
+        gridSvg.appendChild(lbl);
+      }
+      svg.appendChild(gridSvg);
+
+      // Loss line.
+      let d = "";
+      for (let i = 0; i < N; i++) {
+        d += (i === 0 ? "M" : "L") + sx(i).toFixed(1) + " " + sy(ys[i]).toFixed(1) + " ";
+      }
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", d);
+      path.setAttribute("fill", "none");
+      path.setAttribute("stroke", "#ff6b4a");
+      path.setAttribute("stroke-width", "1.6");
+      path.setAttribute("stroke-linejoin", "round");
+      svg.appendChild(path);
+
+      // X label: latest step count.
+      const stepLbl = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      stepLbl.setAttribute("x", W - padR);
+      stepLbl.setAttribute("y", H - 5);
+      stepLbl.setAttribute("text-anchor", "end");
+      stepLbl.setAttribute("fill", "#666");
+      stepLbl.setAttribute("font-family", "ui-monospace, monospace");
+      stepLbl.setAttribute("font-size", "10");
+      stepLbl.textContent = "step " + N;
+      svg.appendChild(stepLbl);
     }
 
-    // Smoke test
-    $("run-smoke").addEventListener("click", () => withErr("smoke-output", async (out) => {
-      out.textContent = "Initializing…";
-      await ensureInit();
-      const b = parseInt($("smoke-b").value);
-      const k = parseInt($("smoke-k").value);
-      const buf = await run_demo(b, k);
-      out.textContent = `[${b}, ${k}] result, first 16:\n` +
-        Array.from(buf).slice(0, 16)
-          .map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
-    }));
-
-    // Transformer block (GPU)
-    $("run-block").addEventListener("click", () => withErr("block-output", async (out) => {
-      out.textContent = "Initializing…";
-      $("block-table").style.display = "none";
-      await ensureInit();
-      const s = parseInt($("block-s").value);
-      const d = parseInt($("block-d").value);
-      const stats = await run_attention_block(s, d);
-      $("t-up").textContent  = stats.upload_ms.toFixed(2);
-      $("t-c").textContent   = stats.compute_ms.toFixed(2);
-      $("t-r").textContent   = stats.readback_ms.toFixed(2);
-      $("t-tot").innerHTML   = `<strong>${stats.total_ms.toFixed(2)}</strong>`;
-      $("block-table").style.display = "table";
-      out.textContent = "First 8 outputs:\n" +
-        Array.from(stats.first_eight)
-          .map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
-    }));
-
-    // Encoder block (CPU autograd)
-    $("run-encoder").addEventListener("click", () => withErr("enc-output", async (out) => {
-      out.textContent = "Running…";
-      $("enc-table").style.display = "none";
-      await ensureInit();
-      const b = parseInt($("enc-b").value);
-      const t = parseInt($("enc-t").value);
-      const d = parseInt($("enc-d").value);
-      const h = parseInt($("enc-h").value);
-      const causal = $("enc-causal").checked;
-      const stats = run_encoder_block(b, t, d, h, causal);
-      $("enc-pc").textContent = stats.param_count.toLocaleString();
-      $("enc-c").textContent = `${stats.compute_ms.toFixed(2)} ms`;
-      $("enc-table").style.display = "table";
-      out.textContent =
-        `Output [${b}, ${t}, ${d}], first 8 values:\n` +
-        Array.from(stats.first_eight)
-          .map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
-    }));
-
-    // CrossAttentionPool (CPU)
-    $("run-pool").addEventListener("click", () => withErr("pool-output", async (out) => {
-      out.textContent = "Running…";
-      $("pool-table").style.display = "none";
-      await ensureInit();
-      const b = parseInt($("pool-b").value);
-      const t = parseInt($("pool-t").value);
-      const d = parseInt($("pool-d").value);
-      const h = parseInt($("pool-h").value);
-      const q = parseInt($("pool-q").value);
-      const stats = run_cross_attention_pool(b, t, d, h, q);
-      const shape = Array.from(stats.out_shape).join(" × ");
-      $("pool-shape").textContent = shape;
-      $("pool-pc").textContent = stats.param_count.toLocaleString();
-      $("pool-c").textContent = `${stats.compute_ms.toFixed(2)} ms`;
-      $("pool-table").style.display = "table";
-      out.textContent =
-        `Pooled output, first 8 values:\n` +
-        Array.from(stats.first_eight)
-          .map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
-    }));
-
-    // Training step (CPU)
-    $("run-train").addEventListener("click", () => withErr("tr-table", async () => {
-      $("tr-table").style.display = "none";
-      await ensureInit();
-      const batch  = parseInt($("tr-b").value);
-      const inDim  = parseInt($("tr-in").value);
-      const hidden = parseInt($("tr-h").value);
-      const outDim = parseInt($("tr-out").value);
-      const maxN   = parseFloat($("tr-mn").value);
-      const stats = run_training_step(batch, inDim, hidden, outDim, maxN);
-      $("tr-pc").textContent = stats.param_count.toLocaleString();
-      $("tr-loss").textContent = stats.loss_before.toFixed(6);
-      $("tr-gn").textContent = stats.grad_norm_before_clip.toFixed(4);
-      $("tr-clipped").innerHTML = stats.clipped
-        ? '<span class="ok">yes</span>'
-        : '<span class="warn">no (under max)</span>';
-      $("tr-fwd").textContent = `${stats.forward_ms.toFixed(2)} ms`;
-      $("tr-bwd").textContent = `${stats.backward_ms.toFixed(2)} ms`;
-      $("tr-clip").textContent = `${stats.clip_ms.toFixed(2)} ms`;
-      $("tr-table").style.display = "table";
-    }));
-
-    setStatus();
+    // Redraw on resize so the canvas stays crisp.
+    new ResizeObserver(() => { drawCanvas(); drawLoss(); }).observe(canvas);
   </script>
 </body>
 </html>

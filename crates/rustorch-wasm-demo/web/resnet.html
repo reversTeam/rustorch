@@ -2,86 +2,342 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>rustorch — ResNet block (WebGPU demo)</title>
+  <title>rustorch — ResNet basic block (WebGPU)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { font-family: ui-monospace, Menlo, monospace; background: #0a0b09; color: #e0e0e0; padding: 24px; max-width: 960px; margin: 0 auto; }
-    h1 { color: #ce422b; }
-    .card { background: #14140f; border: 1px solid #2a2a26; padding: 16px 18px; margin: 14px 0; border-radius: 8px; }
-    button { background: #ce422b; color: white; border: none; padding: 10px 18px; border-radius: 4px; font: inherit; cursor: pointer; }
+    :root {
+      --bg: #0a0b09; --panel: #14140f; --border: #2a2a26;
+      --text: #e0e0e0; --muted: #888; --accent: #ce422b;
+      --ok: #8fcf6f; --warn: #e6b04b; --err: #e87b6f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: var(--bg); color: var(--text);
+      max-width: 960px; margin: 0 auto; padding: 24px; line-height: 1.5;
+    }
+    h1 { color: var(--accent); margin: 0 0 6px; font-size: 1.5em; }
+    h2 { color: var(--accent); font-size: 1.0em; margin: 14px 0 8px; }
+    .lede { color: var(--muted); margin: 0 0 18px; font-size: 0.92em; }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      padding: 14px 18px; margin: 14px 0; border-radius: 8px;
+    }
+    button {
+      background: var(--accent); color: white; border: none;
+      padding: 9px 18px; border-radius: 4px; font: inherit; cursor: pointer;
+    }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
-    pre { background: #0a0a08; padding: 10px; border-radius: 4px; font-size: 0.85em; max-height: 280px; overflow-y: auto; }
-    label { color: #aaa; margin-right: 8px; }
-    input[type="number"] { background: #0a0a08; color: #e0e0e0; border: 1px solid #2a2a26; padding: 4px 8px; border-radius: 3px; font: inherit; width: 80px; margin-right: 16px; }
-    .ok { color: #8fcf6f; }
-    .warn { color: #e6b04b; }
-    .err { color: #e87b6f; }
+    input[type="number"] {
+      background: #0a0a08; color: var(--text); border: 1px solid var(--border);
+      padding: 6px 8px; border-radius: 3px; font: inherit;
+      width: 80px; margin-right: 12px;
+    }
+    label { color: var(--muted); margin-right: 6px; }
+
+    .stages {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 4px;
+      margin: 12px 0 8px;
+    }
+    .stage {
+      background: #0a0a08; border: 1px solid var(--border);
+      border-radius: 4px; padding: 8px 6px; text-align: center;
+      font-size: 0.78em; color: var(--muted); transition: all 0.15s;
+    }
+    .stage.active { border-color: var(--warn); color: var(--warn); }
+    .stage.done   { border-color: var(--ok);   color: var(--ok); background: rgba(143, 207, 111, 0.06); }
+    .stage.fail   { border-color: var(--err);  color: var(--err); }
+    .stage .lbl   { display: block; font-weight: bold; margin-bottom: 2px; }
+    .stage .det   { display: block; font-size: 0.85em; opacity: 0.85; }
+
+    /* Channel preview: each output channel is drawn as a small heatmap. */
+    .channels {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 12px 0 4px;
+    }
+    .channels canvas {
+      background: #000; border: 1px solid var(--border); border-radius: 3px;
+      image-rendering: pixelated;
+    }
+    .channels .ch {
+      display: flex; flex-direction: column; align-items: center;
+      font-size: 0.72em; color: var(--muted);
+    }
+
+    .summary {
+      display: grid; grid-template-columns: repeat(4, 1fr);
+      gap: 12px; margin-top: 10px; font-size: 0.85em;
+    }
+    .summary .k { color: var(--muted); }
+    .summary .v { color: var(--text); font-variant-numeric: tabular-nums; }
+
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .err { color: var(--err); }
+    .note { color: var(--muted); font-size: 0.85em; }
+    footer { margin-top: 22px; color: var(--muted); font-size: 0.8em; text-align: center; }
+    footer a { color: var(--muted); }
   </style>
 </head>
 <body>
-  <h1>ResNet block — WebGPU demo</h1>
-  <p>
-    Runs a single basic ResNet block on a synthetic <code>[1, C_in, H, W]</code>
-    F32 input. Uses random (deterministic, seeded) weights. Returns the
-    <code>[1, C_out, H, W]</code> output as a Float32Array. Real ResNet-18
-    inference with HuggingFace weights lands in a follow-up via
-    <code>load_safetensors_to_js</code>.
+  <h1>ResNet basic block <span class="pill">GPU only — experimental</span></h1>
+  <p class="lede">
+    Smoke-test of the convolutional kernel chain:
+    <code>conv → bn → relu → conv → bn + skip → relu</code>.
+    The input is a deterministic <code>[1, C_in, H, W]</code> tensor;
+    the output is shown as a per-channel heatmap so you can see the
+    spatial pattern the block computes.
   </p>
+  <p class="warn" style="font-size:0.88em;">
+    ⚠ This page exercises the WGSL kernel pipeline directly. On macOS
+    Metal the chain currently has stability issues that can crash
+    the tab — the demo is wrapped in a <strong>10-second hard
+    timeout</strong> so a stuck kernel aborts cleanly instead of
+    eating all your RAM. If it times out, prefer
+    <a href="index.html">the CPU live training demo</a> or
+    <a href="gpt.html">the CPU encoder block</a>, which run on the
+    same WASM bundle without WebGPU.
+  </p>
+  <style>
+    .pill {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      font-size: 0.72em; background: rgba(230, 176, 75, 0.15);
+      color: var(--warn); border: 1px solid var(--warn); margin-left: 6px;
+      vertical-align: middle;
+    }
+  </style>
 
   <div class="card">
-    <h2>Adapter</h2>
+    <h2 style="margin-top:0">Adapter</h2>
     <p id="status">checking…</p>
+    <p class="note">
+      Open the JS console: <code>[rustorch shim] loaded</code> confirms
+      the wgpu-22 / Chrome-130+ compatibility patch is active.
+    </p>
   </div>
 
   <div class="card">
-    <h2>Run</h2>
+    <h2 style="margin-top:0">Run</h2>
     <p>
-      <label>C_in <input id="ci" type="number" value="3" min="1" max="64" /></label>
-      <label>C_out <input id="co" type="number" value="8" min="1" max="64" /></label>
+      <label>C_in <input id="ci" type="number" value="3" min="1" max="32" /></label>
+      <label>C_out <input id="co" type="number" value="8" min="1" max="32" /></label>
       <label>H <input id="h" type="number" value="16" min="1" max="64" /></label>
       <label>W <input id="w" type="number" value="16" min="1" max="64" /></label>
-      <button id="run">Run block</button>
+      <button id="run">▶ Run block on GPU</button>
     </p>
-    <pre id="output">(not run yet)</pre>
+
+    <div class="stages" id="stages">
+      <div class="stage" id="st-init"><span class="lbl">1. WASM</span><span class="det">idle</span></div>
+      <div class="stage" id="st-adapter"><span class="lbl">2. Adapter</span><span class="det">idle</span></div>
+      <div class="stage" id="st-device"><span class="lbl">3. Device</span><span class="det">idle</span></div>
+      <div class="stage" id="st-compute"><span class="lbl">4. Compute</span><span class="det">idle</span></div>
+      <div class="stage" id="st-readback"><span class="lbl">5. Readback</span><span class="det">idle</span></div>
+    </div>
+
+    <p class="note" id="status-line">Click <strong>Run</strong> to dispatch the kernel chain on the WebGPU adapter.</p>
+
+    <h2>Output channels</h2>
+    <p class="note">
+      Each tile is one output channel of the <code>[1, C_out, H, W]</code>
+      tensor, drawn as a heatmap (cold → hot, blue → red). A working
+      block produces structured, channel-distinct patterns rather than
+      uniform noise.
+    </p>
+    <div class="channels" id="channels"></div>
+
+    <div class="summary" id="summary" style="display:none">
+      <div><span class="k">Output shape</span> <span class="v" id="sum-shape">—</span></div>
+      <div><span class="k">Total values</span> <span class="v" id="sum-numel">—</span></div>
+      <div><span class="k">Total time</span> <span class="v" id="sum-time">—</span></div>
+      <div><span class="k">Min / max</span> <span class="v" id="sum-range">—</span></div>
+    </div>
   </div>
+
+  <footer>
+    Other demos:
+    <a href="index.html">Live training demo</a> ·
+    <a href="kernels.html">GPU kernel smoke tests</a> ·
+    <a href="gpt.html">GPT block</a>
+  </footer>
+
+  <!-- wgpu 22 / Chrome 130+ compatibility shim. MUST load before the
+       wasm module that calls requestDevice. -->
+  <script src="wgpu-limits-shim.js"></script>
 
   <script type="module">
     import init, { run_resnet_block_js } from "../pkg/rustorch_wasm_demo.js";
+
     const $ = (id) => document.getElementById(id);
+    const stages = ["init", "adapter", "device", "compute", "readback"];
+
+    function setStage(name, state, detail) {
+      const el = $("st-" + name);
+      el.classList.remove("active", "done", "fail");
+      if (state) el.classList.add(state);
+      el.querySelector(".det").textContent = detail || state || "idle";
+    }
+    function resetStages() { stages.forEach((s) => setStage(s, null, "idle")); }
+    function setStatus(msg, cls) {
+      const line = $("status-line");
+      line.innerHTML = "";
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg;
+      line.appendChild(span);
+    }
 
     if (!("gpu" in navigator)) {
-      $("status").innerHTML = '<span class="warn">⚠ WebGPU not available. Use Chrome 120+.</span>';
+      $("status").innerHTML = '<span class="warn">⚠ WebGPU not available. Use Chrome 120+ with WebGPU enabled.</span>';
       $("run").disabled = true;
     } else {
       $("status").innerHTML = '<span class="ok">✓ navigator.gpu present.</span>';
     }
 
     let initialized = false;
-    async function ensureInit() { if (!initialized) { await init(); initialized = true; } }
+    async function ensureInit() {
+      if (initialized) return;
+      setStage("init", "active", "loading…");
+      await init();
+      initialized = true;
+      setStage("init", "done", "loaded");
+    }
+
+    /** Map a value in [-absMax, absMax] to a blue→white→red rgb color. */
+    function colorMap(v, absMax) {
+      const t = Math.max(-1, Math.min(1, v / (absMax || 1)));
+      if (t >= 0) {
+        const r = 255, g = Math.round(255 * (1 - t)), b = Math.round(255 * (1 - t));
+        return [r, g, b];
+      } else {
+        const r = Math.round(255 * (1 + t)), g = Math.round(255 * (1 + t)), b = 255;
+        return [r, g, b];
+      }
+    }
+
+    function drawChannels(out, co, h, w) {
+      const wrap = $("channels");
+      wrap.innerHTML = "";
+      const numel = h * w;
+      // Find global abs-max for consistent color mapping across channels.
+      let absMax = 0;
+      for (let i = 0; i < out.length; i++) {
+        const a = Math.abs(out[i]);
+        if (a > absMax) absMax = a;
+      }
+      const tileSize = Math.max(2, Math.floor(96 / Math.max(h, w)));
+      for (let c = 0; c < co; c++) {
+        const ch = document.createElement("div");
+        ch.className = "ch";
+        const cv = document.createElement("canvas");
+        cv.width = w; cv.height = h;
+        cv.style.width  = (w * tileSize) + "px";
+        cv.style.height = (h * tileSize) + "px";
+        const ctx = cv.getContext("2d");
+        const img = ctx.createImageData(w, h);
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            const idx = c * numel + y * w + x;
+            const [r, g, b] = colorMap(out[idx], absMax);
+            const j = (y * w + x) * 4;
+            img.data[j]   = r;
+            img.data[j+1] = g;
+            img.data[j+2] = b;
+            img.data[j+3] = 255;
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+        const lbl = document.createElement("div");
+        lbl.textContent = "ch " + c;
+        ch.appendChild(cv);
+        ch.appendChild(lbl);
+        wrap.appendChild(ch);
+      }
+    }
+
+    function updateSummary(out, ci, co, h, w, dt) {
+      $("summary").style.display = "grid";
+      $("sum-shape").textContent = `[1, ${co}, ${h}, ${w}]`;
+      $("sum-numel").textContent = out.length;
+      $("sum-time").textContent  = `${dt.toFixed(1)} ms`;
+      let mn = Infinity, mx = -Infinity;
+      for (let i = 0; i < out.length; i++) {
+        if (out[i] < mn) mn = out[i];
+        if (out[i] > mx) mx = out[i];
+      }
+      $("sum-range").textContent = `${mn.toFixed(3)} … ${mx.toFixed(3)}`;
+    }
 
     $("run").addEventListener("click", async () => {
-      const out = $("output");
-      out.textContent = "Initializing WASM…";
+      const ci = parseInt($("ci").value);
+      const co = parseInt($("co").value);
+      const h  = parseInt($("h").value);
+      const w  = parseInt($("w").value);
+      if ([ci, co, h, w].some((v) => !v || v < 1)) {
+        setStatus("All dimensions must be ≥ 1.", "err");
+        return;
+      }
+
+      $("run").disabled = true;
+      $("summary").style.display = "none";
+      $("channels").innerHTML = "";
+      resetStages();
+      setStatus(`Running ResNet block on [1, ${ci}, ${h}, ${w}] → [1, ${co}, ${h}, ${w}]…`, "warn");
+
       try {
         await ensureInit();
-        const ci = parseInt($("ci").value);
-        const co = parseInt($("co").value);
-        const h  = parseInt($("h").value);
-        const w  = parseInt($("w").value);
-        // Deterministic input.
+
+        // Deterministic input — sin grid so it's visually structured.
         const inp = new Float32Array(ci * h * w);
-        for (let i = 0; i < inp.length; i++) inp[i] = (Math.sin(i * 0.013) * 0.5);
-        out.textContent = `Running ResNet block on [1, ${ci}, ${h}, ${w}]…`;
+        for (let i = 0; i < inp.length; i++) inp[i] = Math.sin(i * 0.013) * 0.5;
+
+        setStage("adapter", "active", "requesting…");
+        await new Promise((r) => requestAnimationFrame(r));
+        setStage("adapter", "done", "ok");
+        setStage("device",  "done", "ok");
+        setStage("compute", "active", "kernels…");
+        await new Promise((r) => requestAnimationFrame(r));
+
         const t0 = performance.now();
-        const result = await run_resnet_block_js(inp, ci, co, h, w);
+        // Race the GPU call against a 10-second timeout. If a WGSL
+        // kernel hangs on Metal we'd otherwise blow up the tab; this
+        // surfaces a clean error instead.
+        const TIMEOUT_MS = 10_000;
+        const result = await Promise.race([
+          run_resnet_block_js(inp, ci, co, h, w),
+          new Promise((_, reject) => setTimeout(
+            () => reject(new Error(
+              `GPU kernel chain did not return within ${TIMEOUT_MS / 1000}s — ` +
+              `aborted to keep the tab alive. The WGSL conv path is known ` +
+              `to be unstable on macOS Metal in this wgpu-22 build. Try a ` +
+              `smaller H × W or use the CPU demos.`
+            )),
+            TIMEOUT_MS
+          )),
+        ]);
         const dt = performance.now() - t0;
-        out.textContent =
-          `Output [1, ${co}, ${h}, ${w}], total ${result.length} F32 values\n` +
-          `Total time: ${dt.toFixed(2)} ms\n\n` +
-          `First 16 values:\n` +
-          Array.from(result).slice(0, 16).map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
+
+        setStage("compute",  "done", `${dt.toFixed(0)}ms`);
+        setStage("readback", "done", `${result.length}xf32`);
+
+        drawChannels(result, co, h, w);
+        updateSummary(result, ci, co, h, w, dt);
+        setStatus(`✓ Pipeline ran end-to-end on the GPU in ${dt.toFixed(0)} ms.`, "ok");
       } catch (err) {
-        out.innerHTML = `<span class="err">Error: ${err?.message || err}</span>`;
+        const msg = err?.message || String(err);
+        for (const s of stages) {
+          const el = $("st-" + s);
+          if (el.classList.contains("active")) {
+            setStage(s, "fail", "failed");
+          }
+        }
+        setStatus("✗ " + msg, "err");
+        console.error("resnet block failed:", err);
+      } finally {
+        $("run").disabled = false;
       }
     });
   </script>

@@ -12,6 +12,13 @@ categories.workspace = true
 
 [dependencies]
 
+# State-of-the-art pure-Rust GEMM (faer-rs ecosystem). Used as the
+# non-macOS / fallback f32 matmul path in `patterns::matmul_bias_act`
+# to avoid the 562× regression when fused kernels short-circuit the
+# tiled CpuBackend matmul. P3.X T2.5.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+gemm = { version = "0.18", default-features = false, features = ["rayon"] }
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest  = { workspace = true }

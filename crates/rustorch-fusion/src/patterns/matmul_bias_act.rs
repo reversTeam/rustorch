@@ -1,24 +1,40 @@
 //! Fused matmul+bias+activation kernels.
 //!
-//! Computes `y = activation(x @ w + b)` in a SINGLE pass over the
-//! output buffer:
+//! Computes `y = activation(x @ w + b)` via a fast two-stage pipeline:
 //!
-//!   for each (m, n):
-//!     acc = bias[n]
-//!     for k in 0..K: acc += x[m, k] * w[k, n]
-//!     y[m, n] = activation(acc)
+//! 1. **Matmul stage**: dispatched through the SIMD/AMX-vectorised
+//!    [`crate::accelerate::sgemm_row_major`] (macOS, AMX) or the
+//!    `gemm` crate (other platforms, NEON+AVX-512). Below
+//!    [`GEMM_DISPATCH_MIN`] = 32 we use a scalar fused inner kernel
+//!    (single pass over the output, accumulator in register, bias and
+//!    activation folded in) — this beats the BLAS dispatch cost for
+//!    tiny shapes that fit in L1d.
 //!
-//! Compared to the naive sequential pipeline (matmul → bias add →
-//! activation), the fused version:
-//! 1. Avoids two extra passes over the M×N output buffer.
-//! 2. Keeps the accumulator in a register / cache line until the
-//!    activation is applied — no round-trip to memory.
+//! 2. **Epilogue stage** (only for the BLAS path): a single SIMD-friendly
+//!    pass over `y[m * n]` applies bias broadcast (per-column) and the
+//!    activation. One read/write per element, LLVM auto-vectorises the
+//!    inner loop.
 //!
-//! Currently scalar with f32 accumulator; LLVM auto-vectorises the
-//! inner-K loop. SIMD intrinsics are a future arch-specific
-//! specialisation.
+//! ### Why two stages instead of one
+//!
+//! Before P3.X T2.5 this kernel ran a hand-rolled scalar 3-loop matmul
+//! that ignored both `gemm` and `cblas_sgemm`. Measured 911 ms on
+//! 1024³ vs 1.62 ms for the dispatched matmul alone — a 562× regression
+//! that silently invalidated all `Linear+ReLU` layers (cf. gotcha note
+//! `b345ef4b`). The fix routes the matmul through the same dispatch as
+//! `CpuBackend::matmul`; the bias+activation epilogue stays in this
+//! crate (it is 100% bandwidth-bound and a separate pass is fine on
+//! M×N output that already fits in L2 after the GEMM).
+//!
+//! For L1d-resident shapes (m, k, n all < 32) the scalar single-pass
+//! fused kernel is preserved as it remains the fastest option there.
 
 use std::cmp::Ordering;
+
+/// Threshold below which the BLAS dispatch overhead exceeds the work.
+/// Calibrated empirically on Apple M4 Max; matches the value used by
+/// `rustorch-cpu::cpu_backend::GEMM_DISPATCH_MIN`.
+const GEMM_DISPATCH_MIN: usize = 32;
 
 /// Activation choices for the fused epilogue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +148,24 @@ pub fn fused_matmul_bias_activation(
         }
     }
 
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+
+    // Fast path: BLAS-vectorised matmul + tight epilogue. Used as soon
+    // as any dimension reaches GEMM_DISPATCH_MIN — past that the
+    // dispatch overhead is amortised and the BLAS path is 100s× the
+    // hand-rolled scalar loop.
+    if m >= GEMM_DISPATCH_MIN && n >= GEMM_DISPATCH_MIN && k >= GEMM_DISPATCH_MIN {
+        matmul_dispatch(x, w, y, m, k, n);
+        apply_bias_activation_epilogue(y, b, m, n, activation);
+        return Ok(());
+    }
+
+    // Slow path (tiny shapes fit in L1d): single-pass scalar fused
+    // kernel. Beats the BLAS dispatch cost for L1d-resident
+    // workloads (m·n·k < ~30 K). LLVM auto-vectorises the inner-K
+    // accumulator loop on `target-cpu=native`.
     for row in 0..m {
         for col in 0..n {
             let mut acc = b.map(|bb| bb[col]).unwrap_or(0.0);
@@ -142,6 +176,125 @@ pub fn fused_matmul_bias_activation(
         }
     }
     Ok(())
+}
+
+/// Dispatch the `[m, k] @ [k, n] -> [m, n]` matmul through the best
+/// available BLAS path. macOS hits Apple AMX via Accelerate; other
+/// non-wasm targets use the `gemm` crate (NEON / AVX-512). wasm32
+/// falls back to the scalar nested-loop kernel.
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+fn matmul_dispatch(x: &[f32], w: &[f32], y: &mut [f32], m: usize, k: usize, n: usize) {
+    // SAFETY: caller validated x.len() == m*k, w.len() == k*n, y.len() == m*n.
+    unsafe {
+        crate::accelerate::sgemm_row_major(m, k, n, x, w, y);
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
+fn matmul_dispatch(x: &[f32], w: &[f32], y: &mut [f32], m: usize, k: usize, n: usize) {
+    // Row-major [m, k] @ [k, n] -> [m, n]:
+    //   strides for the gemm crate (in elements):
+    //     - x: rs=k, cs=1
+    //     - w: rs=n, cs=1
+    //     - y: rs=n, cs=1
+    // SAFETY: buffers are exactly m*k, k*n, m*n long in f32 and live for
+    // the duration of the call. The gemm crate is `unsafe fn` because it
+    // works through raw pointers, not because of additional invariants.
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            y.as_mut_ptr(),
+            1,
+            n as isize,
+            false,
+            x.as_ptr(),
+            1,
+            k as isize,
+            w.as_ptr(),
+            1,
+            n as isize,
+            0.0_f32,
+            1.0_f32,
+            false,
+            false,
+            false,
+            gemm::Parallelism::Rayon(0),
+        );
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::needless_range_loop)]
+fn matmul_dispatch(x: &[f32], w: &[f32], y: &mut [f32], m: usize, k: usize, n: usize) {
+    // No SIMD intrinsics on wasm32; LLVM still auto-vectorises with
+    // simd128 enabled, but we avoid pulling in `gemm` (no wasm support).
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f32;
+            for kk in 0..k {
+                acc += x[row * k + kk] * w[kk * n + col];
+            }
+            y[row * n + col] = acc;
+        }
+    }
+}
+
+/// Apply bias broadcast (per-column) and activation in a single
+/// SIMD-friendly pass over the output buffer.
+///
+/// One read + one write per element. LLVM auto-vectorises the inner
+/// column loop on `target-cpu=native` for `Activation::None` and
+/// `Activation::Relu`; transcendental activations (Gelu, Silu) are
+/// scalar-per-lane today (T8-new pulp pass will replace `.exp()` and
+/// `.tanh()` with vectorised approximations).
+#[inline]
+fn apply_bias_activation_epilogue(
+    y: &mut [f32],
+    b: Option<&[f32]>,
+    m: usize,
+    n: usize,
+    activation: Activation,
+) {
+    match (b, activation) {
+        (None, Activation::None) => { /* matmul output is final */ },
+        (None, act) => {
+            for row in 0..m {
+                let row_slice = &mut y[row * n..row * n + n];
+                for cell in row_slice.iter_mut() {
+                    *cell = act.apply(*cell);
+                }
+            }
+        },
+        (Some(bias), Activation::None) => {
+            for row in 0..m {
+                let row_slice = &mut y[row * n..row * n + n];
+                for (cell, bb) in row_slice.iter_mut().zip(bias.iter()) {
+                    *cell += *bb;
+                }
+            }
+        },
+        (Some(bias), Activation::Relu) => {
+            // The hottest fused path in transformer FFNs. Auto-
+            // vectorised `add + max(0)` on NEON/AVX2.
+            for row in 0..m {
+                let row_slice = &mut y[row * n..row * n + n];
+                for (cell, bb) in row_slice.iter_mut().zip(bias.iter()) {
+                    let v = *cell + *bb;
+                    *cell = v.max(0.0);
+                }
+            }
+        },
+        (Some(bias), act) => {
+            for row in 0..m {
+                let row_slice = &mut y[row * n..row * n + n];
+                for (cell, bb) in row_slice.iter_mut().zip(bias.iter()) {
+                    *cell = act.apply(*cell + *bb);
+                }
+            }
+        },
+    }
 }
 
 /// Naive reference (matmul → bias add → activation as 3 separate
@@ -290,6 +443,115 @@ mod tests {
         // Row 0 cells touch x[0] (NaN) → should be NaN.
         assert!(y[0].is_nan());
         assert!(y[1].is_nan());
+    }
+
+    /// xorshift64* — fixed seed, deterministic, used to seed parity
+    /// tests so that any future tolerance-violation reproduces.
+    fn xorshift_fill(buf: &mut [f32], seed: u64) {
+        let mut s = seed;
+        for cell in buf.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            // Map the low 24 bits into [-1, 1) — keeps GEMM accumulators
+            // in a tame range so naive scalar and Accelerate AMX agree
+            // to ~1e-4 (the upper bound documented in
+            // accelerate::tests::sgemm_row_major_64x64x64_matches_naive).
+            let bits = (s as u32) & 0x00FF_FFFF;
+            *cell = (bits as f32) / 8_388_608.0_f32 - 1.0;
+        }
+    }
+
+    /// Force the BLAS fast path (m, n, k ≥ 32) and assert it stays
+    /// within tolerance of the naive scalar 3-loop reference.
+    /// Regression test for P3.X T2.5 — without the dispatch fix, the
+    /// "fused" kernel was 562× slower on 1024³ but still numerically
+    /// correct, so we also need a perf-independent parity guarantee.
+    #[test]
+    fn fast_path_relu_matches_naive_64x64x64() {
+        let (m, k, n) = (64, 64, 64);
+        let mut x = vec![0.0f32; m * k];
+        let mut w = vec![0.0f32; k * n];
+        let mut bias = vec![0.0f32; n];
+        xorshift_fill(&mut x, 0xDEADBEEF);
+        xorshift_fill(&mut w, 0xCAFEBABE);
+        xorshift_fill(&mut bias, 0x12345678);
+
+        let mut y_fast = vec![0.0f32; m * n];
+        let mut y_naive = vec![0.0f32; m * n];
+        fused_matmul_bias_activation(&x, &w, Some(&bias), &mut y_fast, m, k, n, Activation::Relu)
+            .unwrap();
+        naive_matmul_bias_activation(&x, &w, Some(&bias), &mut y_naive, m, k, n, Activation::Relu)
+            .unwrap();
+        // Tolerance 1e-4 matches the cblas_sgemm parity test in
+        // crate::accelerate::tests. AMX uses a different summation
+        // tree than the scalar reference so bit-exact is not
+        // achievable, but 1e-4 relative is well within float
+        // semantics for f32 GEMM.
+        for i in 0..m * n {
+            let diff = (y_fast[i] - y_naive[i]).abs();
+            let rel = diff / y_naive[i].abs().max(1e-6);
+            assert!(
+                diff <= 1e-4 || rel <= 1e-4,
+                "i={i}: fast={} naive={} diff={diff} rel={rel}",
+                y_fast[i],
+                y_naive[i]
+            );
+        }
+    }
+
+    #[test]
+    fn fast_path_no_activation_matches_naive_128x256x96() {
+        let (m, k, n) = (128, 256, 96);
+        let mut x = vec![0.0f32; m * k];
+        let mut w = vec![0.0f32; k * n];
+        xorshift_fill(&mut x, 0x1111_2222_3333_4444);
+        xorshift_fill(&mut w, 0x5555_6666_7777_8888);
+
+        let mut y_fast = vec![0.0f32; m * n];
+        let mut y_naive = vec![0.0f32; m * n];
+        fused_matmul_bias_activation(&x, &w, None, &mut y_fast, m, k, n, Activation::None).unwrap();
+        naive_matmul_bias_activation(&x, &w, None, &mut y_naive, m, k, n, Activation::None)
+            .unwrap();
+        for i in 0..m * n {
+            let diff = (y_fast[i] - y_naive[i]).abs();
+            let rel = diff / y_naive[i].abs().max(1e-6);
+            assert!(
+                diff <= 1e-3 || rel <= 1e-3,
+                "i={i}: fast={} naive={} diff={diff} rel={rel}",
+                y_fast[i],
+                y_naive[i]
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_m_eq_dispatch_min_uses_fast_path() {
+        // Just above and just below the dispatch threshold: both
+        // should produce numerically equivalent results so callers
+        // never see a behaviour shift around m=32.
+        for &(m, k, n) in &[(31, 31, 31), (32, 32, 32), (33, 33, 33)] {
+            let mut x = vec![0.0f32; m * k];
+            let mut w = vec![0.0f32; k * n];
+            xorshift_fill(&mut x, 0xAAAA_BBBB_CCCC_DDDD ^ m as u64);
+            xorshift_fill(&mut w, 0xEEEE_FFFF_0000_1111 ^ n as u64);
+            let mut y_a = vec![0.0f32; m * n];
+            let mut y_b = vec![0.0f32; m * n];
+            fused_matmul_bias_activation(&x, &w, None, &mut y_a, m, k, n, Activation::Relu)
+                .unwrap();
+            naive_matmul_bias_activation(&x, &w, None, &mut y_b, m, k, n, Activation::Relu)
+                .unwrap();
+            for i in 0..m * n {
+                let diff = (y_a[i] - y_b[i]).abs();
+                let rel = diff / y_b[i].abs().max(1e-6);
+                assert!(
+                    diff <= 1e-4 || rel <= 1e-4,
+                    "shape {m}x{k}x{n} i={i}: fast={} naive={} diff={diff} rel={rel}",
+                    y_a[i],
+                    y_b[i]
+                );
+            }
+        }
     }
 
     #[test]
