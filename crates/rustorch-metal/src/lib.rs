@@ -43,6 +43,9 @@ pub mod backend;
 #[cfg(target_os = "macos")]
 pub mod backend_singleton;
 
+#[cfg(target_os = "macos")]
+pub mod kernels;
+
 /// Stub re-export so non-macOS targets can build code that
 /// references `rustorch_metal::error::MetalError` (the error type)
 /// even when no concrete backend is available.
