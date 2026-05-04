@@ -244,6 +244,118 @@ impl Backend for CpuBackend {
         })
     }
 
+    /// CPU `linear` forward: `C = A @ B + bias_broadcast(N)` in a single
+    /// `cblas_sgemm` call followed by an in-place parallel bias add.
+    /// Skips the separate `add_bias` dispatch that the default trait
+    /// impl would emit (which itself allocates a `[M, N]` intermediate
+    /// before returning a fresh tensor).
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+    fn matmul_with_bias(
+        &self,
+        lhs: &Tensor,
+        rhs: &Tensor,
+        bias: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        // Fast-path eligibility: rank-2 f32 + rank-1 f32 bias matching N.
+        if lhs.dtype() != Dtype::F32
+            || rhs.dtype() != Dtype::F32
+            || bias.dtype() != Dtype::F32
+            || lhs.ndim() != 2
+            || rhs.ndim() != 2
+            || bias.ndim() != 1
+        {
+            // Default composition (matmul + add_bias).
+            let mm = self.matmul(lhs, rhs)?;
+            return self.add_bias(&mm, bias);
+        }
+        let l_shape = lhs.shape();
+        let r_shape = rhs.shape();
+        let bias_shape = bias.shape();
+        let (m, k1) = (l_shape[0], l_shape[1]);
+        let (k2, n) = (r_shape[0], r_shape[1]);
+        if k1 != k2 || bias_shape[0] != n {
+            // Shape error — let the default path surface it cleanly.
+            let mm = self.matmul(lhs, rhs)?;
+            return self.add_bias(&mm, bias);
+        }
+        if m < GEMM_DISPATCH_MIN || n < GEMM_DISPATCH_MIN || k1 < GEMM_DISPATCH_MIN {
+            let mm = self.matmul(lhs, rhs)?;
+            return self.add_bias(&mm, bias);
+        }
+        // Materialise contiguous f32 inputs (zero-copy when already
+        // contiguous).
+        let lhs_owned: Option<Vec<f32>>;
+        let rhs_owned: Option<Vec<f32>>;
+        let lhs_slice: &[f32] = if let Some(s) = lhs.as_slice::<f32>() {
+            lhs_owned = None;
+            s
+        } else {
+            lhs_owned = Some(
+                lhs.iter_elements::<f32>()
+                    .ok_or(BackendError::DtypeMismatch {
+                        op: "matmul_with_bias",
+                        lhs: lhs.dtype(),
+                        rhs: rhs.dtype(),
+                    })?
+                    .collect(),
+            );
+            lhs_owned.as_deref().unwrap()
+        };
+        let rhs_slice: &[f32] = if let Some(s) = rhs.as_slice::<f32>() {
+            rhs_owned = None;
+            s
+        } else {
+            rhs_owned = Some(
+                rhs.iter_elements::<f32>()
+                    .ok_or(BackendError::DtypeMismatch {
+                        op: "matmul_with_bias",
+                        lhs: lhs.dtype(),
+                        rhs: rhs.dtype(),
+                    })?
+                    .collect(),
+            );
+            rhs_owned.as_deref().unwrap()
+        };
+        let bias_slice: &[f32] = bias.as_slice::<f32>().ok_or(BackendError::DtypeMismatch {
+            op: "matmul_with_bias",
+            lhs: lhs.dtype(),
+            rhs: bias.dtype(),
+        })?;
+
+        let mut out_buf: Vec<f32> = vec![0.0_f32; m * n];
+
+        // SAFETY: buffers sized correctly (m·k, k·n, m·n).
+        unsafe {
+            crate::accelerate::sgemm_row_major(m, k1, n, lhs_slice, rhs_slice, &mut out_buf);
+        }
+        drop(lhs_owned);
+        drop(rhs_owned);
+
+        // Parallel in-place bias broadcast: out[b, j] += bias[j].
+        use rayon::prelude::*;
+        const PARALLEL_THRESHOLD: usize = 16_384;
+        if m * n < PARALLEL_THRESHOLD {
+            for b in 0..m {
+                let row = &mut out_buf[b * n..b * n + n];
+                for j in 0..n {
+                    row[j] += bias_slice[j];
+                }
+            }
+        } else {
+            out_buf.par_chunks_mut(n).for_each(|row| {
+                for j in 0..n {
+                    row[j] += bias_slice[j];
+                }
+            });
+        }
+
+        Tensor::from_vec_typed::<f32, _>(vec![m, n], out_buf).map_err(|_| {
+            BackendError::OutOfMemory {
+                bytes: m * n * core::mem::size_of::<f32>(),
+            }
+        })
+    }
+
     fn sum(&self, src: &Tensor) -> Result<Tensor, BackendError> {
         match src.dtype() {
             Dtype::F32 => sum_kernel::<f32>(src, 0.0_f32, |a, b| a + b),
@@ -1129,6 +1241,47 @@ impl Backend for CpuBackend {
         let bias_buf: &[f32] = bias.as_slice::<f32>().ok_or_else(|| {
             BackendError::NumericalError("add_bias: expected contiguous F32 bias".to_string())
         })?;
+        // Native parallel broadcast: write `out[b, j] = x[b, j] + bias[j]`
+        // directly without materialising a `[batch, n_out]` bias_wide
+        // tensor (which previously cost an `extend_from_slice` loop +
+        // a second `self.add` pass + two intermediate allocs).
+        if let Some(x_buf) = x.as_slice::<f32>() {
+            use rayon::prelude::*;
+            let n = batch * n_out;
+            let mut out: Vec<core::mem::MaybeUninit<f32>> = Vec::with_capacity(n);
+            // SAFETY: capacity is exactly n; every slot is written below.
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                out.set_len(n);
+            }
+            const PARALLEL_THRESHOLD: usize = 16_384;
+            if n < PARALLEL_THRESHOLD {
+                for b in 0..batch {
+                    for j in 0..n_out {
+                        out[b * n_out + j].write(x_buf[b * n_out + j] + bias_buf[j]);
+                    }
+                }
+            } else {
+                out.par_chunks_mut(n_out)
+                    .zip(x_buf.par_chunks(n_out))
+                    .for_each(|(out_row, x_row)| {
+                        for j in 0..n_out {
+                            out_row[j].write(x_row[j] + bias_buf[j]);
+                        }
+                    });
+            }
+            // SAFETY: every slot written above.
+            let out: Vec<f32> = unsafe {
+                let mut o = core::mem::ManuallyDrop::new(out);
+                Vec::from_raw_parts(o.as_mut_ptr() as *mut f32, n, o.capacity())
+            };
+            return Tensor::from_vec_typed::<f32, _>(vec![batch, n_out], out).map_err(|_| {
+                BackendError::OutOfMemory {
+                    bytes: n * core::mem::size_of::<f32>(),
+                }
+            });
+        }
+        // Fallback for non-contiguous x.
         let mut wide = Vec::with_capacity(batch * n_out);
         for _ in 0..batch {
             wide.extend_from_slice(bias_buf);
