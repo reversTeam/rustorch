@@ -9,7 +9,7 @@
 
 use crate::backend::MetalBackend;
 use crate::error::MetalError;
-use metal::{Buffer, CompileOptions, MTLSize};
+use metal::{Buffer, MTLSize};
 
 /// Element-wise add: `out[i] = lhs[i] + rhs[i]` for `i ∈ [0, n)`.
 ///
@@ -52,17 +52,7 @@ pub fn add_f32(
         )));
     }
 
-    let library = backend
-        .device
-        .new_library_with_source(ADD_SHADER, &CompileOptions::new())
-        .map_err(MetalError::ShaderCompile)?;
-    let function = library
-        .get_function("add_f32", None)
-        .map_err(|e| MetalError::PipelineState(format!("get_function: {e}")))?;
-    let pipeline = backend
-        .device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(MetalError::PipelineState)?;
+    let pipeline = backend.pipeline("add_f32", ADD_SHADER, "add_f32")?;
 
     let out = backend.alloc_shared(n_bytes)?;
 
@@ -171,17 +161,11 @@ pub fn matmul_simdgroup_f32(
         )));
     }
 
-    let library = backend
-        .device
-        .new_library_with_source(MATMUL_SIMDGROUP_F32_SHADER, &CompileOptions::new())
-        .map_err(MetalError::ShaderCompile)?;
-    let function = library
-        .get_function("matmul_simdgroup_f32", None)
-        .map_err(|e| MetalError::PipelineState(format!("get_function: {e}")))?;
-    let pipeline = backend
-        .device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(MetalError::PipelineState)?;
+    let pipeline = backend.pipeline(
+        "matmul_simdgroup_f32",
+        MATMUL_SIMDGROUP_F32_SHADER,
+        "matmul_simdgroup_f32",
+    )?;
 
     let out = backend.alloc_shared(m * n * 4)?;
 

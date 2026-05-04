@@ -1,8 +1,10 @@
-//! `MetalBackend` — owns the `MTLDevice` and `MTLCommandQueue`.
+//! `MetalBackend` — owns the `MTLDevice`, `MTLCommandQueue`, and the
+//! pipeline-state cache.
 
 use crate::error::MetalError;
-use metal::{Device, MTLResourceOptions};
-use std::sync::Arc;
+use metal::{CompileOptions, ComputePipelineState, Device, MTLResourceOptions};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Apple Metal backend handle. Holds the [`Device`] and
 /// [`CommandQueue`](metal::CommandQueue) used to allocate buffers
@@ -20,6 +22,11 @@ pub struct MetalBackend {
     /// flow through this single queue (commitAndContinue pattern
     /// will multiplex up to N in-flight buffers in a follow-up).
     pub queue: Arc<metal::CommandQueue>,
+    /// Pipeline-state cache keyed by kernel name. Avoids the ~0.3 ms
+    /// MSL compile cost on every dispatch — first call to a kernel
+    /// pays the compile, subsequent calls hit the cache. Same pattern
+    /// as `rustorch_wgpu::cache::PipelineCache` but for Metal pipelines.
+    pipeline_cache: Arc<Mutex<HashMap<&'static str, Arc<ComputePipelineState>>>>,
     /// Adapter name from `device.name()` (e.g. "Apple M4 Max").
     adapter_name: String,
     /// `true` if the device reports `supportsFamily(MTLGPUFamilyMetal3)`
@@ -47,9 +54,59 @@ impl MetalBackend {
         Ok(MetalBackend {
             device: Arc::new(device),
             queue: Arc::new(queue),
+            pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
             adapter_name,
             supports_metal3,
         })
+    }
+
+    /// Compile or look up a compute pipeline state by kernel name.
+    /// First call compiles `source` (paying the ~0.3 ms MSL compile
+    /// cost); subsequent calls return the cached pipeline.
+    ///
+    /// `name` is the cache key — passing the same `name` with
+    /// different `source` values returns the cached pipeline of the
+    /// first call (kernels SHOULD pick a unique name per shader).
+    pub fn pipeline(
+        &self,
+        name: &'static str,
+        source: &str,
+        entry: &str,
+    ) -> Result<Arc<ComputePipelineState>, MetalError> {
+        // Fast path: cache hit. Acquire the lock, look up, drop it.
+        {
+            let guard = self
+                .pipeline_cache
+                .lock()
+                .expect("metal pipeline cache lock");
+            if let Some(p) = guard.get(name) {
+                return Ok(p.clone());
+            }
+        }
+        // Slow path: compile + insert. Two threads racing on the same
+        // name will both compile but only the first insert wins; the
+        // second's compile is wasted GPU work but the pipeline graph
+        // stays consistent.
+        let library = self
+            .device
+            .new_library_with_source(source, &CompileOptions::new())
+            .map_err(MetalError::ShaderCompile)?;
+        let function = library
+            .get_function(entry, None)
+            .map_err(|e| MetalError::PipelineState(format!("get_function {entry}: {e}")))?;
+        let pipeline = self
+            .device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(MetalError::PipelineState)?;
+        let pipeline = Arc::new(pipeline);
+        let mut guard = self
+            .pipeline_cache
+            .lock()
+            .expect("metal pipeline cache lock");
+        Ok(guard
+            .entry(name)
+            .or_insert_with(|| pipeline.clone())
+            .clone())
     }
 
     /// Adapter name reported by `MTLDevice::name()`.
