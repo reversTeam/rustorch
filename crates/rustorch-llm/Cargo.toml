@@ -15,5 +15,6 @@ rustorch-core      = { workspace = true }
 rustorch-serde     = { workspace = true }
 rustorch-nn        = { workspace = true }
 rustorch-tokenizer = { workspace = true }
+rustorch-fusion    = { workspace = true }
 serde              = { workspace = true, features = ["derive"] }
 serde_json         = { version = "1" }

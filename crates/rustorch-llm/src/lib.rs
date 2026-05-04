@@ -43,6 +43,9 @@ use std::path::{Path, PathBuf};
 use rustorch_core::tensor::tensor_impl::Tensor;
 use serde::Deserialize;
 
+pub mod model;
+pub use model::LlamaModel;
+
 /// Errors raised by this crate.
 #[derive(Debug)]
 pub enum LlmError {

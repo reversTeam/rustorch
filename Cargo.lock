@@ -3352,6 +3352,7 @@ name = "rustorch-llm"
 version = "0.0.1"
 dependencies = [
  "rustorch-core",
+ "rustorch-fusion",
  "rustorch-nn",
  "rustorch-serde",
  "rustorch-tokenizer",
