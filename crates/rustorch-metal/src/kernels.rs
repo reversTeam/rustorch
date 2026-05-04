@@ -2599,6 +2599,149 @@ kernel void sgemv_q4_k_f32_simdcoop(
 }
 "#;
 
+// T84 — quad-cooperative Q4_K sgemv. The 32 threads of a simdgroup are
+// split into 4 "quarters" of 8 threads each; each quarter computes one
+// output by K-cooperating across blocks_per_row blocks. Reduction stays
+// inside the quarter via simd_shuffle_xor with masks 1, 2, 4 (which
+// never cross the 8-lane boundary). Best for shapes where blocks_per_row
+// < 32 (so the regular simdcoop kernel wastes 32 - blocks_per_row threads
+// per simdgroup) — typical Qwen3-14B Q4_K rows have blocks_per_row=20.
+const SGEMV_Q4_K_F32_QUADCOOP_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+
+kernel void sgemv_q4_k_f32_quadcoop(
+    device const float* x       [[buffer(0)]],
+    device const uchar* w_q4k   [[buffer(1)]],
+    device float* y             [[buffer(2)]],
+    constant uint2& dims        [[buffer(3)]],   // (K, N)
+    uint tg_id                  [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    // Each tg processes 4 outputs starting at base = tg_id * 4.
+    uint base = tg_id * 4u;
+    uint quarter = tid / 8u;       // 0..3
+    uint lane_q  = tid % 8u;       // 0..7
+    uint n_idx = base + quarter;
+
+    // n_idx may run past N if N % 4 != 0 — handle later before the write,
+    // but still join the reduction so simd_shuffle_xor stays well-defined.
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    uint row_off = (n_idx < N) ? n_idx * blocks_per_row * BLOCK_BYTES : 0u;
+
+    float partial = 0.0;
+    if (n_idx < N) {
+        for (uint blk = lane_q; blk < blocks_per_row; blk += 8u) {
+            device const uchar* block = w_q4k + row_off + blk * BLOCK_BYTES;
+            ushort d_bits = ((ushort)block[1] << 8) | (ushort)block[0];
+            ushort dmin_bits = ((ushort)block[3] << 8) | (ushort)block[2];
+            float d = float(as_type<half>(d_bits));
+            float dmin = float(as_type<half>(dmin_bits));
+            uchar packed[12];
+            for (uint i = 0; i < 12u; ++i) packed[i] = block[4 + i];
+            uchar sc[8], m[8];
+            for (uint i = 0; i < 4u; ++i) {
+                sc[i]     = packed[i] & 0x3F;
+                m[i]      = packed[i + 4] & 0x3F;
+                sc[i + 4] = (packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4);
+                m[i + 4]  = (packed[i + 8] >> 4)   | ((packed[i + 4] >> 6) << 4);
+            }
+            device const uchar4* qs4 = (device const uchar4*)(block + 16);
+            for (uint jp = 0; jp < 4u; ++jp) {
+                uint j0 = 2u * jp;
+                uint j1 = 2u * jp + 1u;
+                float scale0 = d * float(sc[j0]);
+                float min0   = dmin * float(m[j0]);
+                float scale1 = d * float(sc[j1]);
+                float min1   = dmin * float(m[j1]);
+                uint x_low_off  = blk * BLOCK_WEIGHTS + j0 * 32u;
+                uint x_high_off = blk * BLOCK_WEIGHTS + j1 * 32u;
+                uint qs_base = jp * 8u;
+                for (uint kg = 0; kg < 8u; ++kg) {
+                    uchar4 nibs = qs4[qs_base + kg];
+                    uint kk = kg * 4u;
+                    float n0lo = scale0 * float(nibs.x & 0x0F) - min0;
+                    float n1lo = scale0 * float(nibs.y & 0x0F) - min0;
+                    float n2lo = scale0 * float(nibs.z & 0x0F) - min0;
+                    float n3lo = scale0 * float(nibs.w & 0x0F) - min0;
+                    float n0hi = scale1 * float(nibs.x >> 4)   - min1;
+                    float n1hi = scale1 * float(nibs.y >> 4)   - min1;
+                    float n2hi = scale1 * float(nibs.z >> 4)   - min1;
+                    float n3hi = scale1 * float(nibs.w >> 4)   - min1;
+                    partial += x[x_low_off  + kk    ] * n0lo;
+                    partial += x[x_low_off  + kk + 1] * n1lo;
+                    partial += x[x_low_off  + kk + 2] * n2lo;
+                    partial += x[x_low_off  + kk + 3] * n3lo;
+                    partial += x[x_high_off + kk    ] * n0hi;
+                    partial += x[x_high_off + kk + 1] * n1hi;
+                    partial += x[x_high_off + kk + 2] * n2hi;
+                    partial += x[x_high_off + kk + 3] * n3hi;
+                }
+            }
+        }
+    }
+
+    // Reduce within 8-thread quarter. XOR masks 1, 2, 4 stay inside the
+    // 8-lane group (max stride < 8) — quarters don't bleed into each other.
+    float sum = partial;
+    sum += simd_shuffle_xor(sum, 1);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 4);
+    if (lane_q == 0u && n_idx < N) {
+        y[n_idx] = sum;
+    }
+}
+"#;
+
+/// Quad-cooperative Q4_K sgemv (T84). 4 outputs per simdgroup,
+/// 8 threads K-cooperate per output. Reduces the wasted-thread count
+/// when blocks_per_row < 32 (plain simdcoop ties up 32 threads per
+/// output with at most blocks_per_row of them doing useful work).
+pub fn sgemv_q4_k_f32_quadcoop_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32_quadcoop needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_quadcoop: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_quadcoop",
+        SGEMV_Q4_K_F32_QUADCOOP_SHADER,
+        "sgemv_q4_k_f32_quadcoop",
+    )?;
+    let dims = [k as u32, n as u32];
+    // Number of simdgroups = ceil(N/4); one tg per simdgroup (32 threads).
+    let n_groups = n.div_ceil(4) as u64;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * n_groups, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 /// Simdgroup-cooperative Q4_K sgemv (K-reduction across 32 threads).
 /// Best for shapes where 1-thread-per-output already saturates the
 /// GPU but per-thread strided W loads are the bottleneck (huge N).
@@ -2943,6 +3086,198 @@ pub fn sgemv_q4_k_f32_pair_into(
     // total = n_q + n_k + 0. The shader's `gid >= total` skips the
     // V-index path entirely.
     sgemv_q4_k_f32_triple_into(
+        backend, x_buf, w_a_buf, w_b_buf, w_b_buf, out_a, out_b, out_b, k, n_a, n_b, 0,
+    )
+}
+
+// T84 — quad-cooperative fused triple. 4 outputs per simdgroup, each
+// possibly drawn from a different (W, out) slot. Routing is done
+// inside each quarter independently (8 threads pick the same target
+// since they share the same n_idx). Reduces wasted threads when
+// blocks_per_row is small (e.g. Qwen3-14B Q4_K with bpr=20).
+const SGEMV_Q4_K_F32_TRIPLE_QUADCOOP_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+
+kernel void sgemv_q4_k_f32_triple_quadcoop(
+    device const float* x       [[buffer(0)]],
+    device const uchar* w_q     [[buffer(1)]],
+    device const uchar* w_k     [[buffer(2)]],
+    device const uchar* w_v     [[buffer(3)]],
+    device float* out_q         [[buffer(4)]],
+    device float* out_k         [[buffer(5)]],
+    device float* out_v         [[buffer(6)]],
+    constant uint4& dims        [[buffer(7)]],   // (K, n_q, n_k, n_v)
+    uint tg_id                  [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]]
+) {
+    uint K   = dims.x;
+    uint n_q = dims.y;
+    uint n_k = dims.z;
+    uint n_v = dims.w;
+    uint total = n_q + n_k + n_v;
+    uint base = tg_id * 4u;
+    uint quarter = tid / 8u;
+    uint lane_q  = tid % 8u;
+    uint global_idx = base + quarter;
+
+    // Route this quarter to its (W, out, n_idx) tuple.
+    device const uchar* w = w_q;
+    device float* out = out_q;
+    uint n_idx = 0u;
+    bool active = global_idx < total;
+    if (active) {
+        if (global_idx < n_q) {
+            w = w_q;
+            out = out_q;
+            n_idx = global_idx;
+        } else if (global_idx < n_q + n_k) {
+            w = w_k;
+            out = out_k;
+            n_idx = global_idx - n_q;
+        } else {
+            w = w_v;
+            out = out_v;
+            n_idx = global_idx - n_q - n_k;
+        }
+    }
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    uint row_off = active ? n_idx * blocks_per_row * BLOCK_BYTES : 0u;
+
+    float partial = 0.0;
+    if (active) {
+        for (uint blk = lane_q; blk < blocks_per_row; blk += 8u) {
+            device const uchar* block = w + row_off + blk * BLOCK_BYTES;
+            ushort d_bits = ((ushort)block[1] << 8) | (ushort)block[0];
+            ushort dmin_bits = ((ushort)block[3] << 8) | (ushort)block[2];
+            float d = float(as_type<half>(d_bits));
+            float dmin = float(as_type<half>(dmin_bits));
+            uchar packed[12];
+            for (uint i = 0; i < 12u; ++i) packed[i] = block[4 + i];
+            uchar sc[8], m[8];
+            for (uint i = 0; i < 4u; ++i) {
+                sc[i]     = packed[i] & 0x3F;
+                m[i]      = packed[i + 4] & 0x3F;
+                sc[i + 4] = (packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4);
+                m[i + 4]  = (packed[i + 8] >> 4)   | ((packed[i + 4] >> 6) << 4);
+            }
+            device const uchar4* qs4 = (device const uchar4*)(block + 16);
+            for (uint jp = 0; jp < 4u; ++jp) {
+                uint j0 = 2u * jp;
+                uint j1 = 2u * jp + 1u;
+                float scale0 = d * float(sc[j0]);
+                float min0   = dmin * float(m[j0]);
+                float scale1 = d * float(sc[j1]);
+                float min1   = dmin * float(m[j1]);
+                uint x_low_off  = blk * BLOCK_WEIGHTS + j0 * 32u;
+                uint x_high_off = blk * BLOCK_WEIGHTS + j1 * 32u;
+                uint qs_base = jp * 8u;
+                for (uint kg = 0; kg < 8u; ++kg) {
+                    uchar4 nibs = qs4[qs_base + kg];
+                    uint kk = kg * 4u;
+                    float n0lo = scale0 * float(nibs.x & 0x0F) - min0;
+                    float n1lo = scale0 * float(nibs.y & 0x0F) - min0;
+                    float n2lo = scale0 * float(nibs.z & 0x0F) - min0;
+                    float n3lo = scale0 * float(nibs.w & 0x0F) - min0;
+                    float n0hi = scale1 * float(nibs.x >> 4)   - min1;
+                    float n1hi = scale1 * float(nibs.y >> 4)   - min1;
+                    float n2hi = scale1 * float(nibs.z >> 4)   - min1;
+                    float n3hi = scale1 * float(nibs.w >> 4)   - min1;
+                    partial += x[x_low_off  + kk    ] * n0lo;
+                    partial += x[x_low_off  + kk + 1] * n1lo;
+                    partial += x[x_low_off  + kk + 2] * n2lo;
+                    partial += x[x_low_off  + kk + 3] * n3lo;
+                    partial += x[x_high_off + kk    ] * n0hi;
+                    partial += x[x_high_off + kk + 1] * n1hi;
+                    partial += x[x_high_off + kk + 2] * n2hi;
+                    partial += x[x_high_off + kk + 3] * n3hi;
+                }
+            }
+        }
+    }
+
+    // 8-thread quarter reduction via XOR shuffles (mask < 8).
+    float sum = partial;
+    sum += simd_shuffle_xor(sum, 1);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 4);
+    if (lane_q == 0u && active) {
+        out[n_idx] = sum;
+    }
+}
+"#;
+
+/// Fused QKV (or pair via n_v=0) Q4_K sgemv with 4-output-per-simdgroup
+/// quad-cooperative reduction. Best when blocks_per_row ∈ [16, 32) so
+/// the simdcoop variant would waste threads.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemv_q4_k_f32_triple_quadcoop_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q_buf: &Buffer,
+    w_k_buf: &Buffer,
+    w_v_buf: &Buffer,
+    out_q: &Buffer,
+    out_k: &Buffer,
+    out_v: &Buffer,
+    k: usize,
+    n_q: usize,
+    n_k: usize,
+    n_v: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32_triple_quadcoop needs Metal3".to_string(),
+        ));
+    }
+    if k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_triple_quadcoop: K%256==0 required (K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_triple_quadcoop",
+        SGEMV_Q4_K_F32_TRIPLE_QUADCOOP_SHADER,
+        "sgemv_q4_k_f32_triple_quadcoop",
+    )?;
+    let dims = [k as u32, n_q as u32, n_k as u32, n_v as u32];
+    let total = (n_q + n_k + n_v) as u64;
+    let n_groups = total.div_ceil(4);
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q_buf), 0);
+        encoder.set_buffer(2, Some(w_k_buf), 0);
+        encoder.set_buffer(3, Some(w_v_buf), 0);
+        encoder.set_buffer(4, Some(out_q), 0);
+        encoder.set_buffer(5, Some(out_k), 0);
+        encoder.set_buffer(6, Some(out_v), 0);
+        encoder.set_bytes(7, 16, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * n_groups, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+/// Pair variant — calls triple_quadcoop with n_v=0.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemv_q4_k_f32_pair_quadcoop_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_a_buf: &Buffer,
+    w_b_buf: &Buffer,
+    out_a: &Buffer,
+    out_b: &Buffer,
+    k: usize,
+    n_a: usize,
+    n_b: usize,
+) -> Result<(), MetalError> {
+    sgemv_q4_k_f32_triple_quadcoop_into(
         backend, x_buf, w_a_buf, w_b_buf, w_b_buf, out_a, out_b, out_b, k, n_a, n_b, 0,
     )
 }
@@ -4658,6 +4993,52 @@ mod tests {
         for (a, b) in v_s.iter().zip(v_t.iter()) {
             let r = (a - b).abs() / a.abs().max(1e-3);
             assert!(r < 1e-3, "V mismatch: {a} vs {b} (rel {r:.3e})");
+        }
+    }
+
+    /// T84 — quadcoop matches single sgemv.
+    #[test]
+    fn sgemv_q4_k_f32_quadcoop_matches_single() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[quadcoop] skipping: no Metal3");
+            return;
+        }
+        // Test shapes covering: small N (W_K=1024), W_O-like (5120),
+        // and N % 4 != 0 edge case.
+        for &(k, n) in &[(5120usize, 5120usize), (5120, 1024), (5120, 27)] {
+            let w_bytes = build_test_q4k_matrix(n, k, 91);
+            let x: Vec<f32> = (0..k).map(|i| ((i as f32 + 1.0) * 0.001).sin()).collect();
+            let x_buf = backend.alloc_shared(k * 4).unwrap();
+            let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+            let out_single = backend.alloc_shared(n * 4).unwrap();
+            let out_quad = backend.alloc_shared(n * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, k);
+                std::ptr::copy_nonoverlapping(
+                    w_bytes.as_ptr(),
+                    w_buf.contents() as *mut u8,
+                    w_bytes.len(),
+                );
+            }
+            sgemv_q4_k_f32_into(backend, &x_buf, &w_buf, &out_single, k, n).unwrap();
+            backend.drain();
+            sgemv_q4_k_f32_quadcoop_into(backend, &x_buf, &w_buf, &out_quad, k, n).unwrap();
+            backend.drain();
+
+            let s = unsafe {
+                std::slice::from_raw_parts(out_single.contents() as *const f32, n).to_vec()
+            };
+            let q = unsafe {
+                std::slice::from_raw_parts(out_quad.contents() as *const f32, n).to_vec()
+            };
+            for (a, b) in s.iter().zip(q.iter()) {
+                let r = (a - b).abs() / a.abs().max(1e-3);
+                assert!(
+                    r < 1e-3,
+                    "K={k} N={n} mismatch: single={a} quad={b} (rel {r:.3e})"
+                );
+            }
         }
     }
 }

@@ -31,8 +31,9 @@ use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::kernels::{
     add_inplace_f32, gqa_decode_f32, kv_append_f32, rms_norm_f32, rms_norm_per_head_f32,
     rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_pair_into,
-    sgemv_q4_k_f32_simdcoop_into, sgemv_q4_k_f32_triple_into, sgemv_q6_k_f32_into,
-    sgemv_q6_k_f32_simdcoop_into, swiglu_f32,
+    sgemv_q4_k_f32_pair_quadcoop_into, sgemv_q4_k_f32_quadcoop_into, sgemv_q4_k_f32_simdcoop_into,
+    sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_simdcoop_into,
+    swiglu_f32,
 };
 
 use metal::Buffer;
@@ -49,31 +50,32 @@ struct MetalWeight {
 
 impl MetalWeight {
     fn matmul_into(&self, backend: &MetalBackend, x_buf: &Buffer, out_buf: &Buffer) {
-        // Heuristic dispatch: for huge-N (e.g. lm_head 151936) the
-        // simdgroup-cooperative kernel halves the per-thread strided
-        // W loads; for smaller N (Qwen3 FFN/attn projections) the
-        // 1-thread-per-output kernel keeps the simdgroup busy enough
-        // that K-stride cooperation isn't worth the simd_sum overhead.
+        // Three-way kernel selection:
+        //   - blocks_per_row ≥ 32 (K ≥ 8192): simdcoop saturates the simd-
+        //     group nicely (32 threads, 32+ blocks of useful work each).
+        //   - blocks_per_row ∈ [16, 32) and Q4_K and n > 500: quadcoop
+        //     (T84 — 4 outputs per simdgroup, 8 threads K-coop per output)
+        //     beats simdcoop because plain simdcoop wastes 32 - bpr threads.
+        //   - else: 1-thread-per-output simple kernel.
         let blocks_per_row = self.k / 256;
-        // T81 — empirically tuned for Qwen3-14B Q4_K_M on M4 Max:
-        //   n > 500 catches W_O (5120), W_down (5120), V_solo (1024),
-        //   and lm_head (151936). Below 500 the simd_sum overhead
-        //   dominates the bandwidth gain.
-        let use_simdcoop = self.n > 500 && blocks_per_row >= 16;
-        match (self.dtype, use_simdcoop) {
-            (GgmlType::Q4_K, false) => {
-                sgemv_q4_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
-            },
-            (GgmlType::Q4_K, true) => {
+        match (self.dtype, blocks_per_row, self.n) {
+            (GgmlType::Q4_K, bpr, n) if bpr >= 32 && n > 500 => {
                 sgemv_q4_k_f32_simdcoop_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
                     .unwrap()
             },
-            (GgmlType::Q6_K, false) => {
-                sgemv_q6_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
+            (GgmlType::Q4_K, bpr, n) if bpr >= 16 && n > 500 => {
+                sgemv_q4_k_f32_quadcoop_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                    .unwrap()
             },
-            (GgmlType::Q6_K, true) => {
+            (GgmlType::Q4_K, _, _) => {
+                sgemv_q4_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
+            },
+            (GgmlType::Q6_K, bpr, n) if bpr >= 16 && n > 500 => {
                 sgemv_q6_k_f32_simdcoop_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
                     .unwrap()
+            },
+            (GgmlType::Q6_K, _, _) => {
+                sgemv_q6_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
             },
             _ => panic!("unsupported dtype: {:?}", self.dtype),
         }
@@ -242,11 +244,11 @@ fn forward_token(
         // dispatch) and dispatch V separately. Net: 2 kernels per
         // attention layer instead of 3 — still a clear win over the
         // pre-T80 split path.
-        // Empirically, simdcoop loses on QKV (n_q=5120, n_k=1024) for
-        // Qwen3-14B because the simd_sum overhead exceeds the bandwidth
-        // gain at this scale. We keep the simple triple/pair here.
+        // T84: quadcoop-fused QKV. With Q4_K K=5120 (bpr=20),
+        // 4-output-per-simdgroup beats both simple (under-saturates GPU)
+        // and simdcoop (wastes 32-bpr=12 threads per group).
         if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
-            sgemv_q4_k_f32_triple_into(
+            sgemv_q4_k_f32_triple_quadcoop_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -262,7 +264,7 @@ fn forward_token(
             )
             .unwrap();
         } else {
-            sgemv_q4_k_f32_pair_into(
+            sgemv_q4_k_f32_pair_quadcoop_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -372,7 +374,7 @@ fn forward_token(
             cfg.rms_eps,
         )
         .unwrap();
-        // gate + up fused into one dispatch.
+        // gate + up fused into one dispatch (non-simdcoop wins at this scale).
         sgemv_q4_k_f32_pair_into(
             backend,
             &scratch.h_buf,
