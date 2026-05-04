@@ -10,6 +10,58 @@ framework + cBLAS).
 
 ---
 
+## 2026-05-04 — post-T2-rerun (GEMM tiled via `gemm` crate intégré)
+
+**Files**: `rustorch-2026-05-04-post-T2-rerun.json`,
+`pytorch-1thread-2026-05-04-post-T2-rerun.json`,
+`pytorch-12thread-2026-05-04-post-T2-rerun.json`
+
+**Tasks closed**: T2-new (gemm crate integration). T2 ancien (tiled GEMM home-made) abandonné en faveur de l'intégration faer-rs ; T5/T6 ancien (SIMD infra + wide kernel) marqués `failed` car remplacés par T8-new (pulp).
+
+### Headline delta T0 → post-T2 (RusTorch single-thread)
+
+| Op | Shape | T0 | post-T2 | Gain interne | vs PT-1 (T0 → post-T2) |
+|---|---|---:|---:|---:|---:|
+| matmul f32 | 64³ | 134.93 µs | 1.95 µs | **69×** | 80.9× → **1.26×** |
+| matmul f32 | 128³ | 1.14 ms | 12.39 µs | **92×** | 257× → **2.89×** |
+| matmul f32 | 256³ | 10.40 ms | 36.64 µs | **284×** | 413× → **1.49×** |
+| matmul f32 | 512³ | 85.05 ms | 196.03 µs | **434×** | 513× → **1.13×** |
+| matmul f32 | 1024³ | 924.88 ms | **1.62 ms** | **570×** | 672× → **1.20×** ✅ |
+| flash attn | N=2048 | 543.05 ms ⚠ | 246.41 ms | 2.20× | 22× → 10.1× |
+| add inplace | 10M | 20.86 ms | 14.47 ms | 1.44× | 21.7× → 15.6× |
+| softmax | 512×50k | 122.59 ms | 120.40 ms | 1.02× | 3.90× → 3.79× |
+| matmul bf16 | 1024³ | 881.64 ms | 873.91 ms | 1.01× | n/a |
+
+**Cumulative bench time** : 7670.92 ms → 5852.24 ms (**1.31× overall**, dominé par matmul).
+
+**Throughput matmul 1024³** : 2.32 GF/s → **1324 GF/s** (88% du peak Accelerate AMX 1.49 TF/s, sans avoir intégré Accelerate). À 512³ on bat même PyTorch-1.
+
+### Régression critique découverte
+
+**`fused_mbr/fused` 1024³ = 911.54 ms** (vs `matmul_f32` 1024³ = **1.62 ms**).
+La fusion matmul+bias+ReLU n'utilise PAS le path tiled — elle reste sur du naïf 3-loop scalar.
+**562× plus lent que le matmul nu.** Tracker via task **T2.5** (priorité 100).
+Gotcha note `b345ef4b` créée — impact : tout MLP réel rate les 570× du gain T2.
+
+### Validation du plan révisé "integration-first"
+
+T2-new (intégrer `gemm = "0.18"` en 1 LOC) a livré **570×** vs les 180× promis dans la description du plan. Confirme que l'approche faer-rs > BLIS-like home-made. Pattern note `f8baf29f` créée.
+
+### Reste à faire (gaps vs PyTorch-1, par ROI décroissant)
+
+| Op | Actuel | Cible | Gap | Tâche |
+|---|---:|---:|---:|---|
+| **fused matmul+bias+ReLU 1024³** | 911 ms | ≤ 5 ms | 182× | **T2.5 (BLOQUANT)** |
+| add inplace 10M | 14.47 ms | ≤ 2 ms | 7.2× | T8-new (pulp SIMD) |
+| softmax 512×50k | 120 ms | ≤ 30 ms (1-thr) ≤ 8 ms (12-thr) | 4× / 16× | T3 + T9-new (rayon) |
+| flash attn N=2048 | 246 ms | ≤ 30 ms | 8× | T8-new (pulp inner) |
+| matmul bf16 1024³ | 874 ms | ≤ 100 ms | 8.7× | T7 bf16 SIMD |
+| matmul f32 1024³ | 1.62 ms | ≤ 1.4 ms | 1.2× | T3-new (Accelerate FFI) |
+
+**Beaucoup d'optimisation reste à faire** — T2 a réglé matmul nu, mais toute la stack memory-bound (add, softmax, layernorm, flash inner) est encore scalar. Prochaine attaque : T2.5 (fused fix) puis T8-new (pulp SIMD elementwise).
+
+---
+
 ## 2026-05-03 — Baseline T0 (avant toute optim)
 
 **Files**: `rustorch-2026-05-03-baseline-T0.json`,
