@@ -14,6 +14,10 @@ categories.workspace = true
 rustorch-core     = { workspace = true }
 rustorch-autograd = { workspace = true }
 rustorch-cpu      = { workspace = true }
+# rayon: parallelise the CPU AdamW step (Task D Phase 2). Each
+# parameter has up to ~1 M f32 elements; the four scalar update loops
+# scale poorly on a single core.
+rayon             = { workspace = true }
 # Optional wgpu re-upload path (P3.Z Task A): when on, optimisers
 # upload the updated parameter directly into a Storage::Wgpu buffer
 # (skipping the next step's `to_gpu` round trip). Without this
