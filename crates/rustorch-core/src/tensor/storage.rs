@@ -251,9 +251,22 @@ impl CpuStorage {
             return Ok(empty_cpu());
         }
         let layout = alloc_layout(byte_len)?;
-        // SAFETY: layout is non-zero because byte_len > 0.
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).ok_or(StorageError::OutOfMemory { byte_len })?;
+        // T40 — try the thread-local pool first. On a hit we
+        // still need to zero the buffer (zeroed contract); but we
+        // skip the system alloc + page-fault. On a miss we fall
+        // back to alloc_zeroed which combines both.
+        let ptr = if let Some(reused) = cpu_storage_pool::try_acquire(layout) {
+            // SAFETY: reused ptr was allocated with the same layout;
+            // memset it to zero to honour the `zeroed` contract.
+            unsafe {
+                core::ptr::write_bytes(reused.as_ptr(), 0, byte_len);
+            }
+            reused
+        } else {
+            // SAFETY: layout is non-zero because byte_len > 0.
+            let raw = unsafe { alloc::alloc_zeroed(layout) };
+            NonNull::new(raw).ok_or(StorageError::OutOfMemory { byte_len })?
+        };
         Ok(CpuStorage::wrap(ptr, layout, byte_len))
     }
 
@@ -262,9 +275,15 @@ impl CpuStorage {
             return Ok(empty_cpu());
         }
         let layout = alloc_layout(byte_len)?;
-        // SAFETY: layout is non-zero because byte_len > 0.
-        let ptr = unsafe { alloc::alloc(layout) };
-        let ptr = NonNull::new(ptr).ok_or(StorageError::OutOfMemory { byte_len })?;
+        // T40 — try the thread-local pool first; pool buffers carry
+        // unspecified contents so they satisfy `uninit` directly.
+        let ptr = if let Some(reused) = cpu_storage_pool::try_acquire(layout) {
+            reused
+        } else {
+            // SAFETY: layout is non-zero because byte_len > 0.
+            let raw = unsafe { alloc::alloc(layout) };
+            NonNull::new(raw).ok_or(StorageError::OutOfMemory { byte_len })?
+        };
         Ok(CpuStorage::wrap(ptr, layout, byte_len))
     }
 
@@ -346,10 +365,120 @@ impl fmt::Debug for CpuStorageInner {
 impl Drop for CpuStorageInner {
     fn drop(&mut self) {
         if self.byte_len > 0 {
-            // SAFETY: ptr/layout are the ones returned from `alloc_*`
-            // with the same `AllocLayout`.
-            unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+            // T40 — thread-local caching allocator. Instead of
+            // `alloc::dealloc` we try to push the buffer back to
+            // the pool keyed on its allocation layout. The next
+            // allocation request for the same layout will reuse
+            // this buffer instead of going to the system allocator,
+            // saving the page-fault + kernel context-switch cost
+            // on hot transformer paths where Tensor materialise +
+            // drop cycles compound across 60+ ops per forward.
+            //
+            // If the pool refuses (cap reached, or zero-sized), we
+            // fall back to the underlying `alloc::dealloc`.
+            if !cpu_storage_pool::try_release(self.ptr, self.layout) {
+                // SAFETY: ptr/layout are the ones returned from
+                // `alloc_*` with the same `AllocLayout`.
+                unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+            }
         }
+    }
+}
+
+// --------------------------------------------------------------------------
+// T40 — thread-local CpuStorage caching allocator
+// --------------------------------------------------------------------------
+
+/// Thread-local pool of recently-released CpuStorage buffers, keyed
+/// on `(size, align)`. PyTorch's `c10::Allocator` does the same on
+/// CPU; without it, every transformer forward heap-thrashes the
+/// system allocator (60+ allocs at typical layer counts).
+mod cpu_storage_pool {
+    use super::AllocLayout;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::ptr::NonNull;
+
+    /// Maximum buffers retained per (size, align) bucket. Each
+    /// bucket holds buffers for a specific allocation layout; this
+    /// cap keeps total memory bounded even if a workload churns
+    /// through many distinct layouts.
+    const PER_BUCKET_CAP: usize = 16;
+
+    /// Maximum total bytes retained in the pool. Protects against
+    /// pathological workloads that allocate hundreds of MB of
+    /// short-lived tensors in a hot loop.
+    const POOL_BYTE_BUDGET: usize = 256 * 1024 * 1024;
+
+    struct Pool {
+        /// (size, align) -> stack of free buffers.
+        buckets: HashMap<(usize, usize), Vec<NonNull<u8>>>,
+        retained_bytes: usize,
+    }
+
+    impl Pool {
+        fn new() -> Self {
+            Pool {
+                buckets: HashMap::new(),
+                retained_bytes: 0,
+            }
+        }
+    }
+
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            // Release every retained buffer when the thread exits.
+            for ((size, align), stack) in self.buckets.drain() {
+                if let Ok(layout) = AllocLayout::from_size_align(size, align) {
+                    for ptr in stack {
+                        // SAFETY: ptr was originally allocated with
+                        // this exact layout (we only push matching
+                        // (size, align) entries below).
+                        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+                    }
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static POOL: RefCell<Pool> = RefCell::new(Pool::new());
+    }
+
+    /// Try to obtain a buffer matching `layout` from the pool.
+    /// Returns `Some(ptr)` on a hit; the caller becomes the owner
+    /// and is responsible for the (eventual) `dealloc` or
+    /// `try_release`. Returns `None` on a miss.
+    pub fn try_acquire(layout: AllocLayout) -> Option<NonNull<u8>> {
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            let key = (layout.size(), layout.align());
+            let stack = pool.buckets.get_mut(&key)?;
+            let ptr = stack.pop()?;
+            pool.retained_bytes = pool.retained_bytes.saturating_sub(layout.size());
+            Some(ptr)
+        })
+    }
+
+    /// Try to return a buffer to the pool. Returns `true` on a
+    /// successful retain; `false` if the bucket is full or the
+    /// global byte budget is exceeded — in which case the caller
+    /// must `dealloc` the buffer themselves.
+    pub fn try_release(ptr: NonNull<u8>, layout: AllocLayout) -> bool {
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.retained_bytes.saturating_add(layout.size()) > POOL_BYTE_BUDGET {
+                return false;
+            }
+            let key = (layout.size(), layout.align());
+            let stack = pool.buckets.entry(key).or_default();
+            if stack.len() >= PER_BUCKET_CAP {
+                return false;
+            }
+            stack.push(ptr);
+            pool.retained_bytes += layout.size();
+            true
+        })
     }
 }
 
