@@ -23,7 +23,7 @@
 
 use std::env;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustorch_gguf::{GgmlType, GgufFile};
 use rustorch_metal::backend::MetalBackend;
@@ -194,6 +194,95 @@ fn argmax(logits: &[f32]) -> u32 {
                 }
             });
     i as u32
+}
+
+// T85 — Per-stage profiling accumulator. Each field accumulates the wall
+// time spent in that stage across all calls (typically all layers × all
+// tokens). Each stage drains the Metal command buffer to force GPU sync
+// before reading the clock — this serializes execution and inflates
+// total time vs the chained path, but the relative breakdown is accurate.
+#[derive(Default, Debug)]
+struct Stages {
+    embed: Duration,           // CPU memcpy of token embedding into xd_buf
+    attn_norm: Duration,       // RMSNorm pre-attn
+    qkv: Duration,             // Q/K/V matmul (triple_quadcoop or pair+single)
+    qknorm_rope: Duration,     // QK-norm + RoPE on Q & K
+    kv_append: Duration,       // KV cache append (K + V)
+    attention: Duration,       // GQA decode
+    o_residual: Duration,      // W_O matmul + residual add
+    ffn_norm: Duration,        // RMSNorm pre-ffn
+    gate_up: Duration,         // pair_into gate+up
+    swiglu: Duration,          // SwiGLU activation
+    down_residual: Duration,   // W_down matmul + residual add
+    final_norm: Duration,      // Final RMSNorm
+    lm_head: Duration,         // lm_head matmul
+    logits_readback: Duration, // GPU→CPU logits copy + argmax
+}
+
+impl Stages {
+    fn total(&self) -> Duration {
+        self.embed
+            + self.attn_norm
+            + self.qkv
+            + self.qknorm_rope
+            + self.kv_append
+            + self.attention
+            + self.o_residual
+            + self.ffn_norm
+            + self.gate_up
+            + self.swiglu
+            + self.down_residual
+            + self.final_norm
+            + self.lm_head
+            + self.logits_readback
+    }
+
+    fn print_breakdown(&self, n_tokens: usize) {
+        let total = self.total();
+        let total_ms = total.as_secs_f64() * 1000.0;
+        let per_token_ms = total_ms / n_tokens as f64;
+        let row = |label: &str, d: Duration| {
+            let ms = d.as_secs_f64() * 1000.0;
+            let pct = if total_ms > 0.0 {
+                100.0 * ms / total_ms
+            } else {
+                0.0
+            };
+            let per_tok = ms / n_tokens as f64;
+            println!(
+                "  {:<18} {:>9.2} ms total | {:>7.3} ms/tok | {:>5.1}%",
+                label, ms, per_tok, pct
+            );
+        };
+        println!(
+            "\n=== T85 stage breakdown over {} tokens (total {:.2} ms = {:.3} ms/tok) ===",
+            n_tokens, total_ms, per_token_ms
+        );
+        row("embed", self.embed);
+        row("attn_norm", self.attn_norm);
+        row("qkv", self.qkv);
+        row("qknorm_rope", self.qknorm_rope);
+        row("kv_append", self.kv_append);
+        row("attention", self.attention);
+        row("o_residual", self.o_residual);
+        row("ffn_norm", self.ffn_norm);
+        row("gate_up", self.gate_up);
+        row("swiglu", self.swiglu);
+        row("down_residual", self.down_residual);
+        row("final_norm", self.final_norm);
+        row("lm_head", self.lm_head);
+        row("logits_readback", self.logits_readback);
+        println!(
+            "  {:<18} {:>9.2} ms total | {:>7.3} ms/tok | {:>5.1}%",
+            "TOTAL", total_ms, per_token_ms, 100.0
+        );
+        let proxy_tps = 1000.0 / per_token_ms;
+        println!(
+            "  (profiled tok/s = {:.2}, ~{:.1}× slower than chained path due to per-stage drains)",
+            proxy_tps,
+            proxy_tps.recip() / (1.0 / 29.27)
+        );
+    }
 }
 
 fn forward_token(
@@ -427,6 +516,272 @@ fn forward_token(
     argmax(&logits)
 }
 
+// T85 — Stage-instrumented forward_token. Drains the Metal command buffer
+// after each named stage and accumulates the wall time into Stages. The
+// per-stage drains serialize execution and slow the overall path, but
+// give an accurate breakdown of where GPU time actually goes.
+fn forward_token_profiled(
+    backend: &MetalBackend,
+    model: &ModelMetal,
+    token_id: u32,
+    position: usize,
+    scratch: &mut Scratch,
+    stages: &mut Stages,
+) -> u32 {
+    let cfg = model.cfg;
+    let d = cfg.d;
+    let f = cfg.f;
+    let n_heads = cfg.n_heads;
+    let n_kv = cfg.n_kv_heads;
+    let head_dim = cfg.head_dim;
+    let max_seq = cfg.max_seq;
+
+    // 0. Embed (CPU memcpy).
+    let t = Instant::now();
+    let off = (token_id as usize) * d;
+    scratch.x.copy_from_slice(&model.token_emb[off..off + d]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(scratch.x.as_ptr(), scratch.xd_buf.contents() as *mut f32, d);
+    }
+    stages.embed += t.elapsed();
+
+    for (li, layer) in model.layers.iter().enumerate() {
+        // 1. attn_norm.
+        let t = Instant::now();
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.attn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        backend.drain();
+        stages.attn_norm += t.elapsed();
+
+        // 2. QKV.
+        let t = Instant::now();
+        if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
+            sgemv_q4_k_f32_triple_quadcoop_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &layer.w_k.buffer,
+                &layer.w_v.buffer,
+                &scratch.q_buf,
+                &scratch.k_buf,
+                &scratch.v_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+                layer.w_k.n,
+                layer.w_v.n,
+            )
+            .unwrap();
+        } else {
+            sgemv_q4_k_f32_pair_quadcoop_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &layer.w_k.buffer,
+                &scratch.q_buf,
+                &scratch.k_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+                layer.w_k.n,
+            )
+            .unwrap();
+            layer
+                .w_v
+                .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        }
+        backend.drain();
+        stages.qkv += t.elapsed();
+
+        // 3. QK-norm + RoPE.
+        let t = Instant::now();
+        if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
+            rms_norm_per_head_f32(
+                backend,
+                &scratch.q_buf,
+                qn_buf,
+                n_heads,
+                head_dim,
+                cfg.rms_eps,
+            )
+            .unwrap();
+        }
+        if let Some(kn_buf) = layer.attn_k_norm_buf.as_ref() {
+            rms_norm_per_head_f32(backend, &scratch.k_buf, kn_buf, n_kv, head_dim, cfg.rms_eps)
+                .unwrap();
+        }
+        rope_half_split_f32(
+            backend,
+            &scratch.q_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_heads,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        rope_half_split_f32(
+            backend,
+            &scratch.k_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_kv,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        backend.drain();
+        stages.qknorm_rope += t.elapsed();
+
+        // 4. KV append.
+        let t = Instant::now();
+        kv_append_f32(
+            backend,
+            &scratch.k_buf,
+            &scratch.k_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.v_buf,
+            &scratch.v_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        backend.drain();
+        stages.kv_append += t.elapsed();
+
+        // 5. Attention (GQA decode).
+        let t = Instant::now();
+        let kv_len = position + 1;
+        gqa_decode_f32(
+            backend,
+            &scratch.q_buf,
+            &scratch.k_caches[li],
+            &scratch.v_caches[li],
+            &scratch.attn_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            kv_len,
+            max_seq,
+        )
+        .unwrap();
+        backend.drain();
+        stages.attention += t.elapsed();
+
+        // 6. W_O + residual #1.
+        let t = Instant::now();
+        layer
+            .w_o
+            .matmul_into(backend, &scratch.attn_buf, &scratch.o_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.o_buf, d).unwrap();
+        backend.drain();
+        stages.o_residual += t.elapsed();
+
+        // 7. ffn_norm.
+        let t = Instant::now();
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.ffn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        backend.drain();
+        stages.ffn_norm += t.elapsed();
+
+        // 8. gate + up (fused pair, non-simdcoop).
+        let t = Instant::now();
+        sgemv_q4_k_f32_pair_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_gate.buffer,
+            &layer.w_up.buffer,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            layer.w_gate.k,
+            layer.w_gate.n,
+            layer.w_up.n,
+        )
+        .unwrap();
+        backend.drain();
+        stages.gate_up += t.elapsed();
+
+        // 9. SwiGLU.
+        let t = Instant::now();
+        swiglu_f32(
+            backend,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            &scratch.fd_buf,
+            f,
+        )
+        .unwrap();
+        backend.drain();
+        stages.swiglu += t.elapsed();
+
+        // 10. W_down + residual #2.
+        let t = Instant::now();
+        layer
+            .w_down
+            .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
+        backend.drain();
+        stages.down_residual += t.elapsed();
+    }
+
+    // 11. Final RMSNorm.
+    let t = Instant::now();
+    rms_norm_f32(
+        backend,
+        &scratch.xd_buf,
+        &model.final_norm_buf,
+        &scratch.h_buf,
+        cfg.d,
+        cfg.rms_eps,
+    )
+    .unwrap();
+    backend.drain();
+    stages.final_norm += t.elapsed();
+
+    // 12. lm_head.
+    let t = Instant::now();
+    model
+        .lm_head
+        .matmul_into(backend, &scratch.h_buf, &scratch.logits_buf);
+    backend.drain();
+    stages.lm_head += t.elapsed();
+
+    // 13. Logits readback + argmax.
+    let t = Instant::now();
+    let mut logits = vec![0.0_f32; cfg.vocab];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.logits_buf.contents() as *const f32,
+            logits.as_mut_ptr(),
+            cfg.vocab,
+        );
+    }
+    let next = argmax(&logits);
+    stages.logits_readback += t.elapsed();
+    next
+}
+
 struct Scratch {
     x: Vec<f32>,
     h: Vec<f32>,
@@ -623,6 +978,7 @@ fn main() -> ExitCode {
     let mut prompt_ids: Vec<u32> = vec![1];
     let mut n: usize = 50;
     let mut max_seq: usize = 256;
+    let mut profile = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -653,6 +1009,11 @@ fn main() -> ExitCode {
                 args.remove(i);
                 continue;
             },
+            "--profile" => {
+                profile = true;
+                args.remove(i);
+                continue;
+            },
             _ => {},
         }
         i += 1;
@@ -671,12 +1032,17 @@ fn main() -> ExitCode {
     let model = load_model(backend, &path, max_seq);
     let mut scratch = Scratch::new(backend, &model.cfg);
 
+    let mut stages = Stages::default();
     println!("\n→ prefill {} tokens", prompt_ids.len());
     let t_pre = Instant::now();
     let mut last = 0u32;
     let mut cur_pos = 0usize;
     for &tok in prompt_ids.iter() {
-        last = forward_token(backend, &model, tok, cur_pos, &mut scratch);
+        last = if profile {
+            forward_token_profiled(backend, &model, tok, cur_pos, &mut scratch, &mut stages)
+        } else {
+            forward_token(backend, &model, tok, cur_pos, &mut scratch)
+        };
         cur_pos += 1;
     }
     let prefill_d = t_pre.elapsed();
@@ -688,9 +1054,18 @@ fn main() -> ExitCode {
     );
 
     let mut generated = vec![last];
+    // T85 — when profiling, reset accumulator after warmup so prefill
+    // costs (different shapes) don't pollute the decode breakdown.
+    if profile {
+        stages = Stages::default();
+    }
     let t_dec = Instant::now();
     for _ in 1..n {
-        last = forward_token(backend, &model, last, cur_pos, &mut scratch);
+        last = if profile {
+            forward_token_profiled(backend, &model, last, cur_pos, &mut scratch, &mut stages)
+        } else {
+            forward_token(backend, &model, last, cur_pos, &mut scratch)
+        };
         cur_pos += 1;
         generated.push(last);
     }
@@ -701,6 +1076,9 @@ fn main() -> ExitCode {
         decode_d.as_secs_f64(),
         (n - 1) as f64 / decode_d.as_secs_f64()
     );
+    if profile {
+        stages.print_breakdown(n - 1);
+    }
     println!("\ngenerated: {:?}", generated);
     ExitCode::SUCCESS
 }
