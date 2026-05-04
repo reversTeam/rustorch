@@ -2964,6 +2964,193 @@ pub fn sgemv_q4_k_f32_pair_into(
     )
 }
 
+// T81 simdcoop variant of the fused triple. Each output gets a
+// dedicated 32-thread simdgroup that K-cooperates over its row, then
+// reduces via simd_sum. Routing of (W, out) is done at threadgroup
+// granularity — all 32 threads in a simdgroup share the same tg_id
+// so there's no intra-simdgroup divergence on the branch.
+const SGEMV_Q4_K_F32_TRIPLE_SIMDCOOP_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+
+kernel void sgemv_q4_k_f32_triple_simdcoop(
+    device const float* x       [[buffer(0)]],
+    device const uchar* w_q     [[buffer(1)]],
+    device const uchar* w_k     [[buffer(2)]],
+    device const uchar* w_v     [[buffer(3)]],
+    device float* out_q         [[buffer(4)]],
+    device float* out_k         [[buffer(5)]],
+    device float* out_v         [[buffer(6)]],
+    constant uint4& dims        [[buffer(7)]],   // (K, n_q, n_k, n_v)
+    uint tg_id                  [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]],
+    uint sg_size                [[threads_per_simdgroup]]
+) {
+    uint K   = dims.x;
+    uint n_q = dims.y;
+    uint n_k = dims.z;
+    uint n_v = dims.w;
+    uint total = n_q + n_k + n_v;
+    if (tg_id >= total) return;
+
+    device const uchar* w;
+    device float* out;
+    uint n_idx;
+    if (tg_id < n_q) {
+        w = w_q;
+        out = out_q;
+        n_idx = tg_id;
+    } else if (tg_id < n_q + n_k) {
+        w = w_k;
+        out = out_k;
+        n_idx = tg_id - n_q;
+    } else {
+        w = w_v;
+        out = out_v;
+        n_idx = tg_id - n_q - n_k;
+    }
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    uint row_off = n_idx * blocks_per_row * BLOCK_BYTES;
+
+    float partial = 0.0;
+    for (uint blk = tid; blk < blocks_per_row; blk += sg_size) {
+        device const uchar* block = w + row_off + blk * BLOCK_BYTES;
+        ushort d_bits = ((ushort)block[1] << 8) | (ushort)block[0];
+        ushort dmin_bits = ((ushort)block[3] << 8) | (ushort)block[2];
+        float d = float(as_type<half>(d_bits));
+        float dmin = float(as_type<half>(dmin_bits));
+        uchar packed[12];
+        for (uint i = 0; i < 12u; ++i) packed[i] = block[4 + i];
+        uchar sc[8], m[8];
+        for (uint i = 0; i < 4u; ++i) {
+            sc[i]     = packed[i] & 0x3F;
+            m[i]      = packed[i + 4] & 0x3F;
+            sc[i + 4] = (packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4);
+            m[i + 4]  = (packed[i + 8] >> 4)   | ((packed[i + 4] >> 6) << 4);
+        }
+        device const uchar4* qs4 = (device const uchar4*)(block + 16);
+        for (uint jp = 0; jp < 4u; ++jp) {
+            uint j0 = 2u * jp;
+            uint j1 = 2u * jp + 1u;
+            float scale0 = d * float(sc[j0]);
+            float min0   = dmin * float(m[j0]);
+            float scale1 = d * float(sc[j1]);
+            float min1   = dmin * float(m[j1]);
+            uint x_low_off  = blk * BLOCK_WEIGHTS + j0 * 32u;
+            uint x_high_off = blk * BLOCK_WEIGHTS + j1 * 32u;
+            uint qs_base = jp * 8u;
+            for (uint kg = 0; kg < 8u; ++kg) {
+                uchar4 nibs = qs4[qs_base + kg];
+                uint kk = kg * 4u;
+                float n0lo = scale0 * float(nibs.x & 0x0F) - min0;
+                float n1lo = scale0 * float(nibs.y & 0x0F) - min0;
+                float n2lo = scale0 * float(nibs.z & 0x0F) - min0;
+                float n3lo = scale0 * float(nibs.w & 0x0F) - min0;
+                float n0hi = scale1 * float(nibs.x >> 4)   - min1;
+                float n1hi = scale1 * float(nibs.y >> 4)   - min1;
+                float n2hi = scale1 * float(nibs.z >> 4)   - min1;
+                float n3hi = scale1 * float(nibs.w >> 4)   - min1;
+                partial += x[x_low_off  + kk    ] * n0lo;
+                partial += x[x_low_off  + kk + 1] * n1lo;
+                partial += x[x_low_off  + kk + 2] * n2lo;
+                partial += x[x_low_off  + kk + 3] * n3lo;
+                partial += x[x_high_off + kk    ] * n0hi;
+                partial += x[x_high_off + kk + 1] * n1hi;
+                partial += x[x_high_off + kk + 2] * n2hi;
+                partial += x[x_high_off + kk + 3] * n3hi;
+            }
+        }
+    }
+
+    float total_sum = simd_sum(partial);
+    if (tid == 0) {
+        out[n_idx] = total_sum;
+    }
+}
+"#;
+
+/// Simdcoop variant of the fused QKV triple kernel. Each output gets
+/// a dedicated 32-thread simdgroup; reduces dispatch count AND uses
+/// simd-cooperative K-reduction. Best when blocks_per_row >= 16
+/// (K >= 4096); otherwise the simdgroup is under-utilised.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemv_q4_k_f32_triple_simdcoop_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q_buf: &Buffer,
+    w_k_buf: &Buffer,
+    w_v_buf: &Buffer,
+    out_q: &Buffer,
+    out_k: &Buffer,
+    out_v: &Buffer,
+    k: usize,
+    n_q: usize,
+    n_k: usize,
+    n_v: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32_triple_simdcoop needs Metal3".to_string(),
+        ));
+    }
+    if k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_triple_simdcoop: K%256==0 required (K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_triple_simdcoop",
+        SGEMV_Q4_K_F32_TRIPLE_SIMDCOOP_SHADER,
+        "sgemv_q4_k_f32_triple_simdcoop",
+    )?;
+    let dims_buf = backend.alloc_shared(16)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = k as u32;
+        *p.add(1) = n_q as u32;
+        *p.add(2) = n_k as u32;
+        *p.add(3) = n_v as u32;
+    }
+    let total = n_q + n_k + n_v;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q_buf), 0);
+        encoder.set_buffer(2, Some(w_k_buf), 0);
+        encoder.set_buffer(3, Some(w_v_buf), 0);
+        encoder.set_buffer(4, Some(out_q), 0);
+        encoder.set_buffer(5, Some(out_k), 0);
+        encoder.set_buffer(6, Some(out_v), 0);
+        encoder.set_buffer(7, Some(&dims_buf), 0);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * total as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+/// Simdcoop variant of pair_into — Q4_K only.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemv_q4_k_f32_pair_simdcoop_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_a_buf: &Buffer,
+    w_b_buf: &Buffer,
+    out_a: &Buffer,
+    out_b: &Buffer,
+    k: usize,
+    n_a: usize,
+    n_b: usize,
+) -> Result<(), MetalError> {
+    sgemv_q4_k_f32_triple_simdcoop_into(
+        backend, x_buf, w_a_buf, w_b_buf, w_b_buf, out_a, out_b, out_b, k, n_a, n_b, 0,
+    )
+}
+
 /// Direct Q4_K sgemv on Metal — no f32 dequantisation buffer in DRAM.
 /// Variant that writes into a caller-provided output buffer to avoid
 /// the per-call 140KB allocation in the hot path. The caller must
@@ -4458,6 +4645,91 @@ mod tests {
         }
         for (a, b) in b_s.iter().zip(b_p.iter()) {
             assert!((a - b).abs() < 1e-4, "B mismatch: {a} vs {b}");
+        }
+    }
+
+    /// T81 — simdcoop variant of triple matches three single sgemv calls.
+    #[test]
+    fn sgemv_q4_k_f32_triple_simdcoop_matches_three_singles() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[triple_simdcoop] skipping: no Metal3");
+            return;
+        }
+        // K = 4096 to match the >=16 blocks per row constraint.
+        let k = 4096;
+        let n_q = 64;
+        let n_k = 16;
+        let n_v = 16;
+
+        let w_q_bytes = build_test_q4k_matrix(n_q, k, 71);
+        let w_k_bytes = build_test_q4k_matrix(n_k, k, 73);
+        let w_v_bytes = build_test_q4k_matrix(n_v, k, 79);
+        let x: Vec<f32> = (0..k).map(|i| ((i as f32 + 1.0) * 0.001).sin()).collect();
+
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_q_buf = backend.alloc_shared(w_q_bytes.len()).unwrap();
+        let w_k_buf = backend.alloc_shared(w_k_bytes.len()).unwrap();
+        let w_v_buf = backend.alloc_shared(w_v_bytes.len()).unwrap();
+        let out_q_single = backend.alloc_shared(n_q * 4).unwrap();
+        let out_k_single = backend.alloc_shared(n_k * 4).unwrap();
+        let out_v_single = backend.alloc_shared(n_v * 4).unwrap();
+        let out_q_t = backend.alloc_shared(n_q * 4).unwrap();
+        let out_k_t = backend.alloc_shared(n_k * 4).unwrap();
+        let out_v_t = backend.alloc_shared(n_v * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, k);
+            std::ptr::copy_nonoverlapping(
+                w_q_bytes.as_ptr(),
+                w_q_buf.contents() as *mut u8,
+                w_q_bytes.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                w_k_bytes.as_ptr(),
+                w_k_buf.contents() as *mut u8,
+                w_k_bytes.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                w_v_bytes.as_ptr(),
+                w_v_buf.contents() as *mut u8,
+                w_v_bytes.len(),
+            );
+        }
+
+        sgemv_q4_k_f32_into(backend, &x_buf, &w_q_buf, &out_q_single, k, n_q).unwrap();
+        sgemv_q4_k_f32_into(backend, &x_buf, &w_k_buf, &out_k_single, k, n_k).unwrap();
+        sgemv_q4_k_f32_into(backend, &x_buf, &w_v_buf, &out_v_single, k, n_v).unwrap();
+        backend.drain();
+
+        sgemv_q4_k_f32_triple_simdcoop_into(
+            backend, &x_buf, &w_q_buf, &w_k_buf, &w_v_buf, &out_q_t, &out_k_t, &out_v_t, k, n_q,
+            n_k, n_v,
+        )
+        .unwrap();
+        backend.drain();
+
+        let read = |b: &Buffer, n: usize| -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(b.contents() as *const f32, n).to_vec() }
+        };
+        let q_s = read(&out_q_single, n_q);
+        let q_t = read(&out_q_t, n_q);
+        let k_s = read(&out_k_single, n_k);
+        let k_t = read(&out_k_t, n_k);
+        let v_s = read(&out_v_single, n_v);
+        let v_t = read(&out_v_t, n_v);
+
+        // simd_sum reorders FMAs vs scalar sequential — relax tolerance.
+        for (a, b) in q_s.iter().zip(q_t.iter()) {
+            let r = (a - b).abs() / a.abs().max(1e-3);
+            assert!(r < 1e-3, "Q mismatch: {a} vs {b} (rel {r:.3e})");
+        }
+        for (a, b) in k_s.iter().zip(k_t.iter()) {
+            let r = (a - b).abs() / a.abs().max(1e-3);
+            assert!(r < 1e-3, "K mismatch: {a} vs {b} (rel {r:.3e})");
+        }
+        for (a, b) in v_s.iter().zip(v_t.iter()) {
+            let r = (a - b).abs() / a.abs().max(1e-3);
+            assert!(r < 1e-3, "V mismatch: {a} vs {b} (rel {r:.3e})");
         }
     }
 }

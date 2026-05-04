@@ -55,7 +55,11 @@ impl MetalWeight {
         // 1-thread-per-output kernel keeps the simdgroup busy enough
         // that K-stride cooperation isn't worth the simd_sum overhead.
         let blocks_per_row = self.k / 256;
-        let use_simdcoop = self.n > 50_000 && blocks_per_row >= 16;
+        // T81 — empirically tuned for Qwen3-14B Q4_K_M on M4 Max:
+        //   n > 500 catches W_O (5120), W_down (5120), V_solo (1024),
+        //   and lm_head (151936). Below 500 the simd_sum overhead
+        //   dominates the bandwidth gain.
+        let use_simdcoop = self.n > 500 && blocks_per_row >= 16;
         match (self.dtype, use_simdcoop) {
             (GgmlType::Q4_K, false) => {
                 sgemv_q4_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
@@ -238,9 +242,10 @@ fn forward_token(
         // dispatch) and dispatch V separately. Net: 2 kernels per
         // attention layer instead of 3 — still a clear win over the
         // pre-T80 split path.
+        // Empirically, simdcoop loses on QKV (n_q=5120, n_k=1024) for
+        // Qwen3-14B because the simd_sum overhead exceeds the bandwidth
+        // gain at this scale. We keep the simple triple/pair here.
         if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
-            // Symmetric Q4_K_S variant or any quant where V is Q4_K:
-            // the original triple fuse is correct.
             sgemv_q4_k_f32_triple_into(
                 backend,
                 &scratch.h_buf,
@@ -257,7 +262,6 @@ fn forward_token(
             )
             .unwrap();
         } else {
-            // Asymmetric Q4_K_M variant: Q+K Q4_K fused, V Q6_K solo.
             sgemv_q4_k_f32_pair_into(
                 backend,
                 &scratch.h_buf,
