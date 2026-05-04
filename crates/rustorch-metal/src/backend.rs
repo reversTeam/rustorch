@@ -42,6 +42,13 @@ pub struct MetalBackend {
     /// stale entries (whose source buffer has been freed by Drop)
     /// are silently dropped on lookup miss.
     bf16_cache: Arc<Mutex<HashMap<usize, metal::Buffer>>>,
+    /// Free-list buffer pool keyed by exact byte length. Kernel output
+    /// allocations (matmul outputs, intermediates) come from here when
+    /// possible — saves the ~5-10 µs `MTLDevice::new_buffer` cost per
+    /// dispatch. Buffers return to the pool when the wrapping
+    /// `MetalStorage`'s last clone drops (via `with_pool_return` hook).
+    /// MAX_PER_SIZE caps each bucket to bound resident memory.
+    buffer_pool: Arc<Mutex<HashMap<usize, Vec<metal::Buffer>>>>,
     /// Adapter name from `device.name()` (e.g. "Apple M4 Max").
     adapter_name: String,
     /// `true` if the device reports `supportsFamily(MTLGPUFamilyMetal3)`
@@ -72,9 +79,75 @@ impl MetalBackend {
             pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_cmd_buffer: Arc::new(Mutex::new(None)),
             bf16_cache: Arc::new(Mutex::new(HashMap::new())),
+            buffer_pool: Arc::new(Mutex::new(HashMap::new())),
             adapter_name,
             supports_metal3,
         })
+    }
+
+    /// Maximum buffers retained per size bucket. Caps the pool's
+    /// resident memory; once a bucket reaches the limit, additional
+    /// returns drop the buffer normally.
+    const POOL_MAX_PER_SIZE: usize = 8;
+
+    /// Pop a buffer of `byte_len` bytes from the pool, or allocate a
+    /// fresh one if the bucket is empty. Returned buffers come from
+    /// `MTLStorageModeShared` so they're host-mappable on Apple Silicon
+    /// — same semantics as [`Self::alloc_shared`].
+    pub fn pool_get(&self, byte_len: usize) -> Result<metal::Buffer, MetalError> {
+        if byte_len == 0 {
+            return Err(MetalError::ShapeMismatch(
+                "pool_get: byte_len must be > 0".to_string(),
+            ));
+        }
+        {
+            let mut pool = self.buffer_pool.lock().expect("metal buffer_pool lock");
+            if let Some(bucket) = pool.get_mut(&byte_len) {
+                if let Some(buf) = bucket.pop() {
+                    return Ok(buf);
+                }
+            }
+        }
+        // Pool miss → allocate fresh. The pool will fill back in via
+        // `pool_return` when the wrapping `MetalStorage` drops.
+        self.alloc_shared(byte_len)
+    }
+
+    /// Return a buffer to the pool. Drops it if the bucket is full or
+    /// the buffer's actual length doesn't match `byte_len` (defensive).
+    pub fn pool_return(&self, buffer: metal::Buffer, byte_len: usize) {
+        if buffer.length() != byte_len as u64 {
+            // Mismatched bucket — let it drop normally.
+            return;
+        }
+        let mut pool = self.buffer_pool.lock().expect("metal buffer_pool lock");
+        let bucket = pool.entry(byte_len).or_default();
+        if bucket.len() < Self::POOL_MAX_PER_SIZE {
+            bucket.push(buffer);
+        }
+        // else: drop the buffer normally.
+    }
+
+    /// Allocate a [`metal::Buffer`] backed by the pool and wrap it in a
+    /// [`MetalStorage`] whose Drop hook returns the buffer to the pool.
+    /// Caller can build a Tensor from the returned MetalStorage; the
+    /// pool reclaims the buffer automatically when the last clone drops.
+    pub fn pooled_alloc(
+        &self,
+        byte_len: usize,
+    ) -> Result<rustorch_core::tensor::storage::MetalStorage, MetalError> {
+        let buffer = self.pool_get(byte_len)?;
+        // Capture a self-handle for the on_drop callback. We use the
+        // process-wide singleton getter so we don't need to share Arc
+        // ownership through MetalStorage (which only takes a closure).
+        let on_drop = move |b: metal::Buffer| {
+            crate::backend_singleton::metal_backend().pool_return(b, byte_len);
+        };
+        Ok(
+            rustorch_core::tensor::storage::MetalStorage::with_pool_return(
+                buffer, byte_len, on_drop,
+            ),
+        )
     }
 
     /// Get or compute a bf16 view of a Metal buffer. Used by the

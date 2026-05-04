@@ -1076,7 +1076,7 @@ pub fn matmul_simdgroup_f32_coarsened_wide(
         MATMUL_SIMDGROUP_F32_COARSENED_WIDE_SHADER,
         "matmul_simdgroup_f32_coarsened_wide",
     )?;
-    let out = backend.alloc_shared(m * n * 4)?;
+    let out = backend.pool_get(m * n * 4)?;
     // Pass `dims` inline via set_bytes — a 16-byte tiny-uniform fits
     // Metal's "argument-buffer" fast path and avoids the 5–10 µs cost
     // of `alloc_shared(16)` per matmul dispatch (3× per training step).
@@ -1212,7 +1212,7 @@ pub fn matmul_simdgroup_f32_coarsened_wide_bias(
         MATMUL_SIMDGROUP_F32_COARSENED_WIDE_BIAS_SHADER,
         "matmul_simdgroup_f32_coarsened_wide_bias",
     )?;
-    let out = backend.alloc_shared(m * n * 4)?;
+    let out = backend.pool_get(m * n * 4)?;
     // Inline tiny-uniform via set_bytes — see matmul_simdgroup_f32_coarsened_wide
     // above for rationale.
     let dims = [m as u32, k as u32, n as u32, 0u32];
@@ -1385,7 +1385,7 @@ pub fn matmul_simdgroup_f32_b_t(
         MATMUL_SIMDGROUP_F32_TRANSPOSED_SHADER,
         "matmul_simdgroup_f32_b_t",
     )?;
-    let out = backend.alloc_shared(m * n * 4)?;
+    let out = backend.pool_get(m * n * 4)?;
     let dims = [m as u32, k as u32, n as u32, 0u32];
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
@@ -1435,7 +1435,7 @@ pub fn matmul_simdgroup_f32_a_t(
         MATMUL_SIMDGROUP_F32_TRANSPOSED_SHADER,
         "matmul_simdgroup_f32_a_t",
     )?;
-    let out = backend.alloc_shared(m * n * 4)?;
+    let out = backend.pool_get(m * n * 4)?;
     let dims = [m as u32, k as u32, n as u32, 0u32];
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);

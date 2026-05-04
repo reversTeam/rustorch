@@ -313,7 +313,12 @@ impl Backend for MetalBackend {
         // (when params are stored bf16 across steps).
         let _ = matmul_simdgroup_f32_via_bf16;
         let _ = matmul_bf16_in_f32_out;
-        let core = rustorch_core::tensor::storage::MetalStorage::standalone(out, m * n * 4);
+        let byte_len = m * n * 4;
+        let core = rustorch_core::tensor::storage::MetalStorage::with_pool_return(
+            out,
+            byte_len,
+            move |b| crate::backend_singleton::metal_backend().pool_return(b, byte_len),
+        );
         Ok(Tensor::from_metal_storage(core, vec![m, n], lhs.dtype()))
     }
 
@@ -355,7 +360,12 @@ impl Backend for MetalBackend {
         let out =
             crate::kernels::matmul_simdgroup_f32_coarsened_wide_bias(self, &l, &r, &bb, m, k, n)
                 .map_err(|e| metal_err("matmul_with_bias", e))?;
-        let core = rustorch_core::tensor::storage::MetalStorage::standalone(out, m * n * 4);
+        let byte_len = m * n * 4;
+        let core = rustorch_core::tensor::storage::MetalStorage::with_pool_return(
+            out,
+            byte_len,
+            move |b| crate::backend_singleton::metal_backend().pool_return(b, byte_len),
+        );
         Ok(Tensor::from_metal_storage(core, vec![m, n], lhs.dtype()))
     }
 
@@ -460,7 +470,12 @@ impl Backend for MetalBackend {
             crate::kernels::matmul_simdgroup_f32_b_t(self, &l, &r, m, k, n)
                 .map_err(|e| metal_err("matmul_with_transposes", e))?
         };
-        let core = rustorch_core::tensor::storage::MetalStorage::standalone(out, m * n * 4);
+        let byte_len = m * n * 4;
+        let core = rustorch_core::tensor::storage::MetalStorage::with_pool_return(
+            out,
+            byte_len,
+            move |b| crate::backend_singleton::metal_backend().pool_return(b, byte_len),
+        );
         Ok(Tensor::from_metal_storage(core, vec![m, n], lhs.dtype()))
     }
 
