@@ -1848,7 +1848,30 @@ fn matmul_dispatch_f32(
         );
         rhs_owned.as_deref().unwrap()
     };
-    let mut out_buf: Vec<f32> = vec![0.0_f32; m * n];
+    // T11 — skip the zero-init of the output buffer. cblas_sgemm
+    // is called with beta=0 so every cell is overwritten; a prior
+    // zero pass burns ~256 KB / 30 GB/s = ~8 µs on a 256² matmul,
+    // which itself completes in ~25 µs (the zero-fill was a third
+    // of the wall-clock). We use `MaybeUninit` to avoid the lint
+    // about set_len-after-reserve.
+    let mut out_storage: Vec<core::mem::MaybeUninit<f32>> = Vec::with_capacity(m * n);
+    // SAFETY: f32 has no Drop, MaybeUninit<f32> is layout-compatible
+    // with f32, and `sgemm_row_major` (beta=0) overwrites all m*n
+    // cells before any reader sees them.
+    unsafe {
+        out_storage.set_len(m * n);
+    }
+    // SAFETY: re-interpret as Vec<f32>. MaybeUninit<f32> has the
+    // same size + alignment as f32 by definition.
+    let mut out_buf: Vec<f32> = unsafe {
+        let (ptr, len, cap) = (
+            out_storage.as_mut_ptr() as *mut f32,
+            out_storage.len(),
+            out_storage.capacity(),
+        );
+        core::mem::forget(out_storage);
+        Vec::from_raw_parts(ptr, len, cap)
+    };
 
     // SAFETY: input slices have length ≥ m*k / k*n verified by Tensor's
     // contiguity invariant; out_buf is exactly m*n. `cblas_sgemm` is the
