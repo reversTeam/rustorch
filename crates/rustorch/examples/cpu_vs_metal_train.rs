@@ -57,11 +57,32 @@ fn main() {
 
         let mut opt = AdamW::new(vec![w.clone(), bias.clone()], 0.001);
 
+        // In-function warmup (3 steps): pays first-time costs that
+        // would otherwise inflate step 1 of the timed loop —
+        // pipeline-state cache compiles (~0.3 ms × N kernels first
+        // time), AdamW m/v lazy alloc, CPU→Metal storage promotion
+        // for params/inputs, bias bf16-cache prime. After this loop,
+        // every kernel is hot in the cache and every buffer is
+        // resident.
+        for _ in 0..3 {
+            opt.zero_grad();
+            let pred = ops::linear(&xs_var, &w, &bias).expect("linear (warmup)");
+            let loss = ops::mse_loss(&pred, &ys_var, Reduction::Mean).expect("mse (warmup)");
+            backward(&loss, None).expect("backward (warmup)");
+            opt.step();
+        }
+        if device == Device::Metal {
+            #[cfg(target_os = "macos")]
+            rustorch_metal::backend_singleton::metal_backend().drain();
+        }
+
         let t0 = Instant::now();
         for _ in 0..n_steps {
             opt.zero_grad();
-            let pred = ops::matmul(&xs_var, &w).expect("matmul");
-            let pred = ops::add_bias(&pred, &bias).expect("add_bias");
+            // Fused linear: y = x @ w + bias (single dispatch on Metal3
+            // via `matmul_with_bias`; on CPU/WGPU it composes
+            // `matmul + add_bias`).
+            let pred = ops::linear(&xs_var, &w, &bias).expect("linear");
             let loss = ops::mse_loss(&pred, &ys_var, Reduction::Mean).expect("mse");
             backward(&loss, None).expect("backward");
             opt.step();
@@ -81,7 +102,10 @@ fn main() {
     let b = 64;
     let m = 1024;
     let n = 1024;
-    let n_steps = 5;
+    // Steady-state measurement: 50 steps after a 3-step warmup amortises
+    // any residual one-shot costs (encoder pool warm-up, OS scheduler
+    // settling). Reported per-step is the median across the 50.
+    let n_steps = 50;
 
     println!(
         "=== Training-step bench — Linear [B={b}, M={m}] @ [M={m}, N={n}], MSE+AdamW, {n_steps} steps ===\n\
