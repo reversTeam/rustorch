@@ -301,28 +301,49 @@ impl Tensor {
     /// Borrow the buffer as `&[f32]` for the common P0.3-prototype path.
     ///
     /// **Panics** if the tensor is not contiguous F32 with
-    /// `storage_offset == 0`. Use [`Tensor::as_slice`] for the typed,
-    /// fallible form.
+    /// `storage_offset == 0`, or if the storage lives on a non-CPU
+    /// device (Wgpu / Cuda / Metal). Use [`Tensor::as_slice`] for the
+    /// typed, fallible form, or call [`Tensor::to_cpu`] (when
+    /// available) to materialise host bytes first.
     #[inline]
     pub fn data(&self) -> &[f32] {
         match self.as_slice::<f32>() {
             Some(s) => s,
             None => panic!(
-                "Tensor::data() requires contiguous F32 storage with offset 0; \
-                 got dtype={:?}, contiguous={}, offset={}",
+                "Tensor::data() requires contiguous F32 storage on CPU with offset 0; \
+                 got dtype={:?}, contiguous={}, offset={}, device={:?}, on_cpu={}",
                 self.dtype(),
                 self.is_contiguous(),
                 self.storage_offset(),
+                self.device(),
+                self.storage.is_cpu(),
             ),
         }
     }
 
-    /// Borrow the buffer as `&[T]` if the tensor is contiguous, has
-    /// dtype matching `T`, and `storage_offset == 0`. Returns `None`
-    /// otherwise — caller must `.contiguous()` first (P1.1 task
-    /// `Conversions`).
+    /// Borrow the buffer as `&[T]` if the tensor is contiguous F32 on
+    /// CPU storage with `storage_offset == 0` and dtype matching `T`.
+    ///
+    /// **STRICT semantics (P3.Z Task A)**: returns `None` when the
+    /// underlying [`Storage`] lives on a GPU device (`Wgpu`,
+    /// `WgpuShared` not yet mapped, `Cuda`, `Metal`). Callers needing
+    /// host bytes from a GPU tensor must call `.to_cpu()` (sync) or
+    /// `.to_cpu_async()` first to materialise. This catches
+    /// cross-device bugs at the type-system level — no surprise
+    /// per-op host↔device round-trips.
     pub fn as_slice<T: Element>(&self) -> Option<&[T]> {
         if self.dtype() != T::DTYPE || !self.is_contiguous() || self.storage_offset() != 0 {
+            return None;
+        }
+        // P3.Z Task A: strict CPU-only check. WgpuShared with an
+        // already-mapped region also exposes host bytes via
+        // `Storage::as_bytes()` so we accept any storage variant
+        // whose `as_bytes()` returns a non-empty slice (Cpu always,
+        // WgpuShared after `ensure_mapped`).
+        let bytes = self.storage.as_bytes();
+        if bytes.is_empty() && self.numel() > 0 {
+            // Non-CPU storage with no mapped region: caller must
+            // materialise to CPU first.
             return None;
         }
         // SAFETY: dtype matches T; the storage holds `numel * size_of::<T>()`
