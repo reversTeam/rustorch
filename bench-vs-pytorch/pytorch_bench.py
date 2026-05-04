@@ -179,6 +179,8 @@ def run(num_threads, device_label="cpu"):
     # decides whether the perf sprint translates to faster transformer
     # inference vs PyTorch.
     results.append(bench_transformer_block(2, 128, 256, 4, 1024))
+    # T21 — full-scale GPT-2 small block (real production shape).
+    results.append(bench_transformer_block(1, 512, 768, 12, 3072))
     return {
         "framework": "pytorch",
         "device": device_label,

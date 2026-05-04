@@ -228,6 +228,57 @@ fn bench_elementwise_add(c: &mut Criterion) {
     group.finish();
 }
 
+/// T21 — full-scale GPT-2 small block forward (B=1 S=512 D=768
+/// H=12 F=3072). Verifies the T18+T19+T20 wins hold on the real
+/// production shape, not just the small dev shape.
+fn bench_transformer_block_gpt2_small(c: &mut Criterion) {
+    use rustorch_autograd::{no_grad, ops, Variable};
+    use rustorch_fusion::patterns::matmul_bias_act::Activation;
+    use rustorch_nn::{LayerNorm, Linear, Module, MultiHeadAttention};
+
+    let batch = 1_usize;
+    let seq = 512_usize;
+    let d_model = 768_usize;
+    let n_heads = 12_usize;
+    let d_ff = 3072_usize;
+
+    let ln1 = LayerNorm::new(d_model);
+    let mha = MultiHeadAttention::new(d_model, n_heads);
+    let ln2 = LayerNorm::new(d_model);
+    let fc1 = Linear::new(d_model, d_ff);
+    let fc2 = Linear::new(d_ff, d_model);
+
+    let x_data = det(0xC1A0, batch * seq * d_model);
+    let x_tensor = Tensor::from_vec(vec![batch, seq, d_model], x_data).unwrap();
+
+    let mut group = c.benchmark_group("transformer_block_forward_gpt2_small");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(800));
+    group.measurement_time(std::time::Duration::from_secs(5));
+    group.bench_function(
+        BenchmarkId::from_parameter(format!(
+            "B{}S{}D{}H{}F{}",
+            batch, seq, d_model, n_heads, d_ff
+        )),
+        |bb| {
+            bb.iter(|| {
+                no_grad(|| {
+                    let x = Variable::new(x_tensor.clone());
+                    let h = ln1.forward(&x).unwrap();
+                    let h = mha.forward(&h, &h, &h, None).unwrap();
+                    let x = ops::add(&x, &h).unwrap();
+                    let h = ln2.forward(&x).unwrap();
+                    let h = fc1.forward_with_activation(&h, Activation::Relu).unwrap();
+                    let h = fc2.forward(&h).unwrap();
+                    let out = ops::add(&x, &h).unwrap();
+                    hint_black_box(out)
+                })
+            });
+        },
+    );
+    group.finish();
+}
+
 /// Per-stage breakdown of the GPT-2 transformer block — reveals
 /// where the 8× end-to-end gap vs PyTorch concentrates.
 fn bench_transformer_block_breakdown(c: &mut Criterion) {
@@ -317,6 +368,13 @@ fn bench_transformer_block(c: &mut Criterion) {
     use rustorch_fusion::patterns::matmul_bias_act::Activation;
     use rustorch_nn::{LayerNorm, Linear, Module, MultiHeadAttention};
 
+    // Two shape regimes:
+    //   "small"  — fast iteration: B=2 S=128 D=256 H=4  F=1024
+    //   "gpt2"   — real GPT-2-small block: B=1 S=512 D=768 H=12 F=3072
+    // The bench function below runs the small variant; a separate
+    // function `bench_transformer_block_gpt2_small` covers the
+    // real-scale variant (T21). This split keeps the small variant
+    // fast for iterative dev.
     let batch = 2_usize;
     let seq = 128_usize;
     let d_model = 256_usize;
@@ -380,6 +438,7 @@ criterion_group! {
         bench_flash_attention,
         bench_elementwise_add,
         bench_transformer_block,
+        bench_transformer_block_gpt2_small,
         bench_transformer_block_breakdown,
 }
 criterion_main!(benches);
