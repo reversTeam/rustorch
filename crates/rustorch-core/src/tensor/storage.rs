@@ -798,6 +798,16 @@ mod metal_storage {
         pub fn strong_count(&self) -> usize {
             Arc::strong_count(&self.inner)
         }
+
+        /// Stable identifier (Arc pointer cast to usize) for use as a
+        /// cache key. Two clones of the same `MetalStorage` share the
+        /// same id; distinct allocations have distinct ids. Used by
+        /// the Metal backend's bf16-cast cache to amortise f32 → bf16
+        /// conversions across multiple matmul calls on the same buffer.
+        #[inline]
+        pub fn cache_key(&self) -> usize {
+            Arc::as_ptr(&self.inner) as usize
+        }
     }
 
     impl fmt::Debug for MetalStorage {

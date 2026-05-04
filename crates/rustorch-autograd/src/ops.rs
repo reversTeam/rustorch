@@ -18,7 +18,7 @@
 //! pattern.
 
 use crate::backward::BackwardError;
-use crate::dispatch::{pick_backend, require_same_device_2};
+use crate::dispatch::{pick_backend, require_same_device_2, require_same_device_3};
 use crate::node::{Edge, Node};
 use crate::tape::is_grad_enabled;
 use crate::variable::Variable;
@@ -244,26 +244,20 @@ impl Node for MatMulBackward {
         "MatMulBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        // P3.Z Task A round-trip elim: route transpose through the
-        // backend so it stays on-device (Storage::Wgpu in, Storage::Wgpu
-        // out) instead of going via `Tensor::transpose().contiguous()`
-        // which would call `as_slice` on a Wgpu storage and read an
-        // empty host slice. CpuBackend's `transpose` builds a fresh
-        // contiguous Tensor; WgpuBackend's `transpose` materialises
-        // through CPU (legacy fallback) and re-tags Wgpu — both end
-        // states are contiguous + on the right device.
-        let rhs_t = pick_backend(self.device)
-            .transpose(&self.rhs_saved, 0, 1)
-            .expect("transpose rhs");
-        let lhs_t = pick_backend(self.device)
-            .transpose(&self.lhs_saved, 0, 1)
-            .expect("transpose lhs");
+        // Route the transposed matmuls through `matmul_with_transposes`.
+        // Backends that override the default impl (e.g. MetalBackend) fuse
+        // the transpose into the matmul kernel via `simdgroup_load(...,
+        // transpose=true)`, skipping the explicit transpose dispatch +
+        // the intermediate `[N,K]` / `[K,M]` buffer per backward pass.
+        // CPU + WGPU keep the default `transpose + matmul` semantics.
+        // - dX = grad @ W^T  → matmul_with_transposes(grad, W, false, true)
+        // - dW = X^T @ grad  → matmul_with_transposes(X, grad, true, false)
         let g_lhs = pick_backend(self.device)
-            .matmul(grad, &rhs_t)
-            .expect("matmul lhs grad");
+            .matmul_with_transposes(grad, &self.rhs_saved, false, true)
+            .expect("matmul lhs grad (dX = G @ W^T)");
         let g_rhs = pick_backend(self.device)
-            .matmul(&lhs_t, grad)
-            .expect("matmul rhs grad");
+            .matmul_with_transposes(&self.lhs_saved, grad, true, false)
+            .expect("matmul rhs grad (dW = X^T @ G)");
         vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {
@@ -705,6 +699,91 @@ pub fn add_bias(x: &Variable, bias: &Variable) -> Result<Variable, BackwardError
 }
 
 // --------------------------------------------------------------------------
+// linear — y = x @ w + bias.  Forward dispatches to the backend's
+// `matmul_with_bias` (Metal fuses into a single kernel; CPU/WGPU
+// compose). Backward is the chain rule of matmul + add_bias:
+//   dx    = grad @ w^T
+//   dw    = x^T @ grad
+//   dbias = sum(grad, dim=0)
+// --------------------------------------------------------------------------
+
+struct LinearBackward {
+    x_saved: Tensor,
+    w_saved: Tensor,
+    bias_shape: Vec<usize>,
+    device: Device,
+    edges: [Edge; 3],
+}
+
+impl Node for LinearBackward {
+    fn name(&self) -> &'static str {
+        "LinearBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let backend = pick_backend(self.device);
+        // dx = grad @ W^T  (transpose-aware matmul on Metal)
+        let dx = backend
+            .matmul_with_transposes(grad, &self.w_saved, false, true)
+            .expect("linear bw: dx = grad @ W^T");
+        // dW = X^T @ grad
+        let dw = backend
+            .matmul_with_transposes(&self.x_saved, grad, true, false)
+            .expect("linear bw: dW = X^T @ grad");
+        // dbias = sum(grad, dim=0) — collapse the batch axis.
+        let dbias = backend
+            .sum_dim(grad, &[0], false)
+            .expect("linear bw: dbias = sum(grad, dim=0)");
+        let _ = &self.bias_shape; // shape implicit in sum_dim output
+        vec![Some(dx), Some(dw), Some(dbias)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// Fused linear layer forward: `y = x @ w + bias`.
+///
+/// Single autograd op equivalent to `add_bias(matmul(x, w), bias)`,
+/// but the forward goes through the backend's `matmul_with_bias` which
+/// on Metal3-capable devices fuses into a single dispatch (no
+/// intermediate `[B, N]` write-back). Backward decomposes into the
+/// usual matmul + add_bias chain rule, with the matmul side using
+/// `matmul_with_transposes` to skip explicit transpose dispatches.
+pub fn linear(x: &Variable, w: &Variable, bias: &Variable) -> Result<Variable, BackwardError> {
+    let device = require_same_device_3("linear", x, w, bias)?;
+    let x_t = x.tensor();
+    let w_t = w.tensor();
+    let bias_t = bias.tensor();
+    if x_t.ndim() != 2 || w_t.ndim() != 2 || bias_t.ndim() != 1 {
+        return Err(BackwardError::Backend {
+            op: "linear",
+            message: format!(
+                "expected x: rank-2, w: rank-2, bias: rank-1; got {:?}, {:?}, {:?}",
+                x_t.shape(),
+                w_t.shape(),
+                bias_t.shape()
+            ),
+        });
+    }
+    let out = pick_backend(device)
+        .matmul_with_bias(&x_t, &w_t, &bias_t)
+        .map_err(|e| backend_err("linear", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && (x.requires_grad || w.requires_grad || bias.requires_grad) {
+        let node = std::sync::Arc::new(LinearBackward {
+            x_saved: x_t.clone(),
+            w_saved: w_t.clone(),
+            bias_shape: bias_t.shape().to_vec(),
+            device,
+            edges: [x.edge(), w.edge(), bias.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
 // mse_loss — d/dx mse(x, y) = 2 * (x - y) / n  (reduction=mean)
 // --------------------------------------------------------------------------
 
@@ -714,6 +793,11 @@ struct MseBackward {
     reduction: Reduction,
     device: Device,
     edges: [Edge; 2],
+    /// Skip the `neg` dispatch when the target tensor doesn't require
+    /// gradients (the common training case — labels are constants).
+    /// Saves one GPU dispatch per loss invocation.
+    input_requires_grad: bool,
+    target_requires_grad: bool,
 }
 
 impl Node for MseBackward {
@@ -727,11 +811,37 @@ impl Node for MseBackward {
             Reduction::None => 2.0,
         };
         let scale_t = Tensor::scalar(scale);
-        let g_x = pick_backend(self.device)
-            .mul(&self.diff, &scale_t)
-            .expect("mse grad mul");
-        let g_y = pick_backend(self.device).neg(&g_x).expect("mse grad neg");
-        vec![Some(g_x), Some(g_y)]
+        // g_x = diff * scale ; g_y = -g_x. Fold the sign into the scalar
+        // when only one side is needed so we avoid a redundant `mul +
+        // neg` chain. When both sides are needed, the standard `mul +
+        // neg` path stays.
+        match (self.input_requires_grad, self.target_requires_grad) {
+            (true, true) => {
+                let g_x = pick_backend(self.device)
+                    .mul(&self.diff, &scale_t)
+                    .expect("mse grad mul");
+                let g_y = pick_backend(self.device).neg(&g_x).expect("mse grad neg");
+                vec![Some(g_x), Some(g_y)]
+            },
+            (true, false) => {
+                // Common training case: target is a constant (labels).
+                // Skip the `neg` dispatch entirely.
+                let g_x = pick_backend(self.device)
+                    .mul(&self.diff, &scale_t)
+                    .expect("mse grad mul");
+                vec![Some(g_x), None]
+            },
+            (false, true) => {
+                // Symmetric: only target needs a grad. Fold the negation
+                // into the scalar — single mul dispatch, no neg.
+                let neg_scale = Tensor::scalar(-scale);
+                let g_y = pick_backend(self.device)
+                    .mul(&self.diff, &neg_scale)
+                    .expect("mse grad mul (-)");
+                vec![None, Some(g_y)]
+            },
+            (false, false) => vec![None, None],
+        }
     }
     fn next_edges(&self) -> &[Edge] {
         &self.edges
@@ -759,6 +869,8 @@ pub fn mse_loss(
             reduction,
             device,
             edges: [input.edge(), target.edge()],
+            input_requires_grad: input.requires_grad,
+            target_requires_grad: target.requires_grad,
         });
         out_var.grad_fn = Some(node);
         out_var.requires_grad = true;

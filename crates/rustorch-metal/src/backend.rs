@@ -34,6 +34,14 @@ pub struct MetalBackend {
     /// the per-kernel encoder/commit overhead (~50-200 µs each) into
     /// one batch per training step.
     pending_cmd_buffer: Arc<Mutex<Option<metal::CommandBuffer>>>,
+    /// bf16 cast cache: maps `core::MetalStorage` Arc pointers to
+    /// the corresponding bfloat16 Metal buffer. Used by the mixed-
+    /// precision matmul path so that f32 → bf16 casts are paid ONCE
+    /// per buffer (typically the first time a tensor is fed to a
+    /// matmul) instead of every dispatch. Cleared via `drain` —
+    /// stale entries (whose source buffer has been freed by Drop)
+    /// are silently dropped on lookup miss.
+    bf16_cache: Arc<Mutex<HashMap<usize, metal::Buffer>>>,
     /// Adapter name from `device.name()` (e.g. "Apple M4 Max").
     adapter_name: String,
     /// `true` if the device reports `supportsFamily(MTLGPUFamilyMetal3)`
@@ -63,9 +71,56 @@ impl MetalBackend {
             queue: Arc::new(queue),
             pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_cmd_buffer: Arc::new(Mutex::new(None)),
+            bf16_cache: Arc::new(Mutex::new(HashMap::new())),
             adapter_name,
             supports_metal3,
         })
+    }
+
+    /// Get or compute a bf16 view of a Metal buffer. Used by the
+    /// mixed-precision matmul path to amortise f32 → bf16 casts
+    /// across multiple matmul invocations on the same input tensor
+    /// (e.g. forward `xs @ w` and backward `dxs @ w.T` both reuse
+    /// the bf16 cache for `w`).
+    ///
+    /// `cache_key` should be a stable identifier for the source
+    /// buffer (we use the underlying `Arc<MetalStorageInner>`
+    /// pointer from `core::MetalStorage`).
+    pub fn ensure_bf16(
+        &self,
+        cache_key: usize,
+        src_f32: &metal::Buffer,
+        n_elements: usize,
+    ) -> Result<metal::Buffer, crate::error::MetalError> {
+        {
+            let guard = self.bf16_cache.lock().expect("metal bf16_cache lock");
+            if let Some(buf) = guard.get(&cache_key) {
+                return Ok(buf.clone());
+            }
+        }
+        // Cache miss — cast f32 → bf16 and remember the result.
+        let bf16 = crate::kernels::cast_f32_to_bf16_pub(self, src_f32, n_elements)?;
+        let mut guard = self.bf16_cache.lock().expect("metal bf16_cache lock");
+        Ok(guard
+            .entry(cache_key)
+            .or_insert_with(|| bf16.clone())
+            .clone())
+    }
+
+    /// Drop a single entry from the bf16 cache when its source
+    /// buffer has been replaced (e.g. AdamW updates the param's
+    /// MetalStorage to a fresh buffer — the previous bf16 cast is
+    /// stale). Called by callers that mutate Tensor storage.
+    pub fn evict_bf16(&self, cache_key: usize) {
+        let mut guard = self.bf16_cache.lock().expect("metal bf16_cache lock");
+        guard.remove(&cache_key);
+    }
+
+    /// Clear the entire bf16 cache. Use sparingly — defeats the
+    /// purpose of caching. Mainly for tests / state reset.
+    pub fn clear_bf16_cache(&self) {
+        let mut guard = self.bf16_cache.lock().expect("metal bf16_cache lock");
+        guard.clear();
     }
 
     /// Run `f` against a compute encoder on the **shared pending

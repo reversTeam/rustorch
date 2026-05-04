@@ -124,6 +124,38 @@ kernel void fused_adamw_f32(
     }
     param_out[gid] = p_new;
 }
+
+// In-place variant: same math, single param buffer that is read then
+// written. Each thread reads p_old once (line 1) and writes p_new
+// once (last line) — no aliasing hazard for `gid != gid'`.
+kernel void fused_adamw_f32_inplace(
+    constant Params&    params [[buffer(0)]],
+    device       float* param  [[buffer(1)]],
+    device const float* grad   [[buffer(2)]],
+    device       float* m      [[buffer(3)]],
+    device       float* v      [[buffer(4)]],
+    uint                gid    [[thread_position_in_grid]]
+) {
+    if (gid >= params.n) { return; }
+
+    float p_old = param[gid];
+    float g = grad[gid];
+
+    float new_m = params.beta1 * m[gid] + (1.0f - params.beta1) * g;
+    m[gid] = new_m;
+
+    float new_v = params.beta2 * v[gid] + (1.0f - params.beta2) * g * g;
+    v[gid] = new_v;
+
+    float m_hat = new_m / params.bc1;
+    float v_hat = new_v / params.bc2;
+
+    float p_new = p_old - params.lr * m_hat / (sqrt(v_hat) + params.eps);
+    if (params.weight_decay > 0.0f) {
+        p_new = p_new - params.lr * params.weight_decay * p_old;
+    }
+    param[gid] = p_new;
+}
 "#;
 
 /// Run one AdamW step on GPU memory — single MTLComputeCommandEncoder
@@ -180,6 +212,59 @@ pub fn fused_adamw_step(
     // wait_until_completed removed — Metal handles inter-kernel sync via queue order. Only host reads (in transfer.rs::tensor_to_cpu) need an explicit wait.
 
     Ok(param_out)
+}
+
+/// In-place AdamW step. Mutates `param` directly instead of allocating
+/// a fresh `param_out`. Saves one `alloc_shared(n*4)` per param per
+/// step (≈4 MB for a 1024² Linear weight matrix), which adds up across
+/// many params and many steps. Caller keeps the same `param` buffer
+/// across steps — `param.set_data()` is no longer needed.
+///
+/// `m`, `v` are still updated in place (same as the non-inplace path).
+pub fn fused_adamw_step_inplace(
+    backend: &MetalBackend,
+    param: &Buffer,
+    grad: &Buffer,
+    m: &Buffer,
+    v: &Buffer,
+    n: usize,
+    params: AdamWStepParams,
+) -> Result<(), MetalError> {
+    let n_bytes = n * 4;
+    if param.length() < n_bytes as u64
+        || grad.length() < n_bytes as u64
+        || m.length() < n_bytes as u64
+        || v.length() < n_bytes as u64
+    {
+        return Err(MetalError::ShapeMismatch(format!(
+            "fused_adamw_inplace: buffer too small for n={n} (need {n_bytes} bytes each)"
+        )));
+    }
+    let pipeline =
+        backend.pipeline("fused_adamw_f32_inplace", SHADER, "fused_adamw_f32_inplace")?;
+
+    let uniform = params.into_uniform(n as u32);
+    let uniform_buf = backend.alloc_shared(core::mem::size_of::<AdamWUniform>())?;
+    // SAFETY: shared-storage uniform buffer.
+    unsafe {
+        let dst = uniform_buf.contents() as *mut AdamWUniform;
+        *dst = uniform;
+    }
+
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&uniform_buf), 0);
+        encoder.set_buffer(1, Some(param), 0);
+        encoder.set_buffer(2, Some(grad), 0);
+        encoder.set_buffer(3, Some(m), 0);
+        encoder.set_buffer(4, Some(v), 0);
+
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(TG_SIZE.min(max_threads), 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
 }
 
 /// Allocate a zero-initialised shared GPU buffer for fresh `m` / `v`

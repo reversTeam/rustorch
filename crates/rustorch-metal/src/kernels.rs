@@ -450,6 +450,130 @@ pub fn mean_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalE
 }
 
 // ----------------------------------------------------------------------
+// Fused MSE-loss: `(a - b)^2 .sum() / n` (Reduction::Mean) or
+// `(a - b)^2 .sum()` (Reduction::Sum) → scalar `[1]` buffer.
+//
+// Replaces the 3-dispatch path `sub → mul → reduce` with a single
+// 2-stage reduce that fuses the elementwise (a-b)^2 into stage 1.
+// Net savings per training step: 2 dispatches + 2 intermediate
+// `[B,N]` buffers (256 KB each at the bench size).
+// ----------------------------------------------------------------------
+
+const MSE_REDUCE_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ReduceParams {
+    uint n;
+    uint kind;       // 0 = sum, 1 = mean
+};
+
+// Stage 1: each threadgroup reads `a[i]` and `b[i]`, computes
+// `(a-b)^2`, and reduces 256 such squares to one partial.
+kernel void mse_reduce_partial_f32(
+    constant ReduceParams& params [[buffer(0)]],
+    device const float*    a      [[buffer(1)]],
+    device const float*    b      [[buffer(2)]],
+    device       float*    out    [[buffer(3)]],
+    uint  tg_pos  [[threadgroup_position_in_grid]],
+    uint  lid     [[thread_index_in_threadgroup]],
+    uint  tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float scratch[256];
+    uint stride = tg_size;
+    uint base = tg_pos * stride;
+
+    float acc = 0.0f;
+    uint idx = base + lid;
+    if (idx < params.n) {
+        float d = a[idx] - b[idx];
+        acc = d * d;
+    }
+    scratch[lid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction within the threadgroup.
+    for (uint s = stride / 2u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            scratch[lid] += scratch[lid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) {
+        out[tg_pos] = scratch[0];
+    }
+}
+"#;
+
+/// Fused `MSE(a, b)` reduction kernel. Computes
+/// `Σ_i (a[i] - b[i])²` (sum) or `(1/n) Σ_i (a[i] - b[i])²` (mean)
+/// without materialising `a-b` or `(a-b)²` as intermediate buffers.
+///
+/// `kind`: 0 = sum, 1 = mean. Returns a `[1]`-element shared buffer.
+pub fn mse_reduce_f32(
+    backend: &MetalBackend,
+    a: &Buffer,
+    b: &Buffer,
+    n: usize,
+    kind: u32,
+) -> Result<Buffer, MetalError> {
+    let pipeline_partial = backend.pipeline(
+        "mse_reduce_partial",
+        MSE_REDUCE_SHADER,
+        "mse_reduce_partial_f32",
+    )?;
+    // Reuse the existing single-thread finalise (sums partials and
+    // optionally divides by n). Pipeline cache key is shared with the
+    // generic reduce so we don't double-compile.
+    let pipeline_final =
+        backend.pipeline("mse_reduce_final", REDUCE_SHADER, "reduce_finalise_f32")?;
+
+    let stride = 256u64;
+    let n_partials = (n as u64).div_ceil(stride);
+    let partials = backend.alloc_shared((n_partials as usize) * 4)?;
+
+    let params = ReduceParams { n: n as u32, kind };
+    let params_buf = backend.alloc_shared(core::mem::size_of::<ReduceParams>())?;
+    // SAFETY: shared-storage uniform buffer.
+    unsafe {
+        let dst = params_buf.contents() as *mut ReduceParams;
+        *dst = params;
+    }
+
+    // Stage 1: fused (a-b)² reduce → partials.
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline_partial);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(a), 0);
+        encoder.set_buffer(2, Some(b), 0);
+        encoder.set_buffer(3, Some(&partials), 0);
+        let tg = MTLSize::new(stride, 1, 1);
+        let grid = MTLSize::new(n_partials * stride, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+
+    // Stage 2: single-thread finalise (sum + optional /n).
+    let out = backend.alloc_shared(4)?;
+    let n_partials_buf = backend.alloc_shared(4)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = n_partials_buf.contents() as *mut u32;
+        *p = n_partials as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline_final);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(&partials), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&n_partials_buf), 0);
+        let tg2 = MTLSize::new(1, 1, 1);
+        let grid2 = MTLSize::new(1, 1, 1);
+        encoder.dispatch_threads(grid2, tg2);
+    });
+    Ok(out)
+}
+
+// ----------------------------------------------------------------------
 // add_bias: `out[b, n] = x[b, n] + bias[n]` — broadcasts bias across
 // the batch dimension. Used by every Linear layer's forward pass.
 // ----------------------------------------------------------------------
@@ -978,6 +1102,368 @@ pub fn matmul_simdgroup_f32_coarsened_wide(
     Ok(out)
 }
 
+/// Fused matmul + per-column bias-add for the Linear forward pass:
+/// `C = A @ B + bias_broadcast(N)`. Folds the bias add into the
+/// matmul-result write-back, saving one full `add_bias` dispatch +
+/// its `[M, N]` round-trip through global memory per training step.
+///
+/// Same shape constraints as the non-bias variant (`m%16==0`,
+/// `k%8==0`, `n%256==0`) and same 16-simdgroup × 256-col tile layout.
+const MATMUL_SIMDGROUP_F32_COARSENED_WIDE_BIAS_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void matmul_simdgroup_f32_coarsened_wide_bias(
+    device const float* a        [[buffer(0)]],
+    device const float* b        [[buffer(1)]],
+    device const float* bias     [[buffer(2)]],
+    device       float* c        [[buffer(3)]],
+    constant     uint3& dims     [[buffer(4)]],
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    uint  sg_idx                 [[simdgroup_index_in_threadgroup]],
+    uint  lane                   [[thread_index_in_simdgroup]]
+) {
+    uint M = dims.x;
+    uint K = dims.y;
+    uint N = dims.z;
+
+    uint sg_row = sg_idx / 8u;
+    uint sg_col = sg_idx % 8u;
+    uint row_tile = tg_pos.y * 16u + sg_row * 8u;
+    uint col_base = tg_pos.x * 256u + sg_col * 32u;
+    if (row_tile >= M || col_base >= N) { return; }
+
+    simdgroup_matrix<float, 8, 8> mat_a;
+    simdgroup_matrix<float, 8, 8> mat_b0;
+    simdgroup_matrix<float, 8, 8> mat_b1;
+    simdgroup_matrix<float, 8, 8> mat_b2;
+    simdgroup_matrix<float, 8, 8> mat_b3;
+    simdgroup_matrix<float, 8, 8> mat_c0 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c1 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c2 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c3 = simdgroup_matrix<float, 8, 8>(0);
+
+    for (uint k = 0u; k < K; k += 8u) {
+        simdgroup_load(mat_a, a + row_tile * K + k, K);
+        simdgroup_load(mat_b0, b + k * N + col_base + 0u,  N);
+        simdgroup_load(mat_b1, b + k * N + col_base + 8u,  N);
+        simdgroup_load(mat_b2, b + k * N + col_base + 16u, N);
+        simdgroup_load(mat_b3, b + k * N + col_base + 24u, N);
+        simdgroup_multiply_accumulate(mat_c0, mat_a, mat_b0, mat_c0);
+        simdgroup_multiply_accumulate(mat_c1, mat_a, mat_b1, mat_c1);
+        simdgroup_multiply_accumulate(mat_c2, mat_a, mat_b2, mat_c2);
+        simdgroup_multiply_accumulate(mat_c3, mat_a, mat_b3, mat_c3);
+    }
+
+    // Store the simdgroup-matrix tiles into a threadgroup-private tile,
+    // then a per-thread fixup adds the bias and writes to global memory.
+    // Tile dimensions: 16 rows × 256 cols (4096 floats × 4B = 16 KB).
+    threadgroup float tile[16 * 256];
+    threadgroup float* base = &tile[(sg_row * 8u) * 256u + sg_col * 32u];
+    simdgroup_store(mat_c0, base + 0u,  256u);
+    simdgroup_store(mat_c1, base + 8u,  256u);
+    simdgroup_store(mat_c2, base + 16u, 256u);
+    simdgroup_store(mat_c3, base + 24u, 256u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 16 sg × 32 threads = 512 threads / wg. Tile = 4096 floats.
+    // Each thread writes 8 elements (4096 / 512 = 8).
+    uint lid = sg_idx * 32u + lane;
+    uint global_row_base = tg_pos.y * 16u;
+    uint global_col_base = tg_pos.x * 256u;
+    for (uint k = 0u; k < 8u; ++k) {
+        uint flat = lid * 8u + k;
+        uint r = flat / 256u;
+        uint co = flat % 256u;
+        uint gr = global_row_base + r;
+        uint gc = global_col_base + co;
+        if (gr < M && gc < N) {
+            c[gr * N + gc] = tile[r * 256u + co] + bias[gc];
+        }
+    }
+}
+"#;
+
+/// Fused matmul + per-column bias dispatcher. Same constraints as
+/// `matmul_simdgroup_f32_coarsened_wide`. Skips the standalone
+/// `add_bias` dispatch + a 4 MB intermediate write-back per Linear
+/// forward.
+pub fn matmul_simdgroup_f32_coarsened_wide_bias(
+    backend: &MetalBackend,
+    a: &Buffer,
+    b: &Buffer,
+    bias: &Buffer,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "matmul_simdgroup_f32_coarsened_wide_bias needs Metal3".to_string(),
+        ));
+    }
+    if m % 16 != 0 || k % 8 != 0 || n % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "matmul_simdgroup_f32_coarsened_wide_bias needs m%16==0, k%8==0, n%256==0: got m={m}, k={k}, n={n}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "matmul_simdgroup_f32_coarsened_wide_bias",
+        MATMUL_SIMDGROUP_F32_COARSENED_WIDE_BIAS_SHADER,
+        "matmul_simdgroup_f32_coarsened_wide_bias",
+    )?;
+    let out = backend.alloc_shared(m * n * 4)?;
+    let dims_buf = backend.alloc_shared(16)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = m as u32;
+        *p.add(1) = k as u32;
+        *p.add(2) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a), 0);
+        encoder.set_buffer(1, Some(b), 0);
+        encoder.set_buffer(2, Some(bias), 0);
+        encoder.set_buffer(3, Some(&out), 0);
+        encoder.set_buffer(4, Some(&dims_buf), 0);
+        let tg = MTLSize::new(512, 1, 1);
+        let n_tiles_x = (n / 256) as u64;
+        let n_tiles_y = (m / 16) as u64;
+        let grid = MTLSize::new(n_tiles_x * 512, n_tiles_y, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(out)
+}
+
+/// Transpose-aware coarsened-wide matmuls — fuse the transpose into
+/// `simdgroup_load(..., transpose = true)` so we skip the explicit
+/// transpose kernel + intermediate buffer that backward passes would
+/// otherwise dispatch. In `MatMulBackward` (Linear forward `y = x @ W`),
+/// computing `dW = X^T @ dY` and `dX = dY @ W^T` saves 2 transpose
+/// dispatches + their N×N intermediate buffers per training step.
+///
+/// Both kernels mirror `matmul_simdgroup_f32_coarsened_wide`: 16
+/// simdgroups arranged 2 rows × 8 cols, each simdgroup producing 4
+/// output 8×8 tiles in the N direction → 16 rows × 256 cols per
+/// workgroup. Constraints: `m%16==0`, `k%8==0`, `n%256==0`.
+const MATMUL_SIMDGROUP_F32_TRANSPOSED_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+// C = A @ B^T   |   A:[M,K]   B:[N,K]   C:[M,N]
+// Loads B with simdgroup_load(transpose = true) so the kernel sees
+// the logical B^T tile without any explicit transpose pass.
+kernel void matmul_simdgroup_f32_b_t(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device       float* c       [[buffer(2)]],
+    constant     uint3& dims    [[buffer(3)]],
+    uint2 tg_pos                [[threadgroup_position_in_grid]],
+    uint  sg_idx                [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint K = dims.y;
+    uint N = dims.z;
+
+    uint sg_row = sg_idx / 8u;
+    uint sg_col = sg_idx % 8u;
+    uint row_tile = tg_pos.y * 16u + sg_row * 8u;
+    uint col_base = tg_pos.x * 256u + sg_col * 32u;
+    if (row_tile >= M || col_base >= N) { return; }
+
+    simdgroup_matrix<float, 8, 8> mat_a;
+    simdgroup_matrix<float, 8, 8> mat_b0;
+    simdgroup_matrix<float, 8, 8> mat_b1;
+    simdgroup_matrix<float, 8, 8> mat_b2;
+    simdgroup_matrix<float, 8, 8> mat_b3;
+    simdgroup_matrix<float, 8, 8> mat_c0 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c1 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c2 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c3 = simdgroup_matrix<float, 8, 8>(0);
+
+    for (uint k = 0u; k < K; k += 8u) {
+        // A: standard load (row-major).
+        simdgroup_load(mat_a, a + row_tile * K + k, K);
+        // B^T tile @ rows [k, k+8) cols [col_base+ofs, col_base+ofs+8)
+        // = B tile @ rows [col_base+ofs, col_base+ofs+8) cols [k, k+8) loaded transposed.
+        simdgroup_load(mat_b0, b + (col_base + 0u)  * K + k, K, ulong2(0), true);
+        simdgroup_load(mat_b1, b + (col_base + 8u)  * K + k, K, ulong2(0), true);
+        simdgroup_load(mat_b2, b + (col_base + 16u) * K + k, K, ulong2(0), true);
+        simdgroup_load(mat_b3, b + (col_base + 24u) * K + k, K, ulong2(0), true);
+        simdgroup_multiply_accumulate(mat_c0, mat_a, mat_b0, mat_c0);
+        simdgroup_multiply_accumulate(mat_c1, mat_a, mat_b1, mat_c1);
+        simdgroup_multiply_accumulate(mat_c2, mat_a, mat_b2, mat_c2);
+        simdgroup_multiply_accumulate(mat_c3, mat_a, mat_b3, mat_c3);
+    }
+
+    simdgroup_store(mat_c0, c + row_tile * N + col_base + 0u,  N);
+    simdgroup_store(mat_c1, c + row_tile * N + col_base + 8u,  N);
+    simdgroup_store(mat_c2, c + row_tile * N + col_base + 16u, N);
+    simdgroup_store(mat_c3, c + row_tile * N + col_base + 24u, N);
+}
+
+// C = A^T @ B   |   A:[K,M]   B:[K,N]   C:[M,N]
+// Loads A with simdgroup_load(transpose = true) so the kernel sees
+// the logical A^T tile without an explicit transpose pass.
+kernel void matmul_simdgroup_f32_a_t(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device       float* c       [[buffer(2)]],
+    constant     uint3& dims    [[buffer(3)]],
+    uint2 tg_pos                [[threadgroup_position_in_grid]],
+    uint  sg_idx                [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint K = dims.y;
+    uint N = dims.z;
+
+    uint sg_row = sg_idx / 8u;
+    uint sg_col = sg_idx % 8u;
+    uint row_tile = tg_pos.y * 16u + sg_row * 8u;
+    uint col_base = tg_pos.x * 256u + sg_col * 32u;
+    if (row_tile >= M || col_base >= N) { return; }
+
+    simdgroup_matrix<float, 8, 8> mat_a;
+    simdgroup_matrix<float, 8, 8> mat_b0;
+    simdgroup_matrix<float, 8, 8> mat_b1;
+    simdgroup_matrix<float, 8, 8> mat_b2;
+    simdgroup_matrix<float, 8, 8> mat_b3;
+    simdgroup_matrix<float, 8, 8> mat_c0 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c1 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c2 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c3 = simdgroup_matrix<float, 8, 8>(0);
+
+    for (uint k = 0u; k < K; k += 8u) {
+        // A^T tile @ rows [row_tile, row_tile+8) cols [k, k+8)
+        // = A tile @ rows [k, k+8) cols [row_tile, row_tile+8) loaded transposed.
+        simdgroup_load(mat_a, a + k * M + row_tile, M, ulong2(0), true);
+        simdgroup_load(mat_b0, b + k * N + col_base + 0u,  N);
+        simdgroup_load(mat_b1, b + k * N + col_base + 8u,  N);
+        simdgroup_load(mat_b2, b + k * N + col_base + 16u, N);
+        simdgroup_load(mat_b3, b + k * N + col_base + 24u, N);
+        simdgroup_multiply_accumulate(mat_c0, mat_a, mat_b0, mat_c0);
+        simdgroup_multiply_accumulate(mat_c1, mat_a, mat_b1, mat_c1);
+        simdgroup_multiply_accumulate(mat_c2, mat_a, mat_b2, mat_c2);
+        simdgroup_multiply_accumulate(mat_c3, mat_a, mat_b3, mat_c3);
+    }
+
+    simdgroup_store(mat_c0, c + row_tile * N + col_base + 0u,  N);
+    simdgroup_store(mat_c1, c + row_tile * N + col_base + 8u,  N);
+    simdgroup_store(mat_c2, c + row_tile * N + col_base + 16u, N);
+    simdgroup_store(mat_c3, c + row_tile * N + col_base + 24u, N);
+}
+"#;
+
+/// Compute `C = A @ B^T` directly without materialising `B^T`.
+///
+/// `A:[M,K]`, `B:[N,K]` (the un-transposed layout), `C:[M,N]`.
+/// Constraints: `m%16==0`, `k%8==0`, `n%256==0`. Saves one transpose
+/// dispatch + intermediate `[N,K]` buffer per call vs `transpose +
+/// matmul`. Used by `MatMulBackward` for `dX = dY @ W^T`.
+pub fn matmul_simdgroup_f32_b_t(
+    backend: &MetalBackend,
+    a: &Buffer,
+    b: &Buffer,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "matmul_simdgroup_f32_b_t needs Metal3".to_string(),
+        ));
+    }
+    if m % 16 != 0 || k % 8 != 0 || n % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "matmul_simdgroup_f32_b_t needs m%16==0, k%8==0, n%256==0: got m={m}, k={k}, n={n}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "matmul_simdgroup_f32_b_t",
+        MATMUL_SIMDGROUP_F32_TRANSPOSED_SHADER,
+        "matmul_simdgroup_f32_b_t",
+    )?;
+    let out = backend.alloc_shared(m * n * 4)?;
+    let dims_buf = backend.alloc_shared(16)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = m as u32;
+        *p.add(1) = k as u32;
+        *p.add(2) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a), 0);
+        encoder.set_buffer(1, Some(b), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let tg = MTLSize::new(512, 1, 1);
+        let n_tiles_x = (n / 256) as u64;
+        let n_tiles_y = (m / 16) as u64;
+        let grid = MTLSize::new(n_tiles_x * 512, n_tiles_y, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(out)
+}
+
+/// Compute `C = A^T @ B` directly without materialising `A^T`.
+///
+/// `A:[K,M]` (the un-transposed layout), `B:[K,N]`, `C:[M,N]`.
+/// Constraints: `m%16==0`, `k%8==0`, `n%256==0`. Saves one transpose
+/// dispatch + intermediate `[M,K]` buffer per call vs `transpose +
+/// matmul`. Used by `MatMulBackward` for `dW = X^T @ dY`.
+pub fn matmul_simdgroup_f32_a_t(
+    backend: &MetalBackend,
+    a: &Buffer,
+    b: &Buffer,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "matmul_simdgroup_f32_a_t needs Metal3".to_string(),
+        ));
+    }
+    if m % 16 != 0 || k % 8 != 0 || n % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "matmul_simdgroup_f32_a_t needs m%16==0, k%8==0, n%256==0: got m={m}, k={k}, n={n}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "matmul_simdgroup_f32_a_t",
+        MATMUL_SIMDGROUP_F32_TRANSPOSED_SHADER,
+        "matmul_simdgroup_f32_a_t",
+    )?;
+    let out = backend.alloc_shared(m * n * 4)?;
+    let dims_buf = backend.alloc_shared(16)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = m as u32;
+        *p.add(1) = k as u32;
+        *p.add(2) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a), 0);
+        encoder.set_buffer(1, Some(b), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let tg = MTLSize::new(512, 1, 1);
+        let n_tiles_x = (n / 256) as u64;
+        let n_tiles_y = (m / 16) as u64;
+        let grid = MTLSize::new(n_tiles_x * 512, n_tiles_y, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(out)
+}
+
 /// **Thread-coarsened multi-simdgroup matmul** — each simdgroup
 /// computes 4 output 8×8 tiles in the N direction, sharing the same
 /// 8×K row of A across the 4 operations. The load-once / use-many
@@ -1092,6 +1578,179 @@ pub fn matmul_simdgroup_f32_coarsened(
         encoder.dispatch_threads(grid, tg);
     });
     Ok(out)
+}
+
+/// **Mixed-precision matmul** — bf16 inputs, f32 output, f32
+/// accumulator. Reads bf16 via implicit simdgroup_load widening,
+/// keeps f32 accumulation precision, writes f32 out directly.
+/// Eliminates the bf16→f32 OUTPUT cast.
+const MATMUL_BF16_IN_F32_OUT_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void matmul_bf16_in_f32_out(
+    device const bfloat* a       [[buffer(0)]],
+    device const bfloat* b       [[buffer(1)]],
+    device       float*  c       [[buffer(2)]],
+    constant     uint3&  dims    [[buffer(3)]],
+    uint2 tg_pos                  [[threadgroup_position_in_grid]],
+    uint  sg_idx                  [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint K = dims.y;
+    uint N = dims.z;
+
+    uint sg_row = sg_idx / 8u;
+    uint sg_col = sg_idx % 8u;
+    uint row_tile = tg_pos.y * 16u + sg_row * 8u;
+    uint col_base = tg_pos.x * 256u + sg_col * 32u;
+    if (row_tile >= M || col_base >= N) { return; }
+
+    simdgroup_matrix<float, 8, 8> mat_a;
+    simdgroup_matrix<float, 8, 8> mat_b0;
+    simdgroup_matrix<float, 8, 8> mat_b1;
+    simdgroup_matrix<float, 8, 8> mat_b2;
+    simdgroup_matrix<float, 8, 8> mat_b3;
+    simdgroup_matrix<float, 8, 8> mat_c0 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c1 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c2 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c3 = simdgroup_matrix<float, 8, 8>(0);
+
+    for (uint k = 0u; k < K; k += 8u) {
+        simdgroup_load(mat_a, a + row_tile * K + k, K);
+        simdgroup_load(mat_b0, b + k * N + col_base + 0u, N);
+        simdgroup_load(mat_b1, b + k * N + col_base + 8u, N);
+        simdgroup_load(mat_b2, b + k * N + col_base + 16u, N);
+        simdgroup_load(mat_b3, b + k * N + col_base + 24u, N);
+        simdgroup_multiply_accumulate(mat_c0, mat_a, mat_b0, mat_c0);
+        simdgroup_multiply_accumulate(mat_c1, mat_a, mat_b1, mat_c1);
+        simdgroup_multiply_accumulate(mat_c2, mat_a, mat_b2, mat_c2);
+        simdgroup_multiply_accumulate(mat_c3, mat_a, mat_b3, mat_c3);
+    }
+
+    simdgroup_store(mat_c0, c + row_tile * N + col_base + 0u, N);
+    simdgroup_store(mat_c1, c + row_tile * N + col_base + 8u, N);
+    simdgroup_store(mat_c2, c + row_tile * N + col_base + 16u, N);
+    simdgroup_store(mat_c3, c + row_tile * N + col_base + 24u, N);
+}
+"#;
+
+/// Mixed-precision matmul: bf16 inputs, f32 output.
+pub fn matmul_bf16_in_f32_out(
+    backend: &MetalBackend,
+    a_bf16: &Buffer,
+    b_bf16: &Buffer,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "matmul_bf16_in_f32_out needs Metal3".to_string(),
+        ));
+    }
+    if m % 16 != 0 || k % 8 != 0 || n % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "matmul_bf16_in_f32_out needs m%16==0, k%8==0, n%256==0: got m={m}, k={k}, n={n}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "matmul_bf16_in_f32_out",
+        MATMUL_BF16_IN_F32_OUT_SHADER,
+        "matmul_bf16_in_f32_out",
+    )?;
+    let out = backend.alloc_shared(m * n * 4)?;
+    let dims_buf = backend.alloc_shared(16)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = m as u32;
+        *p.add(1) = k as u32;
+        *p.add(2) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_bf16), 0);
+        encoder.set_buffer(1, Some(b_bf16), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let tg = MTLSize::new(512, 1, 1);
+        let n_tiles_x = (n / 256) as u64;
+        let n_tiles_y = (m / 16) as u64;
+        let grid = MTLSize::new(n_tiles_x * 512, n_tiles_y, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(out)
+}
+
+/// Public f32→bf16 cast (used by callers that manage their own
+/// bf16 cache, e.g. for amortising the cast across multiple matmuls).
+pub fn cast_f32_to_bf16_pub(
+    backend: &MetalBackend,
+    src: &Buffer,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    cast_f32_to_bf16_kernel(backend, src, n)
+}
+
+/// Public bf16→f32 cast.
+pub fn cast_bf16_to_f32_pub(
+    backend: &MetalBackend,
+    src: &Buffer,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    cast_bf16_to_f32_kernel(backend, src, n)
+}
+
+/// Public bf16-throughout matmul. Inputs and output all bf16. Caller
+/// managers the input bf16 buffers (typically via the backend's
+/// bf16_cache) and casts the output back to f32 if needed downstream.
+pub fn matmul_simdgroup_bf16_pub(
+    backend: &MetalBackend,
+    a_bf16: &Buffer,
+    b_bf16: &Buffer,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "matmul_simdgroup_bf16_pub needs Metal3".to_string(),
+        ));
+    }
+    if m % 8 != 0 || k % 8 != 0 || n % 64 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "matmul_simdgroup_bf16_pub needs m%8==0, k%8==0, n%64==0: got m={m}, k={k}, n={n}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "matmul_simdgroup_bf16",
+        MATMUL_SIMDGROUP_BF16_SHADER,
+        "matmul_simdgroup_bf16",
+    )?;
+    let c_bf16 = backend.alloc_shared(m * n * 2)?;
+    let dims_buf = backend.alloc_shared(16)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = m as u32;
+        *p.add(1) = k as u32;
+        *p.add(2) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_bf16), 0);
+        encoder.set_buffer(1, Some(b_bf16), 0);
+        encoder.set_buffer(2, Some(&c_bf16), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let tg = MTLSize::new(256, 1, 1);
+        let n_tiles_x = (n / 64) as u64;
+        let n_tiles_y = (m / 8) as u64;
+        let grid = MTLSize::new(n_tiles_x * 256, n_tiles_y, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(c_bf16)
 }
 
 /// **bf16 multi-simdgroup matmul** — uses
@@ -1620,5 +2279,215 @@ mod tests {
                 expected[i]
             );
         }
+    }
+
+    /// Naive CPU `C = A @ B^T` reference: A:[M,K], B:[N,K], C:[M,N].
+    fn cpu_matmul_b_t(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0_f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0_f32;
+                for kk in 0..k {
+                    // A[i, kk] * B[j, kk]   (B^T[kk, j] = B[j, kk])
+                    acc += a[i * k + kk] * b[j * k + kk];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        c
+    }
+
+    /// Naive CPU `C = A^T @ B` reference: A:[K,M], B:[K,N], C:[M,N].
+    fn cpu_matmul_a_t(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0_f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0_f32;
+                for kk in 0..k {
+                    // A^T[i, kk] * B[kk, j]  (A^T[i, kk] = A[kk, i])
+                    acc += a[kk * m + i] * b[kk * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        c
+    }
+
+    fn fill_buf(buf: &Buffer, data: &[f32]) {
+        // SAFETY: shared-storage buffer, host pointer valid for data.len()*4 bytes.
+        unsafe {
+            let p = buf.contents() as *mut f32;
+            for (i, val) in data.iter().enumerate() {
+                *p.add(i) = *val;
+            }
+        }
+    }
+
+    fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
+        let mut dot = 0.0_f64;
+        let mut na = 0.0_f64;
+        let mut nb = 0.0_f64;
+        for i in 0..a.len() {
+            dot += a[i] as f64 * b[i] as f64;
+            na += (a[i] as f64).powi(2);
+            nb += (b[i] as f64).powi(2);
+        }
+        dot / (na.sqrt() * nb.sqrt())
+    }
+
+    #[test]
+    fn matmul_simdgroup_f32_b_t_parity_with_cpu_16x16x256() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[matmul_simdgroup_f32_b_t] skipping: no Metal3");
+            return;
+        }
+        let m = 16;
+        let k = 16;
+        let n = 256;
+        let a = det_vec(m * k, 1.0);
+        let b = det_vec(n * k, 0.5);
+        let expected = cpu_matmul_b_t(&a, &b, m, k, n);
+
+        let a_buf = backend.alloc_shared(m * k * 4).expect("a alloc");
+        let b_buf = backend.alloc_shared(n * k * 4).expect("b alloc");
+        fill_buf(&a_buf, &a);
+        fill_buf(&b_buf, &b);
+
+        let out = matmul_simdgroup_f32_b_t(backend, &a_buf, &b_buf, m, k, n).expect("dispatch");
+        backend.drain();
+        let got: Vec<f32> = unsafe {
+            let p = out.contents() as *const f32;
+            std::slice::from_raw_parts(p, m * n).to_vec()
+        };
+
+        let cs = cosine_sim(&got, &expected);
+        assert!(cs > 0.999, "cosine_sim {cs:.6} too low for b_t kernel");
+    }
+
+    #[test]
+    fn mse_reduce_f32_mean_parity_with_cpu_8192() {
+        let backend = metal_backend();
+        let n = 8192;
+        let a: Vec<f32> = det_vec(n, 1.0);
+        let b: Vec<f32> = det_vec(n, 0.5);
+        let expected_mean: f32 = {
+            let mut acc = 0.0f64;
+            for i in 0..n {
+                let d = (a[i] - b[i]) as f64;
+                acc += d * d;
+            }
+            (acc / n as f64) as f32
+        };
+        let expected_sum: f32 = {
+            let mut acc = 0.0f64;
+            for i in 0..n {
+                let d = (a[i] - b[i]) as f64;
+                acc += d * d;
+            }
+            acc as f32
+        };
+
+        let a_buf = backend.alloc_shared(n * 4).expect("a alloc");
+        let b_buf = backend.alloc_shared(n * 4).expect("b alloc");
+        fill_buf(&a_buf, &a);
+        fill_buf(&b_buf, &b);
+
+        // mean
+        let out_mean = mse_reduce_f32(backend, &a_buf, &b_buf, n, 1).expect("dispatch mean");
+        backend.drain();
+        let got_mean: f32 = unsafe { *(out_mean.contents() as *const f32) };
+        let rel_err_mean =
+            ((got_mean - expected_mean).abs() / expected_mean.abs().max(1e-6)) as f64;
+        assert!(
+            rel_err_mean < 1e-4,
+            "mse_reduce mean mismatch: got {got_mean:.6e} expected {expected_mean:.6e} (rel {rel_err_mean:.2e})"
+        );
+
+        // sum
+        let out_sum = mse_reduce_f32(backend, &a_buf, &b_buf, n, 0).expect("dispatch sum");
+        backend.drain();
+        let got_sum: f32 = unsafe { *(out_sum.contents() as *const f32) };
+        let rel_err_sum = ((got_sum - expected_sum).abs() / expected_sum.abs().max(1e-6)) as f64;
+        assert!(
+            rel_err_sum < 1e-4,
+            "mse_reduce sum mismatch: got {got_sum:.6e} expected {expected_sum:.6e} (rel {rel_err_sum:.2e})"
+        );
+    }
+
+    #[test]
+    fn matmul_simdgroup_f32_coarsened_wide_bias_parity_64x1024x1024() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[matmul_simdgroup_f32_coarsened_wide_bias] skipping: no Metal3");
+            return;
+        }
+        let m = 64;
+        let k = 1024;
+        let n = 1024;
+        let a = det_vec(m * k, 1.0);
+        let b = det_vec(k * n, 0.5);
+        let bias = det_vec(n, 0.25);
+
+        // Expected: standard matmul + bias broadcast across rows.
+        let mut expected = cpu_matmul(&a, &b, m, k, n);
+        for i in 0..m {
+            for j in 0..n {
+                expected[i * n + j] += bias[j];
+            }
+        }
+
+        let a_buf = backend.alloc_shared(m * k * 4).expect("a alloc");
+        let b_buf = backend.alloc_shared(k * n * 4).expect("b alloc");
+        let bias_buf = backend.alloc_shared(n * 4).expect("bias alloc");
+        fill_buf(&a_buf, &a);
+        fill_buf(&b_buf, &b);
+        fill_buf(&bias_buf, &bias);
+
+        let out =
+            matmul_simdgroup_f32_coarsened_wide_bias(backend, &a_buf, &b_buf, &bias_buf, m, k, n)
+                .expect("dispatch");
+        backend.drain();
+        let got: Vec<f32> = unsafe {
+            let p = out.contents() as *const f32;
+            std::slice::from_raw_parts(p, m * n).to_vec()
+        };
+
+        let cs = cosine_sim(&got, &expected);
+        assert!(
+            cs > 0.999,
+            "cosine_sim {cs:.6} too low for matmul+bias kernel"
+        );
+    }
+
+    #[test]
+    fn matmul_simdgroup_f32_a_t_parity_with_cpu_16x16x256() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[matmul_simdgroup_f32_a_t] skipping: no Metal3");
+            return;
+        }
+        let m = 16;
+        let k = 16;
+        let n = 256;
+        // A:[K,M] in raw layout — caller passes a "transposed" buffer.
+        let a = det_vec(k * m, 1.0);
+        let b = det_vec(k * n, 0.5);
+        let expected = cpu_matmul_a_t(&a, &b, m, k, n);
+
+        let a_buf = backend.alloc_shared(k * m * 4).expect("a alloc");
+        let b_buf = backend.alloc_shared(k * n * 4).expect("b alloc");
+        fill_buf(&a_buf, &a);
+        fill_buf(&b_buf, &b);
+
+        let out = matmul_simdgroup_f32_a_t(backend, &a_buf, &b_buf, m, k, n).expect("dispatch");
+        backend.drain();
+        let got: Vec<f32> = unsafe {
+            let p = out.contents() as *const f32;
+            std::slice::from_raw_parts(p, m * n).to_vec()
+        };
+
+        let cs = cosine_sim(&got, &expected);
+        assert!(cs > 0.999, "cosine_sim {cs:.6} too low for a_t kernel");
     }
 }

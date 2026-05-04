@@ -323,7 +323,7 @@ impl Adam {
     fn try_step_metal(&mut self, i: usize) -> bool {
         use rustorch_core::tensor::device::Device;
         use rustorch_metal::backend_singleton::metal_backend;
-        use rustorch_metal::fused_adamw::{allocate_zeros, fused_adamw_step, AdamWStepParams};
+        use rustorch_metal::fused_adamw::{allocate_zeros, AdamWStepParams};
 
         let param = self.params[i].clone();
         let param_tensor = param.tensor();
@@ -424,20 +424,25 @@ impl Adam {
             weight_decay: self.weight_decay,
             t: self.step_t as u32,
         };
-        let new_param = match fused_adamw_step(backend, &param_buf, &grad_buf, m, v, n, step_params)
-        {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
-        let n_bytes = n * 4;
-        let core = rustorch_core::tensor::storage::MetalStorage::standalone(new_param, n_bytes);
-        let new_tensor = rustorch_core::tensor::tensor_impl::Tensor::from_metal_storage(
-            core,
-            param_tensor.shape().to_vec(),
-            param_tensor.dtype(),
-        );
-        param.set_data(new_tensor);
+        // In-place AdamW: write back into `param_buf` instead of
+        // allocating a fresh ~4 MB output. The Tensor wrapping
+        // `param_buf` is shared via `Arc<MetalStorageInner>`, so
+        // mutating the underlying MTLBuffer is observable to all
+        // current readers. No `param.set_data()` needed because the
+        // Tensor's storage Arc is unchanged.
+        use rustorch_metal::fused_adamw::fused_adamw_step_inplace;
+        if fused_adamw_step_inplace(backend, &param_buf, &grad_buf, m, v, n, step_params).is_err() {
+            return false;
+        }
+        // bf16 cache for `param_buf` is now stale (param values just
+        // changed). Evict so the next forward/backward re-casts.
+        if let Some(s) = param_tensor.as_metal_storage() {
+            backend.evict_bf16(s.cache_key());
+        }
+        // No `param.set_data()` needed — the Tensor still wraps the
+        // (now in-place updated) `param_buf` Arc. This also avoids the
+        // first-step "promote CPU storage to Metal" branch on step 2+
+        // since param.tensor() already reports `Storage::Metal`.
         true
     }
 }

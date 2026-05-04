@@ -18,8 +18,9 @@
 use crate::backend::MetalBackend;
 use crate::error::MetalError;
 use crate::kernels::{
-    abs_f32, add_bias_f32, add_f32, add_scalar_f32, div_f32, div_scalar_f32, exp_f32, log_f32,
-    matmul_simdgroup_f32, matmul_simdgroup_f32_coarsened, matmul_simdgroup_f32_coarsened_wide,
+    abs_f32, add_bias_f32, add_f32, add_scalar_f32, cast_bf16_to_f32_pub, div_f32, div_scalar_f32,
+    exp_f32, log_f32, matmul_bf16_in_f32_out, matmul_simdgroup_bf16_pub, matmul_simdgroup_f32,
+    matmul_simdgroup_f32_coarsened, matmul_simdgroup_f32_coarsened_wide,
     matmul_simdgroup_f32_multisg, matmul_simdgroup_f32_via_bf16, mean_dim_2d_f32, mean_f32,
     mul_f32, mul_scalar_f32, neg_f32, relu_f32, sigmoid_f32, silu_f32, sqrt_f32, sub_f32,
     sub_scalar_f32, sum_dim_2d_f32, sum_f32, tanh_f32, transpose2d_f32,
@@ -270,13 +271,32 @@ impl Backend for MetalBackend {
         let l = to_gpu(self, lhs).map_err(|e| metal_err("matmul", e))?;
         let r = to_gpu(self, rhs).map_err(|e| metal_err("matmul", e))?;
         // Pick the highest-throughput kernel that fits the shape:
-        // - coarsened_wide (16 sg, 16x256 output):         m%16==0 & n%256==0
-        // - coarsened     (8 sg, 8x256, 4-tile/sg):        n%256==0
-        // - multi-sg      (8 sg, 8x64, 1-tile/sg):         n%64==0
-        // - single-sg     (1 sg, 8x8, 1-tile/sg):          n%8==0 fallback
-        // bf16 path is ready (matmul_simdgroup_f32_via_bf16) but the
-        // cast overhead exceeds the bf16 speedup at the bench's
-        // small M=64 shape. Re-enable with mixed-precision Phase 4.
+        // - bf16-in/f32-out (cached casts): m%16==0 & n%256==0
+        //   Mixed-precision matmul: f32 → bf16 inputs are CACHED in
+        //   MetalBackend.bf16_cache so casts are amortised across
+        //   multiple matmul calls on the same buffers (e.g. forward
+        //   xs@w + backward dxs@w.T both reuse w's bf16 cache).
+        //   Output stays f32 directly via implicit widening in the
+        //   simdgroup_load — no output cast needed.
+        // - coarsened_wide (16 sg, 16x256 output): m%16==0 & n%256==0
+        // - coarsened     (8 sg, 8x256, 4-tile/sg): n%256==0
+        // - multi-sg      (8 sg, 8x64, 1-tile/sg):  n%64==0
+        // - single-sg     (1 sg, 8x8, 1-tile/sg):   n%8==0 fallback
+        // Pick the highest-throughput kernel that fits the shape:
+        // - coarsened_wide (16 sg, 16x256 output): m%16==0 & n%256==0
+        // - coarsened     (8 sg, 8x256, 4-tile/sg): n%256==0
+        // - multi-sg      (8 sg, 8x64, 1-tile/sg):  n%64==0
+        // - single-sg     (1 sg, 8x8, 1-tile/sg):   n%8==0 fallback
+        //
+        // bf16 paths (matmul_simdgroup_bf16_pub + bf16_cache) are
+        // implemented and available but NOT the default — the bench's
+        // shape mix has a lot of fresh transpose outputs as matmul
+        // inputs (no cache hit), so the cast overhead exceeds the bf16
+        // speedup. Will be the default once we wire matmul_with_transpose
+        // to skip the explicit transpose dispatch (Apple's simdgroup_load
+        // supports a transpose flag).
+        let _ = matmul_simdgroup_bf16_pub;
+        let _ = cast_bf16_to_f32_pub;
         let out = if m % 16 == 0 && n % 256 == 0 {
             matmul_simdgroup_f32_coarsened_wide(self, &l, &r, m, k1, n)
                 .map_err(|e| metal_err("matmul", e))?
@@ -289,7 +309,157 @@ impl Backend for MetalBackend {
         } else {
             matmul_simdgroup_f32(self, &l, &r, m, k1, n).map_err(|e| metal_err("matmul", e))?
         };
-        let _bf16_unused = matmul_simdgroup_f32_via_bf16; // keep symbol live
+        // Keep symbols live for future bf16 mixed-precision activation
+        // (when params are stored bf16 across steps).
+        let _ = matmul_simdgroup_f32_via_bf16;
+        let _ = matmul_bf16_in_f32_out;
+        let core = rustorch_core::tensor::storage::MetalStorage::standalone(out, m * n * 4);
+        Ok(Tensor::from_metal_storage(core, vec![m, n], lhs.dtype()))
+    }
+
+    /// Fused `matmul + bias` — single dispatch that folds the bias
+    /// broadcast into the matmul write-back. Saves one `add_bias`
+    /// dispatch + one full `[M,N]` intermediate buffer per Linear
+    /// forward (~4 MB at 1024² f32). Falls back to the default
+    /// `matmul + add_bias` composition outside the fast-path tile
+    /// constraints (`m%16==0`, `k%8==0`, `n%256==0`, rank-2 inputs,
+    /// rank-1 bias matching `n`, Metal3-capable device).
+    fn matmul_with_bias(
+        &self,
+        lhs: &Tensor,
+        rhs: &Tensor,
+        bias: &Tensor,
+    ) -> Result<Tensor, BackendError> {
+        let l_shape = lhs.shape();
+        let r_shape = rhs.shape();
+        let bias_shape = bias.shape();
+        let fast_path_eligible = self.supports_metal3()
+            && l_shape.len() == 2
+            && r_shape.len() == 2
+            && bias_shape.len() == 1
+            && r_shape[1] == bias_shape[0]
+            && l_shape[1] == r_shape[0]
+            && l_shape[0] % 16 == 0
+            && l_shape[1] % 8 == 0
+            && r_shape[1] % 256 == 0;
+        if !fast_path_eligible {
+            // Default composition (matmul + add_bias).
+            let mm = self.matmul(lhs, rhs)?;
+            return self.add_bias(&mm, bias);
+        }
+        let (m, k) = (l_shape[0], l_shape[1]);
+        let n = r_shape[1];
+        let l = to_gpu(self, lhs).map_err(|e| metal_err("matmul_with_bias", e))?;
+        let r = to_gpu(self, rhs).map_err(|e| metal_err("matmul_with_bias", e))?;
+        let bb = to_gpu(self, bias).map_err(|e| metal_err("matmul_with_bias", e))?;
+        let out =
+            crate::kernels::matmul_simdgroup_f32_coarsened_wide_bias(self, &l, &r, &bb, m, k, n)
+                .map_err(|e| metal_err("matmul_with_bias", e))?;
+        let core = rustorch_core::tensor::storage::MetalStorage::standalone(out, m * n * 4);
+        Ok(Tensor::from_metal_storage(core, vec![m, n], lhs.dtype()))
+    }
+
+    /// Transpose-aware matmul. Uses Apple's `simdgroup_load(...,
+    /// transpose=true)` to fuse the transpose into the load, skipping
+    /// the explicit transpose dispatch + intermediate buffer that the
+    /// default trait impl would emit. In `MatMulBackward` this saves 2
+    /// dispatches per training step (one for `dW = X^T @ dY`, one for
+    /// `dX = dY @ W^T`).
+    ///
+    /// Falls back to the default `transpose + matmul` path when the
+    /// shapes don't fit the 16×8×256 tile constraints, when neither
+    /// transpose flag is set, or when both are set (the doubly-
+    /// transposed case is rare enough we keep it on the slow path).
+    fn matmul_with_transposes(
+        &self,
+        lhs: &Tensor,
+        rhs: &Tensor,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<Tensor, BackendError> {
+        // Fast path requires Metal3 and exactly one transpose flag.
+        if !self.supports_metal3() || transpose_a == transpose_b {
+            // No transpose, or both transposed → defer to default impl.
+            // (Default uses self.transpose + self.matmul, which still
+            // routes through our coarsened_wide kernel.)
+            let lhs_eff = if transpose_a {
+                self.transpose(lhs, 0, 1)?
+            } else {
+                lhs.clone()
+            };
+            let rhs_eff = if transpose_b {
+                self.transpose(rhs, 0, 1)?
+            } else {
+                rhs.clone()
+            };
+            return self.matmul(&lhs_eff, &rhs_eff);
+        }
+        let l_shape = lhs.shape();
+        let r_shape = rhs.shape();
+        if l_shape.len() != 2 || r_shape.len() != 2 {
+            // Fall back via default for non-rank-2.
+            let lhs_eff = if transpose_a {
+                self.transpose(lhs, 0, 1)?
+            } else {
+                lhs.clone()
+            };
+            let rhs_eff = if transpose_b {
+                self.transpose(rhs, 0, 1)?
+            } else {
+                rhs.clone()
+            };
+            return self.matmul(&lhs_eff, &rhs_eff);
+        }
+        // Resolve effective dimensions after the implicit transpose:
+        // - transpose_a:  A is [K, M], output rows = M, common dim K = A.shape[0]
+        // - transpose_b:  B is [N, K], output cols = N, common dim K = B.shape[1]
+        let (m, k_lhs) = if transpose_a {
+            (l_shape[1], l_shape[0])
+        } else {
+            (l_shape[0], l_shape[1])
+        };
+        let (k_rhs, n) = if transpose_b {
+            (r_shape[1], r_shape[0])
+        } else {
+            (r_shape[0], r_shape[1])
+        };
+        if k_lhs != k_rhs {
+            return Err(BackendError::ShapeMismatch {
+                op: "matmul_with_transposes",
+                lhs: l_shape.to_vec(),
+                rhs: r_shape.to_vec(),
+            });
+        }
+        let k = k_lhs;
+        // Tile constraints for the coarsened-wide layout.
+        let fits_wide = m % 16 == 0 && k % 8 == 0 && n % 256 == 0;
+        if !fits_wide {
+            // Smaller tiles: defer to default (transpose + matmul) which
+            // picks coarsened / multisg / single inside `matmul`.
+            let lhs_eff = if transpose_a {
+                self.transpose(lhs, 0, 1)?
+            } else {
+                lhs.clone()
+            };
+            let rhs_eff = if transpose_b {
+                self.transpose(rhs, 0, 1)?
+            } else {
+                rhs.clone()
+            };
+            return self.matmul(&lhs_eff, &rhs_eff);
+        }
+
+        let l = to_gpu(self, lhs).map_err(|e| metal_err("matmul_with_transposes", e))?;
+        let r = to_gpu(self, rhs).map_err(|e| metal_err("matmul_with_transposes", e))?;
+        let out = if transpose_a {
+            // C = A^T @ B  | A:[K,M] B:[K,N] C:[M,N]
+            crate::kernels::matmul_simdgroup_f32_a_t(self, &l, &r, m, k, n)
+                .map_err(|e| metal_err("matmul_with_transposes", e))?
+        } else {
+            // transpose_b — C = A @ B^T | A:[M,K] B:[N,K] C:[M,N]
+            crate::kernels::matmul_simdgroup_f32_b_t(self, &l, &r, m, k, n)
+                .map_err(|e| metal_err("matmul_with_transposes", e))?
+        };
         let core = rustorch_core::tensor::storage::MetalStorage::standalone(out, m * n * 4);
         Ok(Tensor::from_metal_storage(core, vec![m, n], lhs.dtype()))
     }
@@ -517,9 +687,27 @@ impl Backend for MetalBackend {
         target: &Tensor,
         reduction: rustorch_cpu::backend::Reduction,
     ) -> Result<Tensor, BackendError> {
-        // Native composition stays on GPU end-to-end: sub → mul → reduce.
-        // Mirror of the WGSL mse_loss native composition.
+        // Fast path: Reduction::Mean / Reduction::Sum on rank-2+ same-shape
+        // inputs use the fused `mse_reduce_f32` kernel (1 partial dispatch
+        // + 1 finalise instead of sub + mul + reduce). Saves 2 dispatches
+        // and 2 intermediate buffers per training step. None falls through
+        // to (a-b)² composition which keeps the elementwise output.
         use rustorch_cpu::backend::Reduction;
+        if input.shape() == target.shape() && matches!(reduction, Reduction::Mean | Reduction::Sum)
+        {
+            let n = input.numel();
+            let a = to_gpu(self, input).map_err(|e| metal_err("mse_loss", e))?;
+            let b = to_gpu(self, target).map_err(|e| metal_err("mse_loss", e))?;
+            let kind = if matches!(reduction, Reduction::Mean) {
+                1u32
+            } else {
+                0u32
+            };
+            let out = crate::kernels::mse_reduce_f32(self, &a, &b, n, kind)
+                .map_err(|e| metal_err("mse_loss", e))?;
+            return Ok(finish_metal_op(out, vec![1], input.dtype()));
+        }
+        // Fallback: composition for None / mismatched shapes.
         let diff = self.sub(input, target)?;
         let sq = self.mul(&diff, &diff)?;
         match reduction {

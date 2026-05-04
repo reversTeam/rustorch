@@ -2993,6 +2993,7 @@ dependencies = [
  "rustorch-core",
  "rustorch-cpu",
  "rustorch-data",
+ "rustorch-metal",
  "rustorch-nn",
  "rustorch-optim",
  "rustorch-serde",
@@ -3021,6 +3022,7 @@ version = "0.0.1"
 dependencies = [
  "rustorch-core",
  "rustorch-cpu",
+ "rustorch-metal",
  "rustorch-optim",
  "rustorch-wgpu",
  "thiserror 1.0.69",
@@ -3102,6 +3104,7 @@ dependencies = [
  "criterion",
  "half",
  "loom",
+ "metal",
  "ndarray",
  "num-traits",
  "pollster",
@@ -3184,6 +3187,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-metal"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "core-graphics-types",
+ "foreign-types",
+ "metal",
+ "objc",
+ "rustorch-core",
+ "rustorch-cpu",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rustorch-nn"
 version = "0.0.1"
 dependencies = [
@@ -3206,6 +3223,8 @@ dependencies = [
  "rustorch-autograd",
  "rustorch-core",
  "rustorch-cpu",
+ "rustorch-metal",
+ "rustorch-wgpu",
  "thiserror 1.0.69",
 ]
 
