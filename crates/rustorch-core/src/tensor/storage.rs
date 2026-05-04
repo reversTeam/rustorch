@@ -690,37 +690,113 @@ mod cuda_storage {
 #[cfg(feature = "cuda")]
 pub use cuda_storage::CudaStorage;
 
-// -- Metal placeholder ----------------------------------------------------
-// rustorch-metal Task J will swap this for the real objc2-metal-backed type.
+// -- Metal storage --------------------------------------------------------
+// On macOS with `feature = "metal"`, this is a real `metal::Buffer`
+// handle with the same Drop-callback pool pattern used by WgpuStorage.
+// On other targets, it stays a placeholder so feature=metal still
+// compiles for cross-platform CI.
 #[cfg(feature = "metal")]
 mod metal_storage {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use core::mem::ManuallyDrop;
 
-    /// Placeholder Metal storage. `rustorch-metal` Task J will
-    /// populate the inner with a real `id<MTLBuffer>` + heap handle
-    /// for unified-memory zero-copy.
+    /// Drop callback type. Captured at allocation time by the
+    /// `rustorch-metal` heap allocator and invoked exactly once when
+    /// the underlying `metal::Buffer` would otherwise be freed. Lets
+    /// the Metal heap recycle buffers without rustorch-core knowing
+    /// about heap internals.
+    #[cfg(target_os = "macos")]
+    type DropCallback = Box<dyn FnOnce(metal::Buffer) + Send + Sync + 'static>;
+
+    /// Apple `metal::Buffer` handle held by `Storage::Metal`. Cheap
+    /// clone via `Arc<MetalStorageInner>`. Same Drop-hook pool
+    /// pattern as `WgpuStorage`.
     #[derive(Clone)]
     pub struct MetalStorage {
         pub(super) inner: Arc<MetalStorageInner>,
     }
 
+    /// Single owner of a `metal::Buffer` plus the optional return-to-
+    /// heap callback. `ManuallyDrop` lets the `Drop` impl move the
+    /// buffer out and feed it to the callback exactly once.
+    #[cfg(target_os = "macos")]
+    pub struct MetalStorageInner {
+        buffer: ManuallyDrop<metal::Buffer>,
+        byte_len: usize,
+        on_drop: Option<DropCallback>,
+    }
+
+    /// Non-macOS placeholder — same struct shape (so callers compile)
+    /// but holds nothing; constructors error out at runtime.
+    #[cfg(not(target_os = "macos"))]
     pub struct MetalStorageInner {
         byte_len: usize,
     }
 
     impl MetalStorage {
-        /// Build a placeholder with a logical byte length. Real
-        /// allocator API lands with `rustorch-metal` Task J.
+        /// **macOS only**. Wrap a fresh `metal::Buffer` with no heap
+        /// integration. The buffer drops normally when the last
+        /// clone is dropped.
+        #[cfg(target_os = "macos")]
+        pub fn standalone(buffer: metal::Buffer, byte_len: usize) -> Self {
+            MetalStorage {
+                inner: Arc::new(MetalStorageInner {
+                    buffer: ManuallyDrop::new(buffer),
+                    byte_len,
+                    on_drop: None,
+                }),
+            }
+        }
+
+        /// **macOS only**. Wrap a `metal::Buffer` with a return-to-
+        /// heap callback. The callback fires exactly once when the
+        /// last clone is dropped.
+        #[cfg(target_os = "macos")]
+        pub fn with_pool_return(
+            buffer: metal::Buffer,
+            byte_len: usize,
+            on_drop: impl FnOnce(metal::Buffer) + Send + Sync + 'static,
+        ) -> Self {
+            MetalStorage {
+                inner: Arc::new(MetalStorageInner {
+                    buffer: ManuallyDrop::new(buffer),
+                    byte_len,
+                    on_drop: Some(Box::new(on_drop)),
+                }),
+            }
+        }
+
+        /// Build a placeholder with a logical byte length only. Used
+        /// on non-macOS targets and for tests that don't need a real
+        /// buffer. On macOS prefer [`Self::standalone`] /
+        /// [`Self::with_pool_return`].
+        #[cfg(not(target_os = "macos"))]
         pub fn placeholder(byte_len: usize) -> Self {
             MetalStorage {
                 inner: Arc::new(MetalStorageInner { byte_len }),
             }
         }
 
-        /// Logical byte length of the (placeholder) device buffer.
+        /// Borrow the underlying `metal::Buffer`. Used by Metal kernel
+        /// dispatch (set_buffer, etc.). macOS only.
+        #[cfg(target_os = "macos")]
+        #[inline]
+        pub fn buffer(&self) -> &metal::Buffer {
+            &self.inner.buffer
+        }
+
+        /// Logical byte length (may be ≤ `buffer.length()` if the
+        /// allocator pads to a heap bucket size).
         #[inline]
         pub fn byte_len(&self) -> usize {
             self.inner.byte_len
+        }
+
+        /// Strong reference count for the underlying inner allocation.
+        #[inline]
+        pub fn strong_count(&self) -> usize {
+            Arc::strong_count(&self.inner)
         }
     }
 
@@ -729,6 +805,31 @@ mod metal_storage {
             f.debug_struct("MetalStorage")
                 .field("byte_len", &self.inner.byte_len)
                 .finish()
+        }
+    }
+
+    /// `Deref<Target = metal::Buffer>` lets call sites that hold a
+    /// `MetalStorage` access the underlying `metal::Buffer` methods
+    /// (`length()`, `contents()`, …) without an explicit `.buffer()`
+    /// indirection. Mirrors the wgpu side.
+    #[cfg(target_os = "macos")]
+    impl core::ops::Deref for MetalStorage {
+        type Target = metal::Buffer;
+        #[inline]
+        fn deref(&self) -> &metal::Buffer {
+            &self.inner.buffer
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for MetalStorageInner {
+        fn drop(&mut self) {
+            // SAFETY: ManuallyDrop::take is called exactly once at drop time.
+            let buf = unsafe { ManuallyDrop::take(&mut self.buffer) };
+            if let Some(f) = self.on_drop.take() {
+                f(buf);
+            }
+            // else: `buf` falls out of scope and frees the Metal memory normally.
         }
     }
 }

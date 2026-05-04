@@ -30,7 +30,10 @@ loom    = ["dep:loom"]
 # feature on their `rustorch-core` dependency line.
 wgpu  = ["dep:wgpu", "dep:pollster"]
 cuda  = []   # rustorch-cuda will populate concrete CudaStorage when impl lands (Task M)
-metal = []   # rustorch-metal will populate concrete MetalStorage when crate is created (Task J)
+# `metal` pulls the macOS-only `metal` crate (Apple Metal Framework
+# bindings). The dep is target-gated, so enabling this feature on a
+# non-macOS target produces a placeholder MetalStorage (no buffer).
+metal = ["dep:metal"]
 
 [dependencies]
 half       = { workspace = true }
@@ -43,6 +46,13 @@ loom       = { workspace = true, optional = true }
 # Multi-device Storage GPU handles (feature-gated, Task A).
 wgpu       = { workspace = true, optional = true }
 pollster   = { workspace = true, optional = true }
+
+# `metal` is macOS-only. We declare it under a target-gated section
+# so non-macOS builds with feature=metal compile to a placeholder
+# (MetalStorage with no concrete buffer). The crate is "optional"
+# in the macOS table so the `metal` feature controls inclusion.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.29", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

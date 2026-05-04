@@ -220,6 +220,41 @@ impl Tensor {
             _ => None,
         }
     }
+
+    /// Build a Tensor whose storage is a Metal GPU buffer (no CPU
+    /// shadow). Mirrors `Tensor::from_wgpu_storage` for the Apple
+    /// Metal direct backend (P3.Z Task J).
+    ///
+    /// The Tensor is marked `Device::Metal` so autograd dispatch
+    /// routes follow-on ops to `metal_backend()`. Layout is
+    /// contiguous + offset 0.
+    #[cfg(feature = "metal")]
+    pub fn from_metal_storage<S: Into<Shape>>(
+        metal_storage: super::storage::MetalStorage,
+        shape: S,
+        dtype: Dtype,
+    ) -> Tensor {
+        let shape = shape.into();
+        let layout = Layout::contiguous(shape, dtype);
+        Tensor {
+            storage: Storage::Metal(metal_storage),
+            layout,
+            version: VersionCounter::new(),
+            requires_grad: false,
+            device: Device::Metal,
+        }
+    }
+
+    /// Borrow the inner `core::MetalStorage` if this Tensor lives on
+    /// the Metal device. Returns `None` for CPU / Wgpu / Cuda /
+    /// WgpuShared tensors.
+    #[cfg(feature = "metal")]
+    pub fn as_metal_storage(&self) -> Option<&super::storage::MetalStorage> {
+        match &self.storage {
+            Storage::Metal(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 // --------------------------------------------------------------------------

@@ -33,6 +33,10 @@ mlir        = []
 # Pulls rustorch-autograd's `wgpu` feature which transitively brings the
 # rustorch-wgpu backend in. Default OFF to keep CPU-only builds light.
 wgpu        = ["rustorch-autograd/wgpu", "rustorch-optim/wgpu"]
+# P3.Z Task J — Apple Metal direct backend. macOS-only at runtime;
+# the dep chain is target-gated so non-macOS builds with feature
+# `metal` are no-ops.
+metal       = ["rustorch-autograd/metal"]
 
 [[example]]
 name = "mnist_wgpu"
@@ -41,6 +45,10 @@ required-features = ["wgpu"]
 [[example]]
 name = "cpu_vs_wgpu_train"
 required-features = ["wgpu"]
+
+[[example]]
+name = "cpu_vs_metal_train"
+required-features = ["metal"]
 
 [dependencies]
 rustorch-core     = { workspace = true }

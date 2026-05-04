@@ -20,6 +20,12 @@ rustorch-wgpu = { workspace = true, optional = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 
+# P3.Z Task J — Apple Metal direct dispatch. macOS-only crate, so
+# the dep is target-gated; non-macOS builds with feature `metal`
+# compile but `pick_backend(Device::Metal)` panics at runtime.
+[target.'cfg(target_os = "macos")'.dependencies]
+rustorch-metal = { workspace = true, optional = true }
+
 [dev-dependencies]
 # Used by the gpu-tests training-loop test (Phase D step c6aaded6).
 rustorch-optim = { workspace = true }
@@ -31,6 +37,10 @@ default = []
 # error. With it, every autograd op forwards to `wgpu_backend()` when
 # its inputs live on the GPU.
 wgpu = ["dep:rustorch-wgpu"]
+# Enable Variable::device == Metal dispatch through rustorch-metal.
+# Pulls rustorch-core[metal] (which gates the Storage::Metal variant)
+# and rustorch-metal (the macOS direct backend).
+metal = ["rustorch-core/metal", "dep:rustorch-metal"]
 # Run wgpu parity tests that require a real GPU adapter. CI without GPU
 # skips them (cargo test runs them as `ignored`); local dev enables
 # `--features wgpu,gpu-tests` to exercise them.

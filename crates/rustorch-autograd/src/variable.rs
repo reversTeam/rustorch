@@ -85,16 +85,25 @@ impl Variable {
     ///
     /// Transitional bridge: P3.Z Task O FusedAdamW will operate on
     /// `Storage::Wgpu` natively (no host trip), removing this
-    /// download from the optimiser hot path.
+    /// download from the optimiser hot path. Same applies to the
+    /// future Metal FusedAdamW (Task J Phase 4).
     pub fn data_snapshot(&self) -> Tensor {
         let t = self.tensor();
+        if t.storage().is_cpu() {
+            return t;
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            if t.as_metal_storage().is_some() {
+                if let Ok(host) = rustorch_metal::transfer::tensor_to_cpu(&t) {
+                    return host.with_device(t.device());
+                }
+            }
+        }
         #[cfg(feature = "wgpu")]
         {
-            if !t.storage().is_cpu() {
+            if t.as_wgpu_storage().is_some() {
                 if let Ok(host) = rustorch_wgpu::transfer::tensor_to_cpu(&t) {
-                    // Preserve the device tag so the next op still
-                    // dispatches through wgpu_backend(); the storage
-                    // is now CPU but the routing decision survives.
                     return host.with_device(t.device());
                 }
             }
@@ -127,9 +136,20 @@ impl Variable {
     /// bypass this download via [`Variable::raw_grad`].
     pub fn grad(&self) -> Option<Tensor> {
         let g = self.grad.lock().unwrap().clone()?;
+        if g.storage().is_cpu() {
+            return Some(g);
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            if g.as_metal_storage().is_some() {
+                if let Ok(host) = rustorch_metal::transfer::tensor_to_cpu(&g) {
+                    return Some(host.with_device(g.device()));
+                }
+            }
+        }
         #[cfg(feature = "wgpu")]
         {
-            if !g.storage().is_cpu() {
+            if g.as_wgpu_storage().is_some() {
                 if let Ok(host) = rustorch_wgpu::transfer::tensor_to_cpu(&g) {
                     return Some(host.with_device(g.device()));
                 }

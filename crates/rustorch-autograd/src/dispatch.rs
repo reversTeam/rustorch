@@ -34,6 +34,17 @@ pub(crate) fn pick_backend(device: Device) -> &'static dyn Backend {
              Build with `--features wgpu` (or enable the umbrella `rustorch/wgpu` feature) \
              to enable GPU dispatch through `rustorch-wgpu`."
         ),
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        Device::Metal => rustorch_metal::backend_singleton::metal_backend(),
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        Device::Metal => panic!(
+            "rustorch-autograd: dispatched to Device::Metal but the `metal` feature \
+             is OFF or target is not macOS. Build with `--features metal` on a Mac."
+        ),
+        Device::Cuda => panic!(
+            "rustorch-autograd: dispatched to Device::Cuda but the CUDA backend is \
+             not yet wired (P3.Z Task M)."
+        ),
     }
 }
 
