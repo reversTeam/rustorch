@@ -682,15 +682,14 @@ pub fn add_bias(x: &Variable, bias: &Variable) -> Result<Variable, BackwardError
             ),
         });
     }
-    // Forward: broadcast bias along axis 0.
-    let bias_buf: &[f32] = bias_t.as_slice::<f32>().expect("f32");
-    let mut wide = Vec::with_capacity(batch * n_out);
-    for _ in 0..batch {
-        wide.extend_from_slice(bias_buf);
-    }
-    let bias_wide = Tensor::from_vec([batch, n_out], wide).expect("bias broadcast shape");
+    // Forward: dispatch to the backend's native add_bias which knows
+    // how to broadcast a [N] bias across [B, N] without leaving the
+    // device. P3.Z Task A: the previous CPU-side `as_slice + manual
+    // tile + backend.add` round-trip path is gone — that would have
+    // panicked the moment `bias_t` lived on Storage::Wgpu.
+    let _ = (batch, n_out);
     let out = pick_backend(device)
-        .add(&x_t, &bias_wide)
+        .add_bias(&x_t, &bias_t)
         .map_err(|e| backend_err("add_bias", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && (x.requires_grad || bias.requires_grad) {

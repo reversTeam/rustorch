@@ -133,6 +133,63 @@ fn host(t: &Tensor) -> Result<Tensor, BackendError> {
     crate::transfer::tensor_to_cpu(t).map_err(|e| wgpu_err("cpu_fallback", e))
 }
 
+/// Native GPU fast path for `sum_dim` / `mean_dim` on 2D inputs with
+/// a single reduction axis. Returns `None` if the shape/axis pattern
+/// is not yet handled (3D+ tensors, multi-axis reductions) so callers
+/// can fall back to the CPU path.
+///
+/// Composition map:
+/// - input `[d0, d1]`, axis = 1 (last) → `reduce_rows(d0, d1)` → output `[d0]`
+/// - input `[d0, d1]`, axis = 0        → `transpose2d → reduce_rows(d1, d0)` → output `[d1]`
+///
+/// `keepdim = true` keeps the reduced axis as size-1 in the result
+/// shape (`[d0, 1]` / `[1, d1]`); `keepdim = false` drops it.
+fn sum_or_mean_dim_2d(
+    backend: &WgpuBackend,
+    src: &Tensor,
+    dims: &[usize],
+    keepdim: bool,
+    kind: ReduceKind,
+) -> Result<Option<Tensor>, BackendError> {
+    let shape = src.shape();
+    if shape.len() != 2 || dims.len() != 1 {
+        return Ok(None);
+    }
+    let (d0, d1) = (shape[0], shape[1]);
+    let axis = dims[0];
+    let op_name = match kind {
+        ReduceKind::Sum => "sum_dim",
+        ReduceKind::Mean => "mean_dim",
+        _ => return Ok(None),
+    };
+    let inp = to_gpu(backend, src).map_err(|e| wgpu_err(op_name, e))?;
+    let (reduced, out_shape) = match axis {
+        1 => {
+            // Reduce along last axis: [d0, d1] → [d0].
+            let r = reduce_rows(backend, &inp, d0, d1, kind).map_err(|e| wgpu_err(op_name, e))?;
+            let out_shape = if keepdim { vec![d0, 1] } else { vec![d0] };
+            (r, out_shape)
+        },
+        0 => {
+            // Reduce along first axis: transpose [d0, d1] → [d1, d0],
+            // then reduce_rows → [d1].
+            let xt = crate::transpose::transpose2d(backend, &inp, d0, d1)
+                .map_err(|e| wgpu_err(op_name, e))?;
+            let r = reduce_rows(backend, &xt, d1, d0, kind).map_err(|e| wgpu_err(op_name, e))?;
+            let out_shape = if keepdim { vec![1, d1] } else { vec![d1] };
+            (r, out_shape)
+        },
+        _ => {
+            return Err(BackendError::ShapeMismatch {
+                op: op_name,
+                lhs: shape.to_vec(),
+                rhs: dims.to_vec(),
+            });
+        },
+    };
+    Ok(Some(finish_wgpu_op(reduced, out_shape)))
+}
+
 /// CPU fallback: download both operands, run on `cpu_backend()`, return.
 ///
 /// Used by methods like `eq` for which the wgpu crate ships no kernel
@@ -337,27 +394,32 @@ impl Backend for WgpuBackend {
             .map_err(|e| BackendError::NumericalError(format!("reshape build: {e}")))
     }
 
-    /// Reduce-sum along `dims`. CPU fallback for now — Storage Option
-    /// A makes the GPU buffer the canonical home, so we explicitly
-    /// download via [`crate::transfer::tensor_to_cpu`] before handing
-    /// to `cpu_backend().sum_dim`, then re-tag the result Wgpu so
-    /// follow-on autograd ops keep dispatching here. Task N (P3.Z)
-    /// adds a native WGSL kernel that permutes axes and reuses
-    /// `reduce_rows`, eliminating the host trip entirely.
+    /// Reduce-sum along `dims`. Native GPU fast path for 2D inputs
+    /// with single-axis reduction — the common autograd case (e.g.
+    /// AddBackward `unbroadcast_to` reducing axis 0 of `[B, N]` →
+    /// `[N]`, axis 1 of `[B, N]` → `[B]`). Composed via existing
+    /// `reduce_rows` (axis = last) and `transpose2d + reduce_rows`
+    /// (axis = first). Other shapes fall back to CPU (3D+ tensors,
+    /// multi-axis reductions) until generalised in Task N.
     fn sum_dim(&self, src: &Tensor, dims: &[usize], keepdim: bool) -> Result<Tensor, BackendError> {
+        if let Some(out) = sum_or_mean_dim_2d(self, src, dims, keepdim, ReduceKind::Sum)? {
+            return Ok(out);
+        }
         let host_src = crate::transfer::tensor_to_cpu(src).map_err(|e| wgpu_err("sum_dim", e))?;
         let result = cpu_backend().sum_dim(&host_src, dims, keepdim)?;
         Ok(tag_wgpu(result))
     }
 
-    /// Reduce-mean along `dims`. CPU fallback (same justification as
-    /// `sum_dim`).
+    /// Reduce-mean along `dims`. Same fast path as [`sum_dim`].
     fn mean_dim(
         &self,
         src: &Tensor,
         dims: &[usize],
         keepdim: bool,
     ) -> Result<Tensor, BackendError> {
+        if let Some(out) = sum_or_mean_dim_2d(self, src, dims, keepdim, ReduceKind::Mean)? {
+            return Ok(out);
+        }
         let host_src = crate::transfer::tensor_to_cpu(src).map_err(|e| wgpu_err("mean_dim", e))?;
         let result = cpu_backend().mean_dim(&host_src, dims, keepdim)?;
         Ok(tag_wgpu(result))
@@ -455,6 +517,19 @@ impl Backend for WgpuBackend {
         cpu_backend().log_softmax(&host(src)?, dim).map(tag_wgpu)
     }
     fn transpose(&self, src: &Tensor, d0: usize, d1: usize) -> Result<Tensor, BackendError> {
+        // Native WGSL fast path for 2D transpose with axes (0, 1) — by
+        // far the most common case in autograd (matmul backward,
+        // attention QKV permutation). Falls back to CPU for higher
+        // ranks until the WGSL kernel is generalised.
+        let shape = src.shape();
+        if shape.len() == 2 && ((d0 == 0 && d1 == 1) || (d0 == 1 && d1 == 0)) {
+            let m = shape[0];
+            let n = shape[1];
+            let inp = to_gpu(self, src).map_err(|e| wgpu_err("transpose", e))?;
+            let out = crate::transpose::transpose2d(self, &inp, m, n)
+                .map_err(|e| wgpu_err("transpose", e))?;
+            return Ok(finish_wgpu_op(out, vec![n, m]));
+        }
         cpu_backend().transpose(&host(src)?, d0, d1).map(tag_wgpu)
     }
     fn bmm(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackendError> {
@@ -502,9 +577,19 @@ impl Backend for WgpuBackend {
         target: &Tensor,
         reduction: rustorch_cpu::backend::Reduction,
     ) -> Result<Tensor, BackendError> {
-        cpu_backend()
-            .mse_loss(&host(input)?, &host(target)?, reduction)
-            .map(tag_wgpu)
+        // Native composition stays on GPU throughout: diff → sq → reduce.
+        // Uses the existing dispatch_binary kernels (sub, mul) and the
+        // full-tensor reduce (sum / mean), all of which produce
+        // Storage::Wgpu output. No host trip — major win on the
+        // training-loop hot path.
+        use rustorch_cpu::backend::Reduction;
+        let diff = self.sub(input, target)?;
+        let sq = self.mul(&diff, &diff)?;
+        match reduction {
+            Reduction::Mean => self.mean(&sq),
+            Reduction::Sum => self.sum(&sq),
+            Reduction::None => Ok(sq),
+        }
     }
     fn nll_loss(
         &self,
