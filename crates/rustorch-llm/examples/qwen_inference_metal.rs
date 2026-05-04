@@ -30,7 +30,8 @@ use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::kernels::{
     add_inplace_f32, gqa_decode_f32, kv_append_f32, rms_norm_f32, rms_norm_per_head_f32,
-    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q6_k_f32_into, swiglu_f32,
+    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_simdcoop_into, sgemv_q6_k_f32_into,
+    sgemv_q6_k_f32_simdcoop_into, swiglu_f32,
 };
 
 use metal::Buffer;
@@ -47,12 +48,27 @@ struct MetalWeight {
 
 impl MetalWeight {
     fn matmul_into(&self, backend: &MetalBackend, x_buf: &Buffer, out_buf: &Buffer) {
-        match self.dtype {
-            GgmlType::Q4_K => {
+        // Heuristic dispatch: for huge-N (e.g. lm_head 151936) the
+        // simdgroup-cooperative kernel halves the per-thread strided
+        // W loads; for smaller N (Qwen3 FFN/attn projections) the
+        // 1-thread-per-output kernel keeps the simdgroup busy enough
+        // that K-stride cooperation isn't worth the simd_sum overhead.
+        let blocks_per_row = self.k / 256;
+        let use_simdcoop = self.n > 50_000 && blocks_per_row >= 16;
+        match (self.dtype, use_simdcoop) {
+            (GgmlType::Q4_K, false) => {
                 sgemv_q4_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
             },
-            GgmlType::Q6_K => {
+            (GgmlType::Q4_K, true) => {
+                sgemv_q4_k_f32_simdcoop_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                    .unwrap()
+            },
+            (GgmlType::Q6_K, false) => {
                 sgemv_q6_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
+            },
+            (GgmlType::Q6_K, true) => {
+                sgemv_q6_k_f32_simdcoop_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                    .unwrap()
             },
             _ => panic!("unsupported dtype: {:?}", self.dtype),
         }
