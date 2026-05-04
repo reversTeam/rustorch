@@ -34,6 +34,15 @@ pub struct MetalBackend {
     /// the per-kernel encoder/commit overhead (~50-200 µs each) into
     /// one batch per training step.
     pending_cmd_buffer: Arc<Mutex<Option<metal::CommandBuffer>>>,
+    /// T83 — persistent compute encoder, kept open across multiple
+    /// `with_encoder` calls. Each `new_compute_command_encoder` +
+    /// `end_encoding` pair is ~5–10 µs of CPU overhead; on Qwen3-14B
+    /// decode we issue ~580 dispatches per token, so reusing one
+    /// encoder for all of them saves ~3 ms / token. Metal's default
+    /// `MTLDispatchType::Serial` mode automatically inserts the
+    /// memory ordering between consecutive `dispatch_threads` calls,
+    /// so chaining is safe without explicit barriers.
+    pending_encoder: Arc<Mutex<Option<metal::ComputeCommandEncoder>>>,
     /// bf16 cast cache: maps `core::MetalStorage` Arc pointers to
     /// the corresponding bfloat16 Metal buffer. Used by the mixed-
     /// precision matmul path so that f32 → bf16 casts are paid ONCE
@@ -78,6 +87,7 @@ impl MetalBackend {
             queue: Arc::new(queue),
             pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_cmd_buffer: Arc::new(Mutex::new(None)),
+            pending_encoder: Arc::new(Mutex::new(None)),
             bf16_cache: Arc::new(Mutex::new(HashMap::new())),
             buffer_pool: Arc::new(Mutex::new(HashMap::new())),
             adapter_name,
@@ -206,14 +216,25 @@ impl MetalBackend {
     /// `command_buffer + commit + new_command_buffer` overhead
     /// (~50-200 µs each) into a single commit per training step.
     pub fn with_encoder<F: FnOnce(&metal::ComputeCommandEncoderRef)>(&self, f: F) {
-        let mut guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
-        if guard.is_none() {
-            *guard = Some(self.queue.new_command_buffer().to_owned());
+        // T83 — chain dispatches inside a single MTLComputeCommandEncoder,
+        // closed only at drain(). Default MTLDispatchType::Serial inserts
+        // the implicit memory barrier between consecutive dispatches so
+        // we don't need explicit ones here.
+        let mut cb_guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
+        if cb_guard.is_none() {
+            *cb_guard = Some(self.queue.new_command_buffer().to_owned());
         }
-        let cb = guard.as_ref().expect("just created");
-        let encoder = cb.new_compute_command_encoder();
+        let mut enc_guard = self
+            .pending_encoder
+            .lock()
+            .expect("metal pending encoder lock");
+        if enc_guard.is_none() {
+            let cb = cb_guard.as_ref().expect("just created");
+            *enc_guard = Some(cb.new_compute_command_encoder().to_owned());
+        }
+        let encoder = enc_guard.as_ref().expect("just created");
         f(encoder);
-        encoder.end_encoding();
+        // NOTE: do NOT end_encoding here — drain() flushes the chain.
     }
 
     /// Compile or look up a compute pipeline state by kernel name.
@@ -281,6 +302,17 @@ impl MetalBackend {
     /// reads. After draining, the next [`with_encoder`] call
     /// lazily creates a fresh command buffer.
     pub fn drain(&self) {
+        // T83 — close the chained encoder before commit. Order matters:
+        // encoder MUST be ended before the command buffer is committed.
+        {
+            let mut enc_guard = self
+                .pending_encoder
+                .lock()
+                .expect("metal pending encoder lock");
+            if let Some(enc) = enc_guard.take() {
+                enc.end_encoding();
+            }
+        }
         let mut guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
         if let Some(cb) = guard.take() {
             cb.commit();
