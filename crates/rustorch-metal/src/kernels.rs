@@ -532,18 +532,18 @@ pub fn mse_reduce_f32(
     let n_partials = (n as u64).div_ceil(stride);
     let partials = backend.alloc_shared((n_partials as usize) * 4)?;
 
+    // ReduceParams (8 bytes) + n_partials (4 bytes) are tiny constants —
+    // pass inline via set_bytes to avoid 3 small alloc_shared per call.
     let params = ReduceParams { n: n as u32, kind };
-    let params_buf = backend.alloc_shared(core::mem::size_of::<ReduceParams>())?;
-    // SAFETY: shared-storage uniform buffer.
-    unsafe {
-        let dst = params_buf.contents() as *mut ReduceParams;
-        *dst = params;
-    }
 
     // Stage 1: fused (a-b)² reduce → partials.
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline_partial);
-        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_bytes(
+            0,
+            core::mem::size_of::<ReduceParams>() as u64,
+            &params as *const ReduceParams as *const std::ffi::c_void,
+        );
         encoder.set_buffer(1, Some(a), 0);
         encoder.set_buffer(2, Some(b), 0);
         encoder.set_buffer(3, Some(&partials), 0);
@@ -554,18 +554,17 @@ pub fn mse_reduce_f32(
 
     // Stage 2: single-thread finalise (sum + optional /n).
     let out = backend.alloc_shared(4)?;
-    let n_partials_buf = backend.alloc_shared(4)?;
-    // SAFETY: shared-storage uniform.
-    unsafe {
-        let p = n_partials_buf.contents() as *mut u32;
-        *p = n_partials as u32;
-    }
+    let np = n_partials as u32;
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline_final);
-        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_bytes(
+            0,
+            core::mem::size_of::<ReduceParams>() as u64,
+            &params as *const ReduceParams as *const std::ffi::c_void,
+        );
         encoder.set_buffer(1, Some(&partials), 0);
         encoder.set_buffer(2, Some(&out), 0);
-        encoder.set_buffer(3, Some(&n_partials_buf), 0);
+        encoder.set_bytes(3, 4, &np as *const u32 as *const std::ffi::c_void);
         let tg2 = MTLSize::new(1, 1, 1);
         let grid2 = MTLSize::new(1, 1, 1);
         encoder.dispatch_threads(grid2, tg2);
@@ -1078,20 +1077,20 @@ pub fn matmul_simdgroup_f32_coarsened_wide(
         "matmul_simdgroup_f32_coarsened_wide",
     )?;
     let out = backend.alloc_shared(m * n * 4)?;
-    let dims_buf = backend.alloc_shared(16)?;
-    // SAFETY: shared-storage uniform.
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = m as u32;
-        *p.add(1) = k as u32;
-        *p.add(2) = n as u32;
-    }
+    // Pass `dims` inline via set_bytes — a 16-byte tiny-uniform fits
+    // Metal's "argument-buffer" fast path and avoids the 5–10 µs cost
+    // of `alloc_shared(16)` per matmul dispatch (3× per training step).
+    let dims = [m as u32, k as u32, n as u32, 0u32];
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(a), 0);
         encoder.set_buffer(1, Some(b), 0);
         encoder.set_buffer(2, Some(&out), 0);
-        encoder.set_buffer(3, Some(&dims_buf), 0);
+        encoder.set_bytes(
+            3,
+            (dims.len() * 4) as u64,
+            dims.as_ptr() as *const std::ffi::c_void,
+        );
         // 16 simdgroups × 32 threads = 512 threads.
         let tg = MTLSize::new(512, 1, 1);
         let n_tiles_x = (n / 256) as u64;
@@ -1214,21 +1213,20 @@ pub fn matmul_simdgroup_f32_coarsened_wide_bias(
         "matmul_simdgroup_f32_coarsened_wide_bias",
     )?;
     let out = backend.alloc_shared(m * n * 4)?;
-    let dims_buf = backend.alloc_shared(16)?;
-    // SAFETY: shared-storage uniform.
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = m as u32;
-        *p.add(1) = k as u32;
-        *p.add(2) = n as u32;
-    }
+    // Inline tiny-uniform via set_bytes — see matmul_simdgroup_f32_coarsened_wide
+    // above for rationale.
+    let dims = [m as u32, k as u32, n as u32, 0u32];
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(a), 0);
         encoder.set_buffer(1, Some(b), 0);
         encoder.set_buffer(2, Some(bias), 0);
         encoder.set_buffer(3, Some(&out), 0);
-        encoder.set_buffer(4, Some(&dims_buf), 0);
+        encoder.set_bytes(
+            4,
+            (dims.len() * 4) as u64,
+            dims.as_ptr() as *const std::ffi::c_void,
+        );
         let tg = MTLSize::new(512, 1, 1);
         let n_tiles_x = (n / 256) as u64;
         let n_tiles_y = (m / 16) as u64;
@@ -1388,20 +1386,17 @@ pub fn matmul_simdgroup_f32_b_t(
         "matmul_simdgroup_f32_b_t",
     )?;
     let out = backend.alloc_shared(m * n * 4)?;
-    let dims_buf = backend.alloc_shared(16)?;
-    // SAFETY: shared-storage uniform.
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = m as u32;
-        *p.add(1) = k as u32;
-        *p.add(2) = n as u32;
-    }
+    let dims = [m as u32, k as u32, n as u32, 0u32];
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(a), 0);
         encoder.set_buffer(1, Some(b), 0);
         encoder.set_buffer(2, Some(&out), 0);
-        encoder.set_buffer(3, Some(&dims_buf), 0);
+        encoder.set_bytes(
+            3,
+            (dims.len() * 4) as u64,
+            dims.as_ptr() as *const std::ffi::c_void,
+        );
         let tg = MTLSize::new(512, 1, 1);
         let n_tiles_x = (n / 256) as u64;
         let n_tiles_y = (m / 16) as u64;
@@ -1441,20 +1436,17 @@ pub fn matmul_simdgroup_f32_a_t(
         "matmul_simdgroup_f32_a_t",
     )?;
     let out = backend.alloc_shared(m * n * 4)?;
-    let dims_buf = backend.alloc_shared(16)?;
-    // SAFETY: shared-storage uniform.
-    unsafe {
-        let p = dims_buf.contents() as *mut u32;
-        *p.add(0) = m as u32;
-        *p.add(1) = k as u32;
-        *p.add(2) = n as u32;
-    }
+    let dims = [m as u32, k as u32, n as u32, 0u32];
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(a), 0);
         encoder.set_buffer(1, Some(b), 0);
         encoder.set_buffer(2, Some(&out), 0);
-        encoder.set_buffer(3, Some(&dims_buf), 0);
+        encoder.set_bytes(
+            3,
+            (dims.len() * 4) as u64,
+            dims.as_ptr() as *const std::ffi::c_void,
+        );
         let tg = MTLSize::new(512, 1, 1);
         let n_tiles_x = (n / 256) as u64;
         let n_tiles_y = (m / 16) as u64;

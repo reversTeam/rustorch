@@ -243,17 +243,16 @@ pub fn fused_adamw_step_inplace(
     let pipeline =
         backend.pipeline("fused_adamw_f32_inplace", SHADER, "fused_adamw_f32_inplace")?;
 
+    // Pass `Params` uniform inline via set_bytes — saves an alloc_shared
+    // per param per step (≈5–10 µs × 2 params × N steps).
     let uniform = params.into_uniform(n as u32);
-    let uniform_buf = backend.alloc_shared(core::mem::size_of::<AdamWUniform>())?;
-    // SAFETY: shared-storage uniform buffer.
-    unsafe {
-        let dst = uniform_buf.contents() as *mut AdamWUniform;
-        *dst = uniform;
-    }
-
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(&uniform_buf), 0);
+        encoder.set_bytes(
+            0,
+            core::mem::size_of::<AdamWUniform>() as u64,
+            &uniform as *const AdamWUniform as *const std::ffi::c_void,
+        );
         encoder.set_buffer(1, Some(param), 0);
         encoder.set_buffer(2, Some(grad), 0);
         encoder.set_buffer(3, Some(m), 0);
