@@ -69,6 +69,7 @@ pub mod pool;
 pub mod positional;
 pub mod rnn;
 pub mod rope;
+pub mod sampling;
 pub mod sequential;
 pub mod state_dict;
 
