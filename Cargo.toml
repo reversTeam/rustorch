@@ -39,6 +39,7 @@ members = [
     "crates/rustorch-attention",
     "crates/rustorch-quant",
     "crates/rustorch-tokenizer",
+    "crates/rustorch-llm",
     "crates/rustorch-fusion",
     "crates/rustorch-amp",
     "crates/rustorch-checkpoint",
@@ -81,6 +82,7 @@ rustorch-planner   = { version = "0.0.1", path = "crates/rustorch-planner" }
 rustorch-attention = { version = "0.0.1", path = "crates/rustorch-attention" }
 rustorch-quant     = { version = "0.0.1", path = "crates/rustorch-quant" }
 rustorch-tokenizer = { version = "0.0.1", path = "crates/rustorch-tokenizer" }
+rustorch-llm       = { version = "0.0.1", path = "crates/rustorch-llm" }
 rustorch-fusion    = { version = "0.0.1", path = "crates/rustorch-fusion" }
 rustorch-amp       = { version = "0.0.1", path = "crates/rustorch-amp" }
 rustorch-checkpoint = { version = "0.0.1", path = "crates/rustorch-checkpoint" }

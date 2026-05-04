@@ -3348,6 +3348,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustorch-llm"
+version = "0.0.1"
+dependencies = [
+ "rustorch-core",
+ "rustorch-nn",
+ "rustorch-serde",
+ "rustorch-tokenizer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustorch-log"
 version = "0.0.1"
 dependencies = [

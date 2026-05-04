@@ -1,0 +1,19 @@
+[package]
+name = "rustorch-llm"
+description = "LLM-runner core for RusTorch — Llama / Qwen architecture, safetensors checkpoint loader, and the autoregressive decode loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rustorch-core      = { workspace = true }
+rustorch-serde     = { workspace = true }
+rustorch-nn        = { workspace = true }
+rustorch-tokenizer = { workspace = true }
+serde              = { workspace = true, features = ["derive"] }
+serde_json         = { version = "1" }
