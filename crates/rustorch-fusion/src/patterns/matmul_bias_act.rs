@@ -154,23 +154,23 @@ pub fn fused_matmul_bias_activation(
 
     // Fast path: BLAS-vectorised matmul + tight epilogue. Used when
     // total work (m·n·k FLOPs) is large enough to amortise the BLAS
-    // dispatch overhead. T33: previously gated on
-    //   `m >= 32 && n >= 32 && k >= 32`, which fell through to the
-    // scalar 3-loop on M=1 (LM head single-token decode):
-    //   M=1, K=768, N=50257 = 38 M FLOPs — at ~1 GFLOPS scalar that
-    // takes 38 ms instead of the ~1.5 ms cBLAS sgemv hits, a ~25×
-    // single-token decode regression. Now we dispatch on FLOP count
-    // alone (>= 1 M FLOPs ≈ 64³, the original break-even point) so
-    // matrix-vector / vector-matrix patterns (LM head, attention
-    // proj on S=1) reach the BLAS path.
-    const GEMM_DISPATCH_MIN_FLOPS: usize = 1_000_000;
+    // dispatch overhead.
+    //
+    // T33: previously gated on `m,n,k >= 32` which fell through on
+    // M=1 (LM head single-token) — fixed to a FLOP threshold.
+    // T36: the 1 M-FLOPs threshold was still too aggressive — at
+    // M=1, K=768, N=768 (590 K FLOPs, the standard MHA Q/K/V/O
+    // projection on S=1) we were taking the scalar 3-loop at
+    // ~5 GFLOPS = 120 µs, vs ~30 µs via cblas_sgemv. Lowered to
+    // 100 K FLOPs which is roughly the FFI break-even point for
+    // sgemm/sgemv on Accelerate (~256 ns per call).
+    const GEMM_DISPATCH_MIN_FLOPS: usize = 100_000;
     if m * n * k >= GEMM_DISPATCH_MIN_FLOPS {
         matmul_dispatch(x, w, y, m, k, n);
         apply_bias_activation_epilogue(y, b, m, n, activation);
         return Ok(());
     }
-    // Tiny shapes (m·n·k < 1 M) where dispatch overhead exceeds work.
-    // The all-dims < 32 cases are also covered here.
+    // Tiny shapes (m·n·k < 100 K) where dispatch overhead exceeds work.
     let _ = GEMM_DISPATCH_MIN;
 
     // Slow path (tiny shapes fit in L1d): single-pass scalar fused

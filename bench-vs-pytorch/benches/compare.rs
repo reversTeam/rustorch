@@ -266,6 +266,51 @@ fn bench_lm_head(c: &mut Criterion) {
     group.finish();
 }
 
+/// T36 — micro bench: raw `fused_matmul_bias_activation` call
+/// vs the wrapper Linear S=1 path. Isolates the overhead of the
+/// Tensor + Variable wrapping vs the actual sgemv work.
+fn bench_linear_S1_micro(c: &mut Criterion) {
+    use rustorch_autograd::{no_grad, Variable};
+    use rustorch_fusion::patterns::matmul_bias_act::{fused_matmul_bias_activation, Activation};
+    use rustorch_nn::{Linear, Module};
+
+    let m = 1_usize;
+    let k = 768_usize;
+    let n = 768_usize;
+    let x = det(0xA1, m * k);
+    let w = det(0xB2, k * n);
+    let b = det(0xCC, n);
+    let mut y = vec![0.0_f32; m * n];
+
+    let mut group = c.benchmark_group("linear_S1_micro");
+    group.sample_size(50);
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_secs(3));
+
+    // Baseline: pure raw kernel call (no Tensor, no Variable).
+    group.bench_function("fused_kernel_raw", |bb| {
+        bb.iter(|| {
+            fused_matmul_bias_activation(&x, &w, Some(&b), &mut y, m, k, n, Activation::None)
+                .unwrap();
+            hint_black_box(&y);
+        });
+    });
+
+    // Through the Linear module forward (Tensor + Variable wrap).
+    let fc = Linear::new(k, n);
+    let x_t = Tensor::from_vec(vec![m, k], x.clone()).unwrap();
+    group.bench_function("linear_forward_full", |bb| {
+        bb.iter(|| {
+            no_grad(|| {
+                let xv = Variable::new(x_t.clone());
+                hint_black_box(fc.forward(&xv).unwrap())
+            })
+        });
+    });
+
+    group.finish();
+}
+
 /// T33 — per-stage breakdown of the S=1 single-token decode to
 /// pinpoint where the 29.5× gap vs PyTorch comes from. Same
 /// methodology as T17 did for the S=128 block.
@@ -826,5 +871,6 @@ criterion_group! {
         bench_lm_head,
         bench_gpt2_single_token_decode,
         bench_single_token_breakdown,
+        bench_linear_S1_micro,
 }
 criterion_main!(benches);

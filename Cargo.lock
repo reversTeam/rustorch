@@ -2993,6 +2993,7 @@ dependencies = [
  "rustorch-core",
  "rustorch-cpu",
  "rustorch-data",
+ "rustorch-fusion",
  "rustorch-metal",
  "rustorch-nn",
  "rustorch-optim",
