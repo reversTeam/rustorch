@@ -450,6 +450,81 @@ pub fn mean_f32(b: &MetalBackend, s: &Buffer, n: usize) -> Result<Buffer, MetalE
 }
 
 // ----------------------------------------------------------------------
+// add_bias: `out[b, n] = x[b, n] + bias[n]` — broadcasts bias across
+// the batch dimension. Used by every Linear layer's forward pass.
+// ----------------------------------------------------------------------
+
+const ADD_BIAS_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct AddBiasParams {
+    uint b;   // batch
+    uint n;   // features
+};
+
+kernel void add_bias_f32(
+    constant AddBiasParams& params [[buffer(0)]],
+    device const float*     x      [[buffer(1)]],   // [B, N]
+    device const float*     bias   [[buffer(2)]],   // [N]
+    device       float*     out    [[buffer(3)]],   // [B, N]
+    uint                    gid    [[thread_position_in_grid]]
+) {
+    uint B = params.b;
+    uint N = params.n;
+    uint total = B * N;
+    if (gid >= total) { return; }
+    uint col = gid % N;
+    out[gid] = x[gid] + bias[col];
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct AddBiasParams {
+    b: u32,
+    n: u32,
+}
+unsafe impl bytemuck::Zeroable for AddBiasParams {}
+unsafe impl bytemuck::Pod for AddBiasParams {}
+
+/// Native Metal add_bias: `out[b, n] = x[b, n] + bias[n]`.
+/// `x` shape `[B, N]`, `bias` shape `[N]`, output shape `[B, N]`.
+pub fn add_bias_f32(
+    backend: &MetalBackend,
+    x: &Buffer,
+    bias: &Buffer,
+    b_dim: usize,
+    n_dim: usize,
+) -> Result<Buffer, MetalError> {
+    let pipeline = backend.pipeline("add_bias_f32", ADD_BIAS_SHADER, "add_bias_f32")?;
+    let total = b_dim * n_dim;
+    let out = backend.alloc_shared(total * 4)?;
+    let params = AddBiasParams {
+        b: b_dim as u32,
+        n: n_dim as u32,
+    };
+    let params_buf = backend.alloc_shared(core::mem::size_of::<AddBiasParams>())?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let dst = params_buf.contents() as *mut AddBiasParams;
+        *dst = params;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&params_buf), 0);
+        encoder.set_buffer(1, Some(x), 0);
+        encoder.set_buffer(2, Some(bias), 0);
+        encoder.set_buffer(3, Some(&out), 0);
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+        let grid = MTLSize::new(total as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(out)
+}
+
+// ----------------------------------------------------------------------
 // 2D axis reductions: `[d0, d1]` → `[d1]` (axis 0) or `[d0]` (axis 1).
 //
 // Used by `AddBackward::unbroadcast_to` for `add_bias([B,N], [N])`
@@ -660,6 +735,118 @@ pub fn transpose2d_f32(
         let groups_x = (n as u64).div_ceil(16);
         let groups_y = (m as u64).div_ceil(16);
         let grid = MTLSize::new(groups_x * 16, groups_y * 16, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(out)
+}
+
+/// **Wide thread-coarsened matmul (16 sg, 2×8 layout)** — same
+/// 4-output-per-sg pattern as the 8-sg kernel below, but with 16
+/// simdgroups arranged as 2 rows × 8 cols. Each "row" of 8 sg
+/// covers 8 output rows × 256 cols (same as the 8-sg kernel); the
+/// second row of sg covers the next 8 output rows. Workgroup output
+/// tile: 16 × 256 = 4096 outputs / wg.
+///
+/// Doubles the work per workgroup → halves the workgroup count →
+/// improves GPU occupancy on small-M shapes (e.g. the bench's M=64
+/// drops from 32 to 16 workgroups, better filling Apple's ~40 cores).
+const MATMUL_SIMDGROUP_F32_COARSENED_WIDE_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void matmul_simdgroup_f32_coarsened_wide(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device       float* c       [[buffer(2)]],
+    constant     uint3& dims    [[buffer(3)]],
+    uint2 tg_pos                [[threadgroup_position_in_grid]],
+    uint  sg_idx                [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint K = dims.y;
+    uint N = dims.z;
+
+    // 16 simdgroups arranged 2 rows × 8 cols.
+    uint sg_row = sg_idx / 8u;
+    uint sg_col = sg_idx % 8u;
+    uint row_tile = tg_pos.y * 16u + sg_row * 8u;
+    uint col_base = tg_pos.x * 256u + sg_col * 32u;
+    if (row_tile >= M || col_base >= N) { return; }
+
+    simdgroup_matrix<float, 8, 8> mat_a;
+    simdgroup_matrix<float, 8, 8> mat_b0;
+    simdgroup_matrix<float, 8, 8> mat_b1;
+    simdgroup_matrix<float, 8, 8> mat_b2;
+    simdgroup_matrix<float, 8, 8> mat_b3;
+    simdgroup_matrix<float, 8, 8> mat_c0 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c1 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c2 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> mat_c3 = simdgroup_matrix<float, 8, 8>(0);
+
+    for (uint k = 0u; k < K; k += 8u) {
+        simdgroup_load(mat_a, a + row_tile * K + k, K);
+        simdgroup_load(mat_b0, b + k * N + col_base + 0u, N);
+        simdgroup_load(mat_b1, b + k * N + col_base + 8u, N);
+        simdgroup_load(mat_b2, b + k * N + col_base + 16u, N);
+        simdgroup_load(mat_b3, b + k * N + col_base + 24u, N);
+        simdgroup_multiply_accumulate(mat_c0, mat_a, mat_b0, mat_c0);
+        simdgroup_multiply_accumulate(mat_c1, mat_a, mat_b1, mat_c1);
+        simdgroup_multiply_accumulate(mat_c2, mat_a, mat_b2, mat_c2);
+        simdgroup_multiply_accumulate(mat_c3, mat_a, mat_b3, mat_c3);
+    }
+
+    simdgroup_store(mat_c0, c + row_tile * N + col_base + 0u, N);
+    simdgroup_store(mat_c1, c + row_tile * N + col_base + 8u, N);
+    simdgroup_store(mat_c2, c + row_tile * N + col_base + 16u, N);
+    simdgroup_store(mat_c3, c + row_tile * N + col_base + 24u, N);
+}
+"#;
+
+/// 16-simdgroup matmul. Requires `m%16==0`, `k%8==0`, `n%256==0`.
+pub fn matmul_simdgroup_f32_coarsened_wide(
+    backend: &MetalBackend,
+    a: &Buffer,
+    b: &Buffer,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "matmul_simdgroup_f32_coarsened_wide needs Metal3".to_string(),
+        ));
+    }
+    if m % 16 != 0 || k % 8 != 0 || n % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "matmul_simdgroup_f32_coarsened_wide needs m%16==0, k%8==0, n%256==0: got m={m}, k={k}, n={n}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "matmul_simdgroup_f32_coarsened_wide",
+        MATMUL_SIMDGROUP_F32_COARSENED_WIDE_SHADER,
+        "matmul_simdgroup_f32_coarsened_wide",
+    )?;
+    let out = backend.alloc_shared(m * n * 4)?;
+    let dims_buf = backend.alloc_shared(16)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = m as u32;
+        *p.add(1) = k as u32;
+        *p.add(2) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a), 0);
+        encoder.set_buffer(1, Some(b), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        // 16 simdgroups × 32 threads = 512 threads.
+        let tg = MTLSize::new(512, 1, 1);
+        let n_tiles_x = (n / 256) as u64;
+        let n_tiles_y = (m / 16) as u64;
+        let grid = MTLSize::new(n_tiles_x * 512, n_tiles_y, 1);
         encoder.dispatch_threads(grid, tg);
     });
     Ok(out)

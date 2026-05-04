@@ -18,10 +18,11 @@
 use crate::backend::MetalBackend;
 use crate::error::MetalError;
 use crate::kernels::{
-    abs_f32, add_f32, div_f32, exp_f32, log_f32, matmul_simdgroup_f32,
-    matmul_simdgroup_f32_coarsened, matmul_simdgroup_f32_multisg, matmul_simdgroup_f32_via_bf16,
-    mean_dim_2d_f32, mean_f32, mul_f32, neg_f32, relu_f32, sigmoid_f32, silu_f32, sqrt_f32,
-    sub_f32, sum_dim_2d_f32, sum_f32, tanh_f32, transpose2d_f32,
+    abs_f32, add_bias_f32, add_f32, div_f32, exp_f32, log_f32, matmul_simdgroup_f32,
+    matmul_simdgroup_f32_coarsened, matmul_simdgroup_f32_coarsened_wide,
+    matmul_simdgroup_f32_multisg, matmul_simdgroup_f32_via_bf16, mean_dim_2d_f32, mean_f32,
+    mul_f32, neg_f32, relu_f32, sigmoid_f32, silu_f32, sqrt_f32, sub_f32, sum_dim_2d_f32, sum_f32,
+    tanh_f32, transpose2d_f32,
 };
 use crate::transfer::tensor_to_cpu;
 use rustorch_core::tensor::device::Device;
@@ -215,14 +216,17 @@ impl Backend for MetalBackend {
         let l = to_gpu(self, lhs).map_err(|e| metal_err("matmul", e))?;
         let r = to_gpu(self, rhs).map_err(|e| metal_err("matmul", e))?;
         // Pick the highest-throughput kernel that fits the shape:
-        // - coarsened (4 outputs/sg, single mat_a load): n%256==0
-        // - multi-sg (1 output/sg, 8 sg/wg):              n%64==0
-        // - single-sg (1 output/sg, 1 sg/wg):             n%8==0 fallback
+        // - coarsened_wide (16 sg, 16x256 output):         m%16==0 & n%256==0
+        // - coarsened     (8 sg, 8x256, 4-tile/sg):        n%256==0
+        // - multi-sg      (8 sg, 8x64, 1-tile/sg):         n%64==0
+        // - single-sg     (1 sg, 8x8, 1-tile/sg):          n%8==0 fallback
         // bf16 path is ready (matmul_simdgroup_f32_via_bf16) but the
         // cast overhead exceeds the bf16 speedup at the bench's
-        // small M=64 shape. Re-enable when params are stored in bf16
-        // across steps (mixed-precision Phase 4).
-        let out = if n % 256 == 0 {
+        // small M=64 shape. Re-enable with mixed-precision Phase 4.
+        let out = if m % 16 == 0 && n % 256 == 0 {
+            matmul_simdgroup_f32_coarsened_wide(self, &l, &r, m, k1, n)
+                .map_err(|e| metal_err("matmul", e))?
+        } else if n % 256 == 0 {
             matmul_simdgroup_f32_coarsened(self, &l, &r, m, k1, n)
                 .map_err(|e| metal_err("matmul", e))?
         } else if n % 64 == 0 {
@@ -289,11 +293,42 @@ impl Backend for MetalBackend {
         Ok(finish_metal_op(out, vec![1], src.dtype()))
     }
     fn add_bias(&self, x: &Tensor, bias: &Tensor) -> Result<Tensor, BackendError> {
-        cpu_backend()
-            .add_bias(&host(x)?, &host(bias)?)
-            .map(tag_metal)
+        // Native Metal add_bias: broadcasts a [N] bias across [B, N]
+        // input. Stays on GPU end-to-end (no host trip). Matches the
+        // wgpu native add_bias path.
+        let xs = x.shape();
+        let bs = bias.shape();
+        if xs.len() != 2 || bs.len() != 1 || bs[0] != xs[1] {
+            return cpu_backend()
+                .add_bias(&host(x)?, &host(bias)?)
+                .map(tag_metal);
+        }
+        let (b_dim, n_dim) = (xs[0], xs[1]);
+        let xb = to_gpu(self, x).map_err(|e| metal_err("add_bias", e))?;
+        let bb = to_gpu(self, bias).map_err(|e| metal_err("add_bias", e))?;
+        let out =
+            add_bias_f32(self, &xb, &bb, b_dim, n_dim).map_err(|e| metal_err("add_bias", e))?;
+        Ok(finish_metal_op(out, vec![b_dim, n_dim], x.dtype()))
     }
     fn reshape(&self, src: &Tensor, shape: &[usize]) -> Result<Tensor, BackendError> {
+        let numel: usize = shape.iter().product();
+        if numel != src.numel() {
+            return Err(BackendError::ShapeMismatch {
+                op: "reshape",
+                lhs: src.shape().to_vec(),
+                rhs: shape.to_vec(),
+            });
+        }
+        // Storage::Metal: metadata-only op, clone the GPU storage with
+        // a new shape — no kernel needed, no host trip.
+        if let Some(metal_storage) = src.as_metal_storage() {
+            return Ok(Tensor::from_metal_storage(
+                metal_storage.clone(),
+                shape.to_vec(),
+                src.dtype(),
+            ));
+        }
+        // CPU-storage fallback (rare — typically scalar broadcasts).
         cpu_backend().reshape(&host(src)?, shape).map(tag_metal)
     }
     fn sum_dim(&self, src: &Tensor, dims: &[usize], keepdim: bool) -> Result<Tensor, BackendError> {
@@ -325,9 +360,50 @@ impl Backend for MetalBackend {
         grad: &Tensor,
         target_shape: &[usize],
     ) -> Result<Tensor, BackendError> {
-        cpu_backend()
-            .unbroadcast_to(&host(grad)?, target_shape)
-            .map(tag_metal)
+        // Native composition via the backend's own sum_dim + reshape
+        // (both Metal-native), keeping the gradient on GPU end-to-end.
+        // Mirror of WgpuBackend::unbroadcast_to.
+        let grad_shape = grad.shape();
+        if grad_shape == target_shape {
+            return Ok(grad.clone());
+        }
+        let g_ndim = grad_shape.len();
+        let t_ndim = target_shape.len();
+        if t_ndim > g_ndim {
+            return Err(BackendError::ShapeMismatch {
+                op: "unbroadcast_to",
+                lhs: grad_shape.to_vec(),
+                rhs: target_shape.to_vec(),
+            });
+        }
+        let pad = g_ndim - t_ndim;
+        let mut padded = vec![1usize; pad];
+        padded.extend_from_slice(target_shape);
+        for (&g, &t) in grad_shape.iter().zip(padded.iter()) {
+            if t != 1 && t != g {
+                return Err(BackendError::ShapeMismatch {
+                    op: "unbroadcast_to",
+                    lhs: grad_shape.to_vec(),
+                    rhs: target_shape.to_vec(),
+                });
+            }
+        }
+        let reduce_axes: Vec<usize> = padded
+            .iter()
+            .zip(grad_shape.iter())
+            .enumerate()
+            .filter_map(|(axis, (&p, &g))| if p == 1 && g > 1 { Some(axis) } else { None })
+            .collect();
+        let reduced = if reduce_axes.is_empty() {
+            grad.clone()
+        } else {
+            self.sum_dim(grad, &reduce_axes, true)?
+        };
+        if reduced.shape() == target_shape {
+            Ok(reduced)
+        } else {
+            self.reshape(&reduced, target_shape)
+        }
     }
     fn abs(&self, src: &Tensor) -> Result<Tensor, BackendError> {
         unary_native(self, "abs", src, abs_f32)
