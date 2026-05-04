@@ -126,6 +126,70 @@ impl RoPE {
         }
         Ok(())
     }
+
+    /// Apply RoPE in place using the HuggingFace `apply_rotary_pos_emb`
+    /// half-split convention (used by Llama / Qwen / Mistral / Phi when
+    /// the model is loaded from HF or GGUF in HF format).
+    ///
+    /// Unlike [`apply_inplace`] which pairs dimensions `(2k, 2k+1)`
+    /// (interleaved / GPT-NeoX original RoFormer convention), this
+    /// pairs dim `k` with dim `k + D/2` (split-half). The two
+    /// formulations are mathematically equivalent rotations but use
+    /// a different memory layout — and HF weights are baked for the
+    /// half-split layout, so applying interleaved RoPE on HF weights
+    /// scrambles Q/K and breaks attention completely (residual stream
+    /// loses input dependence by layer 1).
+    ///
+    /// Formula:
+    /// ```text
+    ///   x'[k]       = x[k]       * cos(angle) - x[k + D/2] * sin(angle)
+    ///   x'[k + D/2] = x[k + D/2] * cos(angle) + x[k]       * sin(angle)
+    /// ```
+    /// for k in 0..D/2.
+    pub fn apply_inplace_half_split(
+        &self,
+        x: &mut [f32],
+        batch: usize,
+        n_heads: usize,
+        seq: usize,
+        position_offset: usize,
+    ) -> Result<(), RoPEError> {
+        let d = self.head_dim;
+        let half = d / 2;
+        let expected_len = batch * n_heads * seq * d;
+        if x.len() != expected_len {
+            return Err(RoPEError::WrongInputLen {
+                expected: expected_len,
+                got: x.len(),
+            });
+        }
+        if position_offset + seq > self.max_seq {
+            return Err(RoPEError::PositionOverflow {
+                max_seq: self.max_seq,
+                requested: position_offset + seq,
+            });
+        }
+        for b in 0..batch {
+            for h in 0..n_heads {
+                for s in 0..seq {
+                    let p = position_offset + s;
+                    let row_off = b * n_heads * seq * d + h * seq * d + s * d;
+                    let table_off = p * half;
+                    for k in 0..half {
+                        let i0 = row_off + k;
+                        let i1 = row_off + k + half;
+                        let c = self.cos[table_off + k];
+                        let si = self.sin[table_off + k];
+                        let x0 = x[i0];
+                        let x1 = x[i1];
+                        x[i0] = x0 * c - x1 * si;
+                        x[i1] = x1 * c + x0 * si;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Errors raised by RoPE.

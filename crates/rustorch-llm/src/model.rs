@@ -224,13 +224,42 @@ impl LlamaModel {
             let w_up = transpose_2d(&b.w_up, f, d);
             let w_down = transpose_2d(&b.w_down, d, f);
 
+            // NOTE: TeichAI Claude-Distill stores attn_norm/ffn_norm with
+            // mean ≈ 0 instead of mean ≈ 1 (Qwen3 vanilla). Initial guess
+            // was `gamma_eff = 1 + gamma_stored`, but applying that
+            // amplifies the residual by ~80× (because the post-RMSNorm
+            // amplitude becomes ||gamma||·sqrt(d) ≈ 71 instead of 0.89)
+            // and makes the cascade WORSE, not better. So this is NOT
+            // the right convention. The fine-tune likely just learned
+            // small gammas as part of its dynamic. The collapse is
+            // probably caused by something else upstream.
+            let attn_norm = b.attn_norm;
+            let ffn_norm = b.ffn_norm;
+
+            if std::env::var("RUSTORCH_DEBUG_WEIGHT_STATS").is_ok() && i <= 1 {
+                let stats = |name: &str, v: &[f32]| {
+                    let n = v.len();
+                    let mean = v.iter().sum::<f32>() / n as f32;
+                    let sumsq = v.iter().map(|x| x * x).sum::<f32>();
+                    let l2 = sumsq.sqrt();
+                    let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
+                    eprintln!(
+                        "  [w_stats] L{i:>2} {name:>10}  n={n:>10}  l2={l2:>12.4}  mean={mean:>+12.6}  min={min:>+10.4}  max={max:>+10.4}  first8={:?}",
+                        &v[..n.min(8)]
+                    );
+                };
+                stats("ffn_norm_eff", &ffn_norm);
+                stats("w_gate", &w_gate);
+            }
+
             blocks.push(BlockWeights {
-                rms_attn: b.attn_norm,
+                rms_attn: attn_norm,
                 w_q,
                 w_k,
                 w_v,
                 w_o,
-                rms_ffn: b.ffn_norm,
+                rms_ffn: ffn_norm,
                 w_gate,
                 w_up,
                 w_down,
@@ -402,9 +431,22 @@ impl LlamaModel {
             let n = v.len();
             let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             let mean = v.iter().sum::<f32>() / n as f32;
+            let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
+            let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n as f32;
+            let std = var.sqrt();
+            // Print first 4 values + last 3 to compare with llama-eval-callback
+            let first: Vec<String> = v.iter().take(4).map(|x| format!("{:+.4}", x)).collect();
+            let last: Vec<String> = v
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .map(|x| format!("{:+.4}", x))
+                .collect();
             eprintln!(
-                "  [trace] {tag:>20}  l2={l2:>10.4}  mean={mean:>+10.5}  first8={:?}",
-                &v[..n.min(8)]
+                "  [trace] {tag:>22}  l2={l2:>10.3} mean={mean:>+10.4} std={std:>8.3} min={min:>+8.3} max={max:>+8.3}  [{}, ..., {}]",
+                first.join(", "), last.join(", ")
             );
         };
         if trace {
@@ -416,6 +458,9 @@ impl LlamaModel {
             // 1. RMSNorm + Q/K/V proj.
             scratch.h[..d].copy_from_slice(&scratch.x[..d]);
             rms_norm_inplace(&mut scratch.h[..d], &block.rms_attn, cfg.rms_norm_eps);
+            if trace && layer_idx == 0 {
+                dump(&format!("L{layer_idx} attn_h_post_rms"), &scratch.h[..d]);
+            }
             sgemv_dispatch(&scratch.h[..d], &block.w_q, &mut scratch.q[..d], d, d);
             sgemv_dispatch(
                 &scratch.h[..d],
@@ -431,6 +476,11 @@ impl LlamaModel {
                 d,
                 kv_dim,
             );
+            if trace && layer_idx == 0 {
+                dump(&format!("L{layer_idx} q_pre_norm"), &scratch.q[..d]);
+                dump(&format!("L{layer_idx} k_pre_norm"), &scratch.k[..kv_dim]);
+                dump(&format!("L{layer_idx} v"), &scratch.v[..kv_dim]);
+            }
 
             // 2a. Optional Qwen3 per-head Q/K RMSNorm (before RoPE).
             //     Shape is [head_dim]; applied independently to each head's
@@ -455,12 +505,29 @@ impl LlamaModel {
             }
 
             // 2b. RoPE on Q and K.
-            self.rope
-                .apply_inplace(&mut scratch.q[..d], 1, n_heads, 1, position)
-                .unwrap();
-            self.rope
-                .apply_inplace(&mut scratch.k[..kv_dim], 1, n_kv, 1, position)
-                .unwrap();
+            //
+            // HF / GGUF weights are baked for the half-split RoPE
+            // convention used by `apply_rotary_pos_emb`. The legacy
+            // interleaved convention can be re-enabled via env var for
+            // A/B comparison.
+            let rope_interleaved = std::env::var("RUSTORCH_DEBUG_ROPE_INTERLEAVED")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if rope_interleaved {
+                self.rope
+                    .apply_inplace(&mut scratch.q[..d], 1, n_heads, 1, position)
+                    .unwrap();
+                self.rope
+                    .apply_inplace(&mut scratch.k[..kv_dim], 1, n_kv, 1, position)
+                    .unwrap();
+            } else {
+                self.rope
+                    .apply_inplace_half_split(&mut scratch.q[..d], 1, n_heads, 1, position)
+                    .unwrap();
+                self.rope
+                    .apply_inplace_half_split(&mut scratch.k[..kv_dim], 1, n_kv, 1, position)
+                    .unwrap();
+            }
 
             // 3. KV-cache append.
             cache
@@ -503,24 +570,56 @@ impl LlamaModel {
                 d,
                 d,
             );
-            if trace && (layer_idx == 0 || layer_idx == 1) {
-                dump(&format!("L{layer_idx} q[..8]"), &scratch.q[..8]);
-                dump(&format!("L{layer_idx} k[..8]"), &scratch.k[..8]);
-                dump(&format!("L{layer_idx} v[..8]"), &scratch.v[..8]);
-                dump(&format!("L{layer_idx} attn_out"), &scratch.attn_out[..d]);
+            if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} o_out"), &scratch.o_out[..d]);
             }
             for i in 0..d {
                 scratch.x[i] += scratch.o_out[i];
             }
-            if trace && (layer_idx == 0 || layer_idx == 1) {
+            if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} after_attn_res"), &scratch.x[..d]);
             }
 
             // 6. RMSNorm + SwiGLU FFN + residual.
+            //
+            // RUSTORCH_DEBUG_SKIP_FFN_FROM=K disables the FFN sub-block
+            // (sets fc2_out := 0) for all layers >= K. Used to bisect
+            // which layer's FFN destroys the input-dependence of the
+            // residual stream.
+            let skip_ffn_from = std::env::var("RUSTORCH_DEBUG_SKIP_FFN_FROM")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok());
+            if let Some(threshold) = skip_ffn_from {
+                if layer_idx >= threshold {
+                    // Skip: no FFN contribution to residual.
+                    if trace
+                        && (layer_idx == 0 || layer_idx == 1 || layer_idx + 1 == self.blocks.len())
+                    {
+                        dump(
+                            &format!("L{layer_idx} after_ffn_res (FFN SKIPPED)"),
+                            &scratch.x[..d],
+                        );
+                    }
+                    continue;
+                }
+            }
             scratch.h[..d].copy_from_slice(&scratch.x[..d]);
-            rms_norm_inplace(&mut scratch.h[..d], &block.rms_ffn, cfg.rms_norm_eps);
-            if trace && (layer_idx == 0 || layer_idx == 1) {
+            // Optional override: replace ffn_norm gamma with L0's gamma for all
+            // layers (RUSTORCH_DEBUG_FORCE_FFN_NORM_FROM_L0=1) — used to test
+            // whether the per-layer gamma is the source of the input-collapse.
+            let force_l0_gamma = std::env::var("RUSTORCH_DEBUG_FORCE_FFN_NORM_FROM_L0")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if force_l0_gamma && layer_idx > 0 {
+                rms_norm_inplace(
+                    &mut scratch.h[..d],
+                    &self.blocks[0].rms_ffn,
+                    cfg.rms_norm_eps,
+                );
+            } else {
+                rms_norm_inplace(&mut scratch.h[..d], &block.rms_ffn, cfg.rms_norm_eps);
+            }
+            if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} ffn_h_post_rms"), &scratch.h[..d]);
             }
             sgemv_dispatch(
@@ -531,7 +630,7 @@ impl LlamaModel {
                 f,
             );
             sgemv_dispatch(&scratch.h[..d], &block.w_up, &mut scratch.up_out[..f], d, f);
-            if trace && (layer_idx == 0 || layer_idx == 1) {
+            if trace && layer_idx <= 4 {
                 dump(
                     &format!("L{layer_idx} gate_pre_silu"),
                     &scratch.gate_out[..f],
@@ -544,7 +643,7 @@ impl LlamaModel {
                 let s = g / (1.0 + (-g).exp()); // silu(x) = x * sigmoid(x)
                 scratch.gate_out[i] = s * scratch.up_out[i];
             }
-            if trace && (layer_idx == 0 || layer_idx == 1) {
+            if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} swiglu_out"), &scratch.gate_out[..f]);
             }
             sgemv_dispatch(
@@ -554,13 +653,13 @@ impl LlamaModel {
                 f,
                 d,
             );
-            if trace && (layer_idx == 0 || layer_idx == 1) {
+            if trace && layer_idx <= 4 {
                 dump(&format!("L{layer_idx} fc2_out"), &scratch.fc2_out[..d]);
             }
             for i in 0..d {
                 scratch.x[i] += scratch.fc2_out[i];
             }
-            if trace && (layer_idx == 0 || layer_idx == 1 || layer_idx + 1 == self.blocks.len()) {
+            if trace && (layer_idx <= 4 || layer_idx + 1 == self.blocks.len()) {
                 dump(&format!("L{layer_idx} after_ffn_res"), &scratch.x[..d]);
             }
         }
@@ -635,8 +734,20 @@ fn rms_norm_inplace(x: &mut [f32], gamma: &[f32], eps: f32) {
         sq += v * v;
     }
     let inv_rms = 1.0 / (sq * inv_d + eps).sqrt();
-    for i in 0..d {
-        x[i] = x[i] * inv_rms * gamma[i];
+    // RUSTORCH_DEBUG_GAMMA_PLUS_ONE=1 — test the alternate convention
+    // y = x * inv_rms * (1 + gamma) used by some Qwen / TeichAI checkpoints
+    // where gamma is stored as a delta on top of identity.
+    let plus_one = std::env::var("RUSTORCH_DEBUG_GAMMA_PLUS_ONE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if plus_one {
+        for i in 0..d {
+            x[i] = x[i] * inv_rms * (1.0 + gamma[i]);
+        }
+    } else {
+        for i in 0..d {
+            x[i] = x[i] * inv_rms * gamma[i];
+        }
     }
 }
 
