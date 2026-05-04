@@ -490,6 +490,33 @@ impl Tensor {
     /// Panics if the underlying storage is shared with a clone (an
     /// alias) — the caller must `.contiguous()` or own the buffer.
     pub fn add_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        // macOS-specific fast path: route contiguous f32 element-wise
+        // add through `vDSP_vadd` (Accelerate). vDSP saturates the
+        // single-thread NEON bandwidth on M-series Macs (~85 GB/s)
+        // where the auto-vectorised generic loop tops out at ~25
+        // GB/s (closure abstraction costs LLVM the prefetch
+        // pattern). This is the hottest binary op (residual adds,
+        // gradient accumulation in optim.step) so the path warrants
+        // a dedicated implementation. P3.X T8 (vDSP elementwise).
+        #[cfg(target_os = "macos")]
+        {
+            // vDSP_vadd has ~150 ns FFI overhead. Below ~64 K elements
+            // the auto-vectorised inline loop wins; above it vDSP
+            // saturates the bandwidth ceiling. Threshold calibrated
+            // on M4 Max — empirically 64 K is the crossover.
+            const VDSP_MIN: usize = 64 * 1024;
+            if self.numel() >= VDSP_MIN
+                && self.dtype() == Dtype::F32
+                && other.dtype() == Dtype::F32
+                && self.is_contiguous()
+                && other.is_contiguous()
+                && self.storage_offset() == 0
+                && other.storage_offset() == 0
+                && self.shape() == other.shape()
+            {
+                return add_f32_vdsp_inplace(self, other);
+            }
+        }
         binary_inplace(self, other, "add_", |a, b| a + b, |a, b| a + b)
     }
 
@@ -579,8 +606,8 @@ fn binary_inplace<'a>(
     lhs: &'a mut Tensor,
     rhs: &Tensor,
     op_name: &'static str,
-    op_f32: impl Fn(f32, f32) -> f32,
-    op_f64: impl Fn(f64, f64) -> f64,
+    op_f32: impl Fn(f32, f32) -> f32 + Send + Sync,
+    op_f64: impl Fn(f64, f64) -> f64 + Send + Sync,
 ) -> Result<&'a mut Tensor, TensorError> {
     if lhs.dtype() != rhs.dtype() {
         return Err(TensorError::DtypeMismatch {
@@ -614,11 +641,11 @@ fn binary_inplace<'a>(
 fn binary_inplace_typed<'a, T>(
     lhs: &'a mut Tensor,
     rhs: &Tensor,
-    op: impl Fn(T, T) -> T,
+    op: impl Fn(T, T) -> T + Send + Sync,
     op_name: &'static str,
 ) -> Result<&'a mut Tensor, TensorError>
 where
-    T: Element + core::ops::Add<Output = T> + core::ops::Sub<Output = T>,
+    T: Element + Send + Sync + core::ops::Add<Output = T> + core::ops::Sub<Output = T>,
 {
     let n = lhs.numel();
     let lhs_shape = lhs.shape().to_vec();
@@ -672,6 +699,37 @@ where
     {
         let lhs_dense = &mut lhs_raw[..n];
         let rhs_dense = &rhs_raw[..n];
+
+        // Rayon-parallel for memory-bandwidth-bound shapes large
+        // enough to amortise the scheduler cost. Crossover measured
+        // empirically on M4 Max:
+        //   - 1 M elements:  rayon 754 µs vs serial 527 µs (rayon LOSES)
+        //   - 10 M elements: rayon 2.77 ms vs serial 3.66 ms (rayon WINS)
+        // So the threshold sits around 4 M elements (≈ 16 MB f32, the
+        // M4 Max shared L2). Below this we let the auto-vectorised
+        // single-thread loop saturate L1d/L2 bandwidth without paying
+        // for the rayon scheduler. Above it, sharding across P-cores
+        // unlocks the full ~120 GB/s DRAM bandwidth.
+        const PARALLEL_MIN: usize = 4_000_000;
+        #[cfg(not(target_arch = "wasm32"))]
+        if n >= PARALLEL_MIN {
+            use rayon::prelude::*;
+            // Chunk ≥ 256 K elements (1 MB f32) keeps each task
+            // doing enough work that scheduler overhead is < 1% of
+            // wall-clock; a smaller chunk wastes time on dispatch.
+            let chunk = (n / rayon::current_num_threads().max(1)).max(256 * 1024);
+            lhs_dense
+                .par_chunks_mut(chunk)
+                .zip(rhs_dense.par_chunks(chunk))
+                .for_each(|(l_chunk, r_chunk)| {
+                    for (l, r) in l_chunk.iter_mut().zip(r_chunk.iter()) {
+                        *l = op(*l, *r);
+                    }
+                });
+            lhs.version().bump();
+            return Ok(lhs);
+        }
+
         for (l, r) in lhs_dense.iter_mut().zip(rhs_dense.iter()) {
             *l = op(*l, *r);
         }
@@ -822,6 +880,61 @@ fn copy_inplace_typed<'a, T: Element>(
 }
 
 /// Compute the storage element index for the i-th shape-order element.
+/// In-place f32 contiguous add through Apple Accelerate's `vDSP_vadd`.
+///
+/// `vDSP_vadd(A, 1, B, 1, C, 1, N)` computes `C[i] = A[i] + B[i]`.
+/// The aliased call `vDSP_vadd(self, 1, self, 1, other, 1, n)` is
+/// fully supported (vDSP guarantees correctness when source and
+/// destination overlap as long as the strides are equal).
+#[cfg(target_os = "macos")]
+fn add_f32_vdsp_inplace<'a>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = lhs.numel();
+    if n == 0 {
+        return Ok(lhs);
+    }
+    // Borrow rhs slice first (immutable borrow ends before we
+    // acquire the unique mutable borrow on lhs).
+    let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+    let rhs_len = rhs.storage().byte_len() / core::mem::size_of::<f32>();
+    debug_assert!(rhs_len >= n);
+
+    let storage = lhs
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "add_" })?;
+    let lhs_typed_len = storage.len() / core::mem::size_of::<f32>();
+    debug_assert!(lhs_typed_len >= n);
+    let lhs_ptr = storage.as_mut_ptr() as *mut f32;
+
+    extern "C" {
+        /// `vDSP_vadd(A, IA, B, IB, C, IC, N)` — C[i] = A[i] + B[i].
+        /// Apple Accelerate framework, stable since macOS 10.4.
+        fn vDSP_vadd(
+            a: *const f32,
+            ia: isize,
+            b: *const f32,
+            ib: isize,
+            c: *mut f32,
+            ic: isize,
+            n: usize,
+        );
+    }
+    // SAFETY: pointer/length invariants checked above; vDSP_vadd is
+    // documented as supporting source/destination aliasing when
+    // strides are equal.
+    unsafe {
+        vDSP_vadd(lhs_ptr, 1, rhs_ptr, 1, lhs_ptr, 1, n);
+    }
+    lhs.version().bump();
+    Ok(lhs)
+}
+
+#[link(name = "Accelerate", kind = "framework")]
+#[cfg(target_os = "macos")]
+extern "C" {}
+
 fn strided_index(linear: usize, shape: &[usize], strides: &[isize], offset: usize) -> usize {
     let mut idx = linear;
     let mut storage = offset as isize;

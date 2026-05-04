@@ -661,6 +661,7 @@ dependencies = [
  "bytemuck",
  "half",
  "num-traits",
+ "rayon",
  "thiserror",
 ]
 

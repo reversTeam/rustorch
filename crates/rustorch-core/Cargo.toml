@@ -54,6 +54,12 @@ pollster   = { workspace = true, optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.29", optional = true }
 
+# rayon for the contiguous in-place op fast path (binary_inplace,
+# unary_inplace) when n ≥ 1 M elements. Below that the scheduler
+# overhead dominates. wasm32 has no rayon — guarded at call site.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest  = { workspace = true }
