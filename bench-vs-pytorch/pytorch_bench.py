@@ -186,6 +186,74 @@ def bench_embedding(num_embeds, embed_dim, batch):
     return {"op": "embedding", "shape": f"vocab={num_embeds} dim={embed_dim} b={batch}", "median_ns": med, "p99_ns": p99}
 
 
+def bench_rope(batch, n_heads, seq, head_dim):
+    """RoPE — Rotary Position Embeddings. Applied to Q and K every
+    transformer layer of every LLM (Llama / Qwen / Mistral / Phi).
+    """
+    x = torch.empty(batch, n_heads, seq, head_dim).normal_()
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    pos = torch.arange(seq).float()
+    sinusoid = torch.einsum("i,j->ij", pos, inv_freq)  # [seq, hd/2]
+    cos = sinusoid.cos()  # [seq, hd/2]
+    sin = sinusoid.sin()
+
+    def step():
+        with torch.no_grad():
+            # Standard RoPE: rotate (2k, 2k+1) pair
+            x_even = x[..., 0::2]
+            x_odd = x[..., 1::2]
+            rotated_even = x_even * cos - x_odd * sin
+            rotated_odd = x_even * sin + x_odd * cos
+            # Interleave the rotated pairs back into [..., head_dim]
+            stacked = torch.stack([rotated_even, rotated_odd], dim=-1)
+            return stacked.flatten(-2)
+
+    med, p99 = time_fn(step)
+    return {
+        "op": "rope_apply",
+        "shape": f"B={batch} H={n_heads} S={seq} D={head_dim}",
+        "median_ns": med,
+        "p99_ns": p99,
+    }
+
+
+def bench_sampling(vocab_size, top_k, top_p):
+    """Token sampling: temperature + top_k + top_p. One call per
+    decoded token, so the per-call cost matters."""
+    logits = torch.empty(vocab_size).uniform_(-1.0, 1.0)
+
+    def step():
+        with torch.no_grad():
+            # PyTorch standard sampling pipeline.
+            x = logits.clone()
+            # top-k
+            if top_k is not None and top_k < vocab_size:
+                topk_vals, _ = torch.topk(x, top_k)
+                kth = topk_vals[-1]
+                x[x < kth] = float("-inf")
+            # temperature 1, softmax
+            probs = torch.softmax(x, dim=-1)
+            # top-p
+            if top_p is not None and top_p < 1.0:
+                sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                cum = sorted_probs.cumsum(dim=-1)
+                cutoff = (cum < top_p).sum().item() + 1
+                mask = torch.zeros_like(probs)
+                mask[sorted_idx[:cutoff]] = 1
+                probs = probs * mask
+                probs = probs / probs.sum()
+            # Sample.
+            return torch.multinomial(probs, 1)
+
+    med, p99 = time_fn(step)
+    return {
+        "op": "sampling",
+        "shape": f"vocab={vocab_size} top_k={top_k} top_p={top_p}",
+        "median_ns": med,
+        "p99_ns": p99,
+    }
+
+
 def bench_lm_head(rows, d_model, vocab_size):
     """LM head matmul — Linear(d_model -> vocab_size) on `rows` token rows.
 

@@ -266,6 +266,69 @@ fn bench_lm_head(c: &mut Criterion) {
     group.finish();
 }
 
+/// T44 — RoPE bench (Rotary Position Embeddings). On every LLM
+/// forward this is applied to Q and K just before attention; for
+/// long contexts the throughput matters. Validates that our T42
+/// implementation matches or beats PyTorch's equivalent.
+fn bench_rope(c: &mut Criterion) {
+    use rustorch_nn::rope::RoPE;
+
+    let head_dim = 64_usize;
+    let n_heads = 12_usize;
+    let seq = 512_usize;
+    let batch = 1_usize;
+    let n = batch * n_heads * seq * head_dim;
+
+    let rope = RoPE::new(head_dim, 1024, 10000.0);
+    let mut x = det(0xC0DE, n);
+
+    let mut group = c.benchmark_group("rope_apply");
+    group.sample_size(50);
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_secs(2));
+    group.bench_function(
+        BenchmarkId::from_parameter(format!("B{}H{}S{}D{}", batch, n_heads, seq, head_dim)),
+        |bb| {
+            bb.iter(|| {
+                rope.apply_inplace(&mut x, batch, n_heads, seq, 0).unwrap();
+                hint_black_box(&x);
+            });
+        },
+    );
+    group.finish();
+}
+
+/// T44 — sampling bench (top-p + top-k + temperature). One sample
+/// per token at decode time; on a 50K-vocab logits this loop runs
+/// for every generated token, so it must not become a bottleneck.
+fn bench_sampling(c: &mut Criterion) {
+    use rustorch_nn::sampling::{sample_next, SamplingConfig};
+
+    let vocab_size = 50257_usize;
+    let logits = det(0xCA, vocab_size);
+    let cfg = SamplingConfig::default(); // T=1 top_k=50 top_p=0.95
+
+    // Deterministic LCG for reproducibility.
+    let mut s: u64 = 1;
+    let mut next_u = move || {
+        s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        ((s >> 32) as f32) / (u32::MAX as f32)
+    };
+
+    let mut group = c.benchmark_group("sampling");
+    group.sample_size(50);
+    group.bench_function(
+        BenchmarkId::from_parameter(format!("vocab{}_topk50_topp95", vocab_size)),
+        |bb| {
+            bb.iter(|| {
+                let pick = sample_next(&logits, &cfg, &[], &mut next_u);
+                hint_black_box(pick);
+            });
+        },
+    );
+    group.finish();
+}
+
 /// T36 — micro bench: raw `fused_matmul_bias_activation` call
 /// vs the wrapper Linear S=1 path. Isolates the overhead of the
 /// Tensor + Variable wrapping vs the actual sgemv work.
@@ -872,5 +935,7 @@ criterion_group! {
         bench_gpt2_single_token_decode,
         bench_single_token_breakdown,
         bench_linear_S1_micro,
+        bench_rope,
+        bench_sampling,
 }
 criterion_main!(benches);
