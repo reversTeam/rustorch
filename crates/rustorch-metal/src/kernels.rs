@@ -665,6 +665,191 @@ pub fn transpose2d_f32(
     Ok(out)
 }
 
+/// **bf16 multi-simdgroup matmul** — uses
+/// `simdgroup_matrix<bfloat, 8, 8>` (Apple tensor cores at 1.5-2×
+/// the throughput of `<float, 8, 8>` on M3+/M4). Inputs and outputs
+/// are bf16; the f32 → bf16 conversion happens via a separate
+/// `cast_f32_bf16` kernel before this one.
+const MATMUL_SIMDGROUP_BF16_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void matmul_simdgroup_bf16(
+    device const bfloat* a       [[buffer(0)]],
+    device const bfloat* b       [[buffer(1)]],
+    device       bfloat* c       [[buffer(2)]],
+    constant     uint3&  dims    [[buffer(3)]],
+    uint2 tg_pos                  [[threadgroup_position_in_grid]],
+    uint  sg_idx                  [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint K = dims.y;
+    uint N = dims.z;
+
+    uint row_tile = tg_pos.y * 8u;
+    uint col_tile = tg_pos.x * 64u + sg_idx * 8u;
+    if (row_tile >= M || col_tile >= N) { return; }
+
+    simdgroup_matrix<bfloat, 8, 8> mat_a;
+    simdgroup_matrix<bfloat, 8, 8> mat_b;
+    simdgroup_matrix<bfloat, 8, 8> mat_c = simdgroup_matrix<bfloat, 8, 8>(0);
+
+    for (uint k = 0u; k < K; k += 8u) {
+        simdgroup_load(mat_a, a + row_tile * K + k, K);
+        simdgroup_load(mat_b, b + k * N + col_tile, N);
+        simdgroup_multiply_accumulate(mat_c, mat_a, mat_b, mat_c);
+    }
+
+    simdgroup_store(mat_c, c + row_tile * N + col_tile, N);
+}
+"#;
+
+/// Cast f32 → bf16 element-wise.
+const CAST_F32_TO_BF16_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void cast_f32_to_bf16(
+    device const float*  src [[buffer(0)]],
+    device       bfloat* dst [[buffer(1)]],
+    constant     uint&   n   [[buffer(2)]],
+    uint                 gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) { return; }
+    dst[gid] = bfloat(src[gid]);
+}
+"#;
+
+/// Cast bf16 → f32 element-wise.
+const CAST_BF16_TO_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void cast_bf16_to_f32(
+    device const bfloat* src [[buffer(0)]],
+    device       float*  dst [[buffer(1)]],
+    constant     uint&   n   [[buffer(2)]],
+    uint                 gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) { return; }
+    dst[gid] = float(src[gid]);
+}
+"#;
+
+fn cast_f32_to_bf16_kernel(
+    backend: &MetalBackend,
+    src: &Buffer,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    let pipeline = backend.pipeline(
+        "cast_f32_to_bf16",
+        CAST_F32_TO_BF16_SHADER,
+        "cast_f32_to_bf16",
+    )?;
+    let dst = backend.alloc_shared(n * 2)?;
+    let n_buf = backend.alloc_shared(4)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = n_buf.contents() as *mut u32;
+        *p = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src), 0);
+        encoder.set_buffer(1, Some(&dst), 0);
+        encoder.set_buffer(2, Some(&n_buf), 0);
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(dst)
+}
+
+fn cast_bf16_to_f32_kernel(
+    backend: &MetalBackend,
+    src: &Buffer,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    let pipeline = backend.pipeline(
+        "cast_bf16_to_f32",
+        CAST_BF16_TO_F32_SHADER,
+        "cast_bf16_to_f32",
+    )?;
+    let dst = backend.alloc_shared(n * 4)?;
+    let n_buf = backend.alloc_shared(4)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = n_buf.contents() as *mut u32;
+        *p = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src), 0);
+        encoder.set_buffer(1, Some(&dst), 0);
+        encoder.set_buffer(2, Some(&n_buf), 0);
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg = MTLSize::new(256u64.min(max_threads), 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(dst)
+}
+
+/// Run an f32 matmul using bf16 `simdgroup_matrix` internally for
+/// the tensor-core throughput gain. Casts inputs to bf16, runs the
+/// bf16 kernel, casts result back to f32. Net win on M3+/M4 when the
+/// matmul is large enough to amortise the 3 cast kernels.
+pub fn matmul_simdgroup_f32_via_bf16(
+    backend: &MetalBackend,
+    a: &Buffer,
+    b: &Buffer,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "matmul_simdgroup_f32_via_bf16 needs MTLGPUFamily::Metal3".to_string(),
+        ));
+    }
+    if m % 8 != 0 || k % 8 != 0 || n % 64 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "matmul_simdgroup_f32_via_bf16 needs m%8==0, k%8==0, n%64==0: got m={m}, k={k}, n={n}"
+        )));
+    }
+    let a_bf16 = cast_f32_to_bf16_kernel(backend, a, m * k)?;
+    let b_bf16 = cast_f32_to_bf16_kernel(backend, b, k * n)?;
+    let c_bf16 = backend.alloc_shared(m * n * 2)?;
+    let pipeline = backend.pipeline(
+        "matmul_simdgroup_bf16",
+        MATMUL_SIMDGROUP_BF16_SHADER,
+        "matmul_simdgroup_bf16",
+    )?;
+    let dims_buf = backend.alloc_shared(16)?;
+    // SAFETY: shared-storage uniform.
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = m as u32;
+        *p.add(1) = k as u32;
+        *p.add(2) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&a_bf16), 0);
+        encoder.set_buffer(1, Some(&b_bf16), 0);
+        encoder.set_buffer(2, Some(&c_bf16), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let tg = MTLSize::new(256, 1, 1);
+        let n_tiles_x = (n / 64) as u64;
+        let n_tiles_y = (m / 8) as u64;
+        let grid = MTLSize::new(n_tiles_x * 256, n_tiles_y, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    cast_bf16_to_f32_kernel(backend, &c_bf16, m * n)
+}
+
 /// **Multi-simdgroup** matmul kernel — one threadgroup contains 8
 /// simdgroups (256 threads), each computing a separate 8×8 output
 /// tile. Output tile per workgroup: 8×64 (one row of 8 tiles).

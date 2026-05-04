@@ -59,6 +59,10 @@ fn time_train_steps(
         backward(&loss, None).expect("backward");
         opt.step();
     }
+    // Note: this bench may slightly under-measure wgpu perf because
+    // wgpu's queue.submit is async and no explicit drain is issued
+    // here (rustorch-wgpu isn't a direct dep of this crate). The
+    // honest Metal-direct measurement is in cpu_vs_metal_train.
     t0.elapsed()
 }
 
