@@ -2347,6 +2347,169 @@ kernel void sgemv_q4_k_f32(
 }
 "#;
 
+// Transposed-layout variant of the Q4_K sgemv kernel.
+//
+// Layout reshuffle (done once at load time):
+//   original GGUF: row-major [N, K/256, 144] — row n_idx is at offset
+//                  n_idx * blocks_per_row * 144 (contiguous across blocks
+//                  of K, but jumps `bytes_per_row` between adjacent rows).
+//   transposed:    [K/256, N, 144] — for a given block_idx, all N rows
+//                  are contiguous (144 bytes each), so 32 threads in
+//                  the same simdgroup reading the same block_idx hit
+//                  one cache line per ~4 threads instead of N cache
+//                  lines.
+//
+// Reads of `x[block_chunk]` are unchanged (broadcast across the
+// simdgroup is already free). The big win is on the W reads.
+const SGEMV_Q4_K_F32_T_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+
+kernel void sgemv_q4_k_f32_transposed(
+    device const float* x       [[buffer(0)]],   // [K]
+    device const uchar* w_q4k   [[buffer(1)]],   // [K/256, N, 144] transposed
+    device float* y             [[buffer(2)]],   // [N]
+    constant uint2& dims        [[buffer(3)]],   // (K, N)
+    uint gid                    [[thread_position_in_grid]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint n_idx = gid;
+    if (n_idx >= N) return;
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < blocks_per_row; ++blk) {
+        // Transposed offset: block `blk` for row `n_idx` is at
+        //   blk * N * 144 + n_idx * 144
+        device const uchar* block = w_q4k + blk * N * BLOCK_BYTES + n_idx * BLOCK_BYTES;
+
+        ushort d_bits = ((ushort)block[1] << 8) | (ushort)block[0];
+        ushort dmin_bits = ((ushort)block[3] << 8) | (ushort)block[2];
+        float d = float(as_type<half>(d_bits));
+        float dmin = float(as_type<half>(dmin_bits));
+
+        uchar packed[12];
+        for (uint i = 0; i < 12u; ++i) packed[i] = block[4 + i];
+        uchar sc[8], m[8];
+        for (uint i = 0; i < 4u; ++i) {
+            sc[i]     = packed[i] & 0x3F;
+            m[i]      = packed[i + 4] & 0x3F;
+            sc[i + 4] = (packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4);
+            m[i + 4]  = (packed[i + 8] >> 4)   | ((packed[i + 4] >> 6) << 4);
+        }
+
+        device const uchar4* qs4 = (device const uchar4*)(block + 16);
+
+        for (uint jp = 0; jp < 4u; ++jp) {
+            uint j0 = 2u * jp;
+            uint j1 = 2u * jp + 1u;
+            float scale0 = d * float(sc[j0]);
+            float min0   = dmin * float(m[j0]);
+            float scale1 = d * float(sc[j1]);
+            float min1   = dmin * float(m[j1]);
+
+            uint x_low_off  = blk * BLOCK_WEIGHTS + j0 * 32u;
+            uint x_high_off = blk * BLOCK_WEIGHTS + j1 * 32u;
+
+            uint qs_base = jp * 8u;
+            for (uint kg = 0; kg < 8u; ++kg) {
+                uchar4 nibs = qs4[qs_base + kg];
+                uint k = kg * 4u;
+                float n0lo = scale0 * float(nibs.x & 0x0F) - min0;
+                float n1lo = scale0 * float(nibs.y & 0x0F) - min0;
+                float n2lo = scale0 * float(nibs.z & 0x0F) - min0;
+                float n3lo = scale0 * float(nibs.w & 0x0F) - min0;
+                float n0hi = scale1 * float(nibs.x >> 4)   - min1;
+                float n1hi = scale1 * float(nibs.y >> 4)   - min1;
+                float n2hi = scale1 * float(nibs.z >> 4)   - min1;
+                float n3hi = scale1 * float(nibs.w >> 4)   - min1;
+                float4 xlo = float4(x[x_low_off  + k    ],
+                                    x[x_low_off  + k + 1u],
+                                    x[x_low_off  + k + 2u],
+                                    x[x_low_off  + k + 3u]);
+                float4 xhi = float4(x[x_high_off + k    ],
+                                    x[x_high_off + k + 1u],
+                                    x[x_high_off + k + 2u],
+                                    x[x_high_off + k + 3u]);
+                acc += xlo.x * n0lo + xlo.y * n1lo + xlo.z * n2lo + xlo.w * n3lo;
+                acc += xhi.x * n0hi + xhi.y * n1hi + xhi.z * n2hi + xhi.w * n3hi;
+            }
+        }
+    }
+
+    y[n_idx] = acc;
+}
+"#;
+
+/// Q4_K sgemv with transposed weight layout (block-major):
+/// `w_q4k_buf` must be a one-shot repack of the GGUF `[N, K/256, 144]`
+/// row-major bytes into `[K/256, N, 144]` block-major. Use
+/// [`repack_q4_k_transposed`] for the repack helper.
+pub fn sgemv_q4_k_f32_transposed_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32 needs MTLGPUFamily::Metal3 (M3+, A17 Pro+)".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_t: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_transposed",
+        SGEMV_Q4_K_F32_T_SHADER,
+        "sgemv_q4_k_f32_transposed",
+    )?;
+    let dims_buf = backend.alloc_shared(8)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = k as u32;
+        *p.add(1) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let threadgroup_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, threadgroup_size);
+    });
+    Ok(())
+}
+
+/// Repack a Q4_K weight tensor from GGUF `[N, K/256, 144]` row-major
+/// to `[K/256, N, 144]` block-major (one `144`-byte super-block per
+/// (block_idx, row) cell). One-shot, host-side, ~50-700 MB depending
+/// on layer.
+pub fn repack_q4_k_transposed(src: &[u8], k: usize, n: usize) -> Vec<u8> {
+    let blocks_per_row = k / 256;
+    assert_eq!(src.len(), n * blocks_per_row * 144);
+    let mut dst = vec![0u8; src.len()];
+    for n_idx in 0..n {
+        for blk in 0..blocks_per_row {
+            let src_off = n_idx * blocks_per_row * 144 + blk * 144;
+            let dst_off = blk * n * 144 + n_idx * 144;
+            dst[dst_off..dst_off + 144].copy_from_slice(&src[src_off..src_off + 144]);
+        }
+    }
+    dst
+}
+
 /// Direct Q4_K sgemv on Metal — no f32 dequantisation buffer in DRAM.
 /// Variant that writes into a caller-provided output buffer to avoid
 /// the per-call 140KB allocation in the hot path. The caller must
@@ -3038,6 +3201,133 @@ kernel void sgemv_q6_k_f32(
     y[n_idx] = acc;
 }
 "#;
+
+// Transposed-layout variant of sgemv_q6_k_f32 (block-major).
+const SGEMV_Q6_K_F32_T_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q6K_BYTES = 210u;
+constant uint Q6K_WEIGHTS = 256u;
+
+kernel void sgemv_q6_k_f32_transposed(
+    device const float* x       [[buffer(0)]],   // [K]
+    device const uchar* w_q6k   [[buffer(1)]],   // [K/256, N, 210] transposed
+    device float* y             [[buffer(2)]],   // [N]
+    constant uint2& dims        [[buffer(3)]],   // (K, N)
+    uint gid                    [[thread_position_in_grid]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint n_idx = gid;
+    if (n_idx >= N) return;
+
+    uint blocks_per_row = K / Q6K_WEIGHTS;
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < blocks_per_row; ++blk) {
+        // Transposed: block `blk` for row `n_idx` at blk*N*210 + n_idx*210
+        device const uchar* block = w_q6k + blk * N * Q6K_BYTES + n_idx * Q6K_BYTES;
+        device const uchar* ql = block;
+        device const uchar* qh = block + 128;
+        device const char*  sc = (device const char*)(block + 192);
+        ushort d_bits = ((ushort)block[209] << 8) | (ushort)block[208];
+        float d = float(as_type<half>(d_bits));
+
+        for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+            device const uchar* ql_h = ql + half_idx * 64u;
+            device const uchar* qh_h = qh + half_idx * 32u;
+            device const char*  sc_h = sc + half_idx * 8;
+            uint x_h_off = blk * Q6K_WEIGHTS + half_idx * 128u;
+
+            float s1_lo = d * float(sc_h[0]);
+            float s1_hi = d * float(sc_h[1]);
+            float s2_lo = d * float(sc_h[2]);
+            float s2_hi = d * float(sc_h[3]);
+            float s3_lo = d * float(sc_h[4]);
+            float s3_hi = d * float(sc_h[5]);
+            float s4_lo = d * float(sc_h[6]);
+            float s4_hi = d * float(sc_h[7]);
+
+            for (uint l = 0; l < 32u; ++l) {
+                uchar qhh = qh_h[l];
+                int q1 = (int)(ql_h[l]      & 0x0F) | ((int)((qhh >> 0) & 0x03) << 4);
+                int q2 = (int)(ql_h[l + 32] & 0x0F) | ((int)((qhh >> 2) & 0x03) << 4);
+                int q3 = (int)(ql_h[l]      >> 4)   | ((int)((qhh >> 4) & 0x03) << 4);
+                int q4 = (int)(ql_h[l + 32] >> 4)   | ((int)((qhh >> 6) & 0x03) << 4);
+                float s1 = (l < 16u) ? s1_lo : s1_hi;
+                float s2 = (l < 16u) ? s2_lo : s2_hi;
+                float s3 = (l < 16u) ? s3_lo : s3_hi;
+                float s4 = (l < 16u) ? s4_lo : s4_hi;
+                acc += x[x_h_off + l]      * (s1 * float(q1 - 32));
+                acc += x[x_h_off + l + 32] * (s2 * float(q2 - 32));
+                acc += x[x_h_off + l + 64] * (s3 * float(q3 - 32));
+                acc += x[x_h_off + l + 96] * (s4 * float(q4 - 32));
+            }
+        }
+    }
+
+    y[n_idx] = acc;
+}
+"#;
+
+/// Transposed-layout Q6_K sgemv (companion to [`sgemv_q4_k_f32_transposed_into`]).
+pub fn sgemv_q6_k_f32_transposed_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q6k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_f32 needs MTLGPUFamily::Metal3 (M3+, A17 Pro+)".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_f32_t: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q6_k_f32_transposed",
+        SGEMV_Q6_K_F32_T_SHADER,
+        "sgemv_q6_k_f32_transposed",
+    )?;
+    let dims_buf = backend.alloc_shared(8)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = k as u32;
+        *p.add(1) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let threadgroup_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, threadgroup_size);
+    });
+    Ok(())
+}
+
+/// Repack Q6_K from row-major to block-major. See [`repack_q4_k_transposed`].
+pub fn repack_q6_k_transposed(src: &[u8], k: usize, n: usize) -> Vec<u8> {
+    let blocks_per_row = k / 256;
+    assert_eq!(src.len(), n * blocks_per_row * 210);
+    let mut dst = vec![0u8; src.len()];
+    for n_idx in 0..n {
+        for blk in 0..blocks_per_row {
+            let src_off = n_idx * blocks_per_row * 210 + blk * 210;
+            let dst_off = blk * n * 210 + n_idx * 210;
+            dst[dst_off..dst_off + 210].copy_from_slice(&src[src_off..src_off + 210]);
+        }
+    }
+    dst
+}
 
 /// Q6_K equivalent of [`sgemv_q4_k_f32_into`]. Writes into a caller-
 /// provided buffer to avoid the per-call allocation in the hot path.

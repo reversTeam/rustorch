@@ -124,9 +124,13 @@ fn load_metal_weight(backend: &MetalBackend, file: &GgufFile, name: &str) -> Met
         .tensor(name)
         .unwrap_or_else(|| panic!("missing tensor: {name}"));
     let bytes = file.tensor_bytes(t);
-    // GGUF shape ne=[K, N] = numpy [N, K] row-major.
-    // Q4_K / Q6_K bytes are already laid out as N rows of K weights
-    // contiguously, which matches our kernel's expected layout.
+    // GGUF native layout [N, K/256, blk_bytes] row-major matches our
+    // kernel's expected layout — each thread (= one output column)
+    // walks K/256 contiguous super-blocks for its row. Tested
+    // alternative: pre-transpose to [K/256, N, blk_bytes] (block-major)
+    // — turned out to REGRESS perf by ~6% because the per-thread
+    // 144-byte chunks now jump N*144 (~5MB) bytes between blocks,
+    // killing the GPU prefetcher. Sticking with native layout.
     let k = t.shape[0] as usize;
     let n = t.shape[1] as usize;
     MetalWeight {
