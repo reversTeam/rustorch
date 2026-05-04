@@ -1,0 +1,31 @@
+[package]
+name = "rustorch-bench-candle"
+description = "Inference baseline using candle-rs (Metal Q4_K kernels) — measures the upper bound rustorch needs to match for Qwen3-14B Q4_K_M decode."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+# Standalone perf-comparison crate. Not part of the rustorch core
+# inference path — exists only to quantify the gap between our
+# rustorch-llm Metal sgemv work (T68) and a battle-tested
+# Q4_K-on-Metal implementation (candle's `quantized_qwen3` model).
+# Once the rustorch-native path matches or beats this number we
+# can drop the candle dependency.
+
+[dependencies]
+candle-core         = { version = "0.10.2", features = ["metal"] }
+candle-transformers = { version = "0.10.2", features = ["metal"] }
+candle-nn           = { version = "0.10.2", features = ["metal"] }
+tokenizers          = { version = "0.20", default-features = false, features = ["onig"] }
+anyhow              = "1"
+clap                = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "qwen3_candle"
+path = "src/main.rs"

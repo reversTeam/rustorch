@@ -47,6 +47,7 @@ members = [
     "crates/rustorch-cuda",
     "crates/rustorch-metal",
     "crates/rustorch-gguf",
+    "crates/rustorch-bench-candle",
 ]
 exclude = [
     "pytorch", # reference clone of upstream PyTorch (read-only)
