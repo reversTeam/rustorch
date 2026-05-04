@@ -679,6 +679,106 @@ pub fn transpose2d_f32(
     Ok(out)
 }
 
+/// **Multi-simdgroup** matmul kernel — one threadgroup contains 8
+/// simdgroups (256 threads), each computing a separate 8×8 output
+/// tile. Output tile per workgroup: 8×64 (one row of 8 tiles).
+///
+/// This dramatically reduces threadgroup-launch overhead vs the v1
+/// kernel that runs 1 simdgroup per workgroup. On 1024×1024 matmul
+/// the workgroup count drops 8× (from 16384 to 2048), letting the
+/// GPU schedule the work with much better occupancy.
+const MATMUL_SIMDGROUP_F32_MULTISG_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint SG_PER_TG = 8u;
+
+kernel void matmul_simdgroup_f32_multisg(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device       float* c       [[buffer(2)]],
+    constant     uint3& dims    [[buffer(3)]],  // {M, K, N}
+    uint2 tg_pos                [[threadgroup_position_in_grid]],
+    uint  sg_idx                [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint K = dims.y;
+    uint N = dims.z;
+
+    // 8 simdgroups arranged in a single row direction, each
+    // computing one 8x8 output tile. Workgroup output tile = 8x64.
+    uint row_tile = tg_pos.y * 8u;
+    uint col_tile = tg_pos.x * 64u + sg_idx * 8u;
+    if (row_tile >= M || col_tile >= N) { return; }
+
+    simdgroup_matrix<float, 8, 8> mat_a;
+    simdgroup_matrix<float, 8, 8> mat_b;
+    simdgroup_matrix<float, 8, 8> mat_c = simdgroup_matrix<float, 8, 8>(0);
+
+    for (uint k = 0u; k < K; k += 8u) {
+        simdgroup_load(mat_a, a + row_tile * K + k, K);
+        simdgroup_load(mat_b, b + k * N + col_tile, N);
+        simdgroup_multiply_accumulate(mat_c, mat_a, mat_b, mat_c);
+    }
+
+    simdgroup_store(mat_c, c + row_tile * N + col_tile, N);
+}
+"#;
+
+/// Multi-simdgroup matmul on Metal — 8 simdgroups per threadgroup,
+/// each doing one 8×8 output tile. Output tile per workgroup: 8×64.
+/// Same 8-alignment + Metal3 constraints as the v1 single-simdgroup
+/// kernel; specifically `n` must additionally be divisible by 64.
+pub fn matmul_simdgroup_f32_multisg(
+    backend: &MetalBackend,
+    a: &Buffer,
+    b: &Buffer,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "matmul_simdgroup_f32_multisg needs MTLGPUFamily::Metal3".to_string(),
+        ));
+    }
+    if m % 8 != 0 || k % 8 != 0 || n % 64 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "matmul_simdgroup_f32_multisg needs m%8==0, k%8==0, n%64==0: got m={m}, k={k}, n={n}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "matmul_simdgroup_f32_multisg",
+        MATMUL_SIMDGROUP_F32_MULTISG_SHADER,
+        "matmul_simdgroup_f32_multisg",
+    )?;
+    let out = backend.alloc_shared(m * n * 4)?;
+    let dims_buf = backend.alloc_shared(16)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = m as u32;
+        *p.add(1) = k as u32;
+        *p.add(2) = n as u32;
+    }
+    let cmd_buffer = backend.queue.new_command_buffer();
+    let encoder = cmd_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(a), 0);
+    encoder.set_buffer(1, Some(b), 0);
+    encoder.set_buffer(2, Some(&out), 0);
+    encoder.set_buffer(3, Some(&dims_buf), 0);
+    // 256 threads per threadgroup = 8 simdgroups.
+    let tg = MTLSize::new(256, 1, 1);
+    let n_tiles_x = (n / 64) as u64;
+    let n_tiles_y = (m / 8) as u64;
+    let grid = MTLSize::new(n_tiles_x * 256, n_tiles_y, 1);
+    encoder.dispatch_threads(grid, tg);
+    encoder.end_encoding();
+    cmd_buffer.commit();
+    Ok(out)
+}
+
 /// `C = A @ B` matmul using Apple's `simdgroup_matrix<float, 8, 8>`
 /// (Metal 3 family). One simdgroup (32 threads) computes one 8×8
 /// output tile by iterating `K` in chunks of 8.

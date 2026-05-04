@@ -18,9 +18,9 @@
 use crate::backend::MetalBackend;
 use crate::error::MetalError;
 use crate::kernels::{
-    abs_f32, add_f32, div_f32, exp_f32, log_f32, matmul_simdgroup_f32, mean_dim_2d_f32, mean_f32,
-    mul_f32, neg_f32, relu_f32, sigmoid_f32, silu_f32, sqrt_f32, sub_f32, sum_dim_2d_f32, sum_f32,
-    tanh_f32, transpose2d_f32,
+    abs_f32, add_f32, div_f32, exp_f32, log_f32, matmul_simdgroup_f32,
+    matmul_simdgroup_f32_multisg, mean_dim_2d_f32, mean_f32, mul_f32, neg_f32, relu_f32,
+    sigmoid_f32, silu_f32, sqrt_f32, sub_f32, sum_dim_2d_f32, sum_f32, tanh_f32, transpose2d_f32,
 };
 use crate::transfer::tensor_to_cpu;
 use rustorch_core::tensor::device::Device;
@@ -213,8 +213,15 @@ impl Backend for MetalBackend {
         }
         let l = to_gpu(self, lhs).map_err(|e| metal_err("matmul", e))?;
         let r = to_gpu(self, rhs).map_err(|e| metal_err("matmul", e))?;
-        let out =
-            matmul_simdgroup_f32(self, &l, &r, m, k1, n).map_err(|e| metal_err("matmul", e))?;
+        // Multi-simdgroup fast path when N is a multiple of 64 (8
+        // simdgroups × 8 cols each per workgroup). Falls back to the
+        // single-simdgroup kernel for narrower outputs.
+        let out = if n % 64 == 0 {
+            matmul_simdgroup_f32_multisg(self, &l, &r, m, k1, n)
+                .map_err(|e| metal_err("matmul", e))?
+        } else {
+            matmul_simdgroup_f32(self, &l, &r, m, k1, n).map_err(|e| metal_err("matmul", e))?
+        };
         let core = rustorch_core::tensor::storage::MetalStorage::standalone(out, m * n * 4);
         Ok(Tensor::from_metal_storage(core, vec![m, n], lhs.dtype()))
     }
