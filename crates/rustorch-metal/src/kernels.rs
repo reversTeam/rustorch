@@ -2228,6 +2228,144 @@ pub fn sgemv_f32_simd(
     Ok(out)
 }
 
+// =============================================================================
+// sgemv_q4_k_f32 — direct sgemv on Q4_K-quantised weights, no f32 expansion.
+//
+// Reads 144-byte Q4_K super-blocks straight from the GPU buffer, dequantises
+// each block in registers (8 sub-blocks × 32 weights = 256 weights / block,
+// per-sub-block 6-bit scale + 6-bit min, super-block f16 d + f16 dmin), and
+// accumulates the dot product with the matching slice of `x` on the fly.
+//
+// One thread = one output column. The Q4_K weight matrix is laid out
+// `[N, K]` row-major (each output column owns its K weights contiguously,
+// `K / 256` super-blocks of 144 bytes each = `bytes_per_row`). This pattern
+// strides per-row at `bytes_per_row`, which is fine on Apple GPU because
+// each thread reads its own contiguous chunk and there's no cache contention
+// between simdgroup lanes.
+//
+// The big DRAM win: Qwen3-14B `gate_up_proj` (K=5120, N=34816) reads 100 MB
+// of Q4_K bytes vs 712 MB of f32 weights — 7× less bandwidth pressure.
+// =============================================================================
+
+const SGEMV_Q4_K_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+
+kernel void sgemv_q4_k_f32(
+    device const float* x       [[buffer(0)]],   // [K] activation
+    device const uchar* w_q4k   [[buffer(1)]],   // [N, K] Q4_K, row-major: N rows × (K/256) blocks × 144 bytes
+    device float* y             [[buffer(2)]],   // [N] output
+    constant uint2& dims        [[buffer(3)]],   // (K, N)
+    uint gid                    [[thread_position_in_grid]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint n_idx = gid;
+    if (n_idx >= N) return;
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    uint row_off = n_idx * blocks_per_row * BLOCK_BYTES;
+
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < blocks_per_row; ++blk) {
+        device const uchar* block = w_q4k + row_off + blk * BLOCK_BYTES;
+
+        // f16 d (super-block scale for sub-block scales)
+        ushort d_bits = ((ushort)block[1] << 8) | (ushort)block[0];
+        // f16 dmin (super-block scale for sub-block mins)
+        ushort dmin_bits = ((ushort)block[3] << 8) | (ushort)block[2];
+        float d = float(as_type<half>(d_bits));
+        float dmin = float(as_type<half>(dmin_bits));
+
+        // 12 packed scale bytes — unpack into 8 sub-block (sc, m) pairs.
+        uchar packed[12];
+        for (uint i = 0; i < 12; ++i) packed[i] = block[4 + i];
+        uchar sc[8], m[8];
+        for (uint i = 0; i < 4; ++i) {
+            sc[i]     = packed[i] & 0x3F;
+            m[i]      = packed[i + 4] & 0x3F;
+            sc[i + 4] = (packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4);
+            m[i + 4]  = (packed[i + 8] >> 4)   | ((packed[i + 4] >> 6) << 4);
+        }
+
+        // 128 nibble bytes — sub-blocks (j_pair*2, j_pair*2+1) share 32 bytes.
+        device const uchar* qs = block + 16;
+
+        for (uint jp = 0; jp < 4; ++jp) {
+            uint j0 = 2u * jp;
+            uint j1 = 2u * jp + 1u;
+            float scale0 = d * float(sc[j0]);
+            float min0   = dmin * float(m[j0]);
+            float scale1 = d * float(sc[j1]);
+            float min1   = dmin * float(m[j1]);
+
+            uint x_low_off  = blk * BLOCK_WEIGHTS + j0 * 32u;
+            uint x_high_off = blk * BLOCK_WEIGHTS + j1 * 32u;
+
+            for (uint k = 0; k < 32u; ++k) {
+                uchar nib = qs[jp * 32u + k];
+                float w_low  = scale0 * float(nib & 0x0F) - min0;
+                float w_high = scale1 * float(nib >> 4)   - min1;
+                acc += x[x_low_off + k]  * w_low;
+                acc += x[x_high_off + k] * w_high;
+            }
+        }
+    }
+
+    y[n_idx] = acc;
+}
+"#;
+
+/// Direct Q4_K sgemv on Metal — no f32 dequantisation buffer in DRAM.
+///
+/// `x_buf`: f32 activation buffer of length K elements (K * 4 bytes).
+/// `w_q4k_buf`: raw Q4_K weight bytes laid out `[N, K]` row-major
+///   (each row is `K / 256 * 144` bytes).
+/// Returns a freshly-allocated f32 output buffer of length N.
+///
+/// Constraints: `K % 256 == 0` (Q4_K super-block size).
+pub fn sgemv_q4_k_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<Buffer, MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32 needs MTLGPUFamily::Metal3 (M3+, A17 Pro+)".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32 needs K>=1, N>=1, K%256==0: got K={k}, N={n}"
+        )));
+    }
+    let pipeline = backend.pipeline("sgemv_q4_k_f32", SGEMV_Q4_K_F32_SHADER, "sgemv_q4_k_f32")?;
+    let out = backend.alloc_shared(n * 4)?;
+    let dims_buf = backend.alloc_shared(8)?;
+    unsafe {
+        let p = dims_buf.contents() as *mut u32;
+        *p.add(0) = k as u32;
+        *p.add(1) = n as u32;
+    }
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(&out), 0);
+        encoder.set_buffer(3, Some(&dims_buf), 0);
+        let threadgroup_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, threadgroup_size);
+    });
+    Ok(out)
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;

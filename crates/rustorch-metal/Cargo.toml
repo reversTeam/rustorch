@@ -42,6 +42,10 @@ foreign-types = "0.5"
 # Pulled in only by `bench_llm_shapes` example to compare Metal
 # matmul against the Apple Accelerate AMX path used by `rustorch-llm`.
 rustorch-fusion = { workspace = true }
+# Used by `bench_q4k_metal` example for Q4_K weights + correctness ref
+# against the scalar `sgemv_q4_k` CPU implementation.
+rustorch-gguf   = { workspace = true }
+half            = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true
