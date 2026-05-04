@@ -3217,6 +3217,7 @@ dependencies = [
  "rustorch-core",
  "rustorch-cpu",
  "rustorch-derive",
+ "rustorch-fusion",
  "thiserror 1.0.69",
 ]
 

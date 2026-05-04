@@ -232,6 +232,7 @@ fn bench_elementwise_add(c: &mut Criterion) {
 /// where the 8× end-to-end gap vs PyTorch concentrates.
 fn bench_transformer_block_breakdown(c: &mut Criterion) {
     use rustorch_autograd::{no_grad, ops, Variable};
+    use rustorch_fusion::patterns::matmul_bias_act::Activation;
     use rustorch_nn::{LayerNorm, Linear, Module, MultiHeadAttention};
 
     let batch = 2_usize;
@@ -274,8 +275,7 @@ fn bench_transformer_block_breakdown(c: &mut Criterion) {
         bb.iter(|| {
             no_grad(|| {
                 let x = Variable::new(x_tensor.clone());
-                let h = fc1.forward(&x).unwrap();
-                let h = ops::relu(&h).unwrap();
+                let h = fc1.forward_with_activation(&x, Activation::Relu).unwrap();
                 hint_black_box(fc2.forward(&h).unwrap())
             })
         });
@@ -314,6 +314,7 @@ fn bench_transformer_block_breakdown(c: &mut Criterion) {
 /// kernel wins are pointless if the end-to-end block is slower.
 fn bench_transformer_block(c: &mut Criterion) {
     use rustorch_autograd::{no_grad, ops, Variable};
+    use rustorch_fusion::patterns::matmul_bias_act::Activation;
     use rustorch_nn::{LayerNorm, Linear, Module, MultiHeadAttention};
 
     let batch = 2_usize;
@@ -350,10 +351,11 @@ fn bench_transformer_block(c: &mut Criterion) {
                     let h = ln1.forward(&x).unwrap();
                     let h = mha.forward(&h, &h, &h, None).unwrap();
                     let x = ops::add(&x, &h).unwrap();
-                    // FFN sub-block: ln2 -> fc1 -> relu -> fc2 -> residual.
+                    // FFN sub-block: ln2 -> fc1+relu fused -> fc2 -> residual.
+                    // T20: fc1 + relu collapses to a single fused
+                    // matmul+bias+act kernel call (one allocation).
                     let h = ln2.forward(&x).unwrap();
-                    let h = fc1.forward(&h).unwrap();
-                    let h = ops::relu(&h).unwrap();
+                    let h = fc1.forward_with_activation(&h, Activation::Relu).unwrap();
                     let h = fc2.forward(&h).unwrap();
                     let out = ops::add(&x, &h).unwrap();
                     hint_black_box(out)
