@@ -62,6 +62,11 @@ rustorch-optim    = { workspace = true }
 rustorch-data     = { workspace = true }
 rustorch-serde    = { workspace = true }
 
+[dev-dependencies]
+# Used by examples/gpt2_inference_demo.rs to expose the
+# `Activation` enum for the fused Linear forward path.
+rustorch-fusion   = { workspace = true }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
