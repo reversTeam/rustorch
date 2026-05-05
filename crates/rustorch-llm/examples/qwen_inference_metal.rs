@@ -1019,6 +1019,8 @@ fn forward_token(
         }
 
         // 3. QK-norm BEFORE RoPE (Qwen3 HF reference order). All GPU.
+        // (T118 fused norm+rope tried, regressed -3% due to intra-kernel
+        // barrier cost; kernel kept in kernels.rs as research artifact.)
         if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
             rms_norm_per_head_f32(
                 backend,
@@ -1057,7 +1059,7 @@ fn forward_token(
         )
         .unwrap();
 
-        // 4. KV cache append — pure GPU kernel, no drain needed.
+        // 5. KV cache append — pure GPU kernel, no drain needed.
         // (T96 fused variant tried, regressed -2.9% due to thread divergence;
         // see kv_append_kv_f32 in kernels.rs, kept as research artifact.)
         kv_append_f32(
