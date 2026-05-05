@@ -7264,6 +7264,403 @@ pub fn sgemv_q6_k_f32(
     Ok(out)
 }
 
+// ============================================================================
+// T144 — Qwen3.5/3.6 hybrid SSM (Gated DeltaNet) Metal kernels.
+//
+// These four kernels make up the new Metal forward path for the SSM
+// blocks of Qwen3.6-27B and Qwen3.6-35B-A3B (the attention layers of the
+// hybrid models reuse our existing kernels). Decode-time M=1 only —
+// prefill batched variants will land later if needed.
+//
+//   1. ssm_conv1d_step_f32    — depth-wise causal 1-D conv with running
+//                                ring buffer. Per-channel kernel of size
+//                                conv_kernel (typ. 4) × conv_dim (~10240
+//                                for 27B, ~8192 for 35B-A3B). Updates the
+//                                ring buffer in place.
+//   2. l2_norm_per_head_f32   — per-head L2 normalization (sum-of-squares,
+//                                no gamma). Used on Q and K after the conv.
+//   3. delta_net_step_f32     — gated delta-net recurrence. For each head,
+//                                state := exp(gate_h) * state + beta *
+//                                outer(v, k); readout = state @ q.
+//   4. rms_norm_per_head_gated_f32 — per-head RMS norm with shared gamma
+//                                of size head_dim, multiplied pointwise
+//                                by silu(z). Replaces a 3-dispatch chain
+//                                (rms_norm + silu + mul) with one fused op.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. Depth-wise causal 1-D conv with ring-buffer state update
+//
+// Layout:
+//   conv_state : f32 [(kernel - 1) * conv_dim], row-major:
+//                conv_state[t * conv_dim + c] = channel c at history offset t
+//   conv1d_w   : f32 [kernel * conv_dim], row-major:
+//                conv1d_w[k * conv_dim + c] = conv kernel for channel c at lag k
+//   x_in       : f32 [conv_dim] — the new token's qkv_mixed
+//   y_out      : f32 [conv_dim] — output of depth-wise conv (per channel)
+//
+// For each channel c independently:
+//   y[c] = sum_{k=0..K-1} w[k, c] * (k < K-1 ? state[k, c] : x_in[c])
+//   shift state left by one row (state[t-1, c] := state[t, c] for t in 1..K-1)
+//   state[K-2, c] := x_in[c]   ; place current input at the last history slot
+//
+// Dispatch: one thread per channel. We use threadgroups of 64 threads (matches
+// the rest of our pipeline). conv_dim is divisible by 64 in practice (10240,
+// 8192, 6144, etc.), so the dispatch is a clean (conv_dim / 64) threadgroups.
+// ----------------------------------------------------------------------------
+
+const SSM_CONV1D_STEP_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void ssm_conv1d_step_f32(
+    device const float*  x_in        [[buffer(0)]],
+    device const float*  conv1d_w    [[buffer(1)]],
+    device float*        conv_state  [[buffer(2)]],
+    device float*        y_out       [[buffer(3)]],
+    constant uint2&      dims        [[buffer(4)]],   // (conv_kernel, conv_dim)
+    uint                 gid         [[thread_position_in_grid]]
+) {
+    uint kernel_size = dims.x;
+    uint conv_dim    = dims.y;
+    if (gid >= conv_dim) return;
+
+    // Read history (kernel-1 values) for this channel.
+    float acc = 0.0;
+    for (uint t = 0; t + 1 < kernel_size; ++t) {
+        float v = conv_state[t * conv_dim + gid];
+        float w = conv1d_w[t * conv_dim + gid];
+        acc += w * v;
+    }
+    // Add current input × kernel[K-1].
+    float xv = x_in[gid];
+    acc += conv1d_w[(kernel_size - 1) * conv_dim + gid] * xv;
+    y_out[gid] = acc;
+
+    // Update ring buffer: shift left by one timestep, append current input
+    // at last history slot. Each thread handles its own channel — no race.
+    if (kernel_size >= 2) {
+        for (uint t = 0; t + 2 < kernel_size; ++t) {
+            conv_state[t * conv_dim + gid] = conv_state[(t + 1) * conv_dim + gid];
+        }
+        conv_state[(kernel_size - 2) * conv_dim + gid] = xv;
+    }
+}
+"#;
+
+/// T144 — depth-wise causal 1-D conv step + ring-buffer update.
+/// `conv_state` is read+written in place (length `(kernel - 1) * conv_dim`).
+/// `y_out` receives the conv result of length `conv_dim`.
+///
+/// `kernel_size` must be ≥ 1; for kernel_size == 1 the conv is just a per-
+/// channel multiply (no history). Typical kernel_size in Qwen3.6 is 4.
+pub fn ssm_conv1d_step_f32(
+    backend: &MetalBackend,
+    x_in_buf: &Buffer,
+    conv1d_w_buf: &Buffer,
+    conv_state_buf: &Buffer,
+    y_out_buf: &Buffer,
+    kernel_size: usize,
+    conv_dim: usize,
+) -> Result<(), MetalError> {
+    if kernel_size == 0 || conv_dim == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ssm_conv1d_step_f32: kernel_size={kernel_size}, conv_dim={conv_dim}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "ssm_conv1d_step_f32",
+        SSM_CONV1D_STEP_F32_SHADER,
+        "ssm_conv1d_step_f32",
+    )?;
+    let dims = [kernel_size as u32, conv_dim as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_in_buf), 0);
+        encoder.set_buffer(1, Some(conv1d_w_buf), 0);
+        encoder.set_buffer(2, Some(conv_state_buf), 0);
+        encoder.set_buffer(3, Some(y_out_buf), 0);
+        encoder.set_bytes(4, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(conv_dim as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// 2. Per-head L2 normalization (no gamma). Used on Q and K after conv.
+//
+//   For each head h in 0..n_heads:
+//       norm = sqrt(sum_i x[h, i]^2 + eps)
+//       x[h, i] /= norm   for i in 0..head_dim
+//
+// Dispatch: one threadgroup per head, 32 threads/threadgroup (1 simdgroup).
+// Each thread handles head_dim/32 elements (head_dim is 128 in both models).
+// ----------------------------------------------------------------------------
+
+const L2_NORM_PER_HEAD_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void l2_norm_per_head_f32(
+    device float*       x      [[buffer(0)]],
+    constant uint2&     dims   [[buffer(1)]],   // (n_heads, head_dim)
+    constant float&     eps    [[buffer(2)]],
+    uint                tg_id  [[threadgroup_position_in_grid]],
+    ushort              tiisg  [[thread_index_in_simdgroup]]
+) {
+    uint n_heads  = dims.x;
+    uint head_dim = dims.y;
+    uint head     = tg_id;
+    if (head >= n_heads) return;
+
+    uint base = head * head_dim;
+
+    // Sum of squares across the 32 simdgroup lanes.
+    float ss = 0.0;
+    for (uint i = tiisg; i < head_dim; i += 32u) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    ss = simd_sum(ss);
+    float inv = 1.0 / sqrt(ss + eps);
+
+    for (uint i = tiisg; i < head_dim; i += 32u) {
+        x[base + i] = x[base + i] * inv;
+    }
+}
+"#;
+
+/// T144 — per-head L2 normalization in place. `x` has shape `[n_heads,
+/// head_dim]`; each head is normalized independently. `eps` is added to
+/// the sum-of-squares before the sqrt for numerical stability.
+pub fn l2_norm_per_head_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "l2_norm_per_head_f32",
+        L2_NORM_PER_HEAD_F32_SHADER,
+        "l2_norm_per_head_f32",
+    )?;
+    let dims = [n_heads as u32, head_dim as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_bytes(1, 8, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(2, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32, n_heads as u64, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// 3. Gated Delta-Net step — the heart of the SSM block.
+//
+// State per-head shape: [head_dim, head_dim] (= [128, 128] in Qwen3.6).
+// For each head h:
+//   gate = exp(gate_h[h])          ; per-head scalar gate (already includes ssm_a)
+//   beta_h = beta[h]               ; per-head scalar (already sigmoid'd)
+//   for r in 0..head_dim:
+//     v_r = v[h, r]
+//     out_r = 0
+//     for c in 0..head_dim:
+//       updated = gate * state[h, r, c] + beta_h * v_r * k[h, c]
+//       state[h, r, c] = updated
+//       out_r += updated * q[h, c]
+//     out[h, r] = out_r
+//
+// q, k passed as [n_v_heads, head_dim] — caller has already broadcast from
+// n_k_heads to n_v_heads (or they were equal). v has shape [n_v_heads, head_dim].
+//
+// Dispatch decomposition: one threadgroup per (head, row) pair. 32 threads
+// per threadgroup; each thread handles head_dim/32 = 4 columns. simd_sum
+// reduces the readout. State update: each thread writes its own 4 cols
+// — no race.
+// ----------------------------------------------------------------------------
+
+const DELTA_NET_STEP_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void delta_net_step_f32(
+    device const float*  q          [[buffer(0)]],   // [n_v_heads, head_dim]
+    device const float*  k          [[buffer(1)]],   // [n_v_heads, head_dim]
+    device const float*  v          [[buffer(2)]],   // [n_v_heads, head_dim]
+    device const float*  gate_h     [[buffer(3)]],   // [n_v_heads] — already softplus*ssm_a
+    device const float*  beta       [[buffer(4)]],   // [n_v_heads] — already sigmoid'd
+    device float*        state      [[buffer(5)]],   // [n_v_heads, head_dim, head_dim] — read+write
+    device float*        out        [[buffer(6)]],   // [n_v_heads, head_dim]
+    constant uint2&      dims       [[buffer(7)]],   // (n_v_heads, head_dim)
+    uint2                tg_id      [[threadgroup_position_in_grid]],
+    ushort               tiisg      [[thread_index_in_simdgroup]]
+) {
+    uint n_v_heads = dims.x;
+    uint head_dim  = dims.y;
+    uint head = tg_id.y;
+    uint row  = tg_id.x;
+    if (head >= n_v_heads || row >= head_dim) return;
+
+    float gate_val = exp(gate_h[head]);
+    float beta_val = beta[head];
+    float v_r = v[head * head_dim + row];
+
+    // Each thread handles columns [tiisg, tiisg+32, ...]
+    uint state_off = head * head_dim * head_dim + row * head_dim;
+    uint qk_off    = head * head_dim;
+
+    float out_partial = 0.0;
+    for (uint c = tiisg; c < head_dim; c += 32u) {
+        float k_c = k[qk_off + c];
+        float q_c = q[qk_off + c];
+        float updated = gate_val * state[state_off + c] + beta_val * v_r * k_c;
+        state[state_off + c] = updated;
+        out_partial += updated * q_c;
+    }
+
+    // Reduce across the 32 simdgroup threads → one output per (head, row).
+    float row_sum = simd_sum(out_partial);
+    if (tiisg == 0) {
+        out[head * head_dim + row] = row_sum;
+    }
+}
+"#;
+
+/// T144 — gated delta-net step (state update + read-out).
+///
+/// `state` is read+written in place. Shape: `[n_v_heads, head_dim,
+/// head_dim]`. After the call, `out` contains the per-head readout
+/// vector ready for the gated norm.
+///
+/// `q`, `k`, `v` are all `[n_v_heads, head_dim]`. The caller is expected
+/// to have applied L2 norm to q/k and broadcast from n_k_heads to n_v_heads.
+/// `gate_h` is `[n_v_heads]` (already softplus(alpha + dt_bias) * ssm_a).
+/// `beta` is `[n_v_heads]` (already sigmoid).
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net_step_f32(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    k_buf: &Buffer,
+    v_buf: &Buffer,
+    gate_h_buf: &Buffer,
+    beta_buf: &Buffer,
+    state_buf: &Buffer,
+    out_buf: &Buffer,
+    n_v_heads: usize,
+    head_dim: usize,
+) -> Result<(), MetalError> {
+    if n_v_heads == 0 || head_dim == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "delta_net_step_f32: n_v_heads={n_v_heads}, head_dim={head_dim}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "delta_net_step_f32",
+        DELTA_NET_STEP_F32_SHADER,
+        "delta_net_step_f32",
+    )?;
+    let dims = [n_v_heads as u32, head_dim as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_buf), 0);
+        encoder.set_buffer(2, Some(v_buf), 0);
+        encoder.set_buffer(3, Some(gate_h_buf), 0);
+        encoder.set_buffer(4, Some(beta_buf), 0);
+        encoder.set_buffer(5, Some(state_buf), 0);
+        encoder.set_buffer(6, Some(out_buf), 0);
+        encoder.set_bytes(7, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        // Grid: x = row index (head_dim values), y = head index, z = 1.
+        let grid = MTLSize::new(32 * head_dim as u64, n_v_heads as u64, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// 4. Per-head RMSNorm with shared gamma + silu(z) gate, fused.
+//
+// out[h, i] = (x[h, i] / sqrt(mean(x[h]^2) + eps)) * gamma[i] * silu(z[h, i])
+//
+// gamma is shape [head_dim] (shared across heads).
+// z is shape [n_heads, head_dim] — same shape as x.
+//
+// Dispatch: one threadgroup per head, 32 threads/threadgroup.
+// ----------------------------------------------------------------------------
+
+const RMS_NORM_PER_HEAD_GATED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rms_norm_per_head_gated_f32(
+    device float*        x       [[buffer(0)]],   // [n_heads, head_dim] — in place
+    device const float*  gamma   [[buffer(1)]],   // [head_dim]
+    device const float*  z       [[buffer(2)]],   // [n_heads, head_dim]
+    constant uint2&      dims    [[buffer(3)]],   // (n_heads, head_dim)
+    constant float&      eps     [[buffer(4)]],
+    uint                 tg_id   [[threadgroup_position_in_grid]],
+    ushort               tiisg   [[thread_index_in_simdgroup]]
+) {
+    uint n_heads  = dims.x;
+    uint head_dim = dims.y;
+    uint head = tg_id;
+    if (head >= n_heads) return;
+
+    uint base = head * head_dim;
+    float sumsq = 0.0;
+    for (uint i = tiisg; i < head_dim; i += 32u) {
+        float v = x[base + i];
+        sumsq += v * v;
+    }
+    sumsq = simd_sum(sumsq);
+    float inv = 1.0 / sqrt(sumsq / float(head_dim) + eps);
+
+    for (uint i = tiisg; i < head_dim; i += 32u) {
+        float zv = z[base + i];
+        float silu = zv / (1.0 + exp(-zv));
+        x[base + i] = x[base + i] * inv * gamma[i] * silu;
+    }
+}
+"#;
+
+/// T144 — per-head RMS norm × silu(z) fused. `x` is normalized in place
+/// per-head with shared gamma `[head_dim]`, then multiplied by `silu(z)`.
+pub fn rms_norm_per_head_gated_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    gamma_buf: &Buffer,
+    z_buf: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "rms_norm_per_head_gated_f32",
+        RMS_NORM_PER_HEAD_GATED_F32_SHADER,
+        "rms_norm_per_head_gated_f32",
+    )?;
+    let dims = [n_heads as u32, head_dim as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(gamma_buf), 0);
+        encoder.set_buffer(2, Some(z_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32, n_heads as u64, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
