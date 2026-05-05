@@ -2784,6 +2784,150 @@ pub fn sgemv_q4_k_f32_simdcoop_into(
     Ok(())
 }
 
+// T86 — Fused W_down sgemv + residual_add Q4_K simdcoop sgemv.
+//
+// First fusion attempt also tried inlining SwiGLU (silu(gate)*up computed
+// inside this kernel). That regressed by 33% on Qwen3-14B because each
+// output recomputes silu for every K input → with N=5120 and K=17408 the
+// silu+mul cost was multiplied by N (~89M extra silu calls per layer
+// vs 17408 in the standalone swiglu_f32 kernel). The regression was much
+// larger than the dispatch overhead saved by fusion.
+//
+// This version keeps SwiGLU as a separate pre-pass (writing h into an
+// intermediate buffer) and only fuses W_down + residual_add. Replaces 2
+// dispatches per layer (sgemv_q*_simdcoop_into + add_inplace_f32) with 1.
+//
+// Inputs:
+//   `h_buf`:  f32 [K] post-SwiGLU activations (filled by swiglu_f32 first)
+//   `w_q4k`:  Q4_K weights for W_down [N, K] row-major
+//   `y_buf`:  f32 [N] residual stream (xd_buf). In/out: y += dot(h, W[n_idx]).
+//
+// 1 simdgroup per output ensures no two threads write the same y[n_idx],
+// so no atomic needed for the residual add.
+const SGEMV_Q4_K_F32_SIMDCOOP_RESIDUAL_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+
+kernel void sgemv_q4_k_f32_simdcoop_residual(
+    device const float* x       [[buffer(0)]],   // [K] post-SwiGLU h
+    device const uchar* w_q4k   [[buffer(1)]],   // [N, K] W_down Q4_K row-major
+    device float* y             [[buffer(2)]],   // [N] residual stream (in/out)
+    constant uint2& dims        [[buffer(3)]],   // (K, N)
+    uint tg_id                  [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]],
+    uint sg_size                [[threads_per_simdgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint n_idx = tg_id;
+    if (n_idx >= N) return;
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    uint row_off = n_idx * blocks_per_row * BLOCK_BYTES;
+
+    float partial = 0.0;
+
+    for (uint blk = tid; blk < blocks_per_row; blk += sg_size) {
+        device const uchar* block = w_q4k + row_off + blk * BLOCK_BYTES;
+        ushort d_bits = ((ushort)block[1] << 8) | (ushort)block[0];
+        ushort dmin_bits = ((ushort)block[3] << 8) | (ushort)block[2];
+        float d = float(as_type<half>(d_bits));
+        float dmin = float(as_type<half>(dmin_bits));
+        uchar packed[12];
+        for (uint i = 0; i < 12u; ++i) packed[i] = block[4 + i];
+        uchar sc[8], m[8];
+        for (uint i = 0; i < 4u; ++i) {
+            sc[i]     = packed[i] & 0x3F;
+            m[i]      = packed[i + 4] & 0x3F;
+            sc[i + 4] = (packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4);
+            m[i + 4]  = (packed[i + 8] >> 4)   | ((packed[i + 4] >> 6) << 4);
+        }
+        device const uchar4* qs4 = (device const uchar4*)(block + 16);
+        for (uint jp = 0; jp < 4u; ++jp) {
+            uint j0 = 2u * jp;
+            uint j1 = 2u * jp + 1u;
+            float scale0 = d * float(sc[j0]);
+            float min0   = dmin * float(m[j0]);
+            float scale1 = d * float(sc[j1]);
+            float min1   = dmin * float(m[j1]);
+            uint x_low_off  = blk * BLOCK_WEIGHTS + j0 * 32u;
+            uint x_high_off = blk * BLOCK_WEIGHTS + j1 * 32u;
+            uint qs_base = jp * 8u;
+            for (uint kg = 0; kg < 8u; ++kg) {
+                uchar4 nibs = qs4[qs_base + kg];
+                uint kk = kg * 4u;
+                float n0lo = scale0 * float(nibs.x & 0x0F) - min0;
+                float n1lo = scale0 * float(nibs.y & 0x0F) - min0;
+                float n2lo = scale0 * float(nibs.z & 0x0F) - min0;
+                float n3lo = scale0 * float(nibs.w & 0x0F) - min0;
+                float n0hi = scale1 * float(nibs.x >> 4)   - min1;
+                float n1hi = scale1 * float(nibs.y >> 4)   - min1;
+                float n2hi = scale1 * float(nibs.z >> 4)   - min1;
+                float n3hi = scale1 * float(nibs.w >> 4)   - min1;
+                partial += x[x_low_off  + kk    ] * n0lo;
+                partial += x[x_low_off  + kk + 1] * n1lo;
+                partial += x[x_low_off  + kk + 2] * n2lo;
+                partial += x[x_low_off  + kk + 3] * n3lo;
+                partial += x[x_high_off + kk    ] * n0hi;
+                partial += x[x_high_off + kk + 1] * n1hi;
+                partial += x[x_high_off + kk + 2] * n2hi;
+                partial += x[x_high_off + kk + 3] * n3hi;
+            }
+        }
+    }
+
+    float total = simd_sum(partial);
+    if (tid == 0) {
+        // Fused residual add: y[n_idx] already holds x + W_O@attn from
+        // earlier in the layer; we add the FFN tail contribution onto it.
+        y[n_idx] = y[n_idx] + total;
+    }
+}
+"#;
+
+/// T86 — Fused W_down sgemv + residual add (Q4_K simdcoop). Replaces 2
+/// dispatches (sgemv_q4_k_f32_simdcoop_into + add_inplace_f32) with 1.
+/// SwiGLU still runs as a separate pre-pass into `h_buf`.
+pub fn sgemv_q4_k_f32_simdcoop_residual_into(
+    backend: &MetalBackend,
+    h_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    y_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32_simdcoop_residual needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_simdcoop_residual: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_simdcoop_residual",
+        SGEMV_Q4_K_F32_SIMDCOOP_RESIDUAL_SHADER,
+        "sgemv_q4_k_f32_simdcoop_residual",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(h_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 // Same idea for Q6_K.
 const SGEMV_Q6_K_F32_SIMDCOOP_SHADER: &str = r#"
 #include <metal_stdlib>
@@ -2890,6 +3034,122 @@ pub fn sgemv_q6_k_f32_simdcoop_into(
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(w_q6k_buf), 0);
         encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+// T86 — Fused W_down + residual_add Q6_K simdcoop sgemv. Companion to
+// the Q4_K version above. W_down in Qwen3-14B Q4_K_M is systematically
+// Q6_K (210 bytes/super-block). Same fused semantics: y[n_idx] += dot(h, W_q6k[n_idx]).
+const SGEMV_Q6_K_F32_SIMDCOOP_RESIDUAL_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q6K_BYTES = 210u;
+constant uint Q6K_WEIGHTS = 256u;
+
+kernel void sgemv_q6_k_f32_simdcoop_residual(
+    device const float* x       [[buffer(0)]],   // [K] post-SwiGLU h
+    device const uchar* w_q6k   [[buffer(1)]],   // [N, K] W_down Q6_K row-major
+    device float* y             [[buffer(2)]],   // [N] residual stream (in/out)
+    constant uint2& dims        [[buffer(3)]],   // (K, N)
+    uint tg_id                  [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]],
+    uint sg_size                [[threads_per_simdgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint n_idx = tg_id;
+    if (n_idx >= N) return;
+
+    uint blocks_per_row = K / Q6K_WEIGHTS;
+    uint row_off = n_idx * blocks_per_row * Q6K_BYTES;
+
+    float partial = 0.0;
+
+    for (uint blk = tid; blk < blocks_per_row; blk += sg_size) {
+        device const uchar* block = w_q6k + row_off + blk * Q6K_BYTES;
+        device const uchar* ql = block;
+        device const uchar* qh = block + 128;
+        device const char*  sc = (device const char*)(block + 192);
+        ushort d_bits = ((ushort)block[209] << 8) | (ushort)block[208];
+        float d = float(as_type<half>(d_bits));
+
+        for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+            device const uchar* ql_h = ql + half_idx * 64u;
+            device const uchar* qh_h = qh + half_idx * 32u;
+            device const char*  sc_h = sc + half_idx * 8;
+            uint x_h_off = blk * Q6K_WEIGHTS + half_idx * 128u;
+
+            float s1_lo = d * float(sc_h[0]);
+            float s1_hi = d * float(sc_h[1]);
+            float s2_lo = d * float(sc_h[2]);
+            float s2_hi = d * float(sc_h[3]);
+            float s3_lo = d * float(sc_h[4]);
+            float s3_hi = d * float(sc_h[5]);
+            float s4_lo = d * float(sc_h[6]);
+            float s4_hi = d * float(sc_h[7]);
+
+            for (uint l = 0; l < 32u; ++l) {
+                uchar qhh = qh_h[l];
+                int q1 = (int)(ql_h[l]      & 0x0F) | ((int)((qhh >> 0) & 0x03) << 4);
+                int q2 = (int)(ql_h[l + 32] & 0x0F) | ((int)((qhh >> 2) & 0x03) << 4);
+                int q3 = (int)(ql_h[l]      >> 4)   | ((int)((qhh >> 4) & 0x03) << 4);
+                int q4 = (int)(ql_h[l + 32] >> 4)   | ((int)((qhh >> 6) & 0x03) << 4);
+                float s1 = (l < 16u) ? s1_lo : s1_hi;
+                float s2 = (l < 16u) ? s2_lo : s2_hi;
+                float s3 = (l < 16u) ? s3_lo : s3_hi;
+                float s4 = (l < 16u) ? s4_lo : s4_hi;
+                partial += x[x_h_off + l]      * (s1 * float(q1 - 32));
+                partial += x[x_h_off + l + 32] * (s2 * float(q2 - 32));
+                partial += x[x_h_off + l + 64] * (s3 * float(q3 - 32));
+                partial += x[x_h_off + l + 96] * (s4 * float(q4 - 32));
+            }
+        }
+    }
+
+    float total = simd_sum(partial);
+    if (tid == 0) {
+        y[n_idx] = y[n_idx] + total;
+    }
+}
+"#;
+
+/// T86 — Q6_K variant of the fused W_down sgemv + residual add.
+/// Used when W_down is Q6_K (typical of Q4_K_M format).
+pub fn sgemv_q6_k_f32_simdcoop_residual_into(
+    backend: &MetalBackend,
+    h_buf: &Buffer,
+    w_q6k_buf: &Buffer,
+    y_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_f32_simdcoop_residual needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_f32_simdcoop_residual: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q6_k_f32_simdcoop_residual",
+        SGEMV_Q6_K_F32_SIMDCOOP_RESIDUAL_SHADER,
+        "sgemv_q6_k_f32_simdcoop_residual",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(h_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
         encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
         let tg_size = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32 * n as u64, 1, 1);
