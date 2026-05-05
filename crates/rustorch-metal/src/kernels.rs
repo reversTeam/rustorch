@@ -2798,6 +2798,156 @@ pub fn sgemv_q4_k_f32_simdcoop_nr2_into(
     Ok(())
 }
 
+// T92 — Batched Q4_K sgemv kernel (foundation for multi-token forward).
+//
+// Accepts B input vectors of length K (laid out contiguously: x[B*K]) and
+// produces B output vectors of length N (out[B*N]). Each thread computes
+// one output element (n_idx, batch_idx). The Q4_K weight buffer is shared
+// across all B batches — read once per (n_idx, blk) pair, reused for all B.
+//
+// Thread/grid mapping:
+//   - tg_id.x  : n_idx ∈ [0, N)
+//   - tg_id.y  : batch_idx ∈ [0, B)
+//   - 1 thread per output element (no simdgroup K-coop in this baseline
+//     batch kernel; can be added in T93+ as needed)
+//
+// Memory analysis for K=5120, N=5120, B=4:
+//   - W: K*N/2 bytes (Q4_K) = ~7.4 MB; read once, cached for all 4 batches
+//   - x: B*K*4 bytes = 80 KB; read 4 separate vectors
+//   - out: B*N*4 bytes = 80 KB
+//   Per output: (W + B*x + B*out) / (B*N) ≈ K/(N) bytes = 1 byte/output
+//
+// vs B=1 (4 separate sgemv): 4 * (W + K*4 + N*4) / N = ~K * 4 / N bytes/output.
+// Ratio: ~×4 less bandwidth per output for batched.
+const SGEMV_Q4_K_F32_BATCH_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+
+kernel void sgemv_q4_k_f32_batch(
+    device const float* x       [[buffer(0)]],   // [B, K]
+    device const uchar* w_q4k   [[buffer(1)]],   // [N, K] Q4_K row-major
+    device float* y             [[buffer(2)]],   // [B, N]
+    constant uint3& dims        [[buffer(3)]],   // (K, N, B)
+    uint2 gid                   [[thread_position_in_grid]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B = dims.z;
+    uint n_idx = gid.x;
+    uint batch_idx = gid.y;
+    if (n_idx >= N || batch_idx >= B) return;
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    uint row_off = n_idx * blocks_per_row * BLOCK_BYTES;
+    // x base for this batch
+    device const float* xb = x + batch_idx * K;
+
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < blocks_per_row; ++blk) {
+        device const uchar* block = w_q4k + row_off + blk * BLOCK_BYTES;
+        ushort d_bits = ((ushort)block[1] << 8) | (ushort)block[0];
+        ushort dmin_bits = ((ushort)block[3] << 8) | (ushort)block[2];
+        float d = float(as_type<half>(d_bits));
+        float dmin = float(as_type<half>(dmin_bits));
+        uchar packed[12];
+        for (uint i = 0; i < 12u; ++i) packed[i] = block[4 + i];
+        uchar sc[8], m[8];
+        for (uint i = 0; i < 4u; ++i) {
+            sc[i]     = packed[i] & 0x3F;
+            m[i]      = packed[i + 4] & 0x3F;
+            sc[i + 4] = (packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4);
+            m[i + 4]  = (packed[i + 8] >> 4)   | ((packed[i + 4] >> 6) << 4);
+        }
+        device const uchar4* qs4 = (device const uchar4*)(block + 16);
+        for (uint jp = 0; jp < 4u; ++jp) {
+            uint j0 = 2u * jp;
+            uint j1 = 2u * jp + 1u;
+            float scale0 = d * float(sc[j0]);
+            float min0   = dmin * float(m[j0]);
+            float scale1 = d * float(sc[j1]);
+            float min1   = dmin * float(m[j1]);
+            uint x_low_off  = blk * BLOCK_WEIGHTS + j0 * 32u;
+            uint x_high_off = blk * BLOCK_WEIGHTS + j1 * 32u;
+            uint qs_base = jp * 8u;
+            for (uint kg = 0; kg < 8u; ++kg) {
+                uchar4 nibs = qs4[qs_base + kg];
+                uint kk = kg * 4u;
+                float n0lo = scale0 * float(nibs.x & 0x0F) - min0;
+                float n1lo = scale0 * float(nibs.y & 0x0F) - min0;
+                float n2lo = scale0 * float(nibs.z & 0x0F) - min0;
+                float n3lo = scale0 * float(nibs.w & 0x0F) - min0;
+                float n0hi = scale1 * float(nibs.x >> 4)   - min1;
+                float n1hi = scale1 * float(nibs.y >> 4)   - min1;
+                float n2hi = scale1 * float(nibs.z >> 4)   - min1;
+                float n3hi = scale1 * float(nibs.w >> 4)   - min1;
+                acc += xb[x_low_off  + kk    ] * n0lo;
+                acc += xb[x_low_off  + kk + 1] * n1lo;
+                acc += xb[x_low_off  + kk + 2] * n2lo;
+                acc += xb[x_low_off  + kk + 3] * n3lo;
+                acc += xb[x_high_off + kk    ] * n0hi;
+                acc += xb[x_high_off + kk + 1] * n1hi;
+                acc += xb[x_high_off + kk + 2] * n2hi;
+                acc += xb[x_high_off + kk + 3] * n3hi;
+            }
+        }
+    }
+
+    y[batch_idx * N + n_idx] = acc;
+}
+"#;
+
+/// T92 — Batched Q4_K sgemv: compute B independent (x_b @ W^T) in 1 dispatch.
+///
+/// Inputs:
+///   `x_buf`: f32 [B, K] — B input vectors, contiguous batch-major
+///   `w_q4k_buf`: Q4_K weight buffer [N, K/256, 144]
+///   `out_buf`: f32 [B, N] — B output vectors
+///   `k`, `n`, `b`: dimensions
+///
+/// Foundation for multi-token forward (T93+). The W bytes are shared
+/// across all B batches via cache; only x reads scale with B.
+pub fn sgemv_q4_k_f32_batch_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32_batch needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || b == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_batch: K%256==0 required (K={k}, N={n}, B={b})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_batch",
+        SGEMV_Q4_K_F32_BATCH_SHADER,
+        "sgemv_q4_k_f32_batch",
+    )?;
+    let dims = [k as u32, n as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, b as u64, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 // T91 — Faithful port of llama.cpp's `kernel_mul_mv_q4_K_f32_impl`.
 //
 // Three optims combined that our previous nr2 missed:
@@ -5846,6 +5996,86 @@ mod tests {
                 assert!(
                     r < 1e-3,
                     "K={k} N={n} mismatch: single={a} quad={b} (rel {r:.3e})"
+                );
+            }
+        }
+    }
+
+    /// T92 — Batched Q4_K sgemv must match B independent single-vector
+    /// sgemv calls within FMA reorder tolerance.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemv_q4_k_f32_batch_matches_singles() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[batch] skipping: no Metal3");
+            return;
+        }
+        let k = 5120usize;
+        let n = 5120usize;
+        let b = 4usize;
+
+        let w_bytes = build_test_q4k_matrix(n, k, 137);
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+        }
+
+        // Build B different x vectors (different seeds) packed contiguous.
+        let mut x_all = vec![0.0f32; b * k];
+        for batch in 0..b {
+            for i in 0..k {
+                x_all[batch * k + i] = ((i as f32 + 1.0) * 0.001 * (batch as f32 + 1.0)).sin();
+            }
+        }
+        let x_buf = backend.alloc_shared(b * k * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x_all.as_ptr(), x_buf.contents() as *mut f32, b * k);
+        }
+
+        // Reference: B separate sgemv calls.
+        let mut y_ref = vec![0.0f32; b * n];
+        for batch in 0..b {
+            let xb_buf = backend.alloc_shared(k * 4).unwrap();
+            let yb_buf = backend.alloc_shared(n * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    x_all[batch * k..(batch + 1) * k].as_ptr(),
+                    xb_buf.contents() as *mut f32,
+                    k,
+                );
+            }
+            sgemv_q4_k_f32_into(backend, &xb_buf, &w_buf, &yb_buf, k, n).unwrap();
+            backend.drain();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    yb_buf.contents() as *const f32,
+                    y_ref[batch * n..(batch + 1) * n].as_mut_ptr(),
+                    n,
+                );
+            }
+        }
+
+        // Batched call.
+        let y_batch_buf = backend.alloc_shared(b * n * 4).unwrap();
+        sgemv_q4_k_f32_batch_into(backend, &x_buf, &w_buf, &y_batch_buf, k, n, b).unwrap();
+        backend.drain();
+        let y_batch = unsafe {
+            std::slice::from_raw_parts(y_batch_buf.contents() as *const f32, b * n).to_vec()
+        };
+
+        for batch in 0..b {
+            for j in 0..n {
+                let a = y_ref[batch * n + j];
+                let b_val = y_batch[batch * n + j];
+                let r = (a - b_val).abs() / a.abs().max(1e-3);
+                assert!(
+                    r < 1e-3,
+                    "batch={batch} j={j} mismatch: single={a} batch={b_val} (rel {r:.3e})"
                 );
             }
         }
