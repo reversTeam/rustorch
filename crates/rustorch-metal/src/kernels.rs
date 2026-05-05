@@ -3262,6 +3262,313 @@ pub fn sgemv_q4_k_f32_lcpp_nsg2_into(
     Ok(())
 }
 
+// T142 — Q5_K matmul-vec kernel.
+//
+// Q5_K format: 256 weights / 176-byte super-block.
+//   2 bytes d (half) + 2 bytes dmin (half) + 12 packed scales/mins
+//   + 32 bytes qh (high bit per weight) + 128 bytes qs (low 4 bits per weight)
+//
+// 8 sub-blocks of 32 weights each. Sub-block i has its own (sc, m) pair
+// (encoded in the 12 scales bytes — same packing as Q4_K).
+// Per-weight value: w = d * sc_i * (low4 + (qh & u_bit ? 16 : 0)) - dmin * m_i
+//
+// Dispatch matches llama.cpp's `N_R0_Q5_K = 1, N_SG_Q5_K = 2`:
+//   - 64 threads/threadgroup (2 simdgroups × 32)
+//   - Each simdgroup processes NR0_Q5K = 1 row
+//   - Each threadgroup processes NSG_Q5K * NR0_Q5K = 2 rows
+//   - first_row = (tg_id * NSG + sgitg) * NR0_Q5K
+//
+// We use NR0=1 (vs Q4_K's NR0=2) because Q5_K has more per-block state
+// (qh + qs split + 8 sub-block scales) which raises register pressure.
+const SGEMV_Q5_K_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q5K_BYTES = 176u;
+constant uint Q5K_WEIGHTS = 256u;
+constant short NR0_Q5K = 1;
+constant short NSG_Q5K = 2;
+constant ushort KMASK1 = 0x3f3f;
+constant ushort KMASK2 = 0x0f0f;
+constant ushort KMASK3 = 0xc0c0;
+
+kernel void sgemv_q5_k_f32_lcpp_nsg2(
+    device const float*  x      [[buffer(0)]],
+    device const uchar*  w_q5k  [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint2&      dims   [[buffer(3)]],
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint blocks_per_row = K / Q5K_WEIGHTS;
+
+    // tg_id covers NSG*NR0 rows; this simdgroup's first row.
+    uint first_row = (tg_id * (uint)NSG_Q5K + (uint)sgitg) * (uint)NR0_Q5K;
+    if (first_row >= N) return;
+
+    short tid = (short)(tiisg / 4u);   // 0..7
+    short ix  = (short)(tiisg % 4u);   // 0..3 — partition K-blocks across 4 stripes
+    short iq  = tid / 4;                // 0 or 1 — pick low/high half of qs
+    short ir  = tid % 4;                // 0..3 — pick 8-element stripe within half
+
+    short l0 = 8 * ir;
+    short q_offset = 32 * iq + l0;
+    short y_offset = 64 * iq + l0;
+
+    // qh bit-position selectors for the 4 32-element groups within a sub-block-pair.
+    uchar hm1 = 1u << (2*iq);
+    uchar hm2 = hm1 << 1;
+    uchar hm3 = hm1 << 4;
+    uchar hm4 = hm2 << 4;
+
+    int nb = (int)blocks_per_row;
+    uint row_stride = blocks_per_row * Q5K_BYTES;
+
+    float sumf = 0.0;
+    float yl[16];
+    float yh[16];
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    // Walk x in stripes of 4 super-blocks, each thread loading its 16 floats
+    // (low half) + 16 floats (high half) into yl/yh registers. ix selects which
+    // of the 4 stripes this thread participates in.
+    device const float* y1 = x + (uint)ix * Q5K_WEIGHTS + (uint)y_offset;
+
+    for (int i = ix; i < nb; i += 4) {
+        device const float* y2 = y1 + 128;
+        float4 sumy = {0.0, 0.0, 0.0, 0.0};
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l + 0];   sumy[0] += yl[l + 0];
+            yl[l + 8] = y1[l + 32];  sumy[1] += yl[l + 8];
+            yh[l + 0] = y2[l + 0];   sumy[2] += yh[l + 0];
+            yh[l + 8] = y2[l + 32];  sumy[3] += yh[l + 8];
+        }
+
+        // Single-row inner: this simdgroup processes exactly NR0=1 row.
+        device const uchar* block = w_q5k + (uint64_t)first_row * row_stride + (uint)i * Q5K_BYTES;
+        device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+        float d    = float(as_type<half>(dh_ptr[0]));
+        float dmin = float(as_type<half>(dh_ptr[1]));
+
+        // Scales/mins follow the same packing as Q4_K (12 bytes at offset 4).
+        device const uint16_t* a = (device const uint16_t*)(block + 4) + iq;
+        sc16[0] = a[0] & KMASK1;
+        sc16[1] = a[2] & KMASK1;
+        sc16[2] = ((a[4] >> 0) & KMASK2) | ((a[0] & KMASK3) >> 2);
+        sc16[3] = ((a[4] >> 4) & KMASK2) | ((a[2] & KMASK3) >> 2);
+
+        // qh (high bit per weight) follows scales: 32 bytes at offset 16.
+        device const uchar* qh = (device const uchar*)(block + 16) + (uint)l0;
+        // qs (low 4 bits per weight): 128 bytes at offset 16+32=48.
+        device const uchar* q1 = (device const uchar*)(block + 48) + (uint)q_offset;
+        device const uchar* q2 = q1 + 64;
+
+        float4 acc1 = {0.0, 0.0, 0.0, 0.0};
+        float4 acc2 = {0.0, 0.0, 0.0, 0.0};
+        for (short l = 0; l < 8; ++l) {
+            uchar h = qh[l];
+            acc1[0] += yl[l + 0] * (float)(q1[l] & 0x0F);
+            acc1[1] += yl[l + 8] * (float)(q1[l] & 0xF0);
+            acc1[2] += yh[l + 0] * (float)(q2[l] & 0x0F);
+            acc1[3] += yh[l + 8] * (float)(q2[l] & 0xF0);
+            acc2[0] += (h & hm1) ? yl[l + 0] : 0.0;
+            acc2[1] += (h & hm2) ? yl[l + 8] : 0.0;
+            acc2[2] += (h & hm3) ? yh[l + 0] : 0.0;
+            acc2[3] += (h & hm4) ? yh[l + 8] : 0.0;
+        }
+
+        sumf += d * (
+            float(sc8[0]) * (acc1[0]        + 16.0 * acc2[0]) +
+            float(sc8[1]) * (acc1[1]/16.0   + 16.0 * acc2[1]) +
+            float(sc8[4]) * (acc1[2]        + 16.0 * acc2[2]) +
+            float(sc8[5]) * (acc1[3]/16.0   + 16.0 * acc2[3])
+        ) - dmin * (
+            sumy[0] * float(sc8[2]) +
+            sumy[1] * float(sc8[3]) +
+            sumy[2] * float(sc8[6]) +
+            sumy[3] * float(sc8[7])
+        );
+
+        y1 += 4 * (int)Q5K_WEIGHTS;
+    }
+
+    // Reduce across the 32 simdgroup threads into the row output.
+    if (first_row < N) {
+        float row_sum = simd_sum(sumf);
+        if (tiisg == 0) {
+            y[first_row] = row_sum;
+        }
+    }
+}
+"#;
+
+/// T142 — Q5_K matmul-vec via NSG=2 dispatch (one row per simdgroup,
+/// two simdgroups per threadgroup, two rows per threadgroup). Mirrors
+/// our Q4_K / Q6_K nsg2 helpers but with the Q5_K block layout (high
+/// bit + low 4 bits split, 176-byte block).
+///
+/// Used by both Qwen3.6-27B (`ssm_out.weight` is Q5_K) and Qwen3.6-35B-A3B
+/// (`ffn_down_exps.weight` per-expert blocks are Q5_K).
+pub fn sgemv_q5_k_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q5k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q5_k_f32_lcpp_nsg2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q5_k_f32_lcpp_nsg2: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q5_k_f32_lcpp_nsg2",
+        SGEMV_Q5_K_F32_LCPP_NSG2_SHADER,
+        "sgemv_q5_k_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q5k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        // 64 threads/tg = 2 simdgroups × 32. Each tg processes NSG*NR0 = 2 rows.
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(2);
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// T142 — Q8_0 matmul-vec kernel.
+//
+// Q8_0 format: 32 weights / 34-byte block. 2 bytes d (half) + 32 bytes int8
+// quants. Per-weight: w = d * (int8_value).
+//
+// Dispatch: NR0=2, NSG=2 (matches our existing lcpp_nsg2 pattern for Q4_K).
+//   - 64 threads/threadgroup
+//   - Each simdgroup processes 2 rows
+//   - Each threadgroup processes 4 rows
+//
+// Each thread reads one int8 value per block stride (stride = 32) and one
+// float of x. The 32 threads in a simdgroup collaboratively cover all 32
+// weights of one block.
+const SGEMV_Q8_0_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q8_0_WEIGHTS = 32u;
+constant uint Q8_0_BYTES = 34u;
+constant short NR0_Q80 = 2;
+constant short NSG_Q80 = 2;
+
+kernel void sgemv_q8_0_f32_lcpp_nsg2(
+    device const float*  x      [[buffer(0)]],
+    device const uchar*  w_q8   [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint2&      dims   [[buffer(3)]],
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint blocks_per_row = K / Q8_0_WEIGHTS;
+
+    uint first_row = (tg_id * (uint)NSG_Q80 + (uint)sgitg) * (uint)NR0_Q80;
+    if (first_row >= N) return;
+
+    int nb = (int)blocks_per_row;
+    uint row_stride = blocks_per_row * Q8_0_BYTES;
+
+    // Each thread handles 1 weight position within a block, walking blocks in stride 32.
+    short lane = (short)tiisg; // 0..31
+
+    float sumf[2] = {0.0, 0.0};
+
+    for (int ib = 0; ib < nb; ++ib) {
+        // Load x for this block at this lane.
+        float xv = x[ib * (int)Q8_0_WEIGHTS + (int)lane];
+
+        for (short row = 0; row < NR0_Q80; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+            device const uchar* block = w_q8 + (uint64_t)nrow * row_stride + (uint)ib * Q8_0_BYTES;
+            // d = half at offset 0
+            device const uint16_t* dh = (device const uint16_t*)block;
+            float d = float(as_type<half>(dh[0]));
+            // quants: int8 starting at offset 2
+            device const char* qs = (device const char*)(block + 2);
+            int q = (int)qs[lane];
+            sumf[row] += d * (float)q * xv;
+        }
+    }
+
+    // Reduce across the 32 lanes into the per-row output.
+    for (short row = 0; row < NR0_Q80; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) continue;
+        float row_sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y[nrow] = row_sum;
+        }
+    }
+}
+"#;
+
+/// T142 — Q8_0 matmul-vec. Used by Qwen3.6-35B-A3B which stores
+/// `token_embd.weight` and several attention-block tensors in Q8_0.
+/// Same dispatch geometry as our Q4_K nsg2 kernel: NR0=2, NSG=2.
+pub fn sgemv_q8_0_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q8_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q8_0_f32_lcpp_nsg2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 32 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q8_0_f32_lcpp_nsg2: K%32==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q8_0_f32_lcpp_nsg2",
+        SGEMV_Q8_0_F32_LCPP_NSG2_SHADER,
+        "sgemv_q8_0_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q8_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(4);
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T91 — Faithful port of llama.cpp's `kernel_mul_mv_q4_K_f32_impl` with
 /// N_R0_Q4_K=2. Combines load-x-once (yl/yh registers), factored Q4_K
 /// formula (d*combined - dmin*sumy*sc_odd), and 2-row simdgroup processing.
