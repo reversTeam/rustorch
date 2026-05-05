@@ -585,6 +585,208 @@ impl RankStats {
             );
         }
     }
+
+    /// T105 — Validate active subspace via cosine similarity at varying K.
+    /// Splits samples into calibration (first half) and validation (second
+    /// half). Computes top-K eigenvectors of the calibration Gram matrix,
+    /// projects validation samples onto the K-dim subspace, and reports
+    /// the mean cosine(x, P P^T x) — i.e., the fraction of energy captured.
+    ///
+    /// Per layer for K ∈ {8, 16, 32, 64, 128}: average + worst-case cosine.
+    fn print_active_subspace_validation(&self) {
+        let k_list = [8usize, 16, 32, 64, 128];
+
+        println!(
+            "\n=== T105 active subspace cosine validation ({} layers) ===",
+            self.samples_per_layer.len(),
+        );
+        println!("  Per-layer mean cosine²(x, P P^T x) at varying subspace dim K:");
+        println!(
+            "  {:<6} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "layer", "n_use", "K=8", "K=16", "K=32", "K=64", "K=128"
+        );
+
+        let mut sum_per_k = [0.0f64; 5];
+        let mut count = 0;
+
+        for (li, samples) in self.samples_per_layer.iter().enumerate() {
+            let n_have = samples.len();
+            if n_have < 16 {
+                continue;
+            }
+            let n_calib = n_have / 2;
+            let cosines =
+                Self::cosines_for_layer(&samples[..n_calib], &samples[n_calib..], &k_list, self.d);
+            for (idx, &c) in cosines.iter().enumerate() {
+                sum_per_k[idx] += c;
+            }
+            count += 1;
+            println!(
+                "  {:<6} {:>6} {:>10.4} {:>10.4} {:>10.4} {:>10.4} {:>10.4}",
+                li, n_have, cosines[0], cosines[1], cosines[2], cosines[3], cosines[4]
+            );
+        }
+        if count > 0 {
+            println!(
+                "  {:<6} {:>6} {:>10.4} {:>10.4} {:>10.4} {:>10.4} {:>10.4} (mean)",
+                "----",
+                "",
+                sum_per_k[0] / count as f64,
+                sum_per_k[1] / count as f64,
+                sum_per_k[2] / count as f64,
+                sum_per_k[3] / count as f64,
+                sum_per_k[4] / count as f64,
+            );
+            println!("\nDecision (cos² ≥ 0.99 = 99% energy captured):");
+            for (idx, &k) in k_list.iter().enumerate() {
+                let avg = sum_per_k[idx] / count as f64;
+                let mark = if avg >= 0.99 {
+                    "✓"
+                } else if avg >= 0.95 {
+                    "~"
+                } else {
+                    "✗"
+                };
+                println!(
+                    "  {} K={:>3}: avg cos² = {:.4} {}",
+                    mark,
+                    k,
+                    avg,
+                    if avg >= 0.99 {
+                        " — ENERGY ALMOST FULLY PRESERVED, projection viable"
+                    } else if avg >= 0.95 {
+                        " — 95% preserved, marginal"
+                    } else {
+                        " — too much info lost"
+                    }
+                );
+            }
+        }
+    }
+
+    /// For one layer, compute cos²(x, P P^T x) on val samples for each K.
+    /// Returns [cos²(K=8), cos²(K=16), cos²(K=32), cos²(K=64), cos²(K=128)].
+    fn cosines_for_layer(
+        calib: &[Vec<f32>],
+        val: &[Vec<f32>],
+        k_list: &[usize],
+        d: usize,
+    ) -> [f64; 5] {
+        let n = calib.len();
+        let max_k = *k_list.iter().max().unwrap();
+        let k_eff = max_k.min(n.saturating_sub(1));
+
+        // Compute Gram = calib · calib^T (n × n, symmetric)
+        let mut g = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in i..n {
+                let mut acc = 0.0f64;
+                let si = &calib[i];
+                let sj = &calib[j];
+                for kk in 0..d {
+                    acc += si[kk] as f64 * sj[kk] as f64;
+                }
+                g[i * n + j] = acc;
+                g[j * n + i] = acc;
+            }
+        }
+
+        // Top-K eigenvectors via power iteration with deflation.
+        let mut eigvals = vec![0.0f64; k_eff];
+        let mut eigvecs = vec![0.0f64; k_eff * n];
+        let mut g_curr = g.clone();
+        for ki in 0..k_eff {
+            let mut v = vec![1.0f64 / (n as f64).sqrt(); n];
+            for _ in 0..40 {
+                let mut nv = vec![0.0f64; n];
+                for i in 0..n {
+                    let mut acc = 0.0f64;
+                    for j in 0..n {
+                        acc += g_curr[i * n + j] * v[j];
+                    }
+                    nv[i] = acc;
+                }
+                let norm: f64 = nv.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm > 1e-30 {
+                    for x in nv.iter_mut() {
+                        *x /= norm;
+                    }
+                }
+                v = nv;
+            }
+            // Eigenvalue: λ = v^T G v (using current G_curr — eigvec is for original G though)
+            // Use original g (not deflated) for correct eigenvalue:
+            let mut gv = vec![0.0f64; n];
+            for i in 0..n {
+                let mut acc = 0.0f64;
+                for j in 0..n {
+                    acc += g_curr[i * n + j] * v[j];
+                }
+                gv[i] = acc;
+            }
+            let lambda: f64 = (0..n).map(|i| v[i] * gv[i]).sum();
+            eigvals[ki] = lambda.max(1e-30);
+            for i in 0..n {
+                eigvecs[ki * n + i] = v[i];
+            }
+            // Deflate: G' = G_curr - λ v v^T
+            for i in 0..n {
+                for j in 0..n {
+                    g_curr[i * n + j] -= lambda * v[i] * v[j];
+                }
+            }
+        }
+
+        // For each val sample, compute cos² for each K.
+        let mut sum_cos2 = [0.0f64; 5];
+        for x_test in val {
+            let xt_norm_sq: f64 = x_test.iter().map(|&v| (v as f64) * (v as f64)).sum();
+            if xt_norm_sq < 1e-30 {
+                continue;
+            }
+
+            // z[i] = calib[i] · x_test
+            let mut z = vec![0.0f64; n];
+            for i in 0..n {
+                let mut acc = 0.0f64;
+                let si = &calib[i];
+                for kk in 0..d {
+                    acc += si[kk] as f64 * x_test[kk] as f64;
+                }
+                z[i] = acc;
+            }
+
+            // For each K, project onto top-K principal directions:
+            //   v_k = X^T u_k / sqrt(λ_k)  (principal direction in d-space)
+            //   coef_k = v_k · x_test = (X^T u_k / sqrt(λ_k)) · x_test
+            //                         = (u_k^T X) · x_test / sqrt(λ_k)
+            //                         = u_k · z / sqrt(λ_k)
+            //   ||x_proj||² = sum coef_k² (since v_k orthonormal)
+            for (idx, &k_target) in k_list.iter().enumerate() {
+                let k_use = k_target.min(k_eff);
+                let mut energy = 0.0f64;
+                for ki in 0..k_use {
+                    let mut coef = 0.0f64;
+                    for i in 0..n {
+                        coef += eigvecs[ki * n + i] * z[i];
+                    }
+                    coef /= eigvals[ki].sqrt();
+                    energy += coef * coef;
+                }
+                let cos2 = energy / xt_norm_sq;
+                sum_cos2[idx] += cos2.min(1.0);
+            }
+        }
+
+        let n_val = val.len() as f64;
+        [
+            sum_cos2[0] / n_val,
+            sum_cos2[1] / n_val,
+            sum_cos2[2] / n_val,
+            sum_cos2[3] / n_val,
+            sum_cos2[4] / n_val,
+        ]
+    }
 }
 
 // T88a — N-gram hit rate analysis on a generated sequence. Replays the
@@ -2022,6 +2224,7 @@ fn main() -> ExitCode {
     }
     if rank_profile {
         rank_stats.print_breakdown();
+        rank_stats.print_active_subspace_validation();
     }
     println!("\ngenerated: {:?}", generated);
     ExitCode::SUCCESS
