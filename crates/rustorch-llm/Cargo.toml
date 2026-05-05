@@ -43,3 +43,8 @@ required-features = []
 [[example]]
 name = "qwen35_inspect"
 path = "examples/qwen35_inspect.rs"
+
+[[example]]
+name = "qwen35_metal_kernel_parity"
+path = "examples/qwen35_metal_kernel_parity.rs"
+required-features = []
