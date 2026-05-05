@@ -59,6 +59,8 @@ const Q8_0_BYTES: usize = 2 + 32;
 pub const QK_K: usize = 256;
 /// Wire-format size of one Q4_K super-block (144 bytes: 2 d + 2 dmin + 12 scales + 128 nibbles).
 pub const Q4_K_BYTES: usize = 2 + 2 + 12 + 128;
+/// Wire-format size of one Q5_K super-block (176 bytes: 2 d + 2 dmin + 12 scales + 32 qh + 128 qs).
+pub const Q5_K_BYTES: usize = 2 + 2 + 12 + 32 + 128;
 /// Wire-format size of one Q6_K super-block (210 bytes: 128 ql + 64 qh + 16 i8 scales + 2 d_f16).
 pub const Q6_K_BYTES: usize = 128 + 64 + 16 + 2;
 
@@ -88,6 +90,7 @@ pub fn dequantize_block_chunk(
         GgmlType::BF16 => dequant_bf16(src, dst),
         GgmlType::Q8_0 => dequant_q8_0(src, dst),
         GgmlType::Q4_K => dequant_q4_k(src, dst),
+        GgmlType::Q5_K => dequant_q5_k(src, dst),
         GgmlType::Q6_K => dequant_q6_k(src, dst),
         other => Err(DequantError::Unsupported(other)),
     }
@@ -256,6 +259,90 @@ pub fn dequant_q4_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
                 let q = (nibbles[k] >> 4) as f32;
                 out[j1 * 32 + k] = scale1 * q - min1;
             }
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Q5_K  —  256 weights / 176 bytes
+//
+// Layout: 2 d (f16) + 2 dmin (f16) + 12 packed scales (same as Q4_K) +
+//         32 qh (high bit per weight) + 128 qs (low 4 bits per weight).
+// 256 weights are split into 8 sub-blocks of 32 weights. Each sub-block has
+// its own (sc, m) pair (encoded in the 12 scales bytes).
+// For each sub-block i in 0..8 the dequantized value of weight q (5-bit) is:
+//        d * sc[i] * q  -  dmin * m[i]
+// where q = (low_4_bits | (high_bit << 4)) ∈ 0..=31.
+//
+// The high-bit packing follows ggml-quants.c `dequantize_row_q5_K`:
+//
+//   process 64 weights at a time (j in 0,64,128,192):
+//     get scale/min for sub-block 2j, 2j+1
+//     for l in 0..32:
+//       y[j+l]      = d1 * ((ql[l] & 0x0F) + (qh[l] & u1 ? 16 : 0)) - m1
+//       y[j+l+32]   = d2 * ((ql[l] >> 4)   + (qh[l] & u2 ? 16 : 0)) - m2
+//     ql += 32
+//     u1 <<= 2 ; u2 <<= 2     (each sub-block-pair uses adjacent qh bits)
+// =============================================================================
+
+fn dequant_q5_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
+    if dst.len() % QK_K != 0 {
+        return Err(DequantError::OutputSize {
+            expected: dst.len() / QK_K * QK_K,
+            got: dst.len(),
+        });
+    }
+    let nb = dst.len() / QK_K;
+    let needed = nb * Q5_K_BYTES;
+    if src.len() < needed {
+        return Err(DequantError::BufferTooSmall {
+            needed,
+            have: src.len(),
+        });
+    }
+
+    for b in 0..nb {
+        let off = b * Q5_K_BYTES;
+        let d = f16::from_le_bytes([src[off], src[off + 1]]).to_f32();
+        let dmin = f16::from_le_bytes([src[off + 2], src[off + 3]]).to_f32();
+
+        let mut scales12 = [0u8; 12];
+        scales12.copy_from_slice(&src[off + 4..off + 16]);
+        let (sc, m) = unpack_q4_k_sc_m(&scales12);
+
+        let qh = &src[off + 16..off + 16 + 32];
+        let qs_all = &src[off + 16 + 32..off + 16 + 32 + 128];
+        let out = &mut dst[b * QK_K..(b + 1) * QK_K];
+
+        // Process 64 weights at a time (4 iterations covers 256). Each iteration
+        // covers two adjacent sub-blocks (j and j+1) sharing the 32-byte ql tile
+        // and 32-byte qh tile, with two bit-positions selected by u1/u2.
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for pair in 0..4 {
+            // Sub-block indices 2*pair and 2*pair+1
+            let sb0 = 2 * pair;
+            let sb1 = 2 * pair + 1;
+            let scale0 = d * sc[sb0] as f32;
+            let min0 = dmin * m[sb0] as f32;
+            let scale1 = d * sc[sb1] as f32;
+            let min1 = dmin * m[sb1] as f32;
+
+            let ql = &qs_all[pair * 32..(pair + 1) * 32];
+            for l in 0..32 {
+                let low = (ql[l] & 0x0F) as f32;
+                let high = if (qh[l] & u1) != 0 { 16.0_f32 } else { 0.0_f32 };
+                out[sb0 * 32 + l] = scale0 * (low + high) - min0;
+            }
+            for l in 0..32 {
+                let low = (ql[l] >> 4) as f32;
+                let high = if (qh[l] & u2) != 0 { 16.0_f32 } else { 0.0_f32 };
+                out[sb1 * 32 + l] = scale1 * (low + high) - min1;
+            }
+
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
     Ok(())
