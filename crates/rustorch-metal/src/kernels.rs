@@ -4659,11 +4659,10 @@ const RMS_NORM_F32_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// One simdgroup (32 threads) cooperates on one row of x[d]. Each thread
-// stride-loops over k=tid..d step 32, accumulates squared values into a
-// per-thread partial sum, then we use simd_sum to reduce to a single
-// scalar replicated across the simdgroup. Each thread then writes its
-// stride of normalised+scaled values.
+// T97 — RMSNorm with float4 vectorized loads. One simdgroup (32 threads)
+// cooperates on one row of x[d]. Each thread strides over k=tid..d/4 step
+// 32, reading 4 floats per access. Halves the issued load count vs scalar.
+// Falls back to scalar tail if d % 4 != 0.
 kernel void rms_norm_f32(
     device const float* x     [[buffer(0)]],
     device const float* gamma [[buffer(1)]],
@@ -4674,13 +4673,33 @@ kernel void rms_norm_f32(
     uint sg_size              [[threads_per_simdgroup]]
 ) {
     float partial = 0.0;
-    for (uint i = tid; i < d; i += sg_size) {
+    uint d4 = d / 4u;
+
+    device const float4* x4 = (device const float4*)x;
+    for (uint i = tid; i < d4; i += sg_size) {
+        float4 v = x4[i];
+        partial += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    uint tail_start = d4 * 4u;
+    for (uint i = tail_start + tid; i < d; i += sg_size) {
         float v = x[i];
         partial += v * v;
     }
+
     float total = simd_sum(partial);
     float inv_rms = 1.0 / sqrt(total / float(d) + eps);
-    for (uint i = tid; i < d; i += sg_size) {
+
+    device const float4* g4 = (device const float4*)gamma;
+    device float4* y4 = (device float4*)y;
+    for (uint i = tid; i < d4; i += sg_size) {
+        float4 v = x4[i];
+        float4 g = g4[i];
+        y4[i] = float4(v.x * inv_rms * g.x,
+                       v.y * inv_rms * g.y,
+                       v.z * inv_rms * g.z,
+                       v.w * inv_rms * g.w);
+    }
+    for (uint i = tail_start + tid; i < d; i += sg_size) {
         y[i] = x[i] * inv_rms * gamma[i];
     }
 }
