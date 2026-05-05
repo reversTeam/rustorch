@@ -3503,14 +3503,17 @@ kernel void sgemv_q4_k_gather_f32_lcpp_nsg2(
 /// `x_stride_floats == 0` : input partagé broadcast (gate_proj, up_proj).
 /// `x_stride_floats == K` : input par-row (down_proj).
 ///
-/// Indices passés en `set_bytes` (≤ 4 KB → ok pour B ≤ 1024). Si jamais un
-/// caller veut plus, basculer vers un buffer device.
+/// T152.1b — Indices désormais passés via `set_buffer` (Metal Buffer
+/// device-side) au lieu de `set_bytes` (CPU). Ça permet à un kernel amont
+/// (`topk_softmax_norm_f32`) d'écrire les indices directement sur GPU
+/// sans drain CPU intermédiaire.
 #[allow(clippy::too_many_arguments)]
 pub fn sgemv_q4_k_gather_f32_lcpp_nsg2_into(
     backend: &MetalBackend,
     x_buf: &Buffer,
     w_q4k_stacked_buf: &Buffer,
-    indices: &[u32],
+    indices_buf: &Buffer,
+    b: usize,
     out_buf: &Buffer,
     k: usize,
     n: usize,
@@ -3527,14 +3530,8 @@ pub fn sgemv_q4_k_gather_f32_lcpp_nsg2_into(
             "sgemv_q4_k_gather: K%256==0 && N%4==0 required (K={k}, N={n})"
         )));
     }
-    let b = indices.len();
     if b == 0 {
         return Ok(());
-    }
-    if b > 1024 {
-        return Err(MetalError::ShapeMismatch(format!(
-            "sgemv_q4_k_gather: B={b} too large for set_bytes path (max 1024)"
-        )));
     }
     if x_stride_floats != 0 && x_stride_floats != k {
         return Err(MetalError::ShapeMismatch(format!(
@@ -3552,11 +3549,7 @@ pub fn sgemv_q4_k_gather_f32_lcpp_nsg2_into(
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(w_q4k_stacked_buf), 0);
-        encoder.set_bytes(
-            2,
-            (b * 4) as u64,
-            indices.as_ptr() as *const std::ffi::c_void,
-        );
+        encoder.set_buffer(2, Some(indices_buf), 0);
         encoder.set_buffer(3, Some(out_buf), 0);
         encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
         encoder.set_bytes(5, 4, &x_stride_u32 as *const u32 as *const std::ffi::c_void);
@@ -3707,7 +3700,8 @@ pub fn sgemv_q5_k_gather_f32_lcpp_nsg2_into(
     backend: &MetalBackend,
     x_buf: &Buffer,
     w_q5k_stacked_buf: &Buffer,
-    indices: &[u32],
+    indices_buf: &Buffer,
+    b: usize,
     out_buf: &Buffer,
     k: usize,
     n: usize,
@@ -3724,14 +3718,8 @@ pub fn sgemv_q5_k_gather_f32_lcpp_nsg2_into(
             "sgemv_q5_k_gather: K%256==0 required (K={k}, N={n})"
         )));
     }
-    let b = indices.len();
     if b == 0 {
         return Ok(());
-    }
-    if b > 1024 {
-        return Err(MetalError::ShapeMismatch(format!(
-            "sgemv_q5_k_gather: B={b} too large for set_bytes path (max 1024)"
-        )));
     }
     if x_stride_floats != 0 && x_stride_floats != k {
         return Err(MetalError::ShapeMismatch(format!(
@@ -3749,11 +3737,7 @@ pub fn sgemv_q5_k_gather_f32_lcpp_nsg2_into(
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(w_q5k_stacked_buf), 0);
-        encoder.set_bytes(
-            2,
-            (b * 4) as u64,
-            indices.as_ptr() as *const std::ffi::c_void,
-        );
+        encoder.set_buffer(2, Some(indices_buf), 0);
         encoder.set_buffer(3, Some(out_buf), 0);
         encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
         encoder.set_bytes(5, 4, &x_stride_u32 as *const u32 as *const std::ffi::c_void);
@@ -5135,7 +5119,8 @@ pub fn sgemv_q6_k_gather_f32_lcpp_nsg2_into(
     backend: &MetalBackend,
     x_buf: &Buffer,
     w_q6k_stacked_buf: &Buffer,
-    indices: &[u32],
+    indices_buf: &Buffer,
+    b: usize,
     out_buf: &Buffer,
     k: usize,
     n: usize,
@@ -5152,14 +5137,8 @@ pub fn sgemv_q6_k_gather_f32_lcpp_nsg2_into(
             "sgemv_q6_k_gather: K%256==0 && N%4==0 required (K={k}, N={n})"
         )));
     }
-    let b = indices.len();
     if b == 0 {
         return Ok(());
-    }
-    if b > 1024 {
-        return Err(MetalError::ShapeMismatch(format!(
-            "sgemv_q6_k_gather: B={b} too large for set_bytes path"
-        )));
     }
     if x_stride_floats != 0 && x_stride_floats != k {
         return Err(MetalError::ShapeMismatch(format!(
@@ -5177,11 +5156,7 @@ pub fn sgemv_q6_k_gather_f32_lcpp_nsg2_into(
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(w_q6k_stacked_buf), 0);
-        encoder.set_bytes(
-            2,
-            (b * 4) as u64,
-            indices.as_ptr() as *const std::ffi::c_void,
-        );
+        encoder.set_buffer(2, Some(indices_buf), 0);
         encoder.set_buffer(3, Some(out_buf), 0);
         encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
         encoder.set_bytes(5, 4, &x_stride_u32 as *const u32 as *const std::ffi::c_void);
@@ -8414,6 +8389,210 @@ pub fn rms_norm_per_head_gated_f32(
         let tg = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
         encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// T152.1b — Top-K softmax + normalize 100% GPU. Élimine le drain qui
+// précédait la sélection d'experts dans le path MoE.
+//
+// Avant : `gate_inp.matmul_into → moe_logits` puis `backend.drain() + CPU
+// stable softmax + CPU argsort top-K + CPU renormalize`. Le drain coûte
+// ~50-200 µs ; le CPU sort de 256 floats est O(N log N) ≈ 5-15 µs sur
+// M4 Max P-core.
+//
+// Maintenant : 1 dispatch d'un threadgroup unique de 256 threads qui :
+//   1. simd-reduce max(logits)
+//   2. simd-reduce sum(exp(logit - max))
+//   3. probs[i] = exp(logit-max)/sum
+//   4. top-K serial scan dans le simd 0 thread 0 (K=8, N=256 → 2k ops trivial)
+//   5. renormalize les K poids
+//   6. écrit out_idx[K] u32 + out_w[K] f32
+//
+// Threadgroup memory : 256 floats (= 1 KB), tient largement.
+//
+// Compatible jusqu'à N=256 / K=16. Au-delà, augmenter MAX_N_EXPERTS.
+const TOPK_SOFTMAX_NORM_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MAX_N_EXPERTS = 256u;
+constant uint TG_SIZE = 256u;
+constant uint MAX_K = 16u;
+
+kernel void topk_softmax_norm_f32(
+    device const float* logits  [[buffer(0)]],   // [N]
+    device       uint*  out_idx [[buffer(1)]],   // [K] u32
+    device       float* out_w   [[buffer(2)]],   // [K] f32
+    constant uint2&     dims    [[buffer(3)]],   // (N, K)
+    uint                lid     [[thread_position_in_threadgroup]],
+    uint                lane    [[thread_index_in_simdgroup]],
+    uint                sg_idx  [[simdgroup_index_in_threadgroup]]
+) {
+    uint N = dims.x;
+    uint K = dims.y;
+
+    threadgroup float s_buf[MAX_N_EXPERTS];
+    threadgroup float s_red[8];  // par simdgroup pour réductions inter-sg
+
+    // 1. Lecture logit (1 par thread, supporte N <= TG_SIZE).
+    float v = (lid < N) ? logits[lid] : -INFINITY;
+
+    // 2. Max global via simd_max + reduction inter-simdgroup.
+    float m_local = simd_max(v);
+    if (lane == 0) s_red[sg_idx] = m_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0) {
+        float t = (lane < TG_SIZE / 32u) ? s_red[lane] : -INFINITY;
+        float m_global = simd_max(t);
+        if (lane == 0) s_red[0] = m_global;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m_global = s_red[0];
+
+    // 3. exp(logit - max), réduction de la somme.
+    float e = (lid < N) ? exp(v - m_global) : 0.0;
+    float s_local = simd_sum(e);
+    if (lane == 0) s_red[sg_idx] = s_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0) {
+        float t = (lane < TG_SIZE / 32u) ? s_red[lane] : 0.0;
+        float s_global = simd_sum(t);
+        if (lane == 0) s_red[0] = s_global;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s_global = s_red[0];
+
+    // 4. Probabilités stockées dans s_buf pour le scan top-K.
+    float p = (lid < N) ? e / max(s_global, 1e-30f) : -INFINITY;
+    if (lid < N) s_buf[lid] = p;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 5. Top-K serial dans thread 0 (K=8, N=256 → ~2K ops trivial).
+    //    Renormalize et écrit le résultat.
+    if (lid == 0) {
+        float top_w_local[MAX_K];
+        uint  top_idx_local[MAX_K];
+        for (uint k = 0; k < K; ++k) {
+            float best = -INFINITY;
+            uint  best_idx = 0;
+            for (uint i = 0; i < N; ++i) {
+                float pv = s_buf[i];
+                if (pv > best) { best = pv; best_idx = i; }
+            }
+            top_idx_local[k] = best_idx;
+            top_w_local[k]   = best;
+            s_buf[best_idx]  = -INFINITY;
+        }
+        float sum_w = 0.0;
+        for (uint k = 0; k < K; ++k) sum_w += top_w_local[k];
+        float inv = 1.0 / max(sum_w, 6.103515625e-5f);
+        for (uint k = 0; k < K; ++k) {
+            out_idx[k] = top_idx_local[k];
+            out_w[k]   = top_w_local[k] * inv;
+        }
+    }
+}
+"#;
+
+/// T152.1b — top-K softmax + normalize 100% GPU sur 1 threadgroup.
+/// Pré-condition : `n_experts <= 256` et `k <= 16`. Pour le 35B-A3B :
+/// n_experts=256, k=8 → OK.
+pub fn topk_softmax_norm_f32(
+    backend: &MetalBackend,
+    logits_buf: &Buffer,
+    out_idx_buf: &Buffer,
+    out_w_buf: &Buffer,
+    n_experts: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    if n_experts == 0 || k == 0 || n_experts > 256 || k > 16 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "topk_softmax_norm: needs 0 < n_experts <= 256, 0 < k <= 16 (got N={n_experts}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "topk_softmax_norm_f32",
+        TOPK_SOFTMAX_NORM_F32_SHADER,
+        "topk_softmax_norm_f32",
+    )?;
+    let dims = [n_experts as u32, k as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(logits_buf), 0);
+        encoder.set_buffer(1, Some(out_idx_buf), 0);
+        encoder.set_buffer(2, Some(out_w_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(256, 1, 1);
+        let groups = MTLSize::new(1, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// T152.1 — fused sigmoid + weighted add pour shared expert MoE.
+//
+// Le path MoE de Qwen3.5/3.6 a un "shared expert" en plus des routed experts.
+// Sa contribution finale au résidu est :
+//     scalar = sigmoid(dot(gate_inp_shexp, h))
+//     xd[i] += moe_acc[i] + scalar * shared_out[i]
+//
+// Avant T152.1 ça nécessitait `backend.drain() + CPU sigmoid + CPU add`. Le
+// drain coûte ~50-200 µs sur Metal Shared mode. Ce kernel élimine le drain :
+// `dot_scalar` est calculé via un sgemv N=1 (`sgemv_f32_lcpp_simd_into(h,
+// gate_inp_shexp, dot_scalar, d, 1)`) puis ce kernel le lit directement
+// depuis le buffer Metal sans round-trip CPU.
+const SIGMOID_ADD_MOE_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void sigmoid_add_moe_f32(
+    device const float* moe_acc      [[buffer(0)]],   // [D]
+    device const float* shared_out   [[buffer(1)]],   // [D]
+    device const float* dot_scalar   [[buffer(2)]],   // [1]
+    device       float* xd           [[buffer(3)]],   // [D] in/out
+    constant uint&      d            [[buffer(4)]],
+    uint                gid          [[thread_position_in_grid]]
+) {
+    if (gid >= d) return;
+    float s = 1.0 / (1.0 + exp(-dot_scalar[0]));
+    xd[gid] += moe_acc[gid] + s * shared_out[gid];
+}
+"#;
+
+/// T152.1 — `xd[i] += moe_acc[i] + sigmoid(dot_scalar[0]) * shared_out[i]`.
+/// Élimine le drain `backend.drain() + CPU sigmoid + CPU add` qui suivait
+/// les 4 sgemv de l'expert partagé dans le path MoE. Économie : 1 drain
+/// par MoE layer × 16 MoE layers = 16 drains/token sur le 35B-A3B.
+pub fn sigmoid_add_moe_f32(
+    backend: &MetalBackend,
+    moe_acc_buf: &Buffer,
+    shared_out_buf: &Buffer,
+    dot_scalar_buf: &Buffer,
+    xd_buf: &Buffer,
+    d: usize,
+) -> Result<(), MetalError> {
+    if d == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "sigmoid_add_moe_f32: D must be > 0".to_string(),
+        ));
+    }
+    let pipeline = backend.pipeline(
+        "sigmoid_add_moe_f32",
+        SIGMOID_ADD_MOE_F32_SHADER,
+        "sigmoid_add_moe_f32",
+    )?;
+    let d_u32 = d as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(moe_acc_buf), 0);
+        encoder.set_buffer(1, Some(shared_out_buf), 0);
+        encoder.set_buffer(2, Some(dot_scalar_buf), 0);
+        encoder.set_buffer(3, Some(xd_buf), 0);
+        encoder.set_bytes(4, 4, &d_u32 as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(d as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
     });
     Ok(())
 }

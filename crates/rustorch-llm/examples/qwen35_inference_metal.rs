@@ -52,9 +52,9 @@ use rustorch_metal::kernels::{
     sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
     sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
     sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_mul_inplace_f32, split_qg_per_head_f32, split_qkv_f32,
-    ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_f32, zero_f32,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32, sigmoid_mul_inplace_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
+    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -564,6 +564,13 @@ struct Scratch {
     moe_fd_gather: Buffer,   // n_used * expert_f
     moe_down_gather: Buffer, // n_used * d
     moe_topw_buf: Buffer,    // n_used (top-K weights f32, GPU-side for reduce)
+    // T152.1b — buffer indices GPU-side : produit par `topk_softmax_norm_f32`
+    // depuis les routing logits, consommé par les 3 sgemv gather. Élimine le
+    // round-trip CPU et le drain qui le précédait.
+    moe_indices_buf: Buffer, // n_used (u32)
+    // T152.1 — scalar buffer pour `dot(gate_inp_shexp, h)` du shared expert.
+    // Calculé via sgemv N=1 sur GPU, lu par sigmoid_add_moe_f32 sans drain.
+    moe_dot_scalar: Buffer, // 1 (f32)
     // logits
     logits: Buffer, // vocab
 }
@@ -619,6 +626,8 @@ impl Scratch {
             moe_fd_gather: alloc(cfg.n_experts_used.max(1) * cfg.expert_f.max(1) * 4),
             moe_down_gather: alloc(cfg.n_experts_used.max(1) * d * 4),
             moe_topw_buf: alloc(cfg.n_experts_used.max(1) * 4),
+            moe_indices_buf: alloc(cfg.n_experts_used.max(1) * 4),
+            moe_dot_scalar: alloc(4),
             moe_gate: alloc(cfg.expert_f.max(1) * 4),
             moe_up: alloc(cfg.expert_f.max(1) * 4),
             moe_fd: alloc(cfg.expert_f.max(1) * 4),
@@ -1244,65 +1253,29 @@ fn ffn_dense_forward(
             // 1. Routing logits = gate_inp @ h  → [n_experts]
             gate_inp.matmul_into(backend, &scratch.h, &scratch.moe_logits)?;
 
-            // 2. Drain to read logits on CPU. Apply softmax + argsort top-K + normalise weights.
-            backend.drain();
-            let (top_idx, top_w) = unsafe {
-                let logits = std::slice::from_raw_parts(
-                    scratch.moe_logits.contents() as *const f32,
-                    n_experts,
-                );
-                // Stable softmax over all n_experts.
-                let mut mx = f32::NEG_INFINITY;
-                for &v in logits {
-                    if v > mx {
-                        mx = v;
-                    }
-                }
-                let mut probs = vec![0.0_f32; n_experts];
-                let mut z = 0.0_f32;
-                for i in 0..n_experts {
-                    let p = (logits[i] - mx).exp();
-                    probs[i] = p;
-                    z += p;
-                }
-                let inv_z = 1.0 / z.max(1e-30);
-                for p in probs.iter_mut() {
-                    *p *= inv_z;
-                }
-                // Argsort top-K (n_used). For n_experts=256, n_used=8, a partial
-                // selection is fast on CPU.
-                let mut idxs: Vec<usize> = (0..n_experts).collect();
-                idxs.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap());
-                let top: Vec<usize> = idxs[..n_used].to_vec();
-                let mut w: Vec<f32> = top.iter().map(|&i| probs[i]).collect();
-                // Renormalise (norm_w = true in qwen35moe).
-                let s: f32 = w.iter().sum();
-                let inv_s = 1.0 / s.max(6.103_515_6e-5_f32);
-                for x in w.iter_mut() {
-                    *x *= inv_s;
-                }
-                (top, w)
-            };
-
-            // T152 — Upload top-K weights + indices for the gather kernel.
-            // top_w sur GPU pour weighted_reduce_add_f32 ; indices sur CPU,
-            // passés via set_bytes au kernel gather (n_used ≤ 8, fits in 4 KB).
-            let indices_u32: Vec<u32> = top_idx.iter().map(|&i| i as u32).collect();
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    top_w.as_ptr(),
-                    scratch.moe_topw_buf.contents() as *mut f32,
-                    n_used,
-                );
-            }
+            // 2. T152.1b — Top-K + softmax + renormalize 100% GPU.
+            //    Avant : drain + CPU softmax + argsort + renormalize. Maintenant :
+            //    1 dispatch d'un threadgroup unique 256 threads qui produit
+            //    `moe_indices_buf [n_used] u32` + `moe_topw_buf [n_used] f32`.
+            //    Économie : 1 drain × 16 MoE layers = 16 drains/token sur 35B-A3B.
+            topk_softmax_norm_f32(
+                backend,
+                &scratch.moe_logits,
+                &scratch.moe_indices_buf,
+                &scratch.moe_topw_buf,
+                n_experts,
+                n_used,
+            )?;
 
             // 3. T147a — zero the accumulator on GPU (no drain).
             zero_f32(backend, &scratch.moe_acc, d)?;
 
             // 4. T152 — gather sgemv path (1 dispatch / projection au lieu de
             //    n_used dispatchs). Inspired by MLX `affine_gather_qmm_rhs`.
-            //    Dispatch dynamique selon dtype (Q4_K, Q5_K) — Qwen3.6-35B-A3B
-            //    a gate/up=Q4_K et down=Q5_K.
+            //    Dispatch dynamique selon dtype (Q4_K, Q5_K, Q6_K) —
+            //    Qwen3.6-35B-A3B mixe les 3 selon les layers.
+            //    T152.1b — indices viennent de `topk_softmax_norm_f32` (GPU
+            //    buffer, plus de set_bytes CPU).
             let gather_dispatch = |stacked: &StackedQuantizedExperts,
                                    x: &Buffer,
                                    out: &Buffer,
@@ -1315,7 +1288,8 @@ fn ffn_dense_forward(
                         backend,
                         x,
                         &stacked.buffer,
-                        &indices_u32,
+                        &scratch.moe_indices_buf,
+                        n_used,
                         out,
                         k,
                         n,
@@ -1326,7 +1300,8 @@ fn ffn_dense_forward(
                         backend,
                         x,
                         &stacked.buffer,
-                        &indices_u32,
+                        &scratch.moe_indices_buf,
+                        n_used,
                         out,
                         k,
                         n,
@@ -1337,7 +1312,8 @@ fn ffn_dense_forward(
                         backend,
                         x,
                         &stacked.buffer,
-                        &indices_u32,
+                        &scratch.moe_indices_buf,
+                        n_used,
                         out,
                         k,
                         n,
@@ -1422,27 +1398,30 @@ fn ffn_dense_forward(
                 ef,
             )?;
             down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
-            backend.drain();
-            // Shared expert gating: scalar = sigmoid(gate_inp_shexp · h).
-            let shared_gate_scalar = unsafe {
-                let g = std::slice::from_raw_parts(gate_inp_shexp.contents() as *const f32, d);
-                let h = std::slice::from_raw_parts(scratch.h.contents() as *const f32, d);
-                let mut s = 0.0_f32;
-                for i in 0..d {
-                    s += g[i] * h[i];
-                }
-                1.0 / (1.0 + (-s).exp())
-            };
-            // Add shared expert (gated) + accumulated routed experts → xd.
-            unsafe {
-                let acc = std::slice::from_raw_parts(scratch.moe_acc.contents() as *const f32, d);
-                let shared =
-                    std::slice::from_raw_parts(scratch.moe_expert_out.contents() as *const f32, d);
-                let xd = std::slice::from_raw_parts_mut(scratch.xd.contents() as *mut f32, d);
-                for i in 0..d {
-                    xd[i] += acc[i] + shared_gate_scalar * shared[i];
-                }
-            }
+
+            // T152.1 — Shared expert gating + final add ENTIÈREMENT GPU.
+            // Avant : drain + CPU dot + CPU sigmoid + CPU add. Maintenant :
+            // - sgemv N=1 calcule `dot(gate_inp_shexp, h)` dans moe_dot_scalar
+            // - `sigmoid_add_moe_f32` lit le scalaire et applique
+            //   `xd[i] += moe_acc[i] + sigmoid(scalar) * moe_expert_out[i]`
+            // 1 dispatch GPU au lieu de 1 drain + 2 CPU loops sur d éléments.
+            // Économie : 1 drain × 16 MoE layers = 16 drains/token sur 35B-A3B.
+            sgemv_f32_lcpp_simd_into(
+                backend,
+                &scratch.h,
+                gate_inp_shexp,
+                &scratch.moe_dot_scalar,
+                d,
+                1,
+            )?;
+            sigmoid_add_moe_f32(
+                backend,
+                &scratch.moe_acc,
+                &scratch.moe_expert_out,
+                &scratch.moe_dot_scalar,
+                &scratch.xd,
+                d,
+            )?;
             Ok(())
         },
     }
