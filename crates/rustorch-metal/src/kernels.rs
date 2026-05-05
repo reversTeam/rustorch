@@ -6464,35 +6464,40 @@ const ROPE_HALF_SPLIT_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// Apply RoPE half-split convention to one [n_heads * head_dim] row,
-// in place. position is the row's absolute sequence index (used to
-// index into the precomputed cos/sin tables of shape
-// [max_seq, head_dim/2] row-major).
+// Apply RoPE half-split convention in place on one [n_heads * head_dim]
+// row. Only the first `rope_dim` dims of each head are rotated; dims
+// [rope_dim..head_dim] are left untouched (this is the "partial RoPE"
+// convention used by Qwen3.5 / 3.6, where rope_dim < head_dim).
 //
-// Half-split: pair dim k with dim (k + head_dim/2). For k in 0..D/2:
-//   x'[k]      = x[k]      * cos(angle) - x[k + D/2] * sin(angle)
-//   x'[k+D/2]  = x[k+D/2]  * cos(angle) + x[k]       * sin(angle)
-// where angle = position * theta_k.
+// Half-split: pair dim k with dim (k + rope_dim/2). For k in 0..rope_dim/2:
+//   x'[k]            = x[k]            * cos(angle) - x[k + R/2] * sin(angle)
+//   x'[k+R/2]        = x[k+R/2]        * cos(angle) + x[k]       * sin(angle)
+// where R = rope_dim and angle = position * theta_k.
+//
+// `cos_tab` / `sin_tab` shape: [max_seq, rope_dim/2] row-major.
 kernel void rope_half_split_f32(
     device float* x              [[buffer(0)]],   // [n_heads * head_dim]
-    device const float* cos_tab  [[buffer(1)]],   // [max_seq, head_dim/2]
+    device const float* cos_tab  [[buffer(1)]],   // [max_seq, rope_dim/2]
     device const float* sin_tab  [[buffer(2)]],
-    constant uint3& dims         [[buffer(3)]],   // (n_heads, head_dim, position)
+    constant uint4& dims         [[buffer(3)]],   // (n_heads, head_dim, rope_dim, position)
     uint gid                     [[thread_position_in_grid]]
 ) {
     uint n_heads  = dims.x;
     uint head_dim = dims.y;
-    uint position = dims.z;
-    uint half_dim = head_dim / 2u;
-    uint total    = n_heads * half_dim;
+    uint rope_dim = dims.z;
+    uint position = dims.w;
+    uint half_rope = rope_dim / 2u;
+    uint total     = n_heads * half_rope;
     if (gid >= total) return;
 
-    uint h = gid / half_dim;
-    uint k = gid % half_dim;
+    uint h = gid / half_rope;
+    uint k = gid % half_rope;
+    // Only the first rope_dim of each head_dim are rotated. head_dim
+    // is the stride between heads (we never touch dims [rope_dim..head_dim]).
     uint i0 = h * head_dim + k;
-    uint i1 = h * head_dim + k + half_dim;
+    uint i1 = h * head_dim + k + half_rope;
 
-    uint tab_off = position * half_dim + k;
+    uint tab_off = position * half_rope + k;
     float c = cos_tab[tab_off];
     float s = sin_tab[tab_off];
     float x0 = x[i0];
@@ -6504,7 +6509,14 @@ kernel void rope_half_split_f32(
 
 /// Apply half-split RoPE in place on a single decode-step row of
 /// `x[n_heads * head_dim]` at the given absolute sequence position.
-/// The cos/sin tables are precomputed (see `rustorch_nn::rope::RoPE`).
+///
+/// Only the first `rope_dim` dimensions of each head are rotated; the
+/// remaining `head_dim - rope_dim` dims (when `rope_dim < head_dim`)
+/// are left untouched. For a "full RoPE" model where every head dim
+/// participates in the rotation, pass `rope_dim == head_dim`.
+///
+/// `cos_buf` / `sin_buf` are pre-built tables of shape
+/// `[max_seq, rope_dim / 2]` (row-major).
 pub fn rope_half_split_f32(
     backend: &MetalBackend,
     x_buf: &Buffer,
@@ -6512,21 +6524,33 @@ pub fn rope_half_split_f32(
     sin_buf: &Buffer,
     n_heads: usize,
     head_dim: usize,
+    rope_dim: usize,
     position: usize,
 ) -> Result<(), MetalError> {
+    if rope_dim == 0 || rope_dim > head_dim || rope_dim % 2 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "rope_half_split_f32: rope_dim={rope_dim} must be even and \
+             within (0, head_dim={head_dim}]"
+        )));
+    }
     let pipeline = backend.pipeline(
         "rope_half_split_f32",
         ROPE_HALF_SPLIT_SHADER,
         "rope_half_split_f32",
     )?;
-    let dims = [n_heads as u32, head_dim as u32, position as u32]; // T82
-    let total = n_heads * (head_dim / 2);
+    let dims = [
+        n_heads as u32,
+        head_dim as u32,
+        rope_dim as u32,
+        position as u32,
+    ];
+    let total = n_heads * (rope_dim / 2);
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(cos_buf), 0);
         encoder.set_buffer(2, Some(sin_buf), 0);
-        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(3, 16, dims.as_ptr() as *const std::ffi::c_void);
         let tg_size = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new(total as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
@@ -7325,16 +7349,23 @@ kernel void ssm_conv1d_step_f32(
     uint conv_dim    = dims.y;
     if (gid >= conv_dim) return;
 
-    // Read history (kernel-1 values) for this channel.
+    // GGUF conv1d weight has on-disk layout [conv_dim, kernel_size]
+    // (channel-major). The shape `[kernel_size, conv_dim]` recorded in the
+    // GGUF header is just GGUF's reversed-dim convention; the raw byte
+    // storage is `weight[ch * kernel_size + kp]`. So the per-channel kernel
+    // is contiguous and we stride through it with `kp`.
+    uint w_base = gid * kernel_size;
+    // Conv state ring buffer uses stride `conv_dim` per timestep (no
+    // transpose needed since we own the layout): conv_state[t * conv_dim + gid].
     float acc = 0.0;
     for (uint t = 0; t + 1 < kernel_size; ++t) {
         float v = conv_state[t * conv_dim + gid];
-        float w = conv1d_w[t * conv_dim + gid];
+        float w = conv1d_w[w_base + t];
         acc += w * v;
     }
     // Add current input × kernel[K-1].
     float xv = x_in[gid];
-    acc += conv1d_w[(kernel_size - 1) * conv_dim + gid] * xv;
+    acc += conv1d_w[w_base + (kernel_size - 1)] * xv;
     // T144b — fuse SiLU on conv output (was a separate CPU pass).
     float sig = 1.0 / (1.0 + exp(-acc));
     y_out[gid] = acc * sig;
@@ -7437,6 +7468,19 @@ kernel void l2_norm_per_head_f32(
 /// T144 — per-head L2 normalization in place. `x` has shape `[n_heads,
 /// head_dim]`; each head is normalized independently. `eps` is added to
 /// the sum-of-squares before the sqrt for numerical stability.
+///
+/// T150 — fix dispatch dimensionality: previously launched on a 2-D grid
+/// `(32, n_heads, 1)` while the kernel captures `tg_id` as a `uint` (the
+/// X component only). Metal silently truncated `n_heads` Y-axis groups
+/// to `tg_id = 0` for every threadgroup, so only head 0 was normalized
+/// and heads 1..n_heads-1 retained their pre-norm magnitudes. Symptom:
+/// SSM block contributed near-zero to the residual stream because q/k
+/// were not unit-norm, the delta-net step's `(k . q)` ≪ 1, the readout
+/// was tiny, the gated norm + ssm_out projection collapsed to ~0, and
+/// `xd += o` left the residual virtually unchanged across all 32 SSM
+/// layers of Qwen3.6-27B → garbage output. Fixed by collapsing the grid
+/// to 1-D `(32 * n_heads, 1, 1)`, matching the working dispatch pattern
+/// used by `rms_norm_per_head_f32` (q_norm/k_norm, attention).
 pub fn l2_norm_per_head_f32(
     backend: &MetalBackend,
     x_buf: &Buffer,
@@ -7456,7 +7500,7 @@ pub fn l2_norm_per_head_f32(
         encoder.set_bytes(1, 8, dims.as_ptr() as *const std::ffi::c_void);
         encoder.set_bytes(2, 4, &eps as *const f32 as *const std::ffi::c_void);
         let tg = MTLSize::new(32, 1, 1);
-        let grid = MTLSize::new(32, n_heads as u64, 1);
+        let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
         encoder.dispatch_threads(grid, tg);
     });
     Ok(())
@@ -7466,25 +7510,25 @@ pub fn l2_norm_per_head_f32(
 // 3. Gated Delta-Net step — the heart of the SSM block.
 //
 // State per-head shape: [head_dim, head_dim] (= [128, 128] in Qwen3.6).
-// For each head h:
-//   gate = exp(gate_h[h])          ; per-head scalar gate (already includes ssm_a)
-//   beta_h = beta[h]               ; per-head scalar (already sigmoid'd)
-//   for r in 0..head_dim:
-//     v_r = v[h, r]
-//     out_r = 0
-//     for c in 0..head_dim:
-//       updated = gate * state[h, r, c] + beta_h * v_r * k[h, c]
-//       state[h, r, c] = updated
-//       out_r += updated * q[h, c]
-//     out[h, r] = out_r
+// We follow llama.cpp's `build_delta_net_autoregressive` (delta-net-base.cpp,
+// matching HF's Qwen3-Next reference): gated DELTA RULE, not plain linear
+// attention. For each head h:
+//   gamma   = exp(gate_h[h])              ; per-head decay scalar
+//   beta_h  = beta[h]                     ; per-head delta scale (sigmoid'd)
+//   q_scale = 1 / sqrt(head_dim)          ; standard attention scale on q
 //
-// q, k passed as [n_v_heads, head_dim] — caller has already broadcast from
-// n_k_heads to n_v_heads (or they were equal). v has shape [n_v_heads, head_dim].
+//   Step 1 (decay):  state[h, r, c] *= gamma
+//   Step 2 (project): proj[h, r] = sum_c state[h, r, c] * k[h, c]
+//   Step 3 (delta):  delta_r = beta_h * (v[h, r] - proj[h, r])
+//                    state[h, r, c] += delta_r * k[h, c]
+//   Step 4 (readout): out[h, r] = sum_c state[h, r, c] * (q[h, c] * q_scale)
 //
-// Dispatch decomposition: one threadgroup per (head, row) pair. 32 threads
-// per threadgroup; each thread handles head_dim/32 = 4 columns. simd_sum
-// reduces the readout. State update: each thread writes its own 4 cols
-// — no race.
+// q, k passed as [n_k_heads, head_dim] — kernel broadcasts to n_v_heads via
+// integer division (head_k = head_v / repeat). v has shape [n_v_heads, head_dim].
+//
+// Dispatch decomposition: one simdgroup (32 threads) per (head, row) pair.
+// Steps 1+2, 3, and 4 each iterate the head_dim columns in stride-32 chunks
+// across the simdgroup; `simd_sum` reduces both the projection and the readout.
 // ----------------------------------------------------------------------------
 
 const DELTA_NET_STEP_F32_SHADER: &str = r#"
@@ -7505,28 +7549,51 @@ kernel void delta_net_step_f32(
 ) {
     uint n_v_heads = dims.x;
     uint head_dim  = dims.y;
-    uint repeat    = dims.w;   // n_v_heads / n_k_heads
+    uint n_k_heads = dims.z;
     uint head_v = tg_id.y;
     uint row    = tg_id.x;
     if (head_v >= n_v_heads || row >= head_dim) return;
 
-    // Broadcast Q,K from n_k_heads to n_v_heads via integer division.
-    uint head_k = head_v / repeat;
+    // Map V-head to K-head. Qwen3.5 / 3.6 use a TILED V layout (per
+    // llama.cpp's `_LinearAttentionVReorderBase` reorder_rows): the GGUF
+    // converter permutes V from grouped `[k0_v0, k0_v1, k1_v0, k1_v1, ...]`
+    // to tiled `[k0_v0, k1_v0, k0_v1, k1_v1, ...]` so that
+    //     k_head = v_head % n_k_heads
+    //     v_per_k_idx = v_head / n_k_heads
+    // (Qwen3-Next uses the grouped layout — `head_v / repeat` — but we don't
+    // load that arch through this kernel; qwen35 / qwen35moe both go through
+    // the V-reorder converter.)
+    uint head_k = head_v % n_k_heads;
 
-    float gate_val = exp(gate_h[head_v]);
+    float gamma    = exp(gate_h[head_v]);
     float beta_val = beta[head_v];
-    float v_r = v[head_v * head_dim + row];
+    float v_r      = v[head_v * head_dim + row];
+    float q_scale  = 1.0 / sqrt((float)head_dim);
 
     uint state_off = head_v * head_dim * head_dim + row * head_dim;
     uint qk_off    = head_k * head_dim;
 
+    // Steps 1 + 2 fused: decay state in place and accumulate
+    //   proj[r] = sum_c (gamma * state[r, c]) * k[c]
+    // into a per-thread partial sum, then simd-reduce.
+    float proj_partial = 0.0;
+    for (uint c = tiisg; c < head_dim; c += 32u) {
+        float decayed = gamma * state[state_off + c];
+        state[state_off + c] = decayed;
+        proj_partial += decayed * k[qk_off + c];
+    }
+    float proj_r = simd_sum(proj_partial);
+
+    // Step 3: delta-rule update + Step 4: readout (also fused — we already
+    // hold the post-update state value).
+    float delta_r = beta_val * (v_r - proj_r);
     float out_partial = 0.0;
     for (uint c = tiisg; c < head_dim; c += 32u) {
         float k_c = k[qk_off + c];
         float q_c = q[qk_off + c];
-        float updated = gate_val * state[state_off + c] + beta_val * v_r * k_c;
+        float updated = state[state_off + c] + delta_r * k_c;
         state[state_off + c] = updated;
-        out_partial += updated * q_c;
+        out_partial += updated * q_c * q_scale;
     }
 
     float row_sum = simd_sum(out_partial);
@@ -7644,6 +7711,11 @@ kernel void rms_norm_per_head_gated_f32(
 
 /// T144 — per-head RMS norm × silu(z) fused. `x` is normalized in place
 /// per-head with shared gamma `[head_dim]`, then multiplied by `silu(z)`.
+///
+/// T150 — same dispatch fix as `l2_norm_per_head_f32`: collapse the grid
+/// to 1-D `(32 * n_heads, 1, 1)` so `uint tg_id [[threadgroup_position_in_grid]]`
+/// captures the head index correctly. Previously the 2-D grid silently
+/// gave `tg_id = 0` for every threadgroup → only head 0 was processed.
 pub fn rms_norm_per_head_gated_f32(
     backend: &MetalBackend,
     x_buf: &Buffer,
@@ -7667,7 +7739,7 @@ pub fn rms_norm_per_head_gated_f32(
         encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
         encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
         let tg = MTLSize::new(32, 1, 1);
-        let grid = MTLSize::new(32, n_heads as u64, 1);
+        let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
         encoder.dispatch_threads(grid, tg);
     });
     Ok(())
@@ -8898,6 +8970,7 @@ mod tests {
                 &cos_buf,
                 &sin_buf,
                 n_heads,
+                head_dim,
                 head_dim,
                 pos_base + batch,
             )

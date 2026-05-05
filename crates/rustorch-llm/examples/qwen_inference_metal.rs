@@ -1642,6 +1642,7 @@ fn forward_token(
             &model.rope_sin_buf,
             n_heads,
             head_dim,
+            head_dim,
             position,
         )
         .unwrap();
@@ -1651,6 +1652,7 @@ fn forward_token(
             &model.rope_cos_buf,
             &model.rope_sin_buf,
             n_kv,
+            head_dim,
             head_dim,
             position,
         )
@@ -1746,15 +1748,8 @@ fn forward_token(
             .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
         add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
 
-        // T133 — CPU↔GPU pipelining via mid-token async commits. Single-CB
-        // mode commits at end-of-token, so GPU was idle while CPU encoded
-        // all 760 dispatches sequentially. With async commits every K
-        // layers, GPU starts executing segment N while CPU encodes segment
-        // N+1. Buffers in the same MTLCommandQueue execute in commit order,
-        // so xd_buf writes from segment N are visible to segment N+1 reads
-        // without explicit synchronisation. Sweet spot empirically K=5
-        // (8 commits/token, +2.4% on chained); K<5 commit overhead eats
-        // the pipelining gain, K>5 leaves CPU/GPU overlap on the table.
+        // T133 — CPU↔GPU pipelining via mid-token async commits. Sweet
+        // spot empirically K=5 (8 commits/token).
         if (li + 1) % 5 == 0 && li + 1 < cfg.n_layers {
             backend.commit_async();
         }
@@ -1775,6 +1770,253 @@ fn forward_token(
         .lm_head
         .matmul_into(backend, &scratch.h_buf, &scratch.logits_buf);
     backend.drain();
+    let mut logits = vec![0.0_f32; cfg.vocab];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.logits_buf.contents() as *const f32,
+            logits.as_mut_ptr(),
+            cfg.vocab,
+        );
+    }
+    argmax(&logits)
+}
+
+// T134 — Trajectory capture variant: identical to forward_token but reads
+// h_pre_lm_head into a caller-supplied Vec so we can analyse the geometric
+// flow of the residual stream over many decode steps.
+//
+// Used by --dump-h-trajectory to characterise whether (h_t, token_t)
+// linearly predicts h_{t+1}. T104 showed that the activation manifold has
+// effective rank ~10-17 across the whole trajectory; T105 showed that a
+// FIXED projection at that rank fails because the manifold drifts. T134
+// asks the next question: even if the manifold drifts globally, is the
+// LOCAL (one-step-ahead) prediction h_{t+1} ≈ f(h_t, token_t) clean enough
+// to use as a speculative draft?
+fn forward_token_dump_h(
+    backend: &MetalBackend,
+    model: &ModelMetal,
+    token_id: u32,
+    position: usize,
+    scratch: &mut Scratch,
+    h_out: &mut Vec<f32>,
+) -> u32 {
+    let cfg = model.cfg;
+    let d = cfg.d;
+    let f = cfg.f;
+    let n_heads = cfg.n_heads;
+    let n_kv = cfg.n_kv_heads;
+    let head_dim = cfg.head_dim;
+    let max_seq = cfg.max_seq;
+
+    let off = (token_id as usize) * d;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            model.token_emb.as_ptr().add(off),
+            scratch.xd_buf.contents() as *mut f32,
+            d,
+        );
+    }
+
+    for (li, layer) in model.layers.iter().enumerate() {
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.attn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
+            sgemv_q4_k_f32_lcpp_nsg2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &scratch.q_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nsg2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
+                layer.w_k.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nsg2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_v.buffer,
+                &scratch.v_buf,
+                layer.w_v.k,
+                layer.w_v.n,
+            )
+            .unwrap();
+        } else {
+            sgemv_q4_k_f32_lcpp_nsg2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &scratch.q_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nsg2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
+                layer.w_k.n,
+            )
+            .unwrap();
+            layer
+                .w_v
+                .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        }
+        if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
+            rms_norm_per_head_f32(
+                backend,
+                &scratch.q_buf,
+                qn_buf,
+                n_heads,
+                head_dim,
+                cfg.rms_eps,
+            )
+            .unwrap();
+        }
+        if let Some(kn_buf) = layer.attn_k_norm_buf.as_ref() {
+            rms_norm_per_head_f32(backend, &scratch.k_buf, kn_buf, n_kv, head_dim, cfg.rms_eps)
+                .unwrap();
+        }
+        rope_half_split_f32(
+            backend,
+            &scratch.q_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_heads,
+            head_dim,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        rope_half_split_f32(
+            backend,
+            &scratch.k_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_kv,
+            head_dim,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.k_buf,
+            &scratch.k_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.v_buf,
+            &scratch.v_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        let kv_len = position + 1;
+        gqa_decode_f32(
+            backend,
+            &scratch.q_buf,
+            &scratch.k_caches[li],
+            &scratch.v_caches[li],
+            &scratch.attn_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            kv_len,
+            max_seq,
+        )
+        .unwrap();
+        layer
+            .w_o
+            .matmul_into(backend, &scratch.attn_buf, &scratch.o_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.o_buf, d).unwrap();
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.ffn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_lcpp_nsg2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_gate.buffer,
+            &scratch.gate_buf,
+            layer.w_gate.k,
+            layer.w_gate.n,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_lcpp_nsg2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_up.buffer,
+            &scratch.up_buf,
+            layer.w_up.k,
+            layer.w_up.n,
+        )
+        .unwrap();
+        swiglu_f32(
+            backend,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            &scratch.fd_buf,
+            f,
+        )
+        .unwrap();
+        layer
+            .w_down
+            .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
+    }
+
+    rms_norm_f32(
+        backend,
+        &scratch.xd_buf,
+        &model.final_norm_buf,
+        &scratch.h_buf,
+        cfg.d,
+        cfg.rms_eps,
+    )
+    .unwrap();
+    model
+        .lm_head
+        .matmul_into(backend, &scratch.h_buf, &scratch.logits_buf);
+    backend.drain();
+    // Read the post-final_norm hidden state — this is the vector that the
+    // lm_head decodes into the next-token distribution.
+    h_out.resize(cfg.d, 0.0_f32);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.h_buf.contents() as *const f32,
+            h_out.as_mut_ptr(),
+            cfg.d,
+        );
+    }
     let mut logits = vec![0.0_f32; cfg.vocab];
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -1896,6 +2138,7 @@ fn forward_token_profiled(
             &model.rope_sin_buf,
             n_heads,
             head_dim,
+            head_dim,
             position,
         )
         .unwrap();
@@ -1905,6 +2148,7 @@ fn forward_token_profiled(
             &model.rope_cos_buf,
             &model.rope_sin_buf,
             n_kv,
+            head_dim,
             head_dim,
             position,
         )
@@ -2156,6 +2400,7 @@ fn forward_token_sparsity(
             &model.rope_sin_buf,
             n_heads,
             head_dim,
+            head_dim,
             position,
         )
         .unwrap();
@@ -2165,6 +2410,7 @@ fn forward_token_sparsity(
             &model.rope_cos_buf,
             &model.rope_sin_buf,
             n_kv,
+            head_dim,
             head_dim,
             position,
         )
@@ -2379,6 +2625,7 @@ fn forward_token_rank(
             &model.rope_sin_buf,
             n_heads,
             head_dim,
+            head_dim,
             position,
         )
         .unwrap();
@@ -2388,6 +2635,7 @@ fn forward_token_rank(
             &model.rope_cos_buf,
             &model.rope_sin_buf,
             n_kv,
+            head_dim,
             head_dim,
             position,
         )
@@ -2643,6 +2891,7 @@ fn forward_token_entropy(
             &model.rope_sin_buf,
             n_heads,
             head_dim,
+            head_dim,
             position,
         )
         .unwrap();
@@ -2652,6 +2901,7 @@ fn forward_token_entropy(
             &model.rope_cos_buf,
             &model.rope_sin_buf,
             n_kv,
+            head_dim,
             head_dim,
             position,
         )
@@ -2955,6 +3205,7 @@ fn forward_token_layer_cos(
             &model.rope_sin_buf,
             n_heads,
             head_dim,
+            head_dim,
             position,
         )
         .unwrap();
@@ -2964,6 +3215,7 @@ fn forward_token_layer_cos(
             &model.rope_cos_buf,
             &model.rope_sin_buf,
             n_kv,
+            head_dim,
             head_dim,
             position,
         )
@@ -3199,6 +3451,7 @@ fn forward_token_head_stats(
             &model.rope_sin_buf,
             n_heads,
             head_dim,
+            head_dim,
             position,
         )
         .unwrap();
@@ -3208,6 +3461,7 @@ fn forward_token_head_stats(
             &model.rope_cos_buf,
             &model.rope_sin_buf,
             n_kv,
+            head_dim,
             head_dim,
             position,
         )
@@ -3893,6 +4147,7 @@ fn main() -> ExitCode {
     let mut entropy_profile = false;
     let mut layer_cos_profile = false;
     let mut head_stats_profile = false;
+    let mut dump_h_path: Option<String> = None;
     let mut batch_test = false;
     let mut speculative_b: usize = 0; // 0 = off; 2..=4 = enable with B candidates
     let mut i = 0;
@@ -3960,6 +4215,12 @@ fn main() -> ExitCode {
                 args.remove(i);
                 continue;
             },
+            "--dump-h-trajectory" => {
+                dump_h_path = Some(args[i + 1].clone());
+                args.remove(i + 1);
+                args.remove(i);
+                continue;
+            },
             "--batch-test" => {
                 batch_test = true;
                 args.remove(i);
@@ -3995,6 +4256,10 @@ fn main() -> ExitCode {
     let mut entropy_stats = EntropyStats::new();
     let mut layer_cos_stats = LayerCosStats::new(model.cfg.n_layers);
     let mut head_stats = HeadStats::new(model.cfg.n_layers, model.cfg.n_heads);
+    // T134 — trajectory capture: collected (token, h_pre_lm_head) pairs.
+    let mut h_traj_tokens: Vec<u32> = Vec::new();
+    let mut h_traj_vectors: Vec<Vec<f32>> = Vec::new();
+    let mut h_scratch_vec = Vec::with_capacity(model.cfg.d);
     // T125 auxiliary buffers — allocated once, reused for every entropy snapshot.
     // d-sized for final_norm output, vocab-sized for the lm_head logits.
     let entropy_aux_h = backend.alloc_shared(model.cfg.d * 4).unwrap();
@@ -4032,6 +4297,18 @@ fn main() -> ExitCode {
             )
         } else if head_stats_profile {
             forward_token_head_stats(backend, &model, tok, cur_pos, &mut scratch, &mut head_stats)
+        } else if dump_h_path.is_some() {
+            let out = forward_token_dump_h(
+                backend,
+                &model,
+                tok,
+                cur_pos,
+                &mut scratch,
+                &mut h_scratch_vec,
+            );
+            h_traj_tokens.push(tok);
+            h_traj_vectors.push(h_scratch_vec.clone());
+            out
         } else if batch_test {
             // T121 — forward_batch with B=1, parity test vs forward_token
             let outs = forward_batch(backend, &model, &[tok], cur_pos, &mut scratch);
@@ -4199,6 +4476,18 @@ fn main() -> ExitCode {
                     &mut scratch,
                     &mut head_stats,
                 )
+            } else if dump_h_path.is_some() {
+                let out = forward_token_dump_h(
+                    backend,
+                    &model,
+                    last,
+                    cur_pos,
+                    &mut scratch,
+                    &mut h_scratch_vec,
+                );
+                h_traj_tokens.push(last);
+                h_traj_vectors.push(h_scratch_vec.clone());
+                out
             } else if batch_test {
                 let outs = forward_batch(backend, &model, &[last], cur_pos, &mut scratch);
                 outs[0]
@@ -4237,6 +4526,35 @@ fn main() -> ExitCode {
     }
     if head_stats_profile {
         head_stats.print_breakdown();
+    }
+    // T134 — dump h trajectory if requested. Format:
+    //   header (LE u32): n_tokens, d
+    //   tokens (LE u32 × n_tokens)
+    //   h_vectors (LE f32 × n_tokens × d)
+    if let Some(path) = dump_h_path.as_ref() {
+        use std::io::Write;
+        let n = h_traj_tokens.len() as u32;
+        let d = model.cfg.d as u32;
+        println!(
+            "\n=== T134 dumping h trajectory: {} tokens × d={} → {} ===",
+            n, d, path
+        );
+        let mut f = std::fs::File::create(path).expect("open dump file");
+        f.write_all(&n.to_le_bytes()).unwrap();
+        f.write_all(&d.to_le_bytes()).unwrap();
+        for &t in &h_traj_tokens {
+            f.write_all(&t.to_le_bytes()).unwrap();
+        }
+        for v in &h_traj_vectors {
+            for x in v {
+                f.write_all(&x.to_le_bytes()).unwrap();
+            }
+        }
+        f.flush().unwrap();
+        println!(
+            "  wrote {} bytes",
+            8 + 4 * n as usize + 4 * n as usize * d as usize
+        );
     }
     if speculative_b >= 2 {
         let accept_rate = if spec_total_drafts > 0 {

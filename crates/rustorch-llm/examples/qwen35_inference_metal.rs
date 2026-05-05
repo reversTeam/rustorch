@@ -42,7 +42,7 @@ use std::time::Instant;
 use metal::Buffer;
 use rustorch_gguf::metadata::{MetaArray, MetaValue};
 use rustorch_gguf::{dequant_to_f32, GgmlType, GgufFile, TensorInfo};
-use rustorch_llm::qwen35::{parse_config, LayerKind, Qwen35Config, Qwen35Variant};
+use rustorch_llm::qwen35::{describe_model, parse_config, LayerKind, Qwen35Config, Qwen35Variant};
 use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::error::MetalError;
@@ -615,12 +615,18 @@ impl DecodeState {
                     LayerState::Attn(AttnLayerCache { k_cache, v_cache })
                 },
                 LayerKind::Ssm => {
-                    let conv_state = backend
-                        .alloc_shared((cfg.ssm_conv_kernel - 1) * conv_dim * 4)
-                        .unwrap();
-                    let state = backend
-                        .alloc_shared(n_v * head_v_dim * head_v_dim * 4)
-                        .unwrap();
+                    // Conv ring buffer + delta-net state are recurrent state —
+                    // they MUST start at zero, otherwise garbage in the buffers
+                    // (Metal makes no zeroing guarantees on `new_buffer`) would
+                    // taint every SSM layer from token 0 and produce gibberish.
+                    let conv_bytes = (cfg.ssm_conv_kernel - 1) * conv_dim * 4;
+                    let state_bytes = n_v * head_v_dim * head_v_dim * 4;
+                    let conv_state = backend.alloc_shared(conv_bytes).unwrap();
+                    let state = backend.alloc_shared(state_bytes).unwrap();
+                    unsafe {
+                        std::ptr::write_bytes(conv_state.contents() as *mut u8, 0, conv_bytes);
+                        std::ptr::write_bytes(state.contents() as *mut u8, 0, state_bytes);
+                    }
                     LayerState::Ssm(SsmLayerState { conv_state, state })
                 },
             };
@@ -875,8 +881,9 @@ fn attn_block_forward(
     rms_norm_per_head_f32(backend, &scratch.k_attn, &attn.k_norm, n_kv, head_dim, eps)?;
 
     // 6. RoPE on first rope_dim dims of each head.
+    let rope_dim = cfg.rope_dim;
     rope_half_split_f32(
-        backend, &scratch.q, rope_cos, rope_sin, n_q, head_dim, position,
+        backend, &scratch.q, rope_cos, rope_sin, n_q, head_dim, rope_dim, position,
     )?;
     rope_half_split_f32(
         backend,
@@ -885,6 +892,7 @@ fn attn_block_forward(
         rope_sin,
         n_kv,
         head_dim,
+        rope_dim,
         position,
     )?;
 
@@ -947,6 +955,7 @@ fn ssm_block_forward(
     state: &SsmLayerState,
     scratch: &Scratch,
     cfg: &Qwen35Config,
+    dump_prefix: &str,
 ) -> Result<(), MetalError> {
     let d = cfg.d;
     let eps = cfg.rms_eps;
@@ -959,15 +968,45 @@ fn ssm_block_forward(
 
     // 1. RMSNorm on residual stream.
     rms_norm_f32(backend, &scratch.xd, &ssm.attn_norm, &scratch.h, d, eps)?;
+    dump_buf(
+        backend,
+        &scratch.h,
+        d,
+        &format!("{dump_prefix}/ssm/01_norm_h"),
+    );
 
     // 2. Input projections.
     ssm.w_qkv
         .matmul_into(backend, &scratch.h, &scratch.qkv_mixed)?;
+    dump_buf(
+        backend,
+        &scratch.qkv_mixed,
+        conv_dim,
+        &format!("{dump_prefix}/ssm/02_qkv_mixed"),
+    );
     ssm.w_gate.matmul_into(backend, &scratch.h, &scratch.z)?;
+    dump_buf(
+        backend,
+        &scratch.z,
+        value_dim,
+        &format!("{dump_prefix}/ssm/03_z"),
+    );
     ssm.ssm_alpha
         .matmul_into(backend, &scratch.h, &scratch.alpha)?;
+    dump_buf(
+        backend,
+        &scratch.alpha,
+        n_v,
+        &format!("{dump_prefix}/ssm/04_alpha"),
+    );
     ssm.ssm_beta
         .matmul_into(backend, &scratch.h, &scratch.beta)?;
+    dump_buf(
+        backend,
+        &scratch.beta,
+        n_v,
+        &format!("{dump_prefix}/ssm/05_beta"),
+    );
 
     // 3. T146a — fused GPU kernel: gate_h = softplus(alpha + dt_bias) * ssm_a,
     //    beta_sig = sigmoid(beta). No drain needed.
@@ -981,6 +1020,18 @@ fn ssm_block_forward(
         &scratch.beta_sig,
         n_v,
     )?;
+    dump_buf(
+        backend,
+        &scratch.gate_h,
+        n_v,
+        &format!("{dump_prefix}/ssm/06_gate_h"),
+    );
+    dump_buf(
+        backend,
+        &scratch.beta_sig,
+        n_v,
+        &format!("{dump_prefix}/ssm/07_beta_sig"),
+    );
 
     // 4. Conv1d step + ring-buffer update.
     ssm_conv1d_step_f32(
@@ -992,6 +1043,12 @@ fn ssm_block_forward(
         cfg.ssm_conv_kernel,
         conv_dim,
     )?;
+    dump_buf(
+        backend,
+        &scratch.conv_out,
+        conv_dim,
+        &format!("{dump_prefix}/ssm/08_conv_out"),
+    );
     // 5. (SiLU was fused into ssm_conv1d_step_f32 in T144b — no CPU pass.)
     // 6. Split q, k, v from conv_out into separate Metal buffers.
     //    Both 27B and 35B use n_v_heads = repeat * n_k_heads (27B: 48 = 3 × 16,
@@ -1007,10 +1064,40 @@ fn ssm_block_forward(
         std::ptr::copy_nonoverlapping(conv_p.add(key_dim), k_p, key_dim); // [n_k, head_dim]
         std::ptr::copy_nonoverlapping(conv_p.add(2 * key_dim), v_p, value_dim); // [n_v, head_dim]
     }
+    dump_buf(
+        backend,
+        &scratch.q_ssm,
+        key_dim,
+        &format!("{dump_prefix}/ssm/09_q_split"),
+    );
+    dump_buf(
+        backend,
+        &scratch.k_ssm,
+        key_dim,
+        &format!("{dump_prefix}/ssm/10_k_split"),
+    );
+    dump_buf(
+        backend,
+        &scratch.v_ssm,
+        value_dim,
+        &format!("{dump_prefix}/ssm/11_v_split"),
+    );
 
     // 7. Per-head L2 norm on q,k (n_k heads each).
     l2_norm_per_head_f32(backend, &scratch.q_ssm, n_k, head_v_dim, eps)?;
     l2_norm_per_head_f32(backend, &scratch.k_ssm, n_k, head_v_dim, eps)?;
+    dump_buf(
+        backend,
+        &scratch.q_ssm,
+        key_dim,
+        &format!("{dump_prefix}/ssm/12_q_l2"),
+    );
+    dump_buf(
+        backend,
+        &scratch.k_ssm,
+        key_dim,
+        &format!("{dump_prefix}/ssm/13_k_l2"),
+    );
 
     // 8. (Broadcast q,k from n_k → n_v eliminated — delta_net_step handles
     //    the broadcast inline via integer division of head_v.)
@@ -1029,6 +1116,12 @@ fn ssm_block_forward(
         head_v_dim,
         n_k,
     )?;
+    dump_buf(
+        backend,
+        &scratch.ssm_out_buf,
+        value_dim,
+        &format!("{dump_prefix}/ssm/14_dnet_out"),
+    );
 
     // 10. Per-head RMSNorm gated by silu(z).
     rms_norm_per_head_gated_f32(
@@ -1040,10 +1133,17 @@ fn ssm_block_forward(
         head_v_dim,
         eps,
     )?;
+    dump_buf(
+        backend,
+        &scratch.ssm_out_buf,
+        value_dim,
+        &format!("{dump_prefix}/ssm/15_gated_norm"),
+    );
 
     // 11. ssm_out @ out_gated → result, then xd += result.
     ssm.ssm_out
         .matmul_into(backend, &scratch.ssm_out_buf, &scratch.o)?;
+    dump_buf(backend, &scratch.o, d, &format!("{dump_prefix}/ssm/16_o"));
     add_inplace_f32(backend, &scratch.xd, &scratch.o, d)?;
     Ok(())
 }
@@ -1212,6 +1312,88 @@ fn ffn_dense_forward(
 // Top-level forward_token
 // ============================================================================
 
+// ============================================================================
+// T150 — Layer-by-layer bisection helper.
+//
+// Set `RUSTORCH_DUMP_LAYERS=1` to print mean/std/min/max/nan-count + first
+// 8 floats of the residual stream after every step of the forward pass.
+// Set `RUSTORCH_DUMP_DIR=/path` to ALSO write the raw f32-LE buffer to
+// `<dir>/<label>.bin` for offline numerical diff against a reference run
+// (CPU forward, llama.cpp eval-callback, …).
+//
+// Both flags force a `backend.drain()` at every dump point so any in-flight
+// GPU work is visible before we read — perf is intentionally tanked when
+// debug is on.
+// ============================================================================
+fn dump_mode() -> u8 {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if env::var("RUSTORCH_DUMP_DIR").is_ok() {
+            2
+        } else if env::var("RUSTORCH_DUMP_LAYERS").is_ok() {
+            1
+        } else {
+            0
+        }
+    })
+}
+
+fn dump_buf(backend: &MetalBackend, buf: &Buffer, n: usize, label: &str) {
+    let mode = dump_mode();
+    if mode == 0 || n == 0 {
+        return;
+    }
+    backend.drain();
+    let mut v = vec![0.0_f32; n];
+    unsafe {
+        std::ptr::copy_nonoverlapping(buf.contents() as *const f32, v.as_mut_ptr(), n);
+    }
+    let mut sum = 0.0_f64;
+    let mut sumsq = 0.0_f64;
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    let mut nan_count = 0_usize;
+    for &x in &v {
+        if !x.is_finite() {
+            nan_count += 1;
+            continue;
+        }
+        let xd = x as f64;
+        sum += xd;
+        sumsq += xd * xd;
+        if x < mn {
+            mn = x;
+        }
+        if x > mx {
+            mx = x;
+        }
+    }
+    let valid = (n - nan_count).max(1) as f64;
+    let mean = sum / valid;
+    let var = (sumsq / valid - mean * mean).max(0.0);
+    let std = var.sqrt();
+    let preview: Vec<f32> = v.iter().take(8).copied().collect();
+    eprintln!(
+        "[dump] {label:<42} n={n:>7} mean={mean:>+11.3e} std={std:>9.3e} min={mn:>+9.3e} max={mx:>+9.3e} nan={nan_count} head={preview:.4?}"
+    );
+    if mode >= 2 {
+        if let Ok(dir) = env::var("RUSTORCH_DUMP_DIR") {
+            let _ = std::fs::create_dir_all(&dir);
+            let safe = label
+                .chars()
+                .map(|c| match c {
+                    '/' | ' ' | '\t' => '_',
+                    other => other,
+                })
+                .collect::<String>();
+            let path = std::path::PathBuf::from(dir).join(format!("{safe}.bin"));
+            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 4) };
+            let _ = std::fs::write(&path, bytes);
+        }
+    }
+}
+
 fn forward_token(
     backend: &MetalBackend,
     file: &GgufFile,
@@ -1223,10 +1405,20 @@ fn forward_token(
     let cfg = &model.cfg;
     // 1. Embed token into xd.
     embed_token(file, token, &state.scratch.xd, cfg)?;
+    dump_buf(
+        backend,
+        &state.scratch.xd,
+        cfg.d,
+        &format!("p{position:03}/embed"),
+    );
 
     // 2. Per-layer dispatch.
     for li in 0..cfg.n_layers {
         let layer = &model.layers[li];
+        let kind_tag = match layer {
+            LayerMetal::Attn { .. } => "attn",
+            LayerMetal::Ssm { .. } => "ssm_",
+        };
         match (layer, &state.layers[li]) {
             (LayerMetal::Attn { attn, ffn }, LayerState::Attn(cache)) => {
                 attn_block_forward(
@@ -1241,6 +1433,12 @@ fn forward_token(
                     state.max_seq,
                 )
                 .map_err(|e| format!("layer {li} attn: {e:?}"))?;
+                dump_buf(
+                    backend,
+                    &state.scratch.xd,
+                    cfg.d,
+                    &format!("p{position:03}/L{li:02}_{kind_tag}_post_mixer"),
+                );
                 // Post-attention norm (h := norm(xd, attn_post_norm)) for FFN input.
                 rms_norm_f32(
                     backend,
@@ -1251,12 +1449,31 @@ fn forward_token(
                     cfg.rms_eps,
                 )
                 .map_err(|e| format!("layer {li} post norm: {e:?}"))?;
+                dump_buf(
+                    backend,
+                    &state.scratch.h,
+                    cfg.d,
+                    &format!("p{position:03}/L{li:02}_{kind_tag}_post_norm"),
+                );
                 ffn_dense_forward(backend, ffn, &state.scratch, cfg)
                     .map_err(|e| format!("layer {li} ffn: {e:?}"))?;
+                dump_buf(
+                    backend,
+                    &state.scratch.xd,
+                    cfg.d,
+                    &format!("p{position:03}/L{li:02}_{kind_tag}_post_ffn"),
+                );
             },
             (LayerMetal::Ssm { ssm, ffn }, LayerState::Ssm(s)) => {
-                ssm_block_forward(backend, ssm, s, &state.scratch, cfg)
+                let prefix = format!("p{position:03}/L{li:02}");
+                ssm_block_forward(backend, ssm, s, &state.scratch, cfg, &prefix)
                     .map_err(|e| format!("layer {li} ssm: {e:?}"))?;
+                dump_buf(
+                    backend,
+                    &state.scratch.xd,
+                    cfg.d,
+                    &format!("p{position:03}/L{li:02}_{kind_tag}_post_mixer"),
+                );
                 rms_norm_f32(
                     backend,
                     &state.scratch.xd,
@@ -1266,15 +1483,28 @@ fn forward_token(
                     cfg.rms_eps,
                 )
                 .map_err(|e| format!("layer {li} post norm: {e:?}"))?;
+                dump_buf(
+                    backend,
+                    &state.scratch.h,
+                    cfg.d,
+                    &format!("p{position:03}/L{li:02}_{kind_tag}_post_norm"),
+                );
                 ffn_dense_forward(backend, ffn, &state.scratch, cfg)
                     .map_err(|e| format!("layer {li} ffn: {e:?}"))?;
+                dump_buf(
+                    backend,
+                    &state.scratch.xd,
+                    cfg.d,
+                    &format!("p{position:03}/L{li:02}_{kind_tag}_post_ffn"),
+                );
             },
             _ => return Err(format!("layer {li}: kind/state mismatch")),
         }
         // T146c — CPU↔GPU pipelining via mid-token commits. Sweet spot from
         // the 14B (T133) was every 5 layers, gives the GPU steady work while
-        // CPU continues encoding the next segment.
-        if (li + 1) % 5 == 0 && li + 1 < cfg.n_layers {
+        // CPU continues encoding the next segment. Disabled when dumping
+        // (we drain at every hook anyway).
+        if dump_mode() == 0 && (li + 1) % 5 == 0 && li + 1 < cfg.n_layers {
             backend.commit_async();
         }
     }
@@ -1289,11 +1519,23 @@ fn forward_token(
         cfg.rms_eps,
     )
     .map_err(|e| format!("final norm: {e:?}"))?;
+    dump_buf(
+        backend,
+        &state.scratch.h,
+        cfg.d,
+        &format!("p{position:03}/final_norm"),
+    );
     model
         .output
         .matmul_into(backend, &state.scratch.h, &state.scratch.logits)
         .map_err(|e| format!("lm_head: {e:?}"))?;
     backend.drain();
+    dump_buf(
+        backend,
+        &state.scratch.logits,
+        cfg.vocab,
+        &format!("p{position:03}/logits"),
+    );
     Ok(argmax_cpu(&state.scratch.logits, cfg.vocab))
 }
 
@@ -1614,6 +1856,7 @@ fn main() -> ExitCode {
         cfg.attention_indices.len(),
         cfg.ssm_indices.len()
     );
+    println!("\n{}", describe_model(&cfg));
 
     println!("\n→ loading weights into Metal buffers...");
     let (model, stats) = match load_metal_model(backend, &path, &cfg) {
