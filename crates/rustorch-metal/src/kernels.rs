@@ -4888,8 +4888,9 @@ using namespace metal;
 
 // Element-wise SwiGLU: y[i] = silu(gate[i]) * up[i] where
 // silu(x) = x / (1 + exp(-x)).
-// (T99 float4 attempt regressed slightly — divergence between vec/scalar
-// paths costs more than the saved load count at this dispatch granularity.)
+// (T99 + T115 both tried float4 vectorization, both regressed. Likely
+// exp() in float4 form not well-pipelined on Apple GPU at this granularity.
+// Kept scalar.)
 kernel void swiglu_f32(
     device const float* gate [[buffer(0)]],
     device const float* up   [[buffer(1)]],
@@ -4931,13 +4932,14 @@ const KV_APPEND_F32_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// Append a single decode-step's K (or V) slice into the layer's KV
-// cache at the given absolute position. Layout of the cache is
-// [n_kv, max_seq, head_dim] row-major. Layout of src is
-// [n_kv, head_dim] (one row per kv head).
+// T116 — Append KV slice with float4 vectorization.
+// 1 thread = 4 elements. Layout [n_kv, max_seq, head_dim] row-major.
+// For Qwen3-14B: total = n_kv * head_dim = 8 * 128 = 1024 floats per
+// dispatch. f4 = 256 threads per dispatch. Called 80×/token (40 layers ×
+// K and V) — small individual but cumulative load count matters.
 kernel void kv_append_f32(
-    device const float* src  [[buffer(0)]],   // [n_kv * head_dim]
-    device float* dst        [[buffer(1)]],   // [n_kv * max_seq * head_dim]
+    device const float* src  [[buffer(0)]],
+    device float* dst        [[buffer(1)]],
     constant uint3& dims     [[buffer(2)]],   // (n_kv, head_dim, position)
     constant uint& max_seq   [[buffer(3)]],
     uint gid                 [[thread_position_in_grid]]
@@ -4946,11 +4948,34 @@ kernel void kv_append_f32(
     uint head_dim = dims.y;
     uint position = dims.z;
     uint total    = n_kv * head_dim;
-    if (gid >= total) return;
-    uint kvh = gid / head_dim;
-    uint dd  = gid % head_dim;
-    uint dst_off = kvh * max_seq * head_dim + position * head_dim + dd;
-    dst[dst_off] = src[gid];
+    uint t4 = total / 4u;
+
+    if (gid < t4) {
+        // Vectorized float4 path
+        uint flat_base = gid * 4u;
+        // Need to map flat indices to (kvh, dd) — for kv_append they're
+        // contiguous in src[flat], so we just copy 4 floats. But dst layout
+        // has stride: dst[kvh, position, dd] = kvh * max_seq * head_dim + position * head_dim + dd.
+        // If 4 consecutive flat indices stay within same kvh row (head_dim=128
+        // is divisible by 4), then dst offsets are also contiguous → 1 float4 store.
+        // Check: flat_base / head_dim == (flat_base + 3) / head_dim ?
+        // For head_dim multiple of 4: yes, flat_base..flat_base+3 are in same row.
+        uint kvh = flat_base / head_dim;
+        uint dd  = flat_base % head_dim;
+        uint dst_off = kvh * max_seq * head_dim + position * head_dim + dd;
+        device const float4* src4 = (device const float4*)src;
+        device float4* dst4 = (device float4*)(dst + dst_off);
+        dst4[0] = src4[gid];
+        return;
+    }
+    // Scalar tail
+    uint i = t4 * 4u + (gid - t4);
+    if (i < total) {
+        uint kvh = i / head_dim;
+        uint dd  = i % head_dim;
+        uint dst_off = kvh * max_seq * head_dim + position * head_dim + dd;
+        dst[dst_off] = src[i];
+    }
 }
 "#;
 
@@ -4976,7 +5001,10 @@ pub fn kv_append_f32(
         encoder.set_bytes(2, 12, dims.as_ptr() as *const std::ffi::c_void);
         encoder.set_bytes(3, 4, &ms as *const u32 as *const std::ffi::c_void);
         let tg_size = MTLSize::new(64, 1, 1);
-        let grid = MTLSize::new(total as u64, 1, 1);
+        // T116 — float4 vectorized: total/4 threads + tail
+        let t4 = (total / 4) as u64;
+        let tail = (total % 4) as u64;
+        let grid = MTLSize::new(t4 + tail, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
     });
     Ok(())
