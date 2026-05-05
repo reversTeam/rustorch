@@ -791,6 +791,301 @@ impl RankStats {
     }
 }
 
+// T125 — Entropy-Adaptive Decoding profile.
+//
+// Hypothesis (CALM-style early exit): for many tokens, the model's prediction
+// stabilizes well before the final layer. If we run final_norm + lm_head on the
+// residual stream after layer K (≪ 40), and the resulting logits agree with the
+// full-40-layer argmax, we could exit early and save (40-K)/40 of the compute.
+//
+// The gating signal is the entropy H of the early-exit distribution:
+//   H = -Σ p_i log p_i  (in nats)
+// Low H ⇔ confident prediction ⇔ likely safe to exit. We sweep K ∈ {8, 12, 16,
+// 20, 24, 28, 32} and 4 entropy thresholds τ ∈ {0.25, 0.5, 1.0, 2.0} nats. For
+// each (K, τ) we record:
+//   - count   : tokens where H_K < τ (would have been committed early)
+//   - agree   : among those, how many had argmax_K == argmax_full
+// The viable (K, τ) pairs are those with agree/count ≥ 0.95 AND count/total
+// ≥ 0.5 (commit early on ≥ 50% of tokens with ≤ 5% mistakes).
+//
+// Compute cost: per token, 7 extra (final_norm + lm_head) dispatches. lm_head
+// is the single biggest matmul in the model (~5K → 152K), so this profile is
+// significantly slower than baseline decode — that's expected, profile-only.
+const ENTROPY_LAYERS: &[usize] = &[8, 12, 16, 20, 24, 28, 32];
+const ENTROPY_TAUS: &[f64] = &[0.25, 0.5, 1.0, 2.0];
+
+#[derive(Clone, Copy, Default, Debug)]
+struct KStats {
+    /// Number of tokens for which we observed an early-exit logits at this K.
+    count: u64,
+    /// Among count: how many had argmax_K == argmax_full (top-1 match).
+    agree: u64,
+    /// Among count: how many had argmax_full ∈ top-5(K). Justifies a
+    /// "speculate at K, verify with full head" pipeline (the 5 heaviest
+    /// kernels rerun, but only on a 5-candidate forward_batch).
+    in_top5: u64,
+    /// Sum of entropy (nats) over count.
+    entropy_sum: f64,
+    /// Sum of (top1 - top2) margin over count.
+    top_minus_second_sum: f64,
+    /// Sum of cos(h_K_normed, h_full_normed) where h is the post-final_norm
+    /// residual stream. High mean cos ⇔ a learned linear projection P_K
+    /// could close the early-exit gap (T126-rescue idea).
+    cos_h_sum: f64,
+    /// Per-τ buckets: (count_below_tau, agree_below_tau).
+    /// Indexed by τ position in ENTROPY_TAUS.
+    tau_buckets: [(u64, u64); 4],
+}
+
+struct EntropyStats {
+    /// One KStats per layer in ENTROPY_LAYERS.
+    per_k: Vec<KStats>,
+    /// Total tokens observed (denominator for "early-exit fraction").
+    total: u64,
+}
+
+impl EntropyStats {
+    fn new() -> Self {
+        Self {
+            per_k: vec![KStats::default(); ENTROPY_LAYERS.len()],
+            total: 0,
+        }
+    }
+
+    /// Record a single token observation. `pending` is a per-K record:
+    /// (entropy_K, argmax_K, top1_minus_top2_K, top5_K, cos_h_K_to_full).
+    /// `argmax_full` is the full-40-layer prediction (ground truth).
+    fn record(&mut self, pending: &[(f64, u32, f32, [u32; 5], f64)], argmax_full: u32) {
+        debug_assert_eq!(pending.len(), self.per_k.len());
+        self.total += 1;
+        for (k_idx, item) in pending.iter().enumerate() {
+            let (h, am, td, top5, cos_h) = *item;
+            let s = &mut self.per_k[k_idx];
+            s.count += 1;
+            s.entropy_sum += h;
+            s.top_minus_second_sum += td as f64;
+            s.cos_h_sum += cos_h;
+            let agree = am == argmax_full;
+            if agree {
+                s.agree += 1;
+            }
+            if top5.contains(&argmax_full) {
+                s.in_top5 += 1;
+            }
+            for (ti, &tau) in ENTROPY_TAUS.iter().enumerate() {
+                if h < tau {
+                    s.tau_buckets[ti].0 += 1;
+                    if agree {
+                        s.tau_buckets[ti].1 += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn print_breakdown(&self) {
+        println!(
+            "\n=== T125 entropy-adaptive profile ({} tokens observed) ===",
+            self.total
+        );
+        if self.total == 0 {
+            println!("  (no observations)");
+            return;
+        }
+        // Header 1 — unconditional accuracy + average entropy per K
+        println!(
+            "  {:<6} {:>8} {:>10} {:>10} {:>11} {:>10} {:>10}",
+            "layer_K", "count", "top1%", "top5%", "mean_H", "top1-2", "cos(h,full)"
+        );
+        for (k_idx, &k) in ENTROPY_LAYERS.iter().enumerate() {
+            let s = &self.per_k[k_idx];
+            if s.count == 0 {
+                continue;
+            }
+            let match_pct = 100.0 * s.agree as f64 / s.count as f64;
+            let top5_pct = 100.0 * s.in_top5 as f64 / s.count as f64;
+            let mean_h = s.entropy_sum / s.count as f64;
+            let mean_td = s.top_minus_second_sum / s.count as f64;
+            let mean_cos = s.cos_h_sum / s.count as f64;
+            println!(
+                "  {:<6} {:>8} {:>9.2}% {:>9.2}% {:>11.4} {:>10.4} {:>10.4}",
+                k, s.count, match_pct, top5_pct, mean_h, mean_td, mean_cos
+            );
+        }
+
+        // Header 2 — per-τ precision/coverage trade-off
+        println!("\n  Trade-off table — for each (K, τ): coverage = % tokens with H_K < τ;");
+        println!("  precision = % of those that match the full-40-layer argmax.");
+        println!(
+            "  {:<6} {:<6} {:>10} {:>12} {:>12}",
+            "layer_K", "τ", "coverage", "precision", "score"
+        );
+        // score = coverage × precision, rough utility metric (high = both good)
+        let mut best: Option<(usize, f64, f64, f64, f64)> = None; // (k, τ, coverage, precision, score)
+        for (k_idx, &k) in ENTROPY_LAYERS.iter().enumerate() {
+            let s = &self.per_k[k_idx];
+            if s.count == 0 {
+                continue;
+            }
+            for (ti, &tau) in ENTROPY_TAUS.iter().enumerate() {
+                let (n_below, n_agree) = s.tau_buckets[ti];
+                if n_below == 0 {
+                    continue;
+                }
+                let coverage = n_below as f64 / self.total as f64;
+                let precision = n_agree as f64 / n_below as f64;
+                let score = coverage * precision;
+                println!(
+                    "  {:<6} {:<6.2} {:>9.2}% {:>11.2}% {:>12.4}",
+                    k,
+                    tau,
+                    100.0 * coverage,
+                    100.0 * precision,
+                    score
+                );
+                if precision >= 0.95 && (best.is_none() || score > best.as_ref().unwrap().4) {
+                    best = Some((k, tau, coverage, precision, score));
+                }
+            }
+        }
+
+        // Decision verdict
+        println!("\nDecision criteria for entropy-adaptive early exit (T126):");
+        let n_layers_full = 40.0;
+        if let Some((best_k, best_tau, cov, prec, _)) = best {
+            // theoretical decode-step speedup if we exit at K with coverage `cov`
+            // and pay full forward on the rest:
+            //   t_eff = cov × K/40 + (1 - cov)         (full path on misses)
+            //   speedup = 1 / t_eff
+            let frac_k = best_k as f64 / n_layers_full;
+            let t_eff = cov * frac_k + (1.0 - cov);
+            let speedup = 1.0 / t_eff;
+            println!(
+                "  ✓ VIABLE — best (K={}, τ={:.2}): coverage {:.1}%, precision {:.1}% (≥95%).",
+                best_k,
+                best_tau,
+                100.0 * cov,
+                100.0 * prec
+            );
+            println!(
+                "    → Theoretical decode speedup = {:.2}× (vs baseline 40 layers)",
+                speedup
+            );
+            if speedup >= 1.5 {
+                println!(
+                    "    → Proceed to T126 — wire entropy-adaptive skip with K={}, τ={:.2}.",
+                    best_k, best_tau
+                );
+            } else {
+                println!(
+                    "    → Speedup {:.2}× under target 1.5×. Investigate stacking with cosine-gate (T127).",
+                    speedup
+                );
+            }
+        } else {
+            // No precision-95 hit; report the best precision×coverage anyway
+            let mut best_score: Option<(usize, f64, f64, f64)> = None;
+            for (k_idx, &k) in ENTROPY_LAYERS.iter().enumerate() {
+                let s = &self.per_k[k_idx];
+                if s.count == 0 {
+                    continue;
+                }
+                for (ti, &tau) in ENTROPY_TAUS.iter().enumerate() {
+                    let (n_below, n_agree) = s.tau_buckets[ti];
+                    if n_below == 0 {
+                        continue;
+                    }
+                    let coverage = n_below as f64 / self.total as f64;
+                    let precision = n_agree as f64 / n_below as f64;
+                    let score = coverage * precision;
+                    if best_score.is_none() || score > best_score.as_ref().unwrap().3 {
+                        best_score = Some((k, tau, precision, score));
+                    }
+                }
+            }
+            if let Some((k, tau, prec, _)) = best_score {
+                println!(
+                    "  ✗ NO 95%-precision (K, τ) found. Best: K={}, τ={:.2}, precision={:.1}%.",
+                    k,
+                    tau,
+                    100.0 * prec
+                );
+                println!("    → Pivot: try larger K, or different gate (cosine-gate T127, or layer-wise margin).");
+            } else {
+                println!("  ✗ No tokens crossed any τ threshold — early exit not informative.");
+            }
+        }
+    }
+}
+
+/// T125 — Compute softmax entropy (nats), top-5 indices ordered, and
+/// (top1 - top2) margin in a single pass. Numerically stable via max-subtract.
+/// Returns (entropy, argmax, top5_indices, top1_minus_top2_margin).
+fn entropy_top5_margin(logits: &[f32]) -> (f64, u32, [u32; 5], f32) {
+    // Pass 1: find max for numerical stability.
+    let mut max = f32::NEG_INFINITY;
+    for &l in logits {
+        if l > max {
+            max = l;
+        }
+    }
+    // Pass 2: Z + entropy (single accumulation).
+    let mut z = 0.0f64;
+    for &l in logits {
+        z += ((l - max) as f64).exp();
+    }
+    let log_z = z.ln();
+    let mut h = 0.0f64;
+    for &l in logits {
+        let shift = (l - max) as f64;
+        let p = shift.exp() / z;
+        if p > 1e-30 {
+            h -= p * (shift - log_z);
+        }
+    }
+    // Pass 3: top-5 indices (small fixed-size insertion sort).
+    let mut top5_v = [f32::NEG_INFINITY; 5];
+    let mut top5_i = [0u32; 5];
+    for (i, &l) in logits.iter().enumerate() {
+        // insert (l, i) into the sorted-descending top-5 if l > smallest.
+        if l > top5_v[4] {
+            // shift up
+            let mut j = 4usize;
+            while j > 0 && l > top5_v[j - 1] {
+                top5_v[j] = top5_v[j - 1];
+                top5_i[j] = top5_i[j - 1];
+                j -= 1;
+            }
+            top5_v[j] = l;
+            top5_i[j] = i as u32;
+        }
+    }
+    let margin = if top5_v[1].is_finite() {
+        top5_v[0] - top5_v[1]
+    } else {
+        0.0
+    };
+    (h, top5_i[0], top5_i, margin)
+}
+
+/// Cosine similarity between two same-length vectors. Returns 0 if either
+/// has zero norm (defensive).
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for (av, bv) in a.iter().zip(b.iter()) {
+        let av = *av as f64;
+        let bv = *bv as f64;
+        dot += av * bv;
+        na += av * av;
+        nb += bv * bv;
+    }
+    let n = (na.sqrt() * nb.sqrt()).max(1e-30);
+    dot / n
+}
+
 // T88a — N-gram hit rate analysis on a generated sequence. Replays the
 // decode step by step, maintaining a trigram → continuations cache built
 // from the tokens generated so far. At each step ≥ 3 we look up whether
@@ -1898,6 +2193,327 @@ fn forward_token_rank(
     argmax(&logits)
 }
 
+// T125 — Entropy-adaptive forward. Same residual stream as forward_token,
+// but at the end of each layer K ∈ ENTROPY_LAYERS we run an extra
+// (final_norm + lm_head) snapshot from the current xd_buf into auxiliary
+// buffers, compute entropy/argmax/margin on the resulting logits, and
+// stash a per-K record. After the full forward we compare each early-exit
+// argmax to the full-40-layer argmax and feed everything into stats.
+//
+// xd_buf is read-only here (rms_norm + matmul write to fresh buffers), so
+// the residual stream is not disturbed. Cost: 7 extra (rms_norm + lm_head)
+// dispatches per token. The lm_head matmul is the heaviest op in the
+// model, so this profile is ~5-8× slower than baseline decode — fine for
+// profile-only mode.
+fn forward_token_entropy(
+    backend: &MetalBackend,
+    model: &ModelMetal,
+    token_id: u32,
+    position: usize,
+    scratch: &mut Scratch,
+    aux_h_buf: &Buffer,
+    aux_logits_buf: &Buffer,
+    stats: &mut EntropyStats,
+) -> u32 {
+    let cfg = model.cfg;
+    let d = cfg.d;
+    let f = cfg.f;
+    let n_heads = cfg.n_heads;
+    let n_kv = cfg.n_kv_heads;
+    let head_dim = cfg.head_dim;
+    let max_seq = cfg.max_seq;
+
+    let off = (token_id as usize) * d;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            model.token_emb.as_ptr().add(off),
+            scratch.xd_buf.contents() as *mut f32,
+            d,
+        );
+    }
+
+    // Per-token pending records: one (entropy, argmax, margin, top5, _placeholder_cos)
+    // per K snapshot. cos(h_K, h_full) is filled in at the end after the full
+    // forward computes h_full_normed.
+    let mut pending: Vec<(f64, u32, f32, [u32; 5], f64)> = Vec::with_capacity(ENTROPY_LAYERS.len());
+    let mut snap_logits = vec![0.0f32; cfg.vocab];
+    // Captured post-final_norm hidden states at each K (each is d-floats).
+    let mut snap_h: Vec<Vec<f32>> = Vec::with_capacity(ENTROPY_LAYERS.len());
+
+    for (li, layer) in model.layers.iter().enumerate() {
+        // 1. Pre-attn RMSNorm.
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.attn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+
+        // 2. QKV.
+        if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &scratch.q_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
+                layer.w_k.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_v.buffer,
+                &scratch.v_buf,
+                layer.w_v.k,
+                layer.w_v.n,
+            )
+            .unwrap();
+        } else {
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &scratch.q_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
+                layer.w_k.n,
+            )
+            .unwrap();
+            layer
+                .w_v
+                .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        }
+
+        // 3. QK-norm.
+        if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
+            rms_norm_per_head_f32(
+                backend,
+                &scratch.q_buf,
+                qn_buf,
+                n_heads,
+                head_dim,
+                cfg.rms_eps,
+            )
+            .unwrap();
+        }
+        if let Some(kn_buf) = layer.attn_k_norm_buf.as_ref() {
+            rms_norm_per_head_f32(backend, &scratch.k_buf, kn_buf, n_kv, head_dim, cfg.rms_eps)
+                .unwrap();
+        }
+
+        // 4. RoPE.
+        rope_half_split_f32(
+            backend,
+            &scratch.q_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_heads,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        rope_half_split_f32(
+            backend,
+            &scratch.k_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_kv,
+            head_dim,
+            position,
+        )
+        .unwrap();
+
+        // 5. KV append.
+        kv_append_f32(
+            backend,
+            &scratch.k_buf,
+            &scratch.k_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.v_buf,
+            &scratch.v_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+
+        // 6. GQA decode.
+        let kv_len = position + 1;
+        gqa_decode_f32(
+            backend,
+            &scratch.q_buf,
+            &scratch.k_caches[li],
+            &scratch.v_caches[li],
+            &scratch.attn_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            kv_len,
+            max_seq,
+        )
+        .unwrap();
+
+        // 7. O proj + residual.
+        layer
+            .w_o
+            .matmul_into(backend, &scratch.attn_buf, &scratch.o_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.o_buf, d).unwrap();
+
+        // 8. FFN norm.
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.ffn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+
+        // 9. Gate + Up + SwiGLU + Down + residual.
+        sgemv_q4_k_f32_lcpp_nr2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_gate.buffer,
+            &scratch.gate_buf,
+            layer.w_gate.k,
+            layer.w_gate.n,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_lcpp_nr2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_up.buffer,
+            &scratch.up_buf,
+            layer.w_up.k,
+            layer.w_up.n,
+        )
+        .unwrap();
+        swiglu_f32(
+            backend,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            &scratch.fd_buf,
+            f,
+        )
+        .unwrap();
+        layer
+            .w_down
+            .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
+
+        // T125 — early-exit snapshot. Layer index is 0-based so layer K means
+        // we have completed K+1 layers. We compare li+1 to the configured
+        // ENTROPY_LAYERS values to match the natural "after layer K" semantics.
+        let layers_done = li + 1;
+        if ENTROPY_LAYERS.contains(&layers_done) {
+            // Fresh final_norm + lm_head onto a *copy* of the residual stream.
+            // rms_norm reads xd_buf into aux_h_buf — does NOT mutate xd_buf.
+            rms_norm_f32(
+                backend,
+                &scratch.xd_buf,
+                &model.final_norm_buf,
+                aux_h_buf,
+                d,
+                cfg.rms_eps,
+            )
+            .unwrap();
+            model
+                .lm_head
+                .matmul_into(backend, aux_h_buf, aux_logits_buf);
+            backend.drain();
+            // Snapshot the post-final_norm hidden state for cos(h_K, h_full).
+            let mut h_snap = vec![0.0f32; d];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    aux_h_buf.contents() as *const f32,
+                    h_snap.as_mut_ptr(),
+                    d,
+                );
+                std::ptr::copy_nonoverlapping(
+                    aux_logits_buf.contents() as *const f32,
+                    snap_logits.as_mut_ptr(),
+                    cfg.vocab,
+                );
+            }
+            let (h_ent, argmax_k, top5, margin) = entropy_top5_margin(&snap_logits);
+            // cos placeholder filled at end of forward.
+            pending.push((h_ent, argmax_k, margin, top5, 0.0));
+            snap_h.push(h_snap);
+        }
+    }
+
+    // Final layer-norm + lm_head — the ground-truth prediction.
+    rms_norm_f32(
+        backend,
+        &scratch.xd_buf,
+        &model.final_norm_buf,
+        &scratch.h_buf,
+        cfg.d,
+        cfg.rms_eps,
+    )
+    .unwrap();
+    model
+        .lm_head
+        .matmul_into(backend, &scratch.h_buf, &scratch.logits_buf);
+    backend.drain();
+    let mut logits = vec![0.0_f32; cfg.vocab];
+    let mut h_full = vec![0.0f32; cfg.d];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.logits_buf.contents() as *const f32,
+            logits.as_mut_ptr(),
+            cfg.vocab,
+        );
+        std::ptr::copy_nonoverlapping(
+            scratch.h_buf.contents() as *const f32,
+            h_full.as_mut_ptr(),
+            cfg.d,
+        );
+    }
+    let argmax_full = argmax(&logits);
+
+    // Fill cos(h_K, h_full) into each pending entry now that h_full is known.
+    if pending.len() == ENTROPY_LAYERS.len() && snap_h.len() == ENTROPY_LAYERS.len() {
+        for (i, h_k) in snap_h.iter().enumerate() {
+            let c = cosine(h_k, &h_full);
+            pending[i].4 = c;
+        }
+        stats.record(&pending, argmax_full);
+    }
+
+    argmax_full
+}
+
 // T121 — Multi-token forward. Processes B input tokens at consecutive
 // sequence positions [pos_base, pos_base+1, ..., pos_base+B-1] in a single
 // pass through the model, using the batched kernels (T92, T106-T109,
@@ -2461,6 +3077,7 @@ fn main() -> ExitCode {
     let mut sparsity_profile = false;
     let mut ngram_profile = false;
     let mut rank_profile = false;
+    let mut entropy_profile = false;
     let mut batch_test = false;
     let mut speculative_b: usize = 0; // 0 = off; 2..=4 = enable with B candidates
     let mut i = 0;
@@ -2513,6 +3130,11 @@ fn main() -> ExitCode {
                 args.remove(i);
                 continue;
             },
+            "--entropy-profile" => {
+                entropy_profile = true;
+                args.remove(i);
+                continue;
+            },
             "--batch-test" => {
                 batch_test = true;
                 args.remove(i);
@@ -2545,6 +3167,11 @@ fn main() -> ExitCode {
     let mut stages = Stages::default();
     let mut sparsity = SparsityStats::new(model.cfg.n_layers, model.cfg.f);
     let mut rank_stats = RankStats::new(model.cfg.n_layers, model.cfg.d, 100);
+    let mut entropy_stats = EntropyStats::new();
+    // T125 auxiliary buffers — allocated once, reused for every entropy snapshot.
+    // d-sized for final_norm output, vocab-sized for the lm_head logits.
+    let entropy_aux_h = backend.alloc_shared(model.cfg.d * 4).unwrap();
+    let entropy_aux_logits = backend.alloc_shared(model.cfg.vocab * 4).unwrap();
     println!("\n→ prefill {} tokens", prompt_ids.len());
     let t_pre = Instant::now();
     let mut last = 0u32;
@@ -2556,6 +3183,17 @@ fn main() -> ExitCode {
             forward_token_sparsity(backend, &model, tok, cur_pos, &mut scratch, &mut sparsity)
         } else if rank_profile {
             forward_token_rank(backend, &model, tok, cur_pos, &mut scratch, &mut rank_stats)
+        } else if entropy_profile {
+            forward_token_entropy(
+                backend,
+                &model,
+                tok,
+                cur_pos,
+                &mut scratch,
+                &entropy_aux_h,
+                &entropy_aux_logits,
+                &mut entropy_stats,
+            )
         } else if batch_test {
             // T121 — forward_batch with B=1, parity test vs forward_token
             let outs = forward_batch(backend, &model, &[tok], cur_pos, &mut scratch);
@@ -2584,6 +3222,9 @@ fn main() -> ExitCode {
     }
     if rank_profile {
         rank_stats = RankStats::new(model.cfg.n_layers, model.cfg.d, 100);
+    }
+    if entropy_profile {
+        entropy_stats = EntropyStats::new();
     }
     let t_dec = Instant::now();
     let mut spec_total_drafts = 0usize;
@@ -2685,6 +3326,17 @@ fn main() -> ExitCode {
                     &mut scratch,
                     &mut rank_stats,
                 )
+            } else if entropy_profile {
+                forward_token_entropy(
+                    backend,
+                    &model,
+                    last,
+                    cur_pos,
+                    &mut scratch,
+                    &entropy_aux_h,
+                    &entropy_aux_logits,
+                    &mut entropy_stats,
+                )
             } else if batch_test {
                 let outs = forward_batch(backend, &model, &[last], cur_pos, &mut scratch);
                 outs[0]
@@ -2714,6 +3366,9 @@ fn main() -> ExitCode {
     if rank_profile {
         rank_stats.print_breakdown();
         rank_stats.print_active_subspace_validation();
+    }
+    if entropy_profile {
+        entropy_stats.print_breakdown();
     }
     if speculative_b >= 2 {
         let accept_rate = if spec_total_drafts > 0 {
