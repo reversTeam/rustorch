@@ -520,6 +520,14 @@ struct Scratch {
     gate_ffn: Buffer, // f
     up_ffn: Buffer,   // f
     fd_ffn: Buffer,   // f
+    // MoE-specific buffers (only used when variant == Moe)
+    moe_logits: Buffer,      // n_experts (router output)
+    moe_acc: Buffer,         // d (accumulated weighted expert outputs)
+    moe_expert_out: Buffer,  // d (single-expert output, reused per expert)
+    moe_gate: Buffer,        // expert_f
+    moe_up: Buffer,          // expert_f
+    moe_fd: Buffer,          // expert_f
+    moe_shared_gate: Buffer, // 1 (scalar — shared expert gate)
     // logits
     logits: Buffer, // vocab
 }
@@ -561,6 +569,16 @@ impl Scratch {
             gate_ffn: alloc(f * 4),
             up_ffn: alloc(f * 4),
             fd_ffn: alloc(f * 4),
+            // MoE — sized to whichever variant we're loading. n_experts and
+            // expert_f are 0 for non-MoE variants; use .max(1) so the
+            // buffer alloc still succeeds.
+            moe_logits: alloc(cfg.n_experts.max(1) * 4),
+            moe_acc: alloc(d * 4),
+            moe_expert_out: alloc(d * 4),
+            moe_gate: alloc(cfg.expert_f.max(1) * 4),
+            moe_up: alloc(cfg.expert_f.max(1) * 4),
+            moe_fd: alloc(cfg.expert_f.max(1) * 4),
+            moe_shared_gate: alloc(4),
             logits: alloc(cfg.vocab * 4),
         }
     }
@@ -1060,10 +1078,139 @@ fn ffn_dense_forward(
             add_inplace_f32(backend, &scratch.xd, &scratch.fc2, d)?;
             Ok(())
         },
-        FfnLayerMetal::Moe { .. } => {
-            // T145: implement MoE expert dispatch. For now stub: leave xd unchanged.
-            // (This means the 35B-A3B model's FFN is a no-op — produces wrong
-            // outputs but the pipeline compiles and runs end-to-end.)
+        FfnLayerMetal::Moe {
+            gate_inp,
+            gate_inp_shexp,
+            gate_shexp,
+            up_shexp,
+            down_shexp,
+            gate_exps,
+            up_exps,
+            down_exps,
+        } => {
+            let n_experts = cfg.n_experts;
+            let n_used = cfg.n_experts_used;
+            let ef = cfg.expert_f;
+
+            // 1. Routing logits = gate_inp @ h  → [n_experts]
+            gate_inp.matmul_into(backend, &scratch.h, &scratch.moe_logits)?;
+
+            // 2. Drain to read logits on CPU. Apply softmax + argsort top-K + normalise weights.
+            backend.drain();
+            let (top_idx, top_w) = unsafe {
+                let logits = std::slice::from_raw_parts(
+                    scratch.moe_logits.contents() as *const f32,
+                    n_experts,
+                );
+                // Stable softmax over all n_experts.
+                let mut mx = f32::NEG_INFINITY;
+                for &v in logits {
+                    if v > mx {
+                        mx = v;
+                    }
+                }
+                let mut probs = vec![0.0_f32; n_experts];
+                let mut z = 0.0_f32;
+                for i in 0..n_experts {
+                    let p = (logits[i] - mx).exp();
+                    probs[i] = p;
+                    z += p;
+                }
+                let inv_z = 1.0 / z.max(1e-30);
+                for p in probs.iter_mut() {
+                    *p *= inv_z;
+                }
+                // Argsort top-K (n_used). For n_experts=256, n_used=8, a partial
+                // selection is fast on CPU.
+                let mut idxs: Vec<usize> = (0..n_experts).collect();
+                idxs.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap());
+                let top: Vec<usize> = idxs[..n_used].to_vec();
+                let mut w: Vec<f32> = top.iter().map(|&i| probs[i]).collect();
+                // Renormalise (norm_w = true in qwen35moe).
+                let s: f32 = w.iter().sum();
+                let inv_s = 1.0 / s.max(6.103_515_6e-5_f32);
+                for x in w.iter_mut() {
+                    *x *= inv_s;
+                }
+                (top, w)
+            };
+
+            // 3. Zero the accumulator.
+            unsafe {
+                let acc = std::slice::from_raw_parts_mut(scratch.moe_acc.contents() as *mut f32, d);
+                for v in acc.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+
+            // 4. For each top-K expert: compute expert FFN output, weighted-add to accumulator.
+            for k in 0..n_used {
+                let e = top_idx[k];
+                let w_e = top_w[k];
+                gate_exps[e].matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
+                up_exps[e].matmul_into(backend, &scratch.h, &scratch.moe_up)?;
+                swiglu_f32(
+                    backend,
+                    &scratch.moe_gate,
+                    &scratch.moe_up,
+                    &scratch.moe_fd,
+                    ef,
+                )?;
+                down_exps[e].matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
+                // Weighted accumulate on CPU (unified memory).
+                backend.drain();
+                unsafe {
+                    let exp_out = std::slice::from_raw_parts(
+                        scratch.moe_expert_out.contents() as *const f32,
+                        d,
+                    );
+                    let acc =
+                        std::slice::from_raw_parts_mut(scratch.moe_acc.contents() as *mut f32, d);
+                    for i in 0..d {
+                        acc[i] += w_e * exp_out[i];
+                    }
+                }
+            }
+
+            // 5. Shared expert: standard SwiGLU FFN with sigmoid gate scalar.
+            //    shared_gate is a vector of size d (per-element gate, not scalar).
+            //    llama.cpp uses ffn_gate_inp_shexp · h then sigmoid → scalar per token.
+            //    But the GGUF stores ffn_gate_inp_shexp as [d] f32 — applied as a
+            //    point-wise (NOT a dot product). Reading llama.cpp again:
+            //    `shared_gate = build_lora_mm(ffn_gate_inp_shexp, cur)` with
+            //    ffn_gate_inp_shexp of shape [d] would imply a 1×d matrix → output
+            //    is a scalar per token. So a dot product.
+            gate_shexp.matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
+            up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
+            swiglu_f32(
+                backend,
+                &scratch.moe_gate,
+                &scratch.moe_up,
+                &scratch.moe_fd,
+                ef,
+            )?;
+            down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
+            backend.drain();
+            // Shared expert gating: scalar = sigmoid(gate_inp_shexp · h).
+            let shared_gate_scalar = unsafe {
+                let g = std::slice::from_raw_parts(gate_inp_shexp.contents() as *const f32, d);
+                let h = std::slice::from_raw_parts(scratch.h.contents() as *const f32, d);
+                let mut s = 0.0_f32;
+                for i in 0..d {
+                    s += g[i] * h[i];
+                }
+                1.0 / (1.0 + (-s).exp())
+            };
+            // Add shared expert (gated) + accumulated routed experts → xd.
+            unsafe {
+                let acc = std::slice::from_raw_parts(scratch.moe_acc.contents() as *const f32, d);
+                let shared =
+                    std::slice::from_raw_parts(scratch.moe_expert_out.contents() as *const f32, d);
+                let xd = std::slice::from_raw_parts_mut(scratch.xd.contents() as *mut f32, d);
+                for i in 0..d {
+                    xd[i] += acc[i] + shared_gate_scalar * shared[i];
+                }
+            }
             Ok(())
         },
     }
