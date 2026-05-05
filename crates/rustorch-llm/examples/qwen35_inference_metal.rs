@@ -355,12 +355,13 @@ pub fn load_metal_model(
     for li in 0..cfg.n_layers {
         let kind = cfg.layer_kind(li);
         let attn_norm = load_1d_f32(&format!("blk.{li}.attn_norm.weight"), &mut stats)?;
+        let ffn_pre_norm_name = cfg.variant.ffn_pre_norm_name();
         let attn_post_norm =
-            load_1d_f32(&format!("blk.{li}.post_attention_norm.weight"), &mut stats)?;
+            load_1d_f32(&format!("blk.{li}.{ffn_pre_norm_name}.weight"), &mut stats)?;
 
         // FFN sub-block — same on both layer kinds.
         let ffn = match cfg.variant {
-            Qwen35Variant::Dense => {
+            Qwen35Variant::Qwen3PureTransformer | Qwen35Variant::Dense => {
                 let w_gate = load_2d(&format!("blk.{li}.ffn_gate.weight"), &mut stats)?;
                 let w_up = load_2d(&format!("blk.{li}.ffn_up.weight"), &mut stats)?;
                 let w_down = load_2d(&format!("blk.{li}.ffn_down.weight"), &mut stats)?;
@@ -823,21 +824,32 @@ fn attn_block_forward(
     // 1. RMSNorm (xd -> h)
     rms_norm_f32(backend, &scratch.xd, &attn.attn_norm, &scratch.h, d, eps)?;
 
-    // 2. QG = w_q @ h (combined Q + gate, width = 2 * q_dim)
-    attn.w_q.matmul_into(backend, &scratch.h, &scratch.qg)?;
+    // 2. Q (and gate, when applicable). Layout depends on variant:
+    //   - qwen3 (pure transformer): w_q outputs [d → q_dim], no gate.
+    //   - qwen35 / qwen35moe       : w_q outputs [d → 2 * q_dim], Q + gate combined.
+    let has_q_gate = cfg.variant.has_q_gate();
+    if has_q_gate {
+        attn.w_q.matmul_into(backend, &scratch.h, &scratch.qg)?;
+    } else {
+        attn.w_q.matmul_into(backend, &scratch.h, &scratch.q)?;
+    }
     // 3. K = w_k @ h, V = w_v @ h
     attn.w_k.matmul_into(backend, &scratch.h, &scratch.k_attn)?;
     attn.w_v.matmul_into(backend, &scratch.h, &scratch.v_attn)?;
 
-    // 4. T146b — GPU split of QG into Q + gate per head (no drain).
-    split_qg_per_head_f32(
-        backend,
-        &scratch.qg,
-        &scratch.q,
-        &scratch.gate_attn,
-        n_q,
-        head_dim,
-    )?;
+    // 4. T146b — GPU split of QG into Q + gate per head (only for the
+    // Qwen3Next-style variants). For qwen3 the matmul wrote directly into
+    // scratch.q above and no split is needed.
+    if has_q_gate {
+        split_qg_per_head_f32(
+            backend,
+            &scratch.qg,
+            &scratch.q,
+            &scratch.gate_attn,
+            n_q,
+            head_dim,
+        )?;
+    }
 
     // 5. Per-head Q-norm and K-norm (using shared gamma per head_dim).
     rms_norm_per_head_f32(backend, &scratch.q, &attn.q_norm, n_q, head_dim, eps)?;
@@ -891,9 +903,11 @@ fn attn_block_forward(
         max_seq,
     )?;
 
-    // 9. Apply sigmoid(gate) on attention output (Qwen3Next gate) — fused
-    //    Metal kernel `attn_out *= sigmoid(gate_attn)` (T144c). No drain.
-    sigmoid_mul_inplace_f32(backend, &scratch.attn_out, &scratch.gate_attn, q_dim)?;
+    // 9. Apply sigmoid(gate) on attention output (Qwen3Next-only). Pure
+    //    qwen3 has no per-head gate so this is skipped.
+    if has_q_gate {
+        sigmoid_mul_inplace_f32(backend, &scratch.attn_out, &scratch.gate_attn, q_dim)?;
+    }
     let _ = kv_dim; // silence unused
 
     // 10. W_O @ attn_out → o, then xd += o.

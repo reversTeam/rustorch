@@ -476,7 +476,7 @@ fn load_ssm_layer(
 /// Load FFN weights for one layer (dense or MoE).
 fn load_ffn(file: &GgufFile, li: usize, cfg: &Qwen35Config) -> Result<FfnWeights, Qwen35CpuError> {
     match cfg.variant {
-        Qwen35Variant::Dense => {
+        Qwen35Variant::Qwen3PureTransformer | Qwen35Variant::Dense => {
             let f = cfg.f;
             let d = cfg.d;
             let w_gate = load_2d(file, &format!("blk.{li}.ffn_gate.weight"), [f, d])?;

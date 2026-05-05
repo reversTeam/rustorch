@@ -89,12 +89,23 @@ use std::path::Path;
 
 use rustorch_gguf::{GgmlType, GgufFile};
 
-/// Qwen3.5 / Qwen3.6 architecture variant.
+/// Qwen architecture variant. Despite the module name (`qwen35`), this
+/// also covers the legacy `qwen3` (pure transformer) family so the
+/// loader and forward pipeline can dispatch all three Qwen flavours
+/// (14B / 27B / 35B-A3B) from a single binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qwen35Variant {
-    /// `qwen35` — dense FFN. Qwen3.5-27B, Qwen3.6-27B.
+    /// `qwen3` — pure transformer (no SSM), single-width `attn_q` (no
+    /// Q+gate combine), dense FFN, `ffn_norm` for the FFN pre-norm.
+    /// Used by Qwen3-14B and other Qwen3 family checkpoints.
+    Qwen3PureTransformer,
+    /// `qwen35` — hybrid SSM+attention, Qwen3Next attention (Q+gate
+    /// combined, sigmoid gate on attn output), dense FFN,
+    /// `post_attention_norm` for the FFN pre-norm. Used by Qwen3.5-27B,
+    /// Qwen3.6-27B.
     Dense,
-    /// `qwen35moe` — MoE FFN with shared expert. Qwen3.6-35B-A3B.
+    /// `qwen35moe` — same as `Dense` but the FFN is MoE with a parallel
+    /// shared expert. Used by Qwen3.6-35B-A3B.
     Moe,
 }
 
@@ -102,8 +113,30 @@ impl Qwen35Variant {
     /// String key used in GGUF metadata under `<arch>.<param>` paths.
     pub fn arch_str(self) -> &'static str {
         match self {
+            Qwen35Variant::Qwen3PureTransformer => "qwen3",
             Qwen35Variant::Dense => "qwen35",
             Qwen35Variant::Moe => "qwen35moe",
+        }
+    }
+
+    /// True if attention's `wq` carries Q+gate combined (Qwen3Next style).
+    /// False for legacy Qwen3 where `wq` outputs only Q.
+    pub fn has_q_gate(self) -> bool {
+        !matches!(self, Qwen35Variant::Qwen3PureTransformer)
+    }
+
+    /// True if any SSM (gated delta net) layers are present. For pure
+    /// transformer variants this is always false.
+    pub fn has_ssm(self) -> bool {
+        !matches!(self, Qwen35Variant::Qwen3PureTransformer)
+    }
+
+    /// Tensor name used for the FFN pre-norm. `qwen3` calls it
+    /// `ffn_norm`; `qwen35*` calls it `post_attention_norm`.
+    pub fn ffn_pre_norm_name(self) -> &'static str {
+        match self {
+            Qwen35Variant::Qwen3PureTransformer => "ffn_norm",
+            _ => "post_attention_norm",
         }
     }
 }
@@ -203,8 +236,13 @@ impl Qwen35Config {
 
     /// Per-group SSM head dim — the `d_inner` channels are split across
     /// `ssm_groups` groups. Each group carries an independent state matrix.
+    /// Returns 0 when the architecture has no SSM block.
     pub fn ssm_group_dim(&self) -> usize {
-        self.ssm_inner / self.ssm_groups
+        if self.ssm_groups == 0 {
+            0
+        } else {
+            self.ssm_inner / self.ssm_groups
+        }
     }
 
     /// Bytes used per layer for SSM state at decode time:
@@ -284,6 +322,7 @@ pub fn parse_config(path: &Path) -> Result<Qwen35Config, Qwen35LoadError> {
         .ok_or_else(|| Qwen35LoadError::MissingMeta("general.architecture".to_string()))?
         .to_string();
     let variant = match arch_str.as_str() {
+        "qwen3" => Qwen35Variant::Qwen3PureTransformer,
         "qwen35" => Qwen35Variant::Dense,
         "qwen35moe" => Qwen35Variant::Moe,
         other => return Err(Qwen35LoadError::UnsupportedArch(other.to_string())),
@@ -294,31 +333,41 @@ pub fn parse_config(path: &Path) -> Result<Qwen35Config, Qwen35LoadError> {
             .map(|x| x as usize)
             .ok_or_else(|| Qwen35LoadError::MissingMeta(format!("{arch}.{key}")))
     };
-    let opt_u32 = |key: &str| -> usize { meta_u32(&file, arch, key).unwrap_or(0) as usize };
 
     let n_layers = req_u32("block_count")?;
     let d = req_u32("embedding_length")?;
-    // feed_forward_length is only present in the dense variant; MoE uses
-    // expert_feed_forward_length.
-    let f = if variant == Qwen35Variant::Dense {
+    // feed_forward_length is present in pure transformer + dense variant;
+    // MoE uses expert_feed_forward_length.
+    let f = if variant != Qwen35Variant::Moe {
         req_u32("feed_forward_length")?
     } else {
         0
     };
     let n_q_heads = req_u32("attention.head_count")?;
     let n_kv_heads = req_u32("attention.head_count_kv")?;
-    let rope_dim = req_u32("rope.dimension_count")?;
+    // qwen3 has no `rope.dimension_count` metadata key; fall back to full
+    // head_dim (we'll resolve the correct value at attn_head_dim time).
+    let rope_dim = meta_u32(&file, arch, "rope.dimension_count")
+        .map(|x| x as usize)
+        .unwrap_or(0);
     let max_context = req_u32("context_length")?;
     let rms_eps = meta_f32(&file, arch, "attention.layer_norm_rms_epsilon").ok_or_else(|| {
         Qwen35LoadError::MissingMeta(format!("{arch}.attention.layer_norm_rms_epsilon"))
     })?;
     let rope_base = meta_f32(&file, arch, "rope.freq_base").unwrap_or(10_000.0);
 
-    let ssm_inner = req_u32("ssm.inner_size")?;
-    let ssm_state = req_u32("ssm.state_size")?;
-    let ssm_dt_rank = req_u32("ssm.time_step_rank")?;
-    let ssm_groups = req_u32("ssm.group_count")?;
-    let ssm_conv_kernel = req_u32("ssm.conv_kernel")?;
+    // SSM hyperparams only present in the hybrid variants.
+    let (ssm_inner, ssm_state, ssm_dt_rank, ssm_groups, ssm_conv_kernel) = if variant.has_ssm() {
+        (
+            req_u32("ssm.inner_size")?,
+            req_u32("ssm.state_size")?,
+            req_u32("ssm.time_step_rank")?,
+            req_u32("ssm.group_count")?,
+            req_u32("ssm.conv_kernel")?,
+        )
+    } else {
+        (0, 0, 0, 0, 0)
+    };
 
     let n_experts = if variant == Qwen35Variant::Moe {
         req_u32("expert_count")?
@@ -335,7 +384,6 @@ pub fn parse_config(path: &Path) -> Result<Qwen35Config, Qwen35LoadError> {
     } else {
         0
     };
-    let _ = opt_u32; // silence unused-helper warnings on dense path
 
     // Vocab — token_embd.weight shape is [d, vocab] in GGUF tile layout.
     let vocab = file
@@ -385,22 +433,25 @@ pub fn parse_config(path: &Path) -> Result<Qwen35Config, Qwen35LoadError> {
     let ssm_indices: Vec<usize> = ssm_set.into_iter().collect();
 
     // Read `attn_head_dim` from the first attention layer's attn_q.weight
-    // shape. GGUF stores 2D weights as [in, out] = [d, n_q_heads * head_dim].
+    // shape. GGUF stores 2D weights as [in, out].
+    //   qwen3 (pure transformer): out = n_q_heads * head_dim
+    //   qwen35 / qwen35moe       : out = n_q_heads * head_dim * 2 (Q+gate)
     let attn_head_dim = if let Some(&first_attn_li) = attention_indices.first() {
         let q_name = format!("blk.{first_attn_li}.attn_q.weight");
         match file.tensor(&q_name) {
             Some(t) => {
-                // shape[1] is the output dim = n_q_heads * head_dim
                 let out_dim =
                     t.shape.get(1).copied().ok_or_else(|| {
                         Qwen35LoadError::Gguf(format!("{q_name}: shape too short"))
                     })? as usize;
-                if out_dim % n_q_heads != 0 {
+                let factor = if variant.has_q_gate() { 2 } else { 1 };
+                let denom = n_q_heads * factor;
+                if out_dim % denom != 0 {
                     return Err(Qwen35LoadError::Gguf(format!(
-                        "{q_name} out_dim {out_dim} not divisible by n_q_heads {n_q_heads}"
+                        "{q_name} out_dim {out_dim} not divisible by n_q_heads*{factor} = {denom}"
                     )));
                 }
-                out_dim / n_q_heads
+                out_dim / denom
             },
             None => {
                 return Err(Qwen35LoadError::MissingTensor(q_name));
@@ -408,6 +459,13 @@ pub fn parse_config(path: &Path) -> Result<Qwen35Config, Qwen35LoadError> {
         }
     } else {
         0
+    };
+
+    // qwen3 has no rope.dimension_count in metadata — default to full head_dim.
+    let rope_dim = if rope_dim == 0 {
+        attn_head_dim
+    } else {
+        rope_dim
     };
 
     Ok(Qwen35Config {
@@ -499,9 +557,10 @@ pub fn describe_model(cfg: &Qwen35Config) -> String {
 pub fn expected_tensor_names(li: usize, kind: LayerKind, variant: Qwen35Variant) -> Vec<String> {
     let mut v = Vec::new();
     let p = |s: &str| format!("blk.{li}.{s}");
-    // Common across both kinds.
+    // Pre-attention norm — same name on all variants.
     v.push(p("attn_norm.weight"));
-    v.push(p("post_attention_norm.weight"));
+    // FFN pre-norm: qwen3 uses `ffn_norm`, qwen35* uses `post_attention_norm`.
+    v.push(p(&format!("{}.weight", variant.ffn_pre_norm_name())));
     match kind {
         LayerKind::Attention => {
             v.extend([
@@ -528,7 +587,7 @@ pub fn expected_tensor_names(li: usize, kind: LayerKind, variant: Qwen35Variant)
         },
     }
     match variant {
-        Qwen35Variant::Dense => {
+        Qwen35Variant::Qwen3PureTransformer | Qwen35Variant::Dense => {
             v.extend([
                 p("ffn_gate.weight"),
                 p("ffn_up.weight"),
