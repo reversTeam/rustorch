@@ -701,16 +701,24 @@ fn forward_token(
             cfg.rms_eps,
         )
         .unwrap();
-        // gate + up fused into one dispatch (non-simdcoop wins at this scale).
-        sgemv_q4_k_f32_pair_into(
+        // T94 — gate + up via 2 dispatches of lcpp_nr2 (the +9% kernel
+        // from T91). 2 dispatches vs 1 fused — chained encoder (T83)
+        // amortizes the dispatch overhead, and the kernel optims dominate.
+        sgemv_q4_k_f32_lcpp_nr2_into(
             backend,
             &scratch.h_buf,
             &layer.w_gate.buffer,
-            &layer.w_up.buffer,
             &scratch.gate_buf,
-            &scratch.up_buf,
             layer.w_gate.k,
             layer.w_gate.n,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_lcpp_nr2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_up.buffer,
+            &scratch.up_buf,
+            layer.w_up.k,
             layer.w_up.n,
         )
         .unwrap();
