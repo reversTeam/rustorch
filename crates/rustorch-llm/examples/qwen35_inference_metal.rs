@@ -1513,6 +1513,70 @@ fn dump_buf(backend: &MetalBackend, buf: &Buffer, n: usize, label: &str) {
     }
 }
 
+/// T155 — Profiling instrumented forward pour identifier les hot kernels.
+/// Quand `RUSTORCH_PROFILE=1` est set, drain le GPU après chaque phase
+/// majeure (embed, attn, ssm, ffn dense, ffn moe, final, lm_head) et
+/// accumule les timings. Imprimés à la fin du forward via une global mutex.
+/// Coût : ~5-10 ms/token de drains additionnels — acceptable pour diag.
+type ProfileMap = std::sync::Mutex<std::collections::BTreeMap<&'static str, (u64, f64)>>;
+static PROFILE_ACCUM: std::sync::OnceLock<ProfileMap> = std::sync::OnceLock::new();
+
+fn profile_map() -> &'static ProfileMap {
+    PROFILE_ACCUM.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+fn profile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static PROFILE: OnceLock<bool> = OnceLock::new();
+    *PROFILE.get_or_init(|| env::var("RUSTORCH_PROFILE").is_ok())
+}
+
+fn profile_record(label: &'static str, dur: std::time::Duration) {
+    let mut g = profile_map().lock().unwrap();
+    let entry = g.entry(label).or_insert((0u64, 0.0));
+    entry.0 += 1;
+    entry.1 += dur.as_secs_f64();
+}
+
+/// Helper pour timer une phase et accumuler. Drain forcé après.
+fn profile_drain_record(backend: &MetalBackend, label: &'static str, t0: std::time::Instant) {
+    if profile_enabled() {
+        backend.drain();
+        profile_record(label, t0.elapsed());
+    }
+}
+
+fn profile_print_summary() {
+    let g = profile_map().lock().unwrap();
+    if g.is_empty() {
+        return;
+    }
+    let total: f64 = g.values().map(|(_, t)| *t).sum();
+    eprintln!("\n=== RUSTORCH_PROFILE summary (cumulative across all forward calls) ===");
+    eprintln!(
+        "{:<24} {:>10} {:>14} {:>14} {:>9}",
+        "phase", "calls", "total ms", "avg µs/call", "% total"
+    );
+    let mut sorted: Vec<_> = g.iter().collect();
+    sorted.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+    for (label, (n, t)) in sorted {
+        eprintln!(
+            "{label:<24} {n:>10} {:>14.3} {:>14.2} {:>9.2}",
+            t * 1000.0,
+            (t * 1e6) / *n as f64,
+            100.0 * t / total
+        );
+    }
+    eprintln!(
+        "{:<24} {:>10} {:>14.3} {:>14} {:>9.2}",
+        "TOTAL",
+        "—",
+        total * 1000.0,
+        "—",
+        100.0
+    );
+}
+
 fn forward_token(
     backend: &MetalBackend,
     file: &GgufFile,
@@ -1522,6 +1586,7 @@ fn forward_token(
     position: usize,
 ) -> Result<u32, String> {
     let cfg = &model.cfg;
+    let t0 = std::time::Instant::now();
     // 1. Embed token into xd.
     embed_token(file, token, &state.scratch.xd, cfg)?;
     dump_buf(
@@ -1530,6 +1595,7 @@ fn forward_token(
         cfg.d,
         &format!("p{position:03}/embed"),
     );
+    profile_drain_record(backend, "embed", t0);
 
     // 2. Per-layer dispatch.
     for li in 0..cfg.n_layers {
@@ -1538,8 +1604,21 @@ fn forward_token(
             LayerMetal::Attn { .. } => "attn",
             LayerMetal::Ssm { .. } => "ssm_",
         };
+        let t_layer = std::time::Instant::now();
+        let _ = t_layer; // silenced; per-block timings below are more useful
+        let is_moe = matches!(
+            model.layers[li],
+            LayerMetal::Attn {
+                ffn: FfnLayerMetal::Moe { .. },
+                ..
+            } | LayerMetal::Ssm {
+                ffn: FfnLayerMetal::Moe { .. },
+                ..
+            }
+        );
         match (layer, &state.layers[li]) {
             (LayerMetal::Attn { attn, ffn }, LayerState::Attn(cache)) => {
+                let t = std::time::Instant::now();
                 attn_block_forward(
                     backend,
                     attn,
@@ -1552,6 +1631,7 @@ fn forward_token(
                     state.max_seq,
                 )
                 .map_err(|e| format!("layer {li} attn: {e:?}"))?;
+                profile_drain_record(backend, "attn_block", t);
                 dump_buf(
                     backend,
                     &state.scratch.xd,
@@ -1559,6 +1639,7 @@ fn forward_token(
                     &format!("p{position:03}/L{li:02}_{kind_tag}_post_mixer"),
                 );
                 // Post-attention norm (h := norm(xd, attn_post_norm)) for FFN input.
+                let t = std::time::Instant::now();
                 rms_norm_f32(
                     backend,
                     &state.scratch.xd,
@@ -1568,14 +1649,17 @@ fn forward_token(
                     cfg.rms_eps,
                 )
                 .map_err(|e| format!("layer {li} post norm: {e:?}"))?;
+                profile_drain_record(backend, "post_norm", t);
                 dump_buf(
                     backend,
                     &state.scratch.h,
                     cfg.d,
                     &format!("p{position:03}/L{li:02}_{kind_tag}_post_norm"),
                 );
+                let t = std::time::Instant::now();
                 ffn_dense_forward(backend, ffn, &state.scratch, cfg)
                     .map_err(|e| format!("layer {li} ffn: {e:?}"))?;
+                profile_drain_record(backend, if is_moe { "ffn_moe" } else { "ffn_dense" }, t);
                 dump_buf(
                     backend,
                     &state.scratch.xd,
@@ -1585,14 +1669,17 @@ fn forward_token(
             },
             (LayerMetal::Ssm { ssm, ffn }, LayerState::Ssm(s)) => {
                 let prefix = format!("p{position:03}/L{li:02}");
+                let t = std::time::Instant::now();
                 ssm_block_forward(backend, ssm, s, &state.scratch, cfg, &prefix)
                     .map_err(|e| format!("layer {li} ssm: {e:?}"))?;
+                profile_drain_record(backend, "ssm_block", t);
                 dump_buf(
                     backend,
                     &state.scratch.xd,
                     cfg.d,
                     &format!("p{position:03}/L{li:02}_{kind_tag}_post_mixer"),
                 );
+                let t = std::time::Instant::now();
                 rms_norm_f32(
                     backend,
                     &state.scratch.xd,
@@ -1602,14 +1689,17 @@ fn forward_token(
                     cfg.rms_eps,
                 )
                 .map_err(|e| format!("layer {li} post norm: {e:?}"))?;
+                profile_drain_record(backend, "post_norm", t);
                 dump_buf(
                     backend,
                     &state.scratch.h,
                     cfg.d,
                     &format!("p{position:03}/L{li:02}_{kind_tag}_post_norm"),
                 );
+                let t = std::time::Instant::now();
                 ffn_dense_forward(backend, ffn, &state.scratch, cfg)
                     .map_err(|e| format!("layer {li} ffn: {e:?}"))?;
+                profile_drain_record(backend, if is_moe { "ffn_moe" } else { "ffn_dense" }, t);
                 dump_buf(
                     backend,
                     &state.scratch.xd,
@@ -1629,6 +1719,7 @@ fn forward_token(
     }
 
     // 3. Final norm + lm_head.
+    let t = std::time::Instant::now();
     rms_norm_f32(
         backend,
         &state.scratch.xd,
@@ -1638,17 +1729,22 @@ fn forward_token(
         cfg.rms_eps,
     )
     .map_err(|e| format!("final norm: {e:?}"))?;
+    profile_drain_record(backend, "final_norm", t);
     dump_buf(
         backend,
         &state.scratch.h,
         cfg.d,
         &format!("p{position:03}/final_norm"),
     );
+    let t = std::time::Instant::now();
     model
         .output
         .matmul_into(backend, &state.scratch.h, &state.scratch.logits)
         .map_err(|e| format!("lm_head: {e:?}"))?;
     backend.drain();
+    if profile_enabled() {
+        profile_record("lm_head", t.elapsed());
+    }
     dump_buf(
         backend,
         &state.scratch.logits,
@@ -2227,6 +2323,7 @@ fn main() -> ExitCode {
         println!("\n=== Answer ===");
         println!("{}", answer);
         println!("===");
+        profile_print_summary();
         return ExitCode::SUCCESS;
     }
 
@@ -2322,6 +2419,7 @@ fn main() -> ExitCode {
             if hit_eos { " [EOS]" } else { "" }
         );
         println!("\ngenerated tokens: {generated:?}");
+        profile_print_summary();
         return ExitCode::SUCCESS;
     }
 
