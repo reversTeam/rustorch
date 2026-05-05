@@ -5124,6 +5124,182 @@ pub fn sgemv_q6_k_f32_batch_into(
     Ok(())
 }
 
+// T120 — Batched element-wise helpers for forward_batch.
+
+const SWIGLU_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Element-wise SwiGLU on B × f arrays.
+kernel void swiglu_batched_f32(
+    device const float* gate [[buffer(0)]],   // [B, f]
+    device const float* up   [[buffer(1)]],   // [B, f]
+    device float* y          [[buffer(2)]],   // [B, f]
+    constant uint2& dims     [[buffer(3)]],   // (f, B)
+    uint gid [[thread_position_in_grid]]
+) {
+    uint f = dims.x;
+    uint B = dims.y;
+    uint total = f * B;
+    if (gid >= total) return;
+    float g = gate[gid];
+    float s = g / (1.0 + exp(-g));
+    y[gid] = s * up[gid];
+}
+"#;
+
+/// T120 — Batched SwiGLU: element-wise silu(gate)*up on [B, f] arrays.
+pub fn swiglu_batched_f32(
+    backend: &MetalBackend,
+    gate_buf: &Buffer,
+    up_buf: &Buffer,
+    y_buf: &Buffer,
+    f: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "swiglu_batched_f32",
+        SWIGLU_BATCHED_F32_SHADER,
+        "swiglu_batched_f32",
+    )?;
+    let dims = [f as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(gate_buf), 0);
+        encoder.set_buffer(1, Some(up_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(256, 1, 1);
+        let grid = MTLSize::new((f * b) as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+const ADD_INPLACE_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void add_inplace_batched_f32(
+    device float* x       [[buffer(0)]],   // [B, d]
+    device const float* y [[buffer(1)]],   // [B, d]
+    constant uint2& dims  [[buffer(2)]],   // (d, B)
+    uint gid [[thread_position_in_grid]]
+) {
+    uint d = dims.x;
+    uint B = dims.y;
+    uint total = d * B;
+    uint t4 = total / 4u;
+    if (gid < t4) {
+        device float4* x4       = (device float4*)x;
+        device const float4* y4 = (device const float4*)y;
+        x4[gid] += y4[gid];
+        return;
+    }
+    uint i = t4 * 4u + (gid - t4);
+    if (i < total) {
+        x[i] += y[i];
+    }
+}
+"#;
+
+/// T120 — Batched in-place add x[B,d] += y[B,d] (float4 vectorized).
+pub fn add_inplace_batched_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    y_buf: &Buffer,
+    d: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "add_inplace_batched_f32",
+        ADD_INPLACE_BATCHED_F32_SHADER,
+        "add_inplace_batched_f32",
+    )?;
+    let dims = [d as u32, b as u32];
+    let total = d * b;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(y_buf), 0);
+        encoder.set_bytes(2, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(256, 1, 1);
+        let t4 = (total / 4) as u64;
+        let tail = (total % 4) as u64;
+        let grid = MTLSize::new(t4 + tail, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+const RMS_NORM_PER_HEAD_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Per-head RMSNorm batched. Each threadgroup = 1 (batch, head). 32 threads
+// cooperate on head_dim. gamma is shared across all heads and batches.
+kernel void rms_norm_per_head_batched_f32(
+    device float* x           [[buffer(0)]],   // [B, n_heads, head_dim]
+    device const float* gamma [[buffer(1)]],   // [head_dim]
+    constant uint3& dims      [[buffer(2)]],   // (n_heads, head_dim, B)
+    constant float& eps       [[buffer(3)]],
+    uint tg_flat              [[threadgroup_position_in_grid]],
+    uint tid                  [[thread_position_in_threadgroup]],
+    uint sg_size              [[threads_per_simdgroup]]
+) {
+    uint n_heads = dims.x;
+    uint head_dim = dims.y;
+    uint B        = dims.z;
+    uint total_tg = n_heads * B;
+    if (tg_flat >= total_tg) return;
+
+    uint h = tg_flat % n_heads;
+    uint b = tg_flat / n_heads;
+
+    device float* head = x + (b * n_heads + h) * head_dim;
+    float partial = 0.0;
+    for (uint i = tid; i < head_dim; i += sg_size) {
+        float v = head[i];
+        partial += v * v;
+    }
+    float total = simd_sum(partial);
+    float inv_rms = 1.0 / sqrt(total / float(head_dim) + eps);
+    for (uint i = tid; i < head_dim; i += sg_size) {
+        head[i] = head[i] * inv_rms * gamma[i];
+    }
+}
+"#;
+
+/// T120 — Batched per-head RMSNorm. 1 threadgroup per (batch, head).
+pub fn rms_norm_per_head_batched_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    gamma_buf: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    b: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "rms_norm_per_head_batched_f32",
+        RMS_NORM_PER_HEAD_BATCHED_F32_SHADER,
+        "rms_norm_per_head_batched_f32",
+    )?;
+    let dims = [n_heads as u32, head_dim as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(gamma_buf), 0);
+        encoder.set_bytes(2, 12, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(3, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let total_tg = (n_heads * b) as u64;
+        let grid = MTLSize::new(32 * total_tg, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 // T108 — Batched K-only or V-only append. Writes B sequential positions
 // (pos_base, pos_base+1, ..., pos_base+B-1) into the cache from a packed
 // source [B, n_kv * head_dim].
