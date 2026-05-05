@@ -402,6 +402,191 @@ impl SparsityStats {
     }
 }
 
+// T104 — Effective rank profile of post-RMSNorm hidden states.
+// Captures the [d=5120] vector right before each FFN matmul, accumulates
+// over all layers × all decode steps, then computes the participation
+// ratio = (Σ λ_i)² / (Σ λ_i²) per layer, where λ_i are the eigenvalues
+// of the Gram matrix X^T X (or equivalently squared singular values of X).
+//
+// Identity used: for symmetric G = X^T X (or X X^T), trace(G) = Σ λ_i and
+// ||G||_F² = Σ λ_i². So participation ratio is computed without explicit
+// eigendecomposition — O(N² + N*d) per layer for a small N (~50).
+//
+// Decision:
+// - rank_eff ≤ 256 → low-rank active subspace viable, large gain potential
+// - rank_eff ∈ (256, 1024] → marginal, careful evaluation
+// - rank_eff > 1024 → low-rank approach unlikely to pay; pivot
+struct RankStats {
+    /// per-layer: Vec<Vec<f32>> of captured d-dim samples (post-ffn-norm).
+    /// Each inner Vec is a single d=5120 sample.
+    samples_per_layer: Vec<Vec<Vec<f32>>>,
+    d: usize,
+    max_samples_per_layer: usize,
+}
+
+impl RankStats {
+    fn new(n_layers: usize, d: usize, max_samples_per_layer: usize) -> Self {
+        Self {
+            samples_per_layer: (0..n_layers)
+                .map(|_| Vec::with_capacity(max_samples_per_layer))
+                .collect(),
+            d,
+            max_samples_per_layer,
+        }
+    }
+
+    fn record(&mut self, layer_idx: usize, sample: &[f32]) {
+        if self.samples_per_layer[layer_idx].len() < self.max_samples_per_layer {
+            self.samples_per_layer[layer_idx].push(sample.to_vec());
+        }
+    }
+
+    /// Compute participation ratio for one layer's samples.
+    /// Returns (effective_rank, top1_eig, total_eig_sum).
+    fn participation_ratio_for_layer(&self, samples: &[Vec<f32>]) -> (f64, f64, f64) {
+        if samples.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        let n = samples.len();
+        let d = self.d;
+
+        // Compute Gram matrix X X^T of size n × n (symmetric).
+        // gram[i,j] = <samples[i], samples[j]>
+        let mut gram = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in i..n {
+                let mut acc = 0.0f64;
+                let si = &samples[i];
+                let sj = &samples[j];
+                for k in 0..d {
+                    acc += si[k] as f64 * sj[k] as f64;
+                }
+                gram[i * n + j] = acc;
+                gram[j * n + i] = acc;
+            }
+        }
+
+        // trace(G) = Σ λ_i  (since eigenvalues of G are squared singular values of X)
+        let mut trace = 0.0f64;
+        for i in 0..n {
+            trace += gram[i * n + i];
+        }
+
+        // ||G||_F² = Σ_{i,j} G[i,j]² = trace(G²) = Σ λ_i²
+        let mut frob_sq = 0.0f64;
+        for v in &gram {
+            frob_sq += v * v;
+        }
+
+        // Participation ratio = (Σ λ_i)² / (Σ λ_i²)
+        let pr = if frob_sq > 0.0 {
+            trace * trace / frob_sq
+        } else {
+            0.0
+        };
+
+        // Top-1 eigenvalue via single power iteration (5 iters for our purpose).
+        let mut v = vec![1.0f64 / (n as f64).sqrt(); n];
+        let mut top1 = 0.0;
+        for _ in 0..20 {
+            let mut nv = vec![0.0f64; n];
+            for i in 0..n {
+                let mut acc = 0.0;
+                for j in 0..n {
+                    acc += gram[i * n + j] * v[j];
+                }
+                nv[i] = acc;
+            }
+            let norm: f64 = nv.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm > 0.0 {
+                for x in nv.iter_mut() {
+                    *x /= norm;
+                }
+            }
+            top1 = norm;
+            v = nv;
+        }
+
+        (pr, top1, trace)
+    }
+
+    fn print_breakdown(&self) {
+        println!(
+            "\n=== T104 effective rank profile ({} layers, d={}, max {} samples/layer) ===",
+            self.samples_per_layer.len(),
+            self.d,
+            self.max_samples_per_layer
+        );
+        println!(
+            "  {:<6} {:>10} {:>14} {:>14} {:>14}",
+            "layer", "n_smp", "eff_rank", "stable_rank", "top1/total"
+        );
+
+        let mut sum_eff = 0.0f64;
+        let mut count = 0;
+        for (li, samples) in self.samples_per_layer.iter().enumerate() {
+            let (pr, top1, total) = self.participation_ratio_for_layer(samples);
+            let stable_rank = if top1 > 0.0 { total / top1 } else { 0.0 };
+            let frac_top1 = if total > 0.0 { top1 / total } else { 0.0 };
+            println!(
+                "  {:<6} {:>10} {:>14.2} {:>14.2} {:>14.4}",
+                li,
+                samples.len(),
+                pr,
+                stable_rank,
+                frac_top1
+            );
+            if !samples.is_empty() {
+                sum_eff += pr;
+                count += 1;
+            }
+        }
+        let avg_eff = if count > 0 {
+            sum_eff / count as f64
+        } else {
+            0.0
+        };
+        println!(
+            "\n  Average effective rank across layers: {:.2} (max possible = n={} samples)",
+            avg_eff, self.max_samples_per_layer
+        );
+        println!(
+            "  Note: participation ratio is bounded by min(N, d). With N={} samples and d={},",
+            self.max_samples_per_layer, self.d
+        );
+        println!("  rank ≪ N means hidden states truly lie on a low-dim manifold.");
+
+        let limit = self.max_samples_per_layer as f64 * 0.5;
+        println!("\nDecision criteria for active subspace projection (T105+):");
+        if avg_eff <= 64.0 {
+            println!(
+                "  ✓ STRONG VIABLE — avg effective rank {:.1} ≤ 64 (sample limit aside, manifold is very low-dim).",
+                avg_eff
+            );
+            println!("    → Implement projection to ~64-dim subspace, expect ×30+ memory bandwidth saving.");
+        } else if avg_eff <= 128.0 {
+            println!("  ✓ VIABLE — avg effective rank {:.1} ≤ 128.", avg_eff);
+            println!(
+                "    → Implement projection to ~128-256 dim subspace, ×10-20 memory bandwidth."
+            );
+        } else if avg_eff < limit {
+            println!(
+                "  ~ MARGINAL — avg effective rank {:.1} (between 128 and N/2={:.0}).",
+                avg_eff, limit
+            );
+            println!("    → Run again with larger N to confirm plateau, then evaluate.");
+        } else {
+            println!(
+                "  ✗ NOT VIABLE — avg effective rank {:.1} ≥ N/2={:.0}.",
+                avg_eff, limit
+            );
+            println!(
+                "    → Hidden states are full-rank within sample limit. Pivot to other approach."
+            );
+        }
+    }
+}
+
 // T88a — N-gram hit rate analysis on a generated sequence. Replays the
 // decode step by step, maintaining a trigram → continuations cache built
 // from the tokens generated so far. At each step ≥ 3 we look up whether
@@ -1266,6 +1451,231 @@ fn forward_token_sparsity(
     argmax(&logits)
 }
 
+// T104 — Rank-instrumented forward. Drains after each ffn_norm dispatch
+// and reads h_buf (the post-norm input to gate+up sgemv), recording it
+// as a sample for the layer's rank profile.
+fn forward_token_rank(
+    backend: &MetalBackend,
+    model: &ModelMetal,
+    token_id: u32,
+    position: usize,
+    scratch: &mut Scratch,
+    stats: &mut RankStats,
+) -> u32 {
+    let cfg = model.cfg;
+    let d = cfg.d;
+    let f = cfg.f;
+    let n_heads = cfg.n_heads;
+    let n_kv = cfg.n_kv_heads;
+    let head_dim = cfg.head_dim;
+    let max_seq = cfg.max_seq;
+
+    let off = (token_id as usize) * d;
+    scratch.x.copy_from_slice(&model.token_emb[off..off + d]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(scratch.x.as_ptr(), scratch.xd_buf.contents() as *mut f32, d);
+    }
+
+    let mut h_scratch = vec![0.0_f32; d];
+
+    for (li, layer) in model.layers.iter().enumerate() {
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.attn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &scratch.q_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
+                layer.w_k.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_v.buffer,
+                &scratch.v_buf,
+                layer.w_v.k,
+                layer.w_v.n,
+            )
+            .unwrap();
+        } else {
+            layer
+                .w_q
+                .matmul_into(backend, &scratch.h_buf, &scratch.q_buf);
+            layer
+                .w_k
+                .matmul_into(backend, &scratch.h_buf, &scratch.k_buf);
+            layer
+                .w_v
+                .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        }
+        if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
+            rms_norm_per_head_f32(
+                backend,
+                &scratch.q_buf,
+                qn_buf,
+                n_heads,
+                head_dim,
+                cfg.rms_eps,
+            )
+            .unwrap();
+        }
+        if let Some(kn_buf) = layer.attn_k_norm_buf.as_ref() {
+            rms_norm_per_head_f32(backend, &scratch.k_buf, kn_buf, n_kv, head_dim, cfg.rms_eps)
+                .unwrap();
+        }
+        rope_half_split_f32(
+            backend,
+            &scratch.q_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_heads,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        rope_half_split_f32(
+            backend,
+            &scratch.k_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_kv,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.k_buf,
+            &scratch.k_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.v_buf,
+            &scratch.v_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        let kv_len = position + 1;
+        gqa_decode_f32(
+            backend,
+            &scratch.q_buf,
+            &scratch.k_caches[li],
+            &scratch.v_caches[li],
+            &scratch.attn_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            kv_len,
+            max_seq,
+        )
+        .unwrap();
+        layer
+            .w_o
+            .matmul_into(backend, &scratch.attn_buf, &scratch.o_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.o_buf, d).unwrap();
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.ffn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        // T104 — drain & sample h_buf for rank profile.
+        backend.drain();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scratch.h_buf.contents() as *const f32,
+                h_scratch.as_mut_ptr(),
+                d,
+            );
+        }
+        stats.record(li, &h_scratch);
+
+        sgemv_q4_k_f32_lcpp_nr2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_gate.buffer,
+            &scratch.gate_buf,
+            layer.w_gate.k,
+            layer.w_gate.n,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_lcpp_nr2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_up.buffer,
+            &scratch.up_buf,
+            layer.w_up.k,
+            layer.w_up.n,
+        )
+        .unwrap();
+        swiglu_f32(
+            backend,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            &scratch.fd_buf,
+            f,
+        )
+        .unwrap();
+        layer
+            .w_down
+            .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
+    }
+
+    rms_norm_f32(
+        backend,
+        &scratch.xd_buf,
+        &model.final_norm_buf,
+        &scratch.h_buf,
+        cfg.d,
+        cfg.rms_eps,
+    )
+    .unwrap();
+    model
+        .lm_head
+        .matmul_into(backend, &scratch.h_buf, &scratch.logits_buf);
+    backend.drain();
+    let mut logits = vec![0.0_f32; cfg.vocab];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.logits_buf.contents() as *const f32,
+            logits.as_mut_ptr(),
+            cfg.vocab,
+        );
+    }
+    argmax(&logits)
+}
+
 struct Scratch {
     x: Vec<f32>,
     h: Vec<f32>,
@@ -1465,6 +1875,7 @@ fn main() -> ExitCode {
     let mut profile = false;
     let mut sparsity_profile = false;
     let mut ngram_profile = false;
+    let mut rank_profile = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1510,6 +1921,11 @@ fn main() -> ExitCode {
                 args.remove(i);
                 continue;
             },
+            "--rank-profile" => {
+                rank_profile = true;
+                args.remove(i);
+                continue;
+            },
             _ => {},
         }
         i += 1;
@@ -1530,6 +1946,7 @@ fn main() -> ExitCode {
 
     let mut stages = Stages::default();
     let mut sparsity = SparsityStats::new(model.cfg.n_layers, model.cfg.f);
+    let mut rank_stats = RankStats::new(model.cfg.n_layers, model.cfg.d, 100);
     println!("\n→ prefill {} tokens", prompt_ids.len());
     let t_pre = Instant::now();
     let mut last = 0u32;
@@ -1539,6 +1956,8 @@ fn main() -> ExitCode {
             forward_token_profiled(backend, &model, tok, cur_pos, &mut scratch, &mut stages)
         } else if sparsity_profile {
             forward_token_sparsity(backend, &model, tok, cur_pos, &mut scratch, &mut sparsity)
+        } else if rank_profile {
+            forward_token_rank(backend, &model, tok, cur_pos, &mut scratch, &mut rank_stats)
         } else {
             forward_token(backend, &model, tok, cur_pos, &mut scratch)
         };
@@ -1561,12 +1980,24 @@ fn main() -> ExitCode {
     if sparsity_profile {
         sparsity = SparsityStats::new(model.cfg.n_layers, model.cfg.f);
     }
+    if rank_profile {
+        rank_stats = RankStats::new(model.cfg.n_layers, model.cfg.d, 100);
+    }
     let t_dec = Instant::now();
     for _ in 1..n {
         last = if profile {
             forward_token_profiled(backend, &model, last, cur_pos, &mut scratch, &mut stages)
         } else if sparsity_profile {
             forward_token_sparsity(backend, &model, last, cur_pos, &mut scratch, &mut sparsity)
+        } else if rank_profile {
+            forward_token_rank(
+                backend,
+                &model,
+                last,
+                cur_pos,
+                &mut scratch,
+                &mut rank_stats,
+            )
         } else {
             forward_token(backend, &model, last, cur_pos, &mut scratch)
         };
@@ -1588,6 +2019,9 @@ fn main() -> ExitCode {
     }
     if ngram_profile {
         analyze_ngram_hit_rate(&generated, 16);
+    }
+    if rank_profile {
+        rank_stats.print_breakdown();
     }
     println!("\ngenerated: {:?}", generated);
     ExitCode::SUCCESS
