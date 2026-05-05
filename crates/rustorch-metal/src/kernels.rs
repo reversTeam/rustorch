@@ -3081,6 +3081,187 @@ kernel void sgemv_q4_k_f32_lcpp_nr2(
 }
 "#;
 
+// T132 — Same body as T91/lcpp_nr2 but with NSG=2 simdgroups per threadgroup
+// (matching llama.cpp's `N_SG_Q4_K = 2`). Two simdgroups inside one
+// threadgroup let the GPU's threadgroup scheduler interleave compute and
+// memory accesses between them, hiding global-memory latency that a single
+// simdgroup can't mask alone. Each threadgroup processes NSG*NR0 = 4 output
+// rows. Dispatch grid = N/4 threadgroups × 64 threads each.
+//
+// Critical subtle point: `first_row = (tgpig * NSG + sgitg) * NR0`. Each
+// simdgroup inside the threadgroup picks the correct 2-row band via
+// `sgitg`. The two bands are independent — no threadgroup memory or
+// barriers needed (sumf[] is in registers, simd_sum reduces inside one
+// simdgroup, output writes to disjoint rows).
+//
+// Note: tested NSG=4 (128 threads/tg, 8 rows/tg) — gave equivalent chained
+// tok/s to NSG=2 on M4 Max while increasing register pressure marginally.
+// NSG=2 stays the reference value (matches llama.cpp upstream).
+const SGEMV_Q4_K_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+constant short NR0 = 2;
+constant short NSG = 2;
+constant ushort KMASK1 = 0x3f3f;
+constant ushort KMASK2 = 0x0f0f;
+constant ushort KMASK3 = 0xc0c0;
+
+kernel void sgemv_q4_k_f32_lcpp_nsg2(
+    device const float*  x      [[buffer(0)]],
+    device const uchar*  w_q4k  [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint2&      dims   [[buffer(3)]],
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+
+    // Threadgroup tg_id covers (NSG*NR0)=4 rows; this simdgroup handles 2 of them.
+    uint first_row = (tg_id * (uint)NSG + (uint)sgitg) * (uint)NR0;
+    if (first_row >= N) return;
+
+    short ix = (short)(tiisg / 8u);
+    short it = (short)(tiisg % 8u);
+    short iq = it / 4;
+    short ir = it % 4;
+
+    int nb = (int)blocks_per_row;
+
+    device const float* y4 = x + ix * 256 + 64 * iq + 8 * ir;
+
+    float yl[16];
+    float yh[16];
+    float sumf[2] = {0.0, 0.0};
+
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    uint row_stride = blocks_per_row * BLOCK_BYTES;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.0, 0.0, 0.0, 0.0};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_q4k + (uint64_t)nrow * row_stride + (uint)ib * BLOCK_BYTES;
+            device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+            float d    = float(as_type<half>(dh_ptr[0]));
+            float dmin = float(as_type<half>(dh_ptr[1]));
+
+            device const uint16_t* sc = (device const uint16_t*)(block + 4) + iq;
+            device const uint16_t* q1 = (device const uint16_t*)(block + 16) + 16 * iq + 4 * ir;
+            device const uint16_t* q2 = q1 + 32;
+
+            sc16[0] = sc[0] & KMASK1;
+            sc16[1] = sc[2] & KMASK1;
+            sc16[2] = ((sc[4] >> 0) & KMASK2) | ((sc[0] & KMASK3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & KMASK2) | ((sc[2] & KMASK3) >> 2);
+
+            float4 acc1 = {0.0, 0.0, 0.0, 0.0};
+            float4 acc2 = {0.0, 0.0, 0.0, 0.0};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[row] += d * ((acc1[0] + 1.0f/256.0f * acc1[1]) * float(sc8[0]) +
+                              (acc1[2] + 1.0f/256.0f * acc1[3]) * float(sc8[1]) * 1.0f/16.0f +
+                              (acc2[0] + 1.0f/256.0f * acc2[1]) * float(sc8[4]) +
+                              (acc2[2] + 1.0f/256.0f * acc2[3]) * float(sc8[5]) * 1.0f/16.0f) -
+                       dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                               sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        y4 += 4 * (int)BLOCK_WEIGHTS;
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y[nrow] = sum_all;
+        }
+    }
+}
+"#;
+
+/// T132 — lcpp_nr2 with NSG=2 (two simdgroups per threadgroup). Matches
+/// llama.cpp's `N_SG_Q4_K = 2` dispatch, which yields better memory latency
+/// hiding by interleaving compute & memory ops across the two simdgroups
+/// in a single threadgroup. Each threadgroup processes NSG*NR0 = 4 rows.
+///
+/// Auto-falls back to NSG=1 (`sgemv_q4_k_f32_lcpp_nr2_into`) when N is not
+/// divisible by 4, so callers can use this unconditionally.
+pub fn sgemv_q4_k_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32_lcpp_nsg2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_lcpp_nsg2: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    // NSG=2 requires N divisible by 4 (each threadgroup writes 4 rows).
+    // For non-multiple-of-4 N, fall back to NSG=1 lcpp_nr2.
+    if n % 4 != 0 {
+        return sgemv_q4_k_f32_lcpp_nr2_into(backend, x_buf, w_q4k_buf, out_buf, k, n);
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_lcpp_nsg2",
+        SGEMV_Q4_K_F32_LCPP_NSG2_SHADER,
+        "sgemv_q4_k_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        // 64 threads/threadgroup = 2 simdgroups × 32. Each threadgroup
+        // processes NSG*NR0 = 4 rows. Total threadgroups = ceil(N/4).
+        // Use `dispatch_thread_groups` (direct group count) instead of
+        // `dispatch_threads` (which pays a CPU-side divmod-and-pad cost
+        // every call) — matches llama.cpp's dispatch path.
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(4);
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T91 — Faithful port of llama.cpp's `kernel_mul_mv_q4_K_f32_impl` with
 /// N_R0_Q4_K=2. Combines load-x-once (yl/yh registers), factored Q4_K
 /// formula (d*combined - dmin*sumy*sc_odd), and 2-row simdgroup processing.
@@ -3937,6 +4118,144 @@ kernel void sgemv_q6_k_f32_lcpp_nr2(
     }
 }
 "#;
+
+// T132 — Q6_K version of the NSG=2 kernel. Same body as T93 lcpp_nr2 with
+// llama.cpp's `N_SG_Q6_K = 2` dispatch (2 simdgroups per threadgroup).
+const SGEMV_Q6_K_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q6K_BYTES = 210u;
+constant uint Q6K_WEIGHTS = 256u;
+constant short NR0_Q6 = 2;
+constant short NSG_Q6 = 2;
+
+kernel void sgemv_q6_k_f32_lcpp_nsg2(
+    device const float*  x      [[buffer(0)]],
+    device const uchar*  w_q6k  [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint2&      dims   [[buffer(3)]],
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uchar KMASK1 = 0x03;
+    constexpr uchar KMASK2 = 0x0C;
+    constexpr uchar KMASK3 = 0x30;
+    constexpr uchar KMASK4 = 0xC0;
+
+    uint K = dims.x;
+    uint N = dims.y;
+    int nb = (int)(K / Q6K_WEIGHTS);
+
+    uint first_row = (tg_id * (uint)NSG_Q6 + (uint)sgitg) * (uint)NR0_Q6;
+    if (first_row >= N) return;
+
+    short tid = (short)(tiisg / 2u);
+    short ix  = (short)(tiisg % 2u);
+    short ip  = tid / 8;
+    short il  = tid % 8;
+    short l0  = 4 * il;
+    short is  = 8 * ip + l0 / 16;
+
+    short y_offset   = 128 * ip + l0;
+    short q_offset_l = 64 * ip + l0;
+    short q_offset_h = 32 * ip + l0;
+
+    float sumf[2] = {0.0, 0.0};
+    float yl[16];
+
+    uint row_stride = (uint)nb * Q6K_BYTES;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const float* yptr = x + i * (int)Q6K_WEIGHTS + (int)y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = yptr[l +  0];
+            yl[4*l + 1] = yptr[l + 32];
+            yl[4*l + 2] = yptr[l + 64];
+            yl[4*l + 3] = yptr[l + 96];
+        }
+
+        for (short row = 0; row < NR0_Q6; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_q6k + (uint64_t)nrow * row_stride + (uint)i * Q6K_BYTES;
+            device const uchar* q1 = block + 0   + (uint)q_offset_l;
+            device const uchar* q2 = q1 + 32;
+            device const uchar* qh = block + 128 + (uint)q_offset_h;
+            device const char*  sc = (device const char*)(block + 192) + (int)is;
+            device const uint16_t* dh = (device const uint16_t*)(block + 208);
+
+            float d_val = float(as_type<half>(dh[0]));
+
+            float4 sums = {0.0, 0.0, 0.0, 0.0};
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * (float)((int)((q1[l] & 0xF) | ((qh[l] & KMASK1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * (float)((int)((q2[l] & 0xF) | ((qh[l] & KMASK2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * (float)((int)((q1[l]  >> 4) | ((qh[l] & KMASK3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * (float)((int)((q2[l]  >> 4) | ((qh[l] & KMASK4) >> 2)) - 32);
+            }
+
+            sumf[row] += d_val * (sums[0] * float(sc[0]) + sums[1] * float(sc[2])
+                                + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
+        }
+    }
+
+    for (short row = 0; row < NR0_Q6; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y[nrow] = sum_all;
+        }
+    }
+}
+"#;
+
+/// T132 — Q6_K version of the NSG=2 kernel. Mirror of `sgemv_q4_k_f32_lcpp_nsg2_into`
+/// for Q6_K weights (lm_head, some W_V). Each threadgroup processes 4 rows.
+/// Auto-falls back to NSG=1 lcpp_nr2 for N not divisible by 4.
+pub fn sgemv_q6_k_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q6k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_f32_lcpp_nsg2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_f32_lcpp_nsg2: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    if n % 4 != 0 {
+        return sgemv_q6_k_f32_lcpp_nr2_into(backend, x_buf, w_q6k_buf, out_buf, k, n);
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q6_k_f32_lcpp_nsg2",
+        SGEMV_Q6_K_F32_LCPP_NSG2_SHADER,
+        "sgemv_q6_k_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(4);
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
 
 /// T93 — Faithful port of llama.cpp's `kernel_mul_mv_q6_K_f32_impl` with
 /// N_R0_Q6_K=2. Smaller per-row state than T90 (which regressed); 2 rows

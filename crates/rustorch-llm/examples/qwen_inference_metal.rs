@@ -33,9 +33,9 @@ use rustorch_metal::kernels::{
     kv_append_batched_f32, kv_append_f32, rms_norm_batched_f32, rms_norm_f32,
     rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rope_half_split_batched_f32,
     rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_lcpp_nr2_batch_into,
-    sgemv_q4_k_f32_lcpp_nr2_into, sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
+    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
     sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_lcpp_nr2_batch_into,
-    sgemv_q6_k_f32_lcpp_nr2_into, swiglu_batched_f32, swiglu_f32,
+    sgemv_q6_k_f32_lcpp_nsg2_into, swiglu_batched_f32, swiglu_f32,
 };
 
 use metal::Buffer;
@@ -61,22 +61,20 @@ impl MetalWeight {
         //   - else: 1-thread-per-output simple kernel.
         let blocks_per_row = self.k / 256;
         match (self.dtype, blocks_per_row, self.n) {
-            // T91 — Faithful port of llama.cpp's kernel_mul_mv_q4_K_f32_impl
-            // with N_R0_Q4_K=2. Combines load-x-once (yl/yh registers),
-            // factored Q4_K formula (d*combined - dmin*sumy*sc_odd), and
-            // 2-row simdgroup processing.
+            // T132 — NSG=2 (2 simdgroups per threadgroup, 64 threads, 4 rows
+            // per threadgroup). Matches llama.cpp's `N_SG_Q4_K = 2` /
+            // `N_SG_Q6_K = 2` dispatch for memory-latency hiding via inter-
+            // simdgroup interleaving. The NSG=2 helpers auto-fall back to
+            // NSG=1 lcpp_nr2 for N not divisible by 4.
             (GgmlType::Q4_K, bpr, n) if bpr >= 16 && n > 500 => {
-                sgemv_q4_k_f32_lcpp_nr2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                sgemv_q4_k_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
                     .unwrap()
             },
             (GgmlType::Q4_K, _, _) => {
                 sgemv_q4_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
             },
-            // T93 — Faithful port of llama.cpp's kernel_mul_mv_q6_K_f32_impl
-            // with N_R0_Q6_K=2. Different design from T90 (smaller per-row
-            // state, simpler formula) avoids the register spill T90 hit.
             (GgmlType::Q6_K, bpr, n) if bpr >= 16 && n > 500 => {
-                sgemv_q6_k_f32_lcpp_nr2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                sgemv_q6_k_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
                     .unwrap()
             },
             (GgmlType::Q6_K, _, _) => {
@@ -1566,7 +1564,7 @@ fn forward_token(
         // Same chained-encoder amortization argument as T94 for gate+up.
         // For Q4_K W_v case: 3 separate lcpp_nr2 calls. Else: 2 + matmul_into.
         if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -1575,7 +1573,7 @@ fn forward_token(
                 layer.w_q.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_k.buffer,
@@ -1584,7 +1582,7 @@ fn forward_token(
                 layer.w_k.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_v.buffer,
@@ -1594,7 +1592,7 @@ fn forward_token(
             )
             .unwrap();
         } else {
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -1603,7 +1601,7 @@ fn forward_token(
                 layer.w_q.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_k.buffer,
@@ -1717,7 +1715,7 @@ fn forward_token(
         // T94 — gate + up via 2 dispatches of lcpp_nr2 (the +9% kernel
         // from T91). 2 dispatches vs 1 fused — chained encoder (T83)
         // amortizes the dispatch overhead, and the kernel optims dominate.
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_gate.buffer,
@@ -1726,7 +1724,7 @@ fn forward_token(
             layer.w_gate.n,
         )
         .unwrap();
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_up.buffer,
@@ -2308,7 +2306,7 @@ fn forward_token_rank(
         )
         .unwrap();
         if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -2317,7 +2315,7 @@ fn forward_token_rank(
                 layer.w_q.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_k.buffer,
@@ -2326,7 +2324,7 @@ fn forward_token_rank(
                 layer.w_k.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_v.buffer,
@@ -2439,7 +2437,7 @@ fn forward_token_rank(
         }
         stats.record(li, &h_scratch);
 
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_gate.buffer,
@@ -2448,7 +2446,7 @@ fn forward_token_rank(
             layer.w_gate.n,
         )
         .unwrap();
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_up.buffer,
@@ -2556,7 +2554,7 @@ fn forward_token_entropy(
 
         // 2. QKV.
         if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -2565,7 +2563,7 @@ fn forward_token_entropy(
                 layer.w_q.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_k.buffer,
@@ -2574,7 +2572,7 @@ fn forward_token_entropy(
                 layer.w_k.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_v.buffer,
@@ -2584,7 +2582,7 @@ fn forward_token_entropy(
             )
             .unwrap();
         } else {
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -2593,7 +2591,7 @@ fn forward_token_entropy(
                 layer.w_q.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_k.buffer,
@@ -2702,7 +2700,7 @@ fn forward_token_entropy(
         .unwrap();
 
         // 9. Gate + Up + SwiGLU + Down + residual.
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_gate.buffer,
@@ -2711,7 +2709,7 @@ fn forward_token_entropy(
             layer.w_gate.n,
         )
         .unwrap();
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_up.buffer,
@@ -2872,7 +2870,7 @@ fn forward_token_layer_cos(
         )
         .unwrap();
         if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -2881,7 +2879,7 @@ fn forward_token_layer_cos(
                 layer.w_q.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_k.buffer,
@@ -2890,7 +2888,7 @@ fn forward_token_layer_cos(
                 layer.w_k.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_v.buffer,
@@ -2900,7 +2898,7 @@ fn forward_token_layer_cos(
             )
             .unwrap();
         } else {
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -2909,7 +2907,7 @@ fn forward_token_layer_cos(
                 layer.w_q.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_k.buffer,
@@ -3010,7 +3008,7 @@ fn forward_token_layer_cos(
             cfg.rms_eps,
         )
         .unwrap();
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_gate.buffer,
@@ -3019,7 +3017,7 @@ fn forward_token_layer_cos(
             layer.w_gate.n,
         )
         .unwrap();
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_up.buffer,
@@ -3116,7 +3114,7 @@ fn forward_token_head_stats(
         )
         .unwrap();
         if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -3125,7 +3123,7 @@ fn forward_token_head_stats(
                 layer.w_q.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_k.buffer,
@@ -3134,7 +3132,7 @@ fn forward_token_head_stats(
                 layer.w_k.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_v.buffer,
@@ -3144,7 +3142,7 @@ fn forward_token_head_stats(
             )
             .unwrap();
         } else {
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
@@ -3153,7 +3151,7 @@ fn forward_token_head_stats(
                 layer.w_q.n,
             )
             .unwrap();
-            sgemv_q4_k_f32_lcpp_nr2_into(
+            sgemv_q4_k_f32_lcpp_nsg2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_k.buffer,
@@ -3260,7 +3258,7 @@ fn forward_token_head_stats(
             cfg.rms_eps,
         )
         .unwrap();
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_gate.buffer,
@@ -3269,7 +3267,7 @@ fn forward_token_head_stats(
             layer.w_gate.n,
         )
         .unwrap();
-        sgemv_q4_k_f32_lcpp_nr2_into(
+        sgemv_q4_k_f32_lcpp_nsg2_into(
             backend,
             &scratch.h_buf,
             &layer.w_up.buffer,
