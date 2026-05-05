@@ -5356,18 +5356,30 @@ kernel void gqa_decode_f32(
     float sum = simd_sum(local_sum);
     float inv_sum = 1.0 / sum;
 
-    // Phase D: weighted sum of V vectors. Each thread accumulates one
-    // dim of out. With sg_size=32 and head_dim=128 each thread handles
-    // 4 dims via stride loop.
-    // T101 — pre-multiply shared[p] *= inv_sum cooperatively, eliminates
-    // kv_len multiplies in the inner accumulation loop.
+    // T113 — Phase D V-weighted-sum with float4 vectorization.
+    // For head_dim=128, hd4=32 = sg_size → each thread handles exactly
+    // 1 float4. Reduces 4 scalar reads/multiplies to 1 vector read/multiply.
+    // T101 — pre-multiply shared[p] *= inv_sum cooperatively.
     for (uint p = tid; p < kv_len; p += sg_size) {
         shared[p] *= inv_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const float* v_h_base = v_cache + kv_h * max_seq * head_dim;
     device float* out_h = out + q_h * head_dim;
-    for (uint d = tid; d < head_dim; d += sg_size) {
+
+    uint hd4_d = head_dim / 4u;
+    device float4* out_h4 = (device float4*)out_h;
+    for (uint d4 = tid; d4 < hd4_d; d4 += sg_size) {
+        float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint p = 0; p < kv_len; ++p) {
+            device const float4* v_p4 = (device const float4*)(v_h_base + p * head_dim);
+            acc += shared[p] * v_p4[d4];
+        }
+        out_h4[d4] = acc;
+    }
+    // Scalar tail if head_dim % 4 != 0
+    uint tail_start = hd4_d * 4u;
+    for (uint d = tail_start + tid; d < head_dim; d += sg_size) {
         float acc = 0.0;
         for (uint p = 0; p < kv_len; ++p) {
             acc += shared[p] * v_h_base[p * head_dim + d];
