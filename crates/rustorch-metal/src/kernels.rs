@@ -4222,6 +4222,217 @@ pub fn sgemv_q3_k_f32_lcpp_nsg1_into(
     Ok(())
 }
 
+// T160 — Q3_K sgemv NSG=2 NR0=1 fast-path avec ix-stripping (TurboQuant Q3_K).
+//
+// Pattern Q5_K-style : 64 threads par TG = 2 simdgroups (NSG=2), chaque
+// simdgroup possède 1 row (NR0=1). Au sein d'un simdgroup, les 32 threads
+// sont split en `tid = tiisg/4` (0..7, sélectionne une PAIRE de sub-blocks
+// consécutifs) × `ix = tiisg%4` (0..3, K-axis stripe : ¼ des super-blocks).
+// Chaque thread couvre 32 weights (= 2 sub-blocks de 16) par super-block
+// visité, sur nb/4 super-blocks → même travail total que NSG=1 (8×nb), mais
+// inner loops 4× plus denses → meilleure ILP.
+//
+// Préserve l'unpacking Q3_K validé en T158 (hmask + qs + scales 6-bit signed).
+// Optim : `shift`, `half_idx`, `m_bit` SHARED entre sb_first et sb_second
+// (pairs (0,1), (2,3), ..., (14,15) ont sb_in_half pair pour sb_first donc
+// shift identique pour la pair, m_bit identique).
+//
+// Gains attendus vs NSG=1 :
+//   * Halved TG count (NSG=2) → -50 % dispatch overhead
+//   * Inner loops 4× plus denses (yl[16]+yh[16] register-resident, 16 iter
+//     consécutives par sub-block) → meilleur instruction scheduling Apple GPU
+//   * Outer loop iterates ¼ × → fewer block pointer arithmetic
+const SGEMV_Q3_K_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q3K_BYTES = 110u;
+constant uint Q3K_WEIGHTS = 256u;
+constant short NSG_Q3K = 2;
+
+kernel void sgemv_q3_k_f32_lcpp_nsg2(
+    device const float*  x      [[buffer(0)]],   // [K]
+    device const uchar*  w_q3k  [[buffer(1)]],   // [N * blocks_per_row * 110]
+    device float*        y      [[buffer(2)]],   // [N]
+    constant uint2&      dims   [[buffer(3)]],   // (K, N)
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    int  nb = (int)(K / Q3K_WEIGHTS);
+
+    // 2 simdgroups par TG, chaque simdgroup possède 1 row.
+    uint nrow = (uint)tg_id * (uint)NSG_Q3K + (uint)sgitg;
+    if (nrow >= N) return;
+
+    uint row_stride = (uint)nb * Q3K_BYTES;
+
+    // Per-thread layout : ix-stripping.
+    short tid = (short)(tiisg / 4u);   // 0..7 — pair of consecutive sub-blocks
+    short ix  = (short)(tiisg % 4u);   // 0..3 — K-axis stripe
+
+    // Pair de sub-blocks : sb_first = tid*2 (pair), sb_second = tid*2+1.
+    // (0,1), (2,3), ..., (14,15) — pairs au sein de la même half (0..7 ou 8..15).
+    short sb_first  = tid * 2;
+    short sb_second = sb_first + 1;
+
+    // Métadonnées de packing — pre-computed (constants across ib).
+    // sb_first et sb_second partagent half_idx, shift, m_bit (cf analyse T160).
+    short half_idx        = sb_first / 8;             // 0 si tid<4, 1 sinon
+    short sb_in_half_f    = sb_first % 8;             // {0,2,4,6} ou {0,2,4,6}
+    short shift           = (sb_in_half_f / 2) * 2;   // 0,2,4,6
+    short qs_base_first   = half_idx * 32 + 0;        // sb_first→sb_in_half%2==0
+    short qs_base_second  = half_idx * 32 + 16;       // sb_second→sb_in_half%2==1
+    short hmask_base_first  = 0;                      // (sb_in_half%2==0)*16
+    short hmask_base_second = 16;                     // (sb_in_half%2==1)*16
+    short j_global        = half_idx * 4 + sb_in_half_f / 2;
+    uint  m_bit           = 1u << j_global;
+
+    // Position dans x : ce thread couvre [sb_first*16 .. sb_first*16+32) du
+    // super-block courant, sur les ¼ de super-blocks indexés par ix.
+    device const float* y_first = x + (uint)ix * Q3K_WEIGHTS + (uint)sb_first * 16u;
+
+    float sumf = 0.0;
+
+    for (int i = ix; i < nb; i += 4) {
+        // Load 32 floats register-resident pour 1 super-block visité.
+        float yl[16];
+        float yh[16];
+        for (short l = 0; l < 16; ++l) {
+            yl[l] = y_first[l];
+            yh[l] = y_first[l + 16];
+        }
+
+        device const uchar* block = w_q3k + (uint64_t)nrow * row_stride + (uint)i * Q3K_BYTES;
+        device const uchar* hmask = block;
+        device const uchar* qs    = block + 32;
+        device const uchar* sc_raw = block + 96;
+        device const half*  d_ptr = (device const half*)(block + 108);
+        float d_all = float(*d_ptr);
+
+        // Scale sb_first.
+        uchar scale_byte_f;
+        if (sb_first < 4) {
+            scale_byte_f = (sc_raw[sb_first] & 0x0Fu)
+                         | ((sc_raw[8 + sb_first] & 0x03u) << 4u);
+        } else if (sb_first < 8) {
+            short ii = sb_first - 4;
+            scale_byte_f = (sc_raw[4 + ii] & 0x0Fu)
+                         | (((sc_raw[8 + ii] >> 2u) & 0x03u) << 4u);
+        } else if (sb_first < 12) {
+            short ii = sb_first - 8;
+            scale_byte_f = (sc_raw[ii] >> 4u)
+                         | (((sc_raw[8 + ii] >> 4u) & 0x03u) << 4u);
+        } else {
+            short ii = sb_first - 12;
+            scale_byte_f = (sc_raw[4 + ii] >> 4u)
+                         | (((sc_raw[8 + ii] >> 6u) & 0x03u) << 4u);
+        }
+        float dl_f = d_all * (float)((int)((char)scale_byte_f) - 32);
+
+        // Scale sb_second.
+        uchar scale_byte_s;
+        if (sb_second < 4) {
+            scale_byte_s = (sc_raw[sb_second] & 0x0Fu)
+                         | ((sc_raw[8 + sb_second] & 0x03u) << 4u);
+        } else if (sb_second < 8) {
+            short ii = sb_second - 4;
+            scale_byte_s = (sc_raw[4 + ii] & 0x0Fu)
+                         | (((sc_raw[8 + ii] >> 2u) & 0x03u) << 4u);
+        } else if (sb_second < 12) {
+            short ii = sb_second - 8;
+            scale_byte_s = (sc_raw[ii] >> 4u)
+                         | (((sc_raw[8 + ii] >> 4u) & 0x03u) << 4u);
+        } else {
+            short ii = sb_second - 12;
+            scale_byte_s = (sc_raw[4 + ii] >> 4u)
+                         | (((sc_raw[8 + ii] >> 6u) & 0x03u) << 4u);
+        }
+        float dl_s = d_all * (float)((int)((char)scale_byte_s) - 32);
+
+        // Inner loop sb_first : 16 weights register-resident yl[].
+        float acc_f = 0.0;
+        for (uint l = 0; l < 16u; ++l) {
+            uint qs_byte    = qs[(uint)qs_base_first + l];
+            uint hmask_byte = hmask[(uint)hmask_base_first + l];
+            int  q_lo  = (int)((qs_byte >> (uint)shift) & 0x03u);
+            int  h_bit = (hmask_byte & m_bit) != 0u;
+            int  v     = q_lo - (h_bit ? 0 : 4);
+            acc_f += yl[l] * (float)v;
+        }
+        sumf += acc_f * dl_f;
+
+        // Inner loop sb_second : 16 weights register-resident yh[].
+        float acc_s = 0.0;
+        for (uint l = 0; l < 16u; ++l) {
+            uint qs_byte    = qs[(uint)qs_base_second + l];
+            uint hmask_byte = hmask[(uint)hmask_base_second + l];
+            int  q_lo  = (int)((qs_byte >> (uint)shift) & 0x03u);
+            int  h_bit = (hmask_byte & m_bit) != 0u;
+            int  v     = q_lo - (h_bit ? 0 : 4);
+            acc_s += yh[l] * (float)v;
+        }
+        sumf += acc_s * dl_s;
+
+        y_first += 4 * (int)Q3K_WEIGHTS;
+    }
+
+    float row_sum = simd_sum(sumf);
+    if (tiisg == 0) {
+        y[nrow] = row_sum;
+    }
+}
+"#;
+
+/// T160 — Q3_K sgemv NSG=2 NR0=1 ix-stripped fast-path (TurboQuant Q3_K).
+///
+/// 64 threads par TG = 2 simdgroups × 32. Chaque simdgroup possède 1 row
+/// (NR0=1). Au sein d'un simdgroup, ix-stripping : 8 threads/stripe couvrent
+/// 32 weights (= 2 sub-blocks de 16) par super-block, sur ¼ des super-blocks.
+/// Inner loops 4× plus denses que NSG=1 → meilleure ILP Apple GPU.
+///
+/// Pré-conditions identiques à NSG=1 (Metal3 + K%256==0).
+pub fn sgemv_q3_k_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q3k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q3_k_f32_lcpp_nsg2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q3_k_f32_lcpp_nsg2: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q3_k_f32_lcpp_nsg2",
+        SGEMV_Q3_K_F32_LCPP_NSG2_SHADER,
+        "sgemv_q3_k_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q3k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        // 64 threads/tg = 2 simdgroups × 32. Each tg processes 2 rows.
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(2);
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T142 — Q5_K matmul-vec kernel.
 //
 // Q5_K format: 256 weights / 176-byte super-block.
@@ -9587,6 +9798,106 @@ mod tests {
                 "Q3_K mismatch at row {i}: ref={} metal={} (rel err {:.3e})",
                 y_ref[i],
                 y_metal[i],
+                rel
+            );
+        }
+    }
+
+    /// T160 — parité numérique NSG=2 (ix-stripped) vs NSG=1 baseline.
+    ///
+    /// Exerce ix-stripping (K=1024 → 4 super-blocks, chaque ix∈[0..4) en
+    /// visite exactement 1) et la pair sb_first/sb_second pour les 8 tids
+    /// possibles. Tolérance 1e-4 (les sommes d'arrondi peuvent micro-diverger
+    /// entre les 2 ordres d'accumulation simdgroup, mais doivent rester très
+    /// proches).
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemv_q3_k_nsg2_matches_nsg1() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!(
+                "[sgemv_q3_k_nsg2] skipping: device does not support Metal3 ({})",
+                backend.adapter_name()
+            );
+            return;
+        }
+
+        // K = 1024 (4 super-blocks) pour exercer les 4 ix-stripes,
+        // N = 64 (32 TGs NSG=2, donc 32 simdgroups en flight = 64 rows).
+        let k = 1024_usize;
+        let n = 64_usize;
+        let blocks_per_row = k / 256;
+
+        // Build deterministic Q3_K bytes : N rows × blocks_per_row × 110 bytes.
+        let mut w_bytes = vec![0u8; n * blocks_per_row * 110];
+        for nrow in 0..n {
+            for ib in 0..blocks_per_row {
+                let off = (nrow * blocks_per_row + ib) * 110;
+                // hmask : alternance contrôlée par (nrow, ib, i)
+                for i in 0..32 {
+                    w_bytes[off + i] = if (nrow + ib + i) % 2 == 0 { 0xAA } else { 0x55 };
+                }
+                // qs : pattern incrémental pour couvrir tous les q_lo possibles.
+                for i in 0..64 {
+                    w_bytes[off + 32 + i] = ((i as u8 + ib as u8) & 0xC0)
+                        | ((((i as u8) + (ib as u8)) << 2) & 0x30)
+                        | ((((i as u8) + (ib as u8)) << 4) & 0x0C)
+                        | ((((i as u8) + (ib as u8)) << 6) & 0x03);
+                }
+                // scales : 12 bytes packés non triviaux.
+                for i in 0..12 {
+                    w_bytes[off + 96 + i] =
+                        (0x40_u8.wrapping_add((nrow as u8) ^ (i as u8) ^ (ib as u8))) | 0x10;
+                }
+                // d : valeur dépendante de (nrow, ib) en half-float.
+                let d_val = ((nrow as f32 + 1.0) * 0.01) + (ib as f32) * 0.001;
+                let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                w_bytes[off + 108] = d_h[0];
+                w_bytes[off + 109] = d_h[1];
+            }
+        }
+
+        let x = det_vec(k, 2.3);
+
+        // Buffers communs.
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        let y1_buf = backend.alloc_shared(n * 4).unwrap();
+        let y2_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+        }
+
+        // NSG=1 baseline.
+        sgemv_q3_k_f32_lcpp_nsg1_into(backend, &x_buf, &w_buf, &y1_buf, k, n).unwrap();
+        backend.drain();
+        let mut y1 = vec![0.0_f32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(y1_buf.contents() as *const f32, y1.as_mut_ptr(), n);
+        }
+
+        // NSG=2 (ix-stripped).
+        sgemv_q3_k_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y2_buf, k, n).unwrap();
+        backend.drain();
+        let mut y2 = vec![0.0_f32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(y2_buf.contents() as *const f32, y2.as_mut_ptr(), n);
+        }
+
+        for i in 0..n {
+            let abs_err = (y1[i] - y2[i]).abs();
+            let denom = y1[i].abs().max(1e-4);
+            let rel = abs_err / denom;
+            assert!(
+                rel < 1e-4,
+                "Q3_K NSG=2 ≠ NSG=1 at row {i}: nsg1={} nsg2={} (rel err {:.3e})",
+                y1[i],
+                y2[i],
                 rel
             );
         }

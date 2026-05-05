@@ -49,13 +49,13 @@ use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_f32, delta_net_step_f32, gqa_decode_f32, kv_append_f32, l2_norm_per_head_f32,
     rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
-    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q4_k_f32_lcpp_nsg2_into,
-    sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
-    sigmoid_mul_inplace_f32, split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32,
-    ssm_conv1d_step_f32, swiglu_f32, topk_softmax_norm_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_f32, zero_f32,
+    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into,
+    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32, sigmoid_mul_inplace_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
+    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -88,7 +88,45 @@ impl HybridMetalWeight {
             GgmlType::Q3_K => {
                 // T158 phase 1b — Q3_K dequant + sgemv (3.44 bpw, -24% DRAM
                 // vs Q4_K). Validé numériquement vs CPU `dequant_q3_k`.
-                sgemv_q3_k_f32_lcpp_nsg1_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                // T160 phase 1 — bundle NSG=2 NR0=1 : 2 simdgroups par TG,
+                // chaque simdgroup possède 1 row. Halve la dispatch count vs
+                // NSG=1 et améliore la co-residency simdgroup sur Apple GPU.
+                // Fallback NSG=1 si Metal3 absent ou K%256 != 0.
+                // T160 — Q3_K NSG=2 NR0=1 ix-stripped fast-path. +20 % decode
+                // mesuré sur Qwen3-14B Q3_K_M vs T158 NSG=1 (median 32.1 vs 26.8 t/s).
+                // Fallback NSG=1 si Metal3 absent ou K%256 != 0. Le switch
+                // RUSTORCH_Q3K_FORCE_NSG1=1 conserve le legacy NSG=1 pour
+                // bisection / profiling / régression check.
+                let force_nsg1 = std::env::var("RUSTORCH_Q3K_FORCE_NSG1").is_ok();
+                if !force_nsg1 && self.k % 256 == 0 {
+                    sgemv_q3_k_f32_lcpp_nsg2_into(
+                        backend,
+                        x_buf,
+                        &self.buffer,
+                        out_buf,
+                        self.k,
+                        self.n,
+                    )
+                    .or_else(|_| {
+                        sgemv_q3_k_f32_lcpp_nsg1_into(
+                            backend,
+                            x_buf,
+                            &self.buffer,
+                            out_buf,
+                            self.k,
+                            self.n,
+                        )
+                    })
+                } else {
+                    sgemv_q3_k_f32_lcpp_nsg1_into(
+                        backend,
+                        x_buf,
+                        &self.buffer,
+                        out_buf,
+                        self.k,
+                        self.n,
+                    )
+                }
             },
             GgmlType::Q4_K => {
                 sgemv_q4_k_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
