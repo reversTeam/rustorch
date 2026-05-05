@@ -30,8 +30,8 @@ use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::kernels::{
     add_inplace_f32, gqa_decode_f32, kv_append_f32, rms_norm_f32, rms_norm_per_head_f32,
-    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_pair_into,
-    sgemv_q4_k_f32_pair_quadcoop_into, sgemv_q4_k_f32_simdcoop_nr2_into,
+    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_lcpp_nr2_into,
+    sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
     sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_simdcoop_into,
     swiglu_f32,
 };
@@ -59,19 +59,14 @@ impl MetalWeight {
         //   - else: 1-thread-per-output simple kernel.
         let blocks_per_row = self.k / 256;
         match (self.dtype, blocks_per_row, self.n) {
-            // T89 — multi-row simdcoop (2 rows per simdgroup, port of llama.cpp's
-            // N_R0_Q4_K=2). For Q4_K with bpr ≥ 16 and large N (sgemv shapes
-            // where x bytes >> W bytes per row), sharing 1 x-tile across 2
-            // rows halves the x memory bandwidth pressure.
-            (GgmlType::Q4_K, bpr, n) if bpr >= 16 && n > 500 => sgemv_q4_k_f32_simdcoop_nr2_into(
-                backend,
-                x_buf,
-                &self.buffer,
-                out_buf,
-                self.k,
-                self.n,
-            )
-            .unwrap(),
+            // T91 — Faithful port of llama.cpp's kernel_mul_mv_q4_K_f32_impl
+            // with N_R0_Q4_K=2. Combines load-x-once (yl/yh registers),
+            // factored Q4_K formula (d*combined - dmin*sumy*sc_odd), and
+            // 2-row simdgroup processing.
+            (GgmlType::Q4_K, bpr, n) if bpr >= 16 && n > 500 => {
+                sgemv_q4_k_f32_lcpp_nr2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                    .unwrap()
+            },
             (GgmlType::Q4_K, _, _) => {
                 sgemv_q4_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
             },
