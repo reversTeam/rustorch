@@ -1745,6 +1745,19 @@ fn forward_token(
             .w_down
             .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
         add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
+
+        // T133 — CPU↔GPU pipelining via mid-token async commits. Single-CB
+        // mode commits at end-of-token, so GPU was idle while CPU encoded
+        // all 760 dispatches sequentially. With async commits every K
+        // layers, GPU starts executing segment N while CPU encodes segment
+        // N+1. Buffers in the same MTLCommandQueue execute in commit order,
+        // so xd_buf writes from segment N are visible to segment N+1 reads
+        // without explicit synchronisation. Sweet spot empirically K=5
+        // (8 commits/token, +2.4% on chained); K<5 commit overhead eats
+        // the pipelining gain, K>5 leaves CPU/GPU overlap on the table.
+        if (li + 1) % 5 == 0 && li + 1 < cfg.n_layers {
+            backend.commit_async();
+        }
     }
 
     // Final RMSNorm GPU + LM head GPU. Residual stream is in xd_buf;

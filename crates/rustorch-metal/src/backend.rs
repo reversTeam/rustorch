@@ -327,6 +327,42 @@ impl MetalBackend {
         }
     }
 
+    /// **Commit without waiting.** Closes the pending encoder and commits
+    /// the current command buffer to the queue, then immediately returns.
+    /// The GPU starts executing the committed work asynchronously while
+    /// the caller can continue encoding into a NEW command buffer (created
+    /// lazily by the next `with_encoder` call).
+    ///
+    /// This is the CPU↔GPU pipelining lever: in single-CB mode the GPU
+    /// sits idle until the whole token is encoded; with mid-token async
+    /// commits the GPU starts processing segment N while the CPU encodes
+    /// segment N+1. Commits in the same `MTLCommandQueue` execute in
+    /// commit order, so writes from earlier buffers are visible to reads
+    /// in later buffers without explicit synchronisation.
+    ///
+    /// **Caller must still call `drain()` (or another sync point) before
+    /// reading any GPU buffer host-side** — `commit_async` does not wait
+    /// for completion.
+    pub fn commit_async(&self) {
+        {
+            let mut enc_guard = self
+                .pending_encoder
+                .lock()
+                .expect("metal pending encoder lock");
+            if let Some(enc) = enc_guard.take() {
+                enc.end_encoding();
+            }
+        }
+        let mut guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
+        if let Some(cb) = guard.take() {
+            cb.commit();
+            // Deliberately NO wait_until_completed — let the GPU run while
+            // the caller keeps encoding into the next command buffer.
+        }
+        // Leaving cb_guard = None means the next `with_encoder` will
+        // lazily allocate a fresh command buffer for subsequent dispatches.
+    }
+
     /// Allocate a fresh GPU buffer of `byte_len` bytes with the
     /// `MTLStorageModeShared` storage mode — unified memory on Apple
     /// Silicon, so the buffer is mapped to host address space without
