@@ -3526,12 +3526,154 @@ kernel void sgemv_q6_k_f32_simdcoop(
 }
 "#;
 
-// T90 — Multi-row Q6_K simdcoop sgemv (2 rows per simdgroup). Same as
-// the single-row Q6_K simdcoop but processes 2 output rows per simdgroup,
-// sharing the x-tile reads across them. For Qwen3-14B W_down (K=17408,
-// x=70KB per row, W=14280 bytes per row), x reads dominate so multi-row
-// halves the x bandwidth. This is the biggest decode-time stage (~15%
-// of profile time on Qwen3-14B), so the highest-leverage spot for nr2.
+// T93 — Faithful port of llama.cpp's kernel_mul_mv_q6_K_f32_impl with
+// N_R0_Q6_K = 2. Differences from T90 (which regressed -23%):
+//
+//   1. Smaller per-row state (16 floats yl + 4 sums + 1 d_val per row)
+//      vs T90 (8 scales × 2 rows + 4 quants × 2 rows + per-row partials).
+//   2. Simpler per-row formula: dh[0] * (sums[0]*sc[0] + sums[1]*sc[2]
+//      + sums[2]*sc[4] + sums[3]*sc[6]) — single FMA chain per row.
+//   3. Different threading: tid=tiisg/2, ix=tiisg%2 → 16 (ip,il) pairs
+//      cover the block, 2 ix partitions split K work.
+//   4. Per-row pointer increments via direct (nrow,i) addressing, no
+//      block-of-row state duplication.
+//
+// For Qwen3-14B W_down (K=17408, N=5120) — biggest decode stage (~15%).
+const SGEMV_Q6_K_F32_LCPP_NR2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q6K_BYTES = 210u;
+constant uint Q6K_WEIGHTS = 256u;
+constant short NR0_Q6 = 2;
+
+kernel void sgemv_q6_k_f32_lcpp_nr2(
+    device const float*  x      [[buffer(0)]],
+    device const uchar*  w_q6k  [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint2&      dims   [[buffer(3)]],
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]]
+) {
+    constexpr uchar KMASK1 = 0x03;
+    constexpr uchar KMASK2 = 0x0C;
+    constexpr uchar KMASK3 = 0x30;
+    constexpr uchar KMASK4 = 0xC0;
+
+    uint K = dims.x;
+    uint N = dims.y;
+    int nb = (int)(K / Q6K_WEIGHTS);
+
+    uint first_row = tg_id * (uint)NR0_Q6;
+    if (first_row >= N) return;
+
+    short tid = (short)(tiisg / 2u);   // 0..15
+    short ix  = (short)(tiisg % 2u);   // 0 or 1
+    short ip  = tid / 8;                // 0 or 1
+    short il  = tid % 8;                // 0..7
+    short l0  = 4 * il;
+    short is  = 8 * ip + l0 / 16;
+
+    short y_offset   = 128 * ip + l0;
+    short q_offset_l = 64 * ip + l0;
+    short q_offset_h = 32 * ip + l0;
+
+    float sumf[2] = {0.0, 0.0};
+    float yl[16];
+
+    uint row_stride = (uint)nb * Q6K_BYTES;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const float* yptr = x + i * (int)Q6K_WEIGHTS + (int)y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = yptr[l +  0];
+            yl[4*l + 1] = yptr[l + 32];
+            yl[4*l + 2] = yptr[l + 64];
+            yl[4*l + 3] = yptr[l + 96];
+        }
+
+        for (short row = 0; row < NR0_Q6; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_q6k + (uint64_t)nrow * row_stride + (uint)i * Q6K_BYTES;
+            device const uchar* q1 = block + 0   + (uint)q_offset_l;
+            device const uchar* q2 = q1 + 32;
+            device const uchar* qh = block + 128 + (uint)q_offset_h;
+            device const char*  sc = (device const char*)(block + 192) + (int)is;
+            device const uint16_t* dh = (device const uint16_t*)(block + 208);
+
+            float d_val = float(as_type<half>(dh[0]));
+
+            float4 sums = {0.0, 0.0, 0.0, 0.0};
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * (float)((int)((q1[l] & 0xF) | ((qh[l] & KMASK1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * (float)((int)((q2[l] & 0xF) | ((qh[l] & KMASK2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * (float)((int)((q1[l]  >> 4) | ((qh[l] & KMASK3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * (float)((int)((q2[l]  >> 4) | ((qh[l] & KMASK4) >> 2)) - 32);
+            }
+
+            sumf[row] += d_val * (sums[0] * float(sc[0]) + sums[1] * float(sc[2])
+                                + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
+        }
+    }
+
+    for (short row = 0; row < NR0_Q6; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y[nrow] = sum_all;
+        }
+    }
+}
+"#;
+
+/// T93 — Faithful port of llama.cpp's `kernel_mul_mv_q6_K_f32_impl` with
+/// N_R0_Q6_K=2. Smaller per-row state than T90 (which regressed); 2 rows
+/// per simdgroup with manageable register pressure.
+pub fn sgemv_q6_k_f32_lcpp_nr2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q6k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_f32_lcpp_nr2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_f32_lcpp_nr2: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q6_k_f32_lcpp_nr2",
+        SGEMV_Q6_K_F32_LCPP_NR2_SHADER,
+        "sgemv_q6_k_f32_lcpp_nr2",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let n_sg = (n as u64).div_ceil(2);
+        let grid = MTLSize::new(32 * n_sg, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+// T90 (legacy / reverted) — Multi-row Q6_K simdcoop sgemv (2 rows per
+// simdgroup). Same as the single-row Q6_K simdcoop but processes 2
+// output rows per simdgroup, sharing the x-tile reads across them.
+// REGRESSED -23% on Qwen3-14B (likely register spill). Kept for reference.
 const SGEMV_Q6_K_F32_SIMDCOOP_NR2_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

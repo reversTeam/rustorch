@@ -32,7 +32,7 @@ use rustorch_metal::kernels::{
     add_inplace_f32, gqa_decode_f32, kv_append_f32, rms_norm_f32, rms_norm_per_head_f32,
     rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_lcpp_nr2_into,
     sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
-    sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_simdcoop_into,
+    sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_lcpp_nr2_into,
     swiglu_f32,
 };
 
@@ -70,11 +70,11 @@ impl MetalWeight {
             (GgmlType::Q4_K, _, _) => {
                 sgemv_q4_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
             },
-            // T90 reverted: Q6_K simdcoop_nr2 regressed -23% on Qwen3-14B
-            // (likely register spill — too many per-row scales held). Stay
-            // on single-row simdcoop for W_down.
+            // T93 — Faithful port of llama.cpp's kernel_mul_mv_q6_K_f32_impl
+            // with N_R0_Q6_K=2. Different design from T90 (smaller per-row
+            // state, simpler formula) avoids the register spill T90 hit.
             (GgmlType::Q6_K, bpr, n) if bpr >= 16 && n > 500 => {
-                sgemv_q6_k_f32_simdcoop_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                sgemv_q6_k_f32_lcpp_nr2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
                     .unwrap()
             },
             (GgmlType::Q6_K, _, _) => {
