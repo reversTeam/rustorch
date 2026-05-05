@@ -7673,6 +7673,145 @@ pub fn rms_norm_per_head_gated_f32(
     Ok(())
 }
 
+// T146a — SSM block gate computation in one Metal kernel. Used by every
+// SSM layer of the Qwen3.5/3.6 hybrid. Replaces the prior CPU pass:
+//   gate_h[i]   = softplus(alpha[i] + dt_bias[i]) * ssm_a[i]
+//   beta_sig[i] = sigmoid(beta[i])
+// Eliminates one drain per SSM layer × 48 SSM layers = 48 drains/token.
+const SSM_APPLY_GATE_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void ssm_apply_gate_f32(
+    device const float* alpha    [[buffer(0)]],   // [n_v]
+    device const float* beta     [[buffer(1)]],   // [n_v]
+    device const float* dt_bias  [[buffer(2)]],   // [n_v]
+    device const float* ssm_a    [[buffer(3)]],   // [n_v]
+    device float*       gate_h   [[buffer(4)]],   // [n_v] out
+    device float*       beta_sig [[buffer(5)]],   // [n_v] out
+    constant uint&      n        [[buffer(6)]],
+    uint                gid      [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float a = alpha[gid] + dt_bias[gid];
+    // Stable softplus
+    float sp;
+    if (a > 20.0)       sp = a;
+    else if (a < -20.0) sp = exp(a);
+    else                sp = log(1.0 + exp(a));
+    gate_h[gid] = sp * ssm_a[gid];
+    beta_sig[gid] = 1.0 / (1.0 + exp(-beta[gid]));
+}
+"#;
+
+/// T146a — fused SSM-block gate ops:
+///
+///   - `gate_h[i] = softplus(alpha[i] + dt_bias[i]) * ssm_a[i]`
+///   - `beta_sig[i] = sigmoid(beta[i])`
+///
+/// All buffers are `n_v`-sized (typ. 32-48). Replaces the CPU helper
+/// `ssm_apply_gate_ops` and saves one drain per SSM layer.
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_apply_gate_f32(
+    backend: &MetalBackend,
+    alpha_buf: &Buffer,
+    beta_buf: &Buffer,
+    dt_bias_buf: &Buffer,
+    ssm_a_buf: &Buffer,
+    gate_h_buf: &Buffer,
+    beta_sig_buf: &Buffer,
+    n_v: usize,
+) -> Result<(), MetalError> {
+    if n_v == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "ssm_apply_gate_f32: n_v must be > 0".to_string(),
+        ));
+    }
+    let pipeline = backend.pipeline(
+        "ssm_apply_gate_f32",
+        SSM_APPLY_GATE_F32_SHADER,
+        "ssm_apply_gate_f32",
+    )?;
+    let n_u = n_v as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(alpha_buf), 0);
+        encoder.set_buffer(1, Some(beta_buf), 0);
+        encoder.set_buffer(2, Some(dt_bias_buf), 0);
+        encoder.set_buffer(3, Some(ssm_a_buf), 0);
+        encoder.set_buffer(4, Some(gate_h_buf), 0);
+        encoder.set_buffer(5, Some(beta_sig_buf), 0);
+        encoder.set_bytes(6, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(n_v as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// T146b — Per-head split of the combined QG buffer (Q + gate, 2x output
+// width) into separate Q and gate buffers. Used by Qwen3Next attention
+// where wq outputs `2 * head_dim * n_q` and the first half-per-head is Q,
+// second half is the gate. Eliminates one drain per attention layer ×
+// 16 attention layers = 16 drains/token.
+const SPLIT_QG_PER_HEAD_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void split_qg_per_head_f32(
+    device const float* qg       [[buffer(0)]],   // [n_q, 2 * head_dim]
+    device float*       q        [[buffer(1)]],   // [n_q, head_dim] out
+    device float*       gate     [[buffer(2)]],   // [n_q, head_dim] out
+    constant uint2&     dims     [[buffer(3)]],   // (n_q, head_dim)
+    uint2               gid      [[thread_position_in_grid]]
+) {
+    uint n_q = dims.x;
+    uint head_dim = dims.y;
+    uint h = gid.y;
+    uint i = gid.x;
+    if (h >= n_q || i >= head_dim) return;
+    uint src_off = h * 2u * head_dim;
+    uint dst_off = h * head_dim;
+    q[dst_off + i] = qg[src_off + i];
+    gate[dst_off + i] = qg[src_off + head_dim + i];
+}
+"#;
+
+/// T146b — per-head split of `qg` into `q` and `gate`. `qg` has shape
+/// `[n_q, 2 * head_dim]` (the Qwen3Next combined Q + gate output). After
+/// the call, `q[h, i] = qg[h, i]` and `gate[h, i] = qg[h, head_dim + i]`.
+pub fn split_qg_per_head_f32(
+    backend: &MetalBackend,
+    qg_buf: &Buffer,
+    q_buf: &Buffer,
+    gate_buf: &Buffer,
+    n_q: usize,
+    head_dim: usize,
+) -> Result<(), MetalError> {
+    if n_q == 0 || head_dim == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "split_qg_per_head_f32: n_q={n_q}, head_dim={head_dim}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "split_qg_per_head_f32",
+        SPLIT_QG_PER_HEAD_F32_SHADER,
+        "split_qg_per_head_f32",
+    )?;
+    let dims = [n_q as u32, head_dim as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(qg_buf), 0);
+        encoder.set_buffer(1, Some(q_buf), 0);
+        encoder.set_buffer(2, Some(gate_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(head_dim as u64, n_q as u64, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
 // T144c — Fused `out *= sigmoid(gate)` in place. Used by Qwen3Next
 // attention to apply the per-head gate to the post-GQA output before the
 // W_O projection. Eliminates one drain + CPU pass per attention layer

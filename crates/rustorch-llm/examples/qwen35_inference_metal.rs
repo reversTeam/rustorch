@@ -49,7 +49,8 @@ use rustorch_metal::kernels::{
     add_inplace_f32, delta_net_step_f32, gqa_decode_f32, kv_append_f32, l2_norm_per_head_f32,
     rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
     sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_mul_inplace_f32, ssm_conv1d_step_f32, swiglu_f32,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_mul_inplace_f32, split_qg_per_head_f32,
+    ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -828,26 +829,15 @@ fn attn_block_forward(
     attn.w_k.matmul_into(backend, &scratch.h, &scratch.k_attn)?;
     attn.w_v.matmul_into(backend, &scratch.h, &scratch.v_attn)?;
 
-    // 4. Drain to access qg on CPU for splitting Q + gate. The split is
-    // strided: per-head [head_dim Q | head_dim gate], so we need two
-    // separate buffers. Once we have a fused split kernel this can stay
-    // on GPU; for now CPU is fine.
-    backend.drain();
-    unsafe {
-        let qg_p = scratch.qg.contents() as *const f32;
-        let q_p = scratch.q.contents() as *mut f32;
-        let gate_p = scratch.gate_attn.contents() as *mut f32;
-        for h in 0..n_q {
-            let src_off = h * 2 * head_dim;
-            let dst_off = h * head_dim;
-            std::ptr::copy_nonoverlapping(qg_p.add(src_off), q_p.add(dst_off), head_dim);
-            std::ptr::copy_nonoverlapping(
-                qg_p.add(src_off + head_dim),
-                gate_p.add(dst_off),
-                head_dim,
-            );
-        }
-    }
+    // 4. T146b — GPU split of QG into Q + gate per head (no drain).
+    split_qg_per_head_f32(
+        backend,
+        &scratch.qg,
+        &scratch.q,
+        &scratch.gate_attn,
+        n_q,
+        head_dim,
+    )?;
 
     // 5. Per-head Q-norm and K-norm (using shared gamma per head_dim).
     rms_norm_per_head_f32(backend, &scratch.q, &attn.q_norm, n_q, head_dim, eps)?;
@@ -946,21 +936,18 @@ fn ssm_block_forward(
     ssm.ssm_beta
         .matmul_into(backend, &scratch.h, &scratch.beta)?;
 
-    // 3. CPU-side: gate_h = softplus(alpha + dt_bias) * ssm_a, beta_sig = sigmoid(beta).
-    backend.drain();
-    let dt_bias_slice =
-        unsafe { std::slice::from_raw_parts(ssm.dt_bias.contents() as *const f32, n_v) };
-    let ssm_a_slice =
-        unsafe { std::slice::from_raw_parts(ssm.ssm_a.contents() as *const f32, n_v) };
-    ssm_apply_gate_ops(
+    // 3. T146a — fused GPU kernel: gate_h = softplus(alpha + dt_bias) * ssm_a,
+    //    beta_sig = sigmoid(beta). No drain needed.
+    ssm_apply_gate_f32(
+        backend,
         &scratch.alpha,
         &scratch.beta,
-        dt_bias_slice,
-        ssm_a_slice,
+        &ssm.dt_bias,
+        &ssm.ssm_a,
         &scratch.gate_h,
         &scratch.beta_sig,
         n_v,
-    );
+    )?;
 
     // 4. Conv1d step + ring-buffer update.
     ssm_conv1d_step_f32(
@@ -1130,6 +1117,12 @@ fn forward_token(
                     .map_err(|e| format!("layer {li} ffn: {e:?}"))?;
             },
             _ => return Err(format!("layer {li}: kind/state mismatch")),
+        }
+        // T146c — CPU↔GPU pipelining via mid-token commits. Sweet spot from
+        // the 14B (T133) was every 5 layers, gives the GPU steady work while
+        // CPU continues encoding the next segment.
+        if (li + 1) % 5 == 0 && li + 1 < cfg.n_layers {
+            backend.commit_async();
         }
     }
 
