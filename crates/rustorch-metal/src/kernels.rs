@@ -7812,6 +7812,96 @@ pub fn split_qg_per_head_f32(
     Ok(())
 }
 
+// T147a — `acc += w * src` in place. Used by the MoE FFN forward to
+// accumulate weighted per-expert outputs without draining between
+// experts. Eliminates one drain per active expert (8 drains × 40 MoE
+// layers = 320 drains/token saved on the 35B-A3B).
+const WEIGHTED_ADD_INPLACE_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void weighted_add_inplace_f32(
+    device float*        acc     [[buffer(0)]],
+    device const float*  src     [[buffer(1)]],
+    constant float&      w       [[buffer(2)]],
+    constant uint&       n       [[buffer(3)]],
+    uint                 gid     [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    acc[gid] = acc[gid] + w * src[gid];
+}
+"#;
+
+/// `acc[i] += weight * src[i]` for `i` in `0..n`. Used by MoE FFN to
+/// accumulate per-expert outputs weighted by the top-K softmax probs.
+pub fn weighted_add_inplace_f32(
+    backend: &MetalBackend,
+    acc_buf: &Buffer,
+    src_buf: &Buffer,
+    weight: f32,
+    n: usize,
+) -> Result<(), MetalError> {
+    if n == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "weighted_add_inplace_f32: n must be > 0".to_string(),
+        ));
+    }
+    let pipeline = backend.pipeline(
+        "weighted_add_inplace_f32",
+        WEIGHTED_ADD_INPLACE_F32_SHADER,
+        "weighted_add_inplace_f32",
+    )?;
+    let n_u = n as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(acc_buf), 0);
+        encoder.set_buffer(1, Some(src_buf), 0);
+        encoder.set_bytes(2, 4, &weight as *const f32 as *const std::ffi::c_void);
+        encoder.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// T147a — Zero a Metal buffer in-place via GPU. Used to reset the MoE
+// accumulator at the start of each layer's MoE FFN. Avoids a drain that
+// would otherwise be needed for a CPU memset.
+const ZERO_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void zero_f32(
+    device float*  buf  [[buffer(0)]],
+    constant uint& n    [[buffer(1)]],
+    uint           gid  [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    buf[gid] = 0.0;
+}
+"#;
+
+/// Zero `n` f32 elements at the start of `buf` on the GPU. Used by MoE.
+pub fn zero_f32(backend: &MetalBackend, buf: &Buffer, n: usize) -> Result<(), MetalError> {
+    if n == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "zero_f32: n must be > 0".to_string(),
+        ));
+    }
+    let pipeline = backend.pipeline("zero_f32", ZERO_F32_SHADER, "zero_f32")?;
+    let n_u = n as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(buf), 0);
+        encoder.set_bytes(1, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
 // T144c — Fused `out *= sigmoid(gate)` in place. Used by Qwen3Next
 // attention to apply the per-head gate to the post-GQA output before the
 // W_O projection. Eliminates one drain + CPU pass per attention layer

@@ -50,7 +50,7 @@ use rustorch_metal::kernels::{
     rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
     sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
     sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_mul_inplace_f32, split_qg_per_head_f32,
-    ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
+    ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32, weighted_add_inplace_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -1135,15 +1135,12 @@ fn ffn_dense_forward(
                 (top, w)
             };
 
-            // 3. Zero the accumulator.
-            unsafe {
-                let acc = std::slice::from_raw_parts_mut(scratch.moe_acc.contents() as *mut f32, d);
-                for v in acc.iter_mut() {
-                    *v = 0.0;
-                }
-            }
+            // 3. T147a — zero the accumulator on GPU (no drain).
+            zero_f32(backend, &scratch.moe_acc, d)?;
 
-            // 4. For each top-K expert: compute expert FFN output, weighted-add to accumulator.
+            // 4. For each top-K expert: compute expert FFN output and
+            //    GPU-weighted-add into the accumulator. No drain between
+            //    experts — chained encoder serialises through buffer deps.
             for k in 0..n_used {
                 let e = top_idx[k];
                 let w_e = top_w[k];
@@ -1157,19 +1154,13 @@ fn ffn_dense_forward(
                     ef,
                 )?;
                 down_exps[e].matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
-                // Weighted accumulate on CPU (unified memory).
-                backend.drain();
-                unsafe {
-                    let exp_out = std::slice::from_raw_parts(
-                        scratch.moe_expert_out.contents() as *const f32,
-                        d,
-                    );
-                    let acc =
-                        std::slice::from_raw_parts_mut(scratch.moe_acc.contents() as *mut f32, d);
-                    for i in 0..d {
-                        acc[i] += w_e * exp_out[i];
-                    }
-                }
+                weighted_add_inplace_f32(
+                    backend,
+                    &scratch.moe_acc,
+                    &scratch.moe_expert_out,
+                    w_e,
+                    d,
+                )?;
             }
 
             // 5. Shared expert: standard SwiGLU FFN with sigmoid gate scalar.
