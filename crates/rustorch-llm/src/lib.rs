@@ -46,6 +46,7 @@ use serde::Deserialize;
 pub mod gguf_loader;
 pub mod model;
 pub mod qwen35;
+pub mod qwen35_cpu;
 pub use gguf_loader::{GgufBlockWeights, GgufWeights};
 pub use model::LlamaModel;
 pub use qwen35::{
