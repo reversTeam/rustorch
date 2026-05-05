@@ -33,13 +33,14 @@
 // strictest unused-code lints during this phase.
 #![allow(dead_code, unused_imports)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use metal::Buffer;
+use rustorch_gguf::metadata::{MetaArray, MetaValue};
 use rustorch_gguf::{dequant_to_f32, GgmlType, GgufFile, TensorInfo};
 use rustorch_llm::qwen35::{parse_config, LayerKind, Qwen35Config, Qwen35Variant};
 use rustorch_metal::backend::MetalBackend;
@@ -1296,6 +1297,292 @@ fn forward_token(
     Ok(argmax_cpu(&state.scratch.logits, cfg.vocab))
 }
 
+// ============================================================================
+// Byte-level BPE tokenizer using vocab + merges from the GGUF metadata.
+// Same algorithm GPT-2 / Qwen2 / Qwen3 / Qwen3.5 / Qwen3.6 use: each input
+// byte is mapped to a printable Unicode char, then BPE merges are applied
+// greedily by rank, then strings are looked up in the vocab.
+// ============================================================================
+
+/// Build the 256-byte → unicode codepoint map used by the GPT-2 / Qwen
+/// byte-level pretokenizer. Bytes that are already printable map to
+/// themselves; non-printable bytes get assigned codepoints starting at
+/// 0x100. Reverse map is via a HashMap built once.
+fn bytes_to_unicode_map() -> ([char; 256], HashMap<char, u8>) {
+    let mut bs: Vec<u32> = Vec::with_capacity(256);
+    for c in (b'!' as u32)..=(b'~' as u32) {
+        bs.push(c);
+    }
+    for c in 0xA1..=0xAC {
+        bs.push(c);
+    }
+    for c in 0xAE..=0xFF {
+        bs.push(c);
+    }
+    let mut cs: Vec<u32> = bs.clone();
+    let mut n = 0u32;
+    for b in 0..256u32 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push(256 + n);
+            n += 1;
+        }
+    }
+    let mut byte_to_char = ['\0'; 256];
+    let mut char_to_byte = HashMap::new();
+    for (b, c) in bs.iter().zip(cs.iter()) {
+        let ch = char::from_u32(*c).unwrap_or('?');
+        byte_to_char[*b as usize] = ch;
+        char_to_byte.insert(ch, *b as u8);
+    }
+    (byte_to_char, char_to_byte)
+}
+
+struct GgufTokenizer {
+    /// Token-id → token string (byte-mapped).
+    tokens: Vec<String>,
+    /// Token string → id.
+    vocab: HashMap<String, u32>,
+    /// BPE merge pairs ranked by index (lower = higher priority).
+    ranks: HashMap<(String, String), usize>,
+    byte_to_char: [char; 256],
+    char_to_byte: HashMap<char, u8>,
+    eos_id: u32,
+}
+
+impl GgufTokenizer {
+    fn from_gguf(file: &GgufFile) -> Result<Self, String> {
+        let tokens_array = file
+            .metadata()
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.as_array())
+            .ok_or("missing tokenizer.ggml.tokens")?;
+        let tokens: Vec<String> = match tokens_array {
+            MetaArray::String(v) => v.clone(),
+            _ => return Err("tokenizer.ggml.tokens is not a String array".into()),
+        };
+        let merges_array = file
+            .metadata()
+            .get("tokenizer.ggml.merges")
+            .and_then(|v| v.as_array())
+            .ok_or("missing tokenizer.ggml.merges")?;
+        let merges: Vec<String> = match merges_array {
+            MetaArray::String(v) => v.clone(),
+            _ => return Err("tokenizer.ggml.merges is not a String array".into()),
+        };
+        let mut vocab = HashMap::with_capacity(tokens.len());
+        for (i, t) in tokens.iter().enumerate() {
+            vocab.insert(t.clone(), i as u32);
+        }
+        let mut ranks = HashMap::with_capacity(merges.len());
+        for (i, m) in merges.iter().enumerate() {
+            if let Some((a, b)) = m.split_once(' ') {
+                ranks.insert((a.to_string(), b.to_string()), i);
+            }
+        }
+        let (byte_to_char, char_to_byte) = bytes_to_unicode_map();
+        // EOS may live under tokenizer.ggml.eos_token_id, eot_id, or im_end.
+        let eos_id = file
+            .metadata()
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| match v {
+                MetaValue::U32(x) => Some(*x),
+                MetaValue::U64(x) => Some(*x as u32),
+                MetaValue::I32(x) => Some(*x as u32),
+                _ => None,
+            })
+            .unwrap_or(2);
+        Ok(Self {
+            tokens,
+            vocab,
+            ranks,
+            byte_to_char,
+            char_to_byte,
+            eos_id,
+        })
+    }
+
+    /// Resolve a special-token string like "<|im_start|>" to its single
+    /// token id (without going through BPE).
+    fn special_id(&self, s: &str) -> Option<u32> {
+        self.vocab.get(s).copied()
+    }
+
+    /// Run BPE on a single chunk of input chars (byte-mapped). Greedy
+    /// lowest-rank merge.
+    fn bpe(&self, token: &str) -> Vec<String> {
+        let mut word: Vec<String> = token.chars().map(|c| c.to_string()).collect();
+        loop {
+            let mut best_rank = usize::MAX;
+            let mut best_idx = None;
+            for i in 0..word.len().saturating_sub(1) {
+                if let Some(&r) = self.ranks.get(&(word[i].clone(), word[i + 1].clone())) {
+                    if r < best_rank {
+                        best_rank = r;
+                        best_idx = Some(i);
+                    }
+                }
+            }
+            match best_idx {
+                Some(i) => {
+                    let merged = format!("{}{}", word[i], word[i + 1]);
+                    word.splice(i..=i + 1, std::iter::once(merged));
+                },
+                None => break,
+            }
+        }
+        word
+    }
+
+    /// Pre-tokenize `text` into rough chunks (whitespace + word/non-word
+    /// boundaries) similar to the GPT-2 regex but using a Rust-only,
+    /// `\p{L}`-free approximation. Imperfect on Unicode-heavy input but
+    /// adequate for English chat prompts.
+    fn pre_tokenize(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            // Consume leading single space if next char is alphanumeric/punct.
+            let mut chunk = String::new();
+            if chars[i] == ' ' && i + 1 < chars.len() && !chars[i + 1].is_whitespace() {
+                chunk.push(' ');
+                i += 1;
+            }
+            if i >= chars.len() {
+                out.push(chunk);
+                break;
+            }
+            let c0 = chars[i];
+            if c0.is_alphanumeric() {
+                while i < chars.len() && chars[i].is_alphanumeric() {
+                    chunk.push(chars[i]);
+                    i += 1;
+                }
+            } else if c0.is_whitespace() {
+                while i < chars.len() && chars[i].is_whitespace() {
+                    chunk.push(chars[i]);
+                    i += 1;
+                }
+            } else {
+                // Punctuation / symbol: take one char at a time.
+                chunk.push(c0);
+                i += 1;
+            }
+            out.push(chunk);
+        }
+        out
+    }
+
+    /// Encode raw `text` to token ids. Special tokens like `<|im_start|>`
+    /// are recognised verbatim if they're in the vocab.
+    fn encode(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        // Split on the special-token markers we care about. Anything between
+        // them goes through BPE. This is a simple linear scan that's enough
+        // for ChatML wrapping.
+        let specials = [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|im_sep|>",
+            "<|object_ref_start|>",
+            "<|object_ref_end|>",
+        ];
+        let mut rest = text;
+        loop {
+            // Find the earliest occurrence of any special token.
+            let mut earliest: Option<(usize, &str)> = None;
+            for s in &specials {
+                if let Some(pos) = rest.find(s) {
+                    if earliest.map_or(true, |(p, _)| pos < p) {
+                        earliest = Some((pos, s));
+                    }
+                }
+            }
+            match earliest {
+                Some((pos, s)) => {
+                    if pos > 0 {
+                        let pre = &rest[..pos];
+                        out.extend(self.encode_segment(pre));
+                    }
+                    if let Some(id) = self.special_id(s) {
+                        out.push(id);
+                    } else {
+                        out.extend(self.encode_segment(s));
+                    }
+                    rest = &rest[pos + s.len()..];
+                },
+                None => {
+                    if !rest.is_empty() {
+                        out.extend(self.encode_segment(rest));
+                    }
+                    break;
+                },
+            }
+        }
+        out
+    }
+
+    fn encode_segment(&self, segment: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for chunk in Self::pre_tokenize(segment) {
+            let bytes = chunk.as_bytes();
+            let mapped: String = bytes
+                .iter()
+                .map(|&b| self.byte_to_char[b as usize])
+                .collect();
+            for piece in self.bpe(&mapped) {
+                if let Some(&id) = self.vocab.get(&piece) {
+                    ids.push(id);
+                } else {
+                    // Fallback: emit each char as its own token id.
+                    for ch in piece.chars() {
+                        let s = ch.to_string();
+                        if let Some(&id) = self.vocab.get(&s) {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// Decode token ids back to text, reversing the byte-level mapping.
+    fn decode(&self, ids: &[u32]) -> String {
+        let mut joined = String::new();
+        for &id in ids {
+            if let Some(t) = self.tokens.get(id as usize) {
+                joined.push_str(t);
+            }
+        }
+        let mut bytes: Vec<u8> = Vec::with_capacity(joined.len());
+        for ch in joined.chars() {
+            if let Some(&b) = self.char_to_byte.get(&ch) {
+                bytes.push(b);
+            } else {
+                // Multi-byte char that's a special token surface form (e.g.
+                // <|im_end|>): keep as UTF-8.
+                let mut buf = [0u8; 4];
+                let s = ch.encode_utf8(&mut buf);
+                bytes.extend_from_slice(s.as_bytes());
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn chatml_prompt(&self, system: &str, user: &str) -> String {
+        let mut s = String::new();
+        if !system.is_empty() {
+            s.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", system));
+        }
+        s.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", user));
+        s.push_str("<|im_start|>assistant\n");
+        s
+    }
+}
+
 fn main() -> ExitCode {
     let path = match env::args().nth(1) {
         Some(p) => PathBuf::from(p),
@@ -1427,16 +1714,57 @@ fn main() -> ExitCode {
     println!("\n✓ T143 loader smoke-test PASS");
 
     // ----------------------------------------------------------------
-    // Optional: --forward N to run the full hybrid forward and emit N
-    // tokens. Skipped if not requested.
+    // Optional inference flags:
+    //   --forward N        : generate N tokens (prefill + decode).
+    //   --prompt-ids 1,234 : comma-separated token ids to prefill with
+    //                        (defaults to [BOS=1] when only --forward
+    //                        is provided).
+    //   --max-seq N        : KV cache time dimension (default 256).
+    //   --eos-id N         : stop generation if any of these IDs is sampled
+    //                        (comma-separated). Default empty.
+    //   --stream           : print each generated token id as it is decoded.
     // ----------------------------------------------------------------
     let forward_n: Option<usize> = env::args()
         .skip_while(|a| a != "--forward")
         .nth(1)
         .and_then(|a| a.parse::<usize>().ok());
-    if let Some(n) = forward_n {
-        println!("\n=== Running forward for {n} tokens (T143b end-to-end) ===");
-        // Reload the GGUF for embed lookup (we need the file handle).
+    let prompt_ids: Option<Vec<u32>> =
+        env::args()
+            .skip_while(|a| a != "--prompt-ids")
+            .nth(1)
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse::<u32>().ok())
+                    .collect::<Vec<u32>>()
+            });
+    let max_seq: usize = env::args()
+        .skip_while(|a| a != "--max-seq")
+        .nth(1)
+        .and_then(|a| a.parse::<usize>().ok())
+        .unwrap_or(256);
+    let eos_ids: Vec<u32> = env::args()
+        .skip_while(|a| a != "--eos-id")
+        .nth(1)
+        .map(|s| {
+            s.split(',')
+                .filter_map(|t| t.trim().parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let stream = env::args().any(|a| a == "--stream");
+
+    // High-level chat: --prompt "text" auto-tokenises through the GGUF's
+    // embedded vocab+merges and wraps the prompt in the Qwen ChatML
+    // template. Decoded answer is printed at the end.
+    let prompt_text: Option<String> = env::args().skip_while(|a| a != "--prompt").nth(1);
+    let system_text: String = env::args()
+        .skip_while(|a| a != "--system")
+        .nth(1)
+        .unwrap_or_default();
+    let no_chat_template = env::args().any(|a| a == "--no-chat-template");
+
+    if let Some(prompt_str) = prompt_text {
+        println!("\n=== Chat mode (Rust tokenizer + ChatML) ===");
         let file = match GgufFile::open(&path) {
             Ok(f) => f,
             Err(e) => {
@@ -1444,20 +1772,136 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             },
         };
-        let max_seq = 256_usize;
+        let tok = match GgufTokenizer::from_gguf(&file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("tokenizer init: {e}");
+                return ExitCode::FAILURE;
+            },
+        };
+        let n = forward_n.unwrap_or(128);
+        let wrapped = if no_chat_template {
+            prompt_str.clone()
+        } else {
+            tok.chatml_prompt(&system_text, &prompt_str)
+        };
+        let prompt_ids = tok.encode(&wrapped);
+        // Add im_end as an extra stop token alongside the EOS.
+        let im_end_id = tok.special_id("<|im_end|>").unwrap_or(tok.eos_id);
+        let stops: [u32; 2] = [tok.eos_id, im_end_id];
+        println!(
+            "  prompt ({} tok): {}{}",
+            prompt_ids.len(),
+            &wrapped.chars().take(120).collect::<String>(),
+            if wrapped.chars().count() > 120 {
+                "..."
+            } else {
+                ""
+            }
+        );
+        let mut state = DecodeState::new(backend, &cfg, max_seq);
+        let mut last = 0u32;
+        let mut cur_pos = 0_usize;
+        let t0 = Instant::now();
+        for &t in &prompt_ids {
+            match forward_token(backend, &file, &model, &mut state, t, cur_pos) {
+                Ok(out) => last = out,
+                Err(e) => {
+                    eprintln!("forward error at prefill: {e}");
+                    return ExitCode::FAILURE;
+                },
+            }
+            cur_pos += 1;
+        }
+        let prefill_d = t0.elapsed();
+        println!(
+            "  prefill: {} tok in {:.3}s ({:.2} tok/s)",
+            prompt_ids.len(),
+            prefill_d.as_secs_f64(),
+            prompt_ids.len() as f64 / prefill_d.as_secs_f64()
+        );
+
+        let mut generated = vec![last];
+        let t0 = Instant::now();
+        let mut hit_stop = false;
+        for _ in 1..n {
+            if cur_pos + 1 >= max_seq {
+                break;
+            }
+            match forward_token(backend, &file, &model, &mut state, last, cur_pos) {
+                Ok(out) => {
+                    last = out;
+                    generated.push(last);
+                    cur_pos += 1;
+                    if stops.contains(&last) {
+                        hit_stop = true;
+                        break;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("forward error at decode: {e}");
+                    return ExitCode::FAILURE;
+                },
+            }
+        }
+        let decode_d = t0.elapsed();
+        let n_decoded = generated.len().saturating_sub(1) as f64;
+        println!(
+            "  decode : {} tok in {:.3}s ({:.2} tok/s){}",
+            n_decoded as usize,
+            decode_d.as_secs_f64(),
+            n_decoded / decode_d.as_secs_f64().max(1e-9),
+            if hit_stop { " [STOP]" } else { "" }
+        );
+        // Strip a trailing stop token if present so the answer doesn't
+        // include the marker text.
+        let mut answer_ids = generated.clone();
+        if let Some(&l) = answer_ids.last() {
+            if stops.contains(&l) {
+                answer_ids.pop();
+            }
+        }
+        let answer = tok.decode(&answer_ids);
+        println!("\n=== Answer ===");
+        println!("{}", answer);
+        println!("===");
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(n) = forward_n {
+        println!("\n=== Running forward for {n} tokens (T143b end-to-end) ===");
+        let file = match GgufFile::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("reopen gguf: {e:?}");
+                return ExitCode::FAILURE;
+            },
+        };
         let mut state = DecodeState::new(backend, &cfg, max_seq);
 
-        // Prefill prompt tokens (for now: just BOS=1) then decode.
-        let prompt: Vec<u32> = vec![1];
+        // Prefill: take the user-supplied prompt ids if given, else fall back
+        // to [BOS=1] which matches the legacy --forward smoke-test.
+        let prompt: Vec<u32> = prompt_ids.clone().unwrap_or_else(|| vec![1]);
+        if prompt.len() >= max_seq {
+            eprintln!(
+                "prompt has {} tokens but max_seq={max_seq}. Pass --max-seq with a larger value.",
+                prompt.len()
+            );
+            return ExitCode::FAILURE;
+        }
+        if stream {
+            print!("prefill ids: ");
+            for &t in &prompt {
+                print!("{t} ");
+            }
+            println!();
+        }
         let mut last = 0u32;
         let mut cur_pos = 0_usize;
         let t0 = Instant::now();
         for &tok in &prompt {
             match forward_token(backend, &file, &model, &mut state, tok, cur_pos) {
-                Ok(out) => {
-                    last = out;
-                    println!("  prefill[{cur_pos}] tok={tok} -> next argmax = {last}");
-                },
+                Ok(out) => last = out,
                 Err(e) => {
                     eprintln!("forward error at prefill: {e}");
                     return ExitCode::FAILURE;
@@ -1474,13 +1918,31 @@ fn main() -> ExitCode {
         );
 
         let mut generated = vec![last];
+        if stream {
+            println!("first generated id (after prefill): {last}");
+        }
         let t0 = Instant::now();
+        let mut hit_eos = false;
         for _ in 1..n {
+            if cur_pos + 1 >= max_seq {
+                eprintln!(
+                    "reached max_seq={max_seq} during decode, stopping after {} tokens",
+                    generated.len()
+                );
+                break;
+            }
             match forward_token(backend, &file, &model, &mut state, last, cur_pos) {
                 Ok(out) => {
                     last = out;
                     generated.push(last);
+                    if stream {
+                        println!("  decode[{cur_pos}] -> {last}");
+                    }
                     cur_pos += 1;
+                    if eos_ids.contains(&last) {
+                        hit_eos = true;
+                        break;
+                    }
                 },
                 Err(e) => {
                     eprintln!("forward error at decode: {e}");
@@ -1489,16 +1951,19 @@ fn main() -> ExitCode {
             }
         }
         let decode_d = t0.elapsed();
+        let n_decoded = generated.len().saturating_sub(1) as f64;
         println!(
-            "  decode : {} tok in {:.3}s ({:.2} tok/s)",
-            n - 1,
+            "  decode : {} tok in {:.3}s ({:.2} tok/s){}",
+            n_decoded as usize,
             decode_d.as_secs_f64(),
-            (n.saturating_sub(1)) as f64 / decode_d.as_secs_f64()
+            n_decoded / decode_d.as_secs_f64().max(1e-9),
+            if hit_eos { " [EOS]" } else { "" }
         );
         println!("\ngenerated tokens: {generated:?}");
         return ExitCode::SUCCESS;
     }
 
     println!("  Tip: pass `--forward N` to run an end-to-end forward for N tokens.");
+    println!("       Optional: --prompt-ids 1,2,3 (comma-sep ids) --max-seq N --eos-id N --stream");
     ExitCode::SUCCESS
 }
