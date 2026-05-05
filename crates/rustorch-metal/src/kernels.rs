@@ -4073,6 +4073,155 @@ pub fn sgemv_q5_k_gather_f32_lcpp_nsg2_into(
     Ok(())
 }
 
+// T158 — Q3_K matmul-vec kernel (3.4375 bpw, -24 % DRAM vs Q4_K).
+//
+// Format Q3_K (110 bytes / super-block de 256 weights) :
+//   - hmask[32]  : high bit (bit 2) de chaque weight, packed 8 weights/byte
+//   - qs[64]     : low 2 bits par weight, packed 4 weights/byte
+//   - scales[12] : 16 sub-block scales 6-bit signed, packing complexe
+//   - d (f16)    : super-block scale
+//
+// Per-weight : `w = d × (sc[sb] - 32) × (q_low2 - (h_bit ? 0 : 4))`
+// où sc[sb] est le scale signed 6-bit en [-32, 31].
+//
+// Cette première version vise la simplicité (1 simdgroup par row, chaque
+// thread couvre 8 weights consécutifs par super-block, simd_sum à la fin).
+// Optim future : pattern NSG=2 NR0=2 chunké comme Q4_K si bench < 80 %
+// peak DRAM.
+//
+// Validé numériquement par CPU `dequant_q3_k` (rustorch-gguf) + tests Q4_K
+// kernel infra.
+const SGEMV_Q3_K_F32_LCPP_NSG1_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q3K_BYTES = 110u;
+constant uint Q3K_WEIGHTS = 256u;
+
+kernel void sgemv_q3_k_f32_lcpp_nsg1(
+    device const float*  x      [[buffer(0)]],   // [K]
+    device const uchar*  w_q3k  [[buffer(1)]],   // [N * blocks_per_row * 110]
+    device float*        y      [[buffer(2)]],   // [N]
+    constant uint2&      dims   [[buffer(3)]],   // (K, N)
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    int  nb = (int)(K / Q3K_WEIGHTS);
+
+    // Une row par threadgroup (NSG=1 NR0=1).
+    uint nrow = tg_id;
+    if (nrow >= N) return;
+
+    uint row_stride = (uint)nb * Q3K_BYTES;
+
+    // Layout per-thread : tiisg ∈ [0, 32), couvre 8 weights consécutifs
+    // par super-block aux positions [tiisg*8, tiisg*8 + 8).
+    uint sb_global    = tiisg / 2u;          // 0..15 (sub-block global)
+    uint l_offset     = (tiisg % 2u) * 8u;   // 0 ou 8 (offset dans sub-block)
+    uint half_idx     = sb_global / 8u;       // 0 ou 1
+    uint sb_in_half   = sb_global % 8u;       // 0..7
+    uint shift        = (sb_in_half / 2u) * 2u;             // 0,2,4,6
+    uint qs_byte_base = half_idx * 32u + (sb_in_half % 2u) * 16u;
+    uint hmask_base   = (sb_in_half % 2u) * 16u;
+    uint j_global     = half_idx * 4u + (sb_in_half / 2u);
+    uint m_bit        = 1u << j_global;
+
+    float sumf = 0.0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        device const uchar* block = w_q3k + (uint64_t)nrow * row_stride + (uint)ib * Q3K_BYTES;
+        device const uchar* hmask = block;
+        device const uchar* qs    = block + 32;
+        device const uchar* sc_raw = block + 96;
+        device const half*  d_ptr = (device const half*)(block + 108);
+        float d_all = float(*d_ptr);
+
+        // Compute le scale 6-bit signed pour ce sub-block (cf rustorch-gguf
+        // dequant_q3_k pour le packing détaillé).
+        uchar scale_byte;
+        if (sb_global < 4u) {
+            scale_byte = (sc_raw[sb_global] & 0x0Fu)
+                       | ((sc_raw[8u + sb_global] & 0x03u) << 4u);
+        } else if (sb_global < 8u) {
+            uint i = sb_global - 4u;
+            scale_byte = (sc_raw[4u + i] & 0x0Fu)
+                       | (((sc_raw[8u + i] >> 2u) & 0x03u) << 4u);
+        } else if (sb_global < 12u) {
+            uint i = sb_global - 8u;
+            scale_byte = (sc_raw[i] >> 4u)
+                       | (((sc_raw[8u + i] >> 4u) & 0x03u) << 4u);
+        } else {
+            uint i = sb_global - 12u;
+            scale_byte = (sc_raw[4u + i] >> 4u)
+                       | (((sc_raw[8u + i] >> 6u) & 0x03u) << 4u);
+        }
+        // Sign-extend 8-bit. scale_byte ∈ [0, 63] représente signed [0..63]
+        // post-cast i8 (high bit toujours 0 sur 6-bit, donc pas de besoin
+        // particulier de sign-extend explicite).
+        float dl = d_all * (float)((int)((char)scale_byte) - 32);
+
+        // Process les 8 weights de ce thread.
+        uint x_base = (uint)ib * Q3K_WEIGHTS + tiisg * 8u;
+        for (uint k = 0; k < 8u; ++k) {
+            uint l = l_offset + k;
+            uint qs_byte    = qs[qs_byte_base + l];
+            uint hmask_byte = hmask[hmask_base + l];
+            int  q_lo  = (int)((qs_byte >> shift) & 0x03u);
+            int  h_bit = (hmask_byte & m_bit) != 0u;
+            int  v     = q_lo - (h_bit ? 0 : 4);
+            sumf += x[x_base + k] * dl * (float)v;
+        }
+    }
+
+    float row_sum = simd_sum(sumf);
+    if (tiisg == 0) {
+        y[nrow] = row_sum;
+    }
+}
+"#;
+
+/// T158 phase 1b — Q3_K sgemv Metal `y = W @ x` où W est `[N, K]` Q3_K.
+/// Une row par threadgroup, 32 threads (1 simdgroup) par row, simd_sum.
+/// Pré-conditions : `K % 256 == 0` (alignement super-block).
+pub fn sgemv_q3_k_f32_lcpp_nsg1_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q3k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q3_k_f32_lcpp_nsg1 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q3_k_f32_lcpp_nsg1: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q3_k_f32_lcpp_nsg1",
+        SGEMV_Q3_K_F32_LCPP_NSG1_SHADER,
+        "sgemv_q3_k_f32_lcpp_nsg1",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q3k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let groups = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T142 — Q5_K matmul-vec kernel.
 //
 // Q5_K format: 256 weights / 176-byte super-block.
@@ -9342,6 +9491,105 @@ mod tests {
         (0..n)
             .map(|i| ((i as f32 + 1.0) * seed * 0.001).sin())
             .collect()
+    }
+
+    /// T158 phase 1b — validation Metal Q3_K kernel vs CPU dequant + naive matmul.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemv_q3_k_matches_cpu_dequant_reference() {
+        use rustorch_gguf::dequant::dequantize_block_chunk;
+        use rustorch_gguf::tensor::GgmlType;
+
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!(
+                "[sgemv_q3_k] skipping: device does not support Metal3 ({})",
+                backend.adapter_name()
+            );
+            return;
+        }
+
+        // K = 256 (1 super-block per row), N = 32 (1 threadgroup of 32 threads
+        // per row, 32 rows total = 32 threadgroups in dispatch).
+        let k = 256_usize;
+        let n = 32_usize;
+        let blocks_per_row = k / 256;
+
+        // Build deterministic Q3_K bytes : N rows × 110 bytes/super-block.
+        // We hand-craft each block with varying d, scales, qs, hmask so the
+        // dequant exercises non-trivial paths.
+        let mut w_bytes = vec![0u8; n * blocks_per_row * 110];
+        for nrow in 0..n {
+            let off = nrow * blocks_per_row * 110;
+            // hmask : alternate 0xAA / 0x55 patterns so half the weights have
+            // h_bit=1 (offset 0) and half h_bit=0 (offset -4).
+            for i in 0..32 {
+                w_bytes[off + i] = if (nrow + i) % 2 == 0 { 0xAA } else { 0x55 };
+            }
+            // qs : write incrementing low-2-bit pairs so we get diverse q_lo values.
+            for i in 0..64 {
+                w_bytes[off + 32 + i] = ((i as u8) & 0xC0)
+                    | (((i as u8) << 2) & 0x30)
+                    | (((i as u8) << 4) & 0x0C)
+                    | (((i as u8) << 6) & 0x03);
+            }
+            // scales : non-zero packed pattern so unpacking covers all 16 sub-blocks.
+            for i in 0..12 {
+                w_bytes[off + 96 + i] = (0x40_u8.wrapping_add((nrow as u8) ^ (i as u8))) | 0x10;
+            }
+            // d = nrow + 1 as half-float (small positive value)
+            let d_val = (nrow as f32 + 1.0) * 0.01;
+            let d_h = half::f16::from_f32(d_val).to_le_bytes();
+            w_bytes[off + 108] = d_h[0];
+            w_bytes[off + 109] = d_h[1];
+        }
+
+        // CPU reference : dequantize each row to f32 then matmul with x.
+        let x = det_vec(k, 1.7);
+        let mut y_ref = vec![0.0_f32; n];
+        for (nrow, y_slot) in y_ref.iter_mut().enumerate() {
+            let row_off = nrow * blocks_per_row * 110;
+            let row_bytes = &w_bytes[row_off..row_off + blocks_per_row * 110];
+            let mut row_w = vec![0.0_f32; k];
+            dequantize_block_chunk(GgmlType::Q3_K, row_bytes, &mut row_w).unwrap();
+            let mut s = 0.0_f32;
+            for kk in 0..k {
+                s += x[kk] * row_w[kk];
+            }
+            *y_slot = s;
+        }
+
+        // Metal kernel.
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        let y_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+        }
+        sgemv_q3_k_f32_lcpp_nsg1_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        backend.drain();
+        let mut y_metal = vec![0.0_f32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y_metal.as_mut_ptr(), n);
+        }
+
+        for i in 0..n {
+            let abs_err = (y_ref[i] - y_metal[i]).abs();
+            let denom = y_ref[i].abs().max(1e-4);
+            let rel = abs_err / denom;
+            assert!(
+                rel < 1e-3,
+                "Q3_K mismatch at row {i}: ref={} metal={} (rel err {:.3e})",
+                y_ref[i],
+                y_metal[i],
+                rel
+            );
+        }
     }
 
     #[test]

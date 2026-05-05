@@ -49,12 +49,13 @@ use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_f32, delta_net_step_f32, gqa_decode_f32, kv_append_f32, l2_norm_per_head_f32,
     rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
-    sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32, sigmoid_mul_inplace_f32,
-    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
-    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_f32, zero_f32,
+    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+    sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
+    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
+    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
+    sigmoid_mul_inplace_f32, split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32,
+    ssm_conv1d_step_f32, swiglu_f32, topk_softmax_norm_f32, weighted_add_inplace_f32,
+    weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -84,6 +85,11 @@ impl HybridMetalWeight {
         out_buf: &Buffer,
     ) -> Result<(), MetalError> {
         match self.dtype {
+            GgmlType::Q3_K => {
+                // T158 phase 1b — Q3_K dequant + sgemv (3.44 bpw, -24% DRAM
+                // vs Q4_K). Validé numériquement vs CPU `dequant_q3_k`.
+                sgemv_q3_k_f32_lcpp_nsg1_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+            },
             GgmlType::Q4_K => {
                 sgemv_q4_k_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
             },
