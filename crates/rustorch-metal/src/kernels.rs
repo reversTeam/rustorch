@@ -2599,6 +2599,205 @@ kernel void sgemv_q4_k_f32_simdcoop(
 }
 "#;
 
+// T89 — Multi-row Q4_K simdcoop sgemv. Port of llama.cpp's
+// `kernel_mul_mv_q4_K_f32_impl` with N_R0_Q4_K = 2: process 2 output rows
+// per simdgroup. The 32 threads K-cooperate identically to the single-row
+// simdcoop, but maintain 2 partial accumulators (one per row) and read
+// from 2 weight rows simultaneously. The shared x-tile is loaded once
+// per block and reused for both rows — divides x memory traffic by 2.
+//
+// For Qwen3-14B Q4_K_M shapes (K=5120, x=20KB per row, W=2880 bytes per row),
+// x reads dominate bandwidth so multi-row is a clear win.
+const SGEMV_Q4_K_F32_SIMDCOOP_NR2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+
+kernel void sgemv_q4_k_f32_simdcoop_nr2(
+    device const float* x       [[buffer(0)]],
+    device const uchar* w_q4k   [[buffer(1)]],
+    device float* y             [[buffer(2)]],
+    constant uint2& dims        [[buffer(3)]],   // (K, N)
+    uint tg_id                  [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]],
+    uint sg_size                [[threads_per_simdgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint n_idx_base = tg_id * 2u;
+    if (n_idx_base >= N) return;
+    bool has_row1 = (n_idx_base + 1u) < N;
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    uint row_off_0 = n_idx_base * blocks_per_row * BLOCK_BYTES;
+    uint row_off_1 = (n_idx_base + 1u) * blocks_per_row * BLOCK_BYTES;
+
+    float partial0 = 0.0;
+    float partial1 = 0.0;
+
+    for (uint blk = tid; blk < blocks_per_row; blk += sg_size) {
+        // Pre-load the x-tile once for this block (256 floats spread
+        // across 8 sub-block slices of 32 each). We don't actually
+        // pre-load in registers since each lane fetches its own
+        // x[xx], but the shared block index ensures the GPU's L2 /
+        // texture cache is warm for both rows' subsequent loads.
+        uint x_blk_base = blk * BLOCK_WEIGHTS;
+
+        // --- Row 0 ---
+        device const uchar* block0 = w_q4k + row_off_0 + blk * BLOCK_BYTES;
+        ushort d_bits0 = ((ushort)block0[1] << 8) | (ushort)block0[0];
+        ushort dmin_bits0 = ((ushort)block0[3] << 8) | (ushort)block0[2];
+        float d0 = float(as_type<half>(d_bits0));
+        float dmin0 = float(as_type<half>(dmin_bits0));
+        uchar packed0[12];
+        for (uint i = 0; i < 12u; ++i) packed0[i] = block0[4 + i];
+        uchar sc0[8], m0[8];
+        for (uint i = 0; i < 4u; ++i) {
+            sc0[i]     = packed0[i] & 0x3F;
+            m0[i]      = packed0[i + 4] & 0x3F;
+            sc0[i + 4] = (packed0[i + 8] & 0x0F) | ((packed0[i] >> 6) << 4);
+            m0[i + 4]  = (packed0[i + 8] >> 4)   | ((packed0[i + 4] >> 6) << 4);
+        }
+        device const uchar4* qs4_0 = (device const uchar4*)(block0 + 16);
+
+        // --- Row 1 ---
+        device const uchar* block1 = w_q4k + row_off_1 + blk * BLOCK_BYTES;
+        ushort d_bits1 = has_row1 ? (((ushort)block1[1] << 8) | (ushort)block1[0]) : 0u;
+        ushort dmin_bits1 = has_row1 ? (((ushort)block1[3] << 8) | (ushort)block1[2]) : 0u;
+        float d1 = has_row1 ? float(as_type<half>(d_bits1)) : 0.0f;
+        float dmin1 = has_row1 ? float(as_type<half>(dmin_bits1)) : 0.0f;
+        uchar packed1[12];
+        if (has_row1) {
+            for (uint i = 0; i < 12u; ++i) packed1[i] = block1[4 + i];
+        } else {
+            for (uint i = 0; i < 12u; ++i) packed1[i] = 0;
+        }
+        uchar sc1[8], m1[8];
+        for (uint i = 0; i < 4u; ++i) {
+            sc1[i]     = packed1[i] & 0x3F;
+            m1[i]      = packed1[i + 4] & 0x3F;
+            sc1[i + 4] = (packed1[i + 8] & 0x0F) | ((packed1[i] >> 6) << 4);
+            m1[i + 4]  = (packed1[i + 8] >> 4)   | ((packed1[i + 4] >> 6) << 4);
+        }
+        device const uchar4* qs4_1 = (device const uchar4*)(block1 + 16);
+
+        // Inner loop: walk the 4 (j0, j1) pairs × 8 nibble groups, fetching
+        // x once per position and using it for both rows.
+        for (uint jp = 0; jp < 4u; ++jp) {
+            uint j0 = 2u * jp;
+            uint j1 = 2u * jp + 1u;
+
+            float scale00 = d0 * float(sc0[j0]);
+            float min00   = dmin0 * float(m0[j0]);
+            float scale01 = d0 * float(sc0[j1]);
+            float min01   = dmin0 * float(m0[j1]);
+
+            float scale10 = d1 * float(sc1[j0]);
+            float min10   = dmin1 * float(m1[j0]);
+            float scale11 = d1 * float(sc1[j1]);
+            float min11   = dmin1 * float(m1[j1]);
+
+            uint x_low_off  = x_blk_base + j0 * 32u;
+            uint x_high_off = x_blk_base + j1 * 32u;
+            uint qs_base = jp * 8u;
+
+            for (uint kg = 0; kg < 8u; ++kg) {
+                uchar4 nibs0 = qs4_0[qs_base + kg];
+                uchar4 nibs1 = qs4_1[qs_base + kg];
+                uint kk = kg * 4u;
+
+                // Fetch x once, use for both rows
+                float xl0 = x[x_low_off  + kk    ];
+                float xl1 = x[x_low_off  + kk + 1];
+                float xl2 = x[x_low_off  + kk + 2];
+                float xl3 = x[x_low_off  + kk + 3];
+                float xh0 = x[x_high_off + kk    ];
+                float xh1 = x[x_high_off + kk + 1];
+                float xh2 = x[x_high_off + kk + 2];
+                float xh3 = x[x_high_off + kk + 3];
+
+                // Row 0 partials
+                partial0 += xl0 * (scale00 * float(nibs0.x & 0x0F) - min00);
+                partial0 += xl1 * (scale00 * float(nibs0.y & 0x0F) - min00);
+                partial0 += xl2 * (scale00 * float(nibs0.z & 0x0F) - min00);
+                partial0 += xl3 * (scale00 * float(nibs0.w & 0x0F) - min00);
+                partial0 += xh0 * (scale01 * float(nibs0.x >> 4)   - min01);
+                partial0 += xh1 * (scale01 * float(nibs0.y >> 4)   - min01);
+                partial0 += xh2 * (scale01 * float(nibs0.z >> 4)   - min01);
+                partial0 += xh3 * (scale01 * float(nibs0.w >> 4)   - min01);
+
+                // Row 1 partials
+                partial1 += xl0 * (scale10 * float(nibs1.x & 0x0F) - min10);
+                partial1 += xl1 * (scale10 * float(nibs1.y & 0x0F) - min10);
+                partial1 += xl2 * (scale10 * float(nibs1.z & 0x0F) - min10);
+                partial1 += xl3 * (scale10 * float(nibs1.w & 0x0F) - min10);
+                partial1 += xh0 * (scale11 * float(nibs1.x >> 4)   - min11);
+                partial1 += xh1 * (scale11 * float(nibs1.y >> 4)   - min11);
+                partial1 += xh2 * (scale11 * float(nibs1.z >> 4)   - min11);
+                partial1 += xh3 * (scale11 * float(nibs1.w >> 4)   - min11);
+            }
+        }
+    }
+
+    float total0 = simd_sum(partial0);
+    float total1 = simd_sum(partial1);
+    if (tid == 0) {
+        y[n_idx_base] = total0;
+        if (has_row1) {
+            y[n_idx_base + 1u] = total1;
+        }
+    }
+}
+"#;
+
+/// T89 — Multi-row Q4_K simdcoop sgemv (2 rows per simdgroup).
+///
+/// Same K-cooperation as `sgemv_q4_k_f32_simdcoop_into` but processes 2
+/// output rows per simdgroup. Halves x-memory bandwidth pressure when
+/// blocks_per_row × BLOCK_BYTES (W bytes per row) is small relative to
+/// K × 4 (x bytes), which is the common case for Qwen3-14B (e.g., gate/up
+/// at K=5120: W=2880B per row, x=20KB → x dominates 7×).
+pub fn sgemv_q4_k_f32_simdcoop_nr2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32_simdcoop_nr2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_simdcoop_nr2: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_simdcoop_nr2",
+        SGEMV_Q4_K_F32_SIMDCOOP_NR2_SHADER,
+        "sgemv_q4_k_f32_simdcoop_nr2",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        // n/2 simdgroups (round up) since each handles 2 rows.
+        let n_sg = (n as u64).div_ceil(2);
+        let grid = MTLSize::new(32 * n_sg, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 // T84 — quad-cooperative Q4_K sgemv. The 32 threads of a simdgroup are
 // split into 4 "quarters" of 8 threads each; each quarter computes one
 // output by K-cooperating across blocks_per_row blocks. Reduction stays
@@ -3002,6 +3201,182 @@ kernel void sgemv_q6_k_f32_simdcoop(
     }
 }
 "#;
+
+// T90 — Multi-row Q6_K simdcoop sgemv (2 rows per simdgroup). Same as
+// the single-row Q6_K simdcoop but processes 2 output rows per simdgroup,
+// sharing the x-tile reads across them. For Qwen3-14B W_down (K=17408,
+// x=70KB per row, W=14280 bytes per row), x reads dominate so multi-row
+// halves the x bandwidth. This is the biggest decode-time stage (~15%
+// of profile time on Qwen3-14B), so the highest-leverage spot for nr2.
+const SGEMV_Q6_K_F32_SIMDCOOP_NR2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q6K_BYTES = 210u;
+constant uint Q6K_WEIGHTS = 256u;
+
+kernel void sgemv_q6_k_f32_simdcoop_nr2(
+    device const float* x       [[buffer(0)]],
+    device const uchar* w_q6k   [[buffer(1)]],
+    device float* y             [[buffer(2)]],
+    constant uint2& dims        [[buffer(3)]],
+    uint tg_id                  [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]],
+    uint sg_size                [[threads_per_simdgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint n_idx_base = tg_id * 2u;
+    if (n_idx_base >= N) return;
+    bool has_row1 = (n_idx_base + 1u) < N;
+
+    uint blocks_per_row = K / Q6K_WEIGHTS;
+    uint row_off_0 = n_idx_base * blocks_per_row * Q6K_BYTES;
+    uint row_off_1 = (n_idx_base + 1u) * blocks_per_row * Q6K_BYTES;
+
+    float partial0 = 0.0;
+    float partial1 = 0.0;
+
+    for (uint blk = tid; blk < blocks_per_row; blk += sg_size) {
+        // Row 0 block
+        device const uchar* block0 = w_q6k + row_off_0 + blk * Q6K_BYTES;
+        device const uchar* ql0 = block0;
+        device const uchar* qh0 = block0 + 128;
+        device const char*  sc0 = (device const char*)(block0 + 192);
+        ushort d_bits0 = ((ushort)block0[209] << 8) | (ushort)block0[208];
+        float d0 = float(as_type<half>(d_bits0));
+
+        // Row 1 block (if exists)
+        device const uchar* block1 = w_q6k + row_off_1 + blk * Q6K_BYTES;
+        device const uchar* ql1 = block1;
+        device const uchar* qh1 = block1 + 128;
+        device const char*  sc1 = (device const char*)(block1 + 192);
+        ushort d_bits1 = has_row1 ? (((ushort)block1[209] << 8) | (ushort)block1[208]) : 0u;
+        float d1 = has_row1 ? float(as_type<half>(d_bits1)) : 0.0f;
+
+        for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+            device const uchar* ql_h0 = ql0 + half_idx * 64u;
+            device const uchar* qh_h0 = qh0 + half_idx * 32u;
+            device const char*  sc_h0 = sc0 + half_idx * 8;
+
+            device const uchar* ql_h1 = ql1 + half_idx * 64u;
+            device const uchar* qh_h1 = qh1 + half_idx * 32u;
+            device const char*  sc_h1 = sc1 + half_idx * 8;
+
+            uint x_h_off = blk * Q6K_WEIGHTS + half_idx * 128u;
+
+            float s1_lo_0 = d0 * float(sc_h0[0]);
+            float s1_hi_0 = d0 * float(sc_h0[1]);
+            float s2_lo_0 = d0 * float(sc_h0[2]);
+            float s2_hi_0 = d0 * float(sc_h0[3]);
+            float s3_lo_0 = d0 * float(sc_h0[4]);
+            float s3_hi_0 = d0 * float(sc_h0[5]);
+            float s4_lo_0 = d0 * float(sc_h0[6]);
+            float s4_hi_0 = d0 * float(sc_h0[7]);
+
+            float s1_lo_1 = d1 * float(sc_h1[0]);
+            float s1_hi_1 = d1 * float(sc_h1[1]);
+            float s2_lo_1 = d1 * float(sc_h1[2]);
+            float s2_hi_1 = d1 * float(sc_h1[3]);
+            float s3_lo_1 = d1 * float(sc_h1[4]);
+            float s3_hi_1 = d1 * float(sc_h1[5]);
+            float s4_lo_1 = d1 * float(sc_h1[6]);
+            float s4_hi_1 = d1 * float(sc_h1[7]);
+
+            for (uint l = 0; l < 32u; ++l) {
+                // Row 0 quants
+                uchar qhh0 = qh_h0[l];
+                int q1_0 = (int)(ql_h0[l]      & 0x0F) | ((int)((qhh0 >> 0) & 0x03) << 4);
+                int q2_0 = (int)(ql_h0[l + 32] & 0x0F) | ((int)((qhh0 >> 2) & 0x03) << 4);
+                int q3_0 = (int)(ql_h0[l]      >> 4)   | ((int)((qhh0 >> 4) & 0x03) << 4);
+                int q4_0 = (int)(ql_h0[l + 32] >> 4)   | ((int)((qhh0 >> 6) & 0x03) << 4);
+
+                // Row 1 quants
+                uchar qhh1 = qh_h1[l];
+                int q1_1 = (int)(ql_h1[l]      & 0x0F) | ((int)((qhh1 >> 0) & 0x03) << 4);
+                int q2_1 = (int)(ql_h1[l + 32] & 0x0F) | ((int)((qhh1 >> 2) & 0x03) << 4);
+                int q3_1 = (int)(ql_h1[l]      >> 4)   | ((int)((qhh1 >> 4) & 0x03) << 4);
+                int q4_1 = (int)(ql_h1[l + 32] >> 4)   | ((int)((qhh1 >> 6) & 0x03) << 4);
+
+                float s1_0 = (l < 16u) ? s1_lo_0 : s1_hi_0;
+                float s2_0 = (l < 16u) ? s2_lo_0 : s2_hi_0;
+                float s3_0 = (l < 16u) ? s3_lo_0 : s3_hi_0;
+                float s4_0 = (l < 16u) ? s4_lo_0 : s4_hi_0;
+
+                float s1_1 = (l < 16u) ? s1_lo_1 : s1_hi_1;
+                float s2_1 = (l < 16u) ? s2_lo_1 : s2_hi_1;
+                float s3_1 = (l < 16u) ? s3_lo_1 : s3_hi_1;
+                float s4_1 = (l < 16u) ? s4_lo_1 : s4_hi_1;
+
+                // Shared x reads
+                float xv1 = x[x_h_off + l];
+                float xv2 = x[x_h_off + l + 32];
+                float xv3 = x[x_h_off + l + 64];
+                float xv4 = x[x_h_off + l + 96];
+
+                partial0 += xv1 * (s1_0 * float(q1_0 - 32));
+                partial0 += xv2 * (s2_0 * float(q2_0 - 32));
+                partial0 += xv3 * (s3_0 * float(q3_0 - 32));
+                partial0 += xv4 * (s4_0 * float(q4_0 - 32));
+
+                partial1 += xv1 * (s1_1 * float(q1_1 - 32));
+                partial1 += xv2 * (s2_1 * float(q2_1 - 32));
+                partial1 += xv3 * (s3_1 * float(q3_1 - 32));
+                partial1 += xv4 * (s4_1 * float(q4_1 - 32));
+            }
+        }
+    }
+
+    float total0 = simd_sum(partial0);
+    float total1 = simd_sum(partial1);
+    if (tid == 0) {
+        y[n_idx_base] = total0;
+        if (has_row1) {
+            y[n_idx_base + 1u] = total1;
+        }
+    }
+}
+"#;
+
+/// T90 — Multi-row Q6_K simdcoop sgemv (2 rows per simdgroup).
+/// For Qwen3-14B W_down (K=17408, Q6_K) where x bandwidth dominates.
+pub fn sgemv_q6_k_f32_simdcoop_nr2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q6k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_f32_simdcoop_nr2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_f32_simdcoop_nr2: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q6_k_f32_simdcoop_nr2",
+        SGEMV_Q6_K_F32_SIMDCOOP_NR2_SHADER,
+        "sgemv_q6_k_f32_simdcoop_nr2",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let n_sg = (n as u64).div_ceil(2);
+        let grid = MTLSize::new(32 * n_sg, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
 
 /// Simdgroup-cooperative Q6_K sgemv. Companion to
 /// [`sgemv_q4_k_f32_simdcoop_into`]. Best for huge N (lm_head).
