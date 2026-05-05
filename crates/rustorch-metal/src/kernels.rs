@@ -4736,12 +4736,13 @@ const RMS_NORM_PER_HEAD_F32_SHADER: &str = r#"
 using namespace metal;
 
 // Per-head RMSNorm (Qwen3 q_norm / k_norm). One threadgroup = one head;
-// 32 threads cooperate on head_dim. gamma is shared across heads
-// (shape [head_dim]).
+// 32 threads cooperate on head_dim. gamma is shared across heads.
+// (T98 float4 attempt regressed -1% — head_dim=128 too small to amortize
+// vector overhead; reverted to scalar.)
 kernel void rms_norm_per_head_f32(
-    device float* x           [[buffer(0)]],     // [n_heads * head_dim]
-    device const float* gamma [[buffer(1)]],     // [head_dim]
-    constant uint2& dims      [[buffer(2)]],     // (n_heads, head_dim)
+    device float* x           [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    constant uint2& dims      [[buffer(2)]],
     constant float& eps       [[buffer(3)]],
     uint h                    [[threadgroup_position_in_grid]],
     uint tid                  [[thread_position_in_threadgroup]],
@@ -4798,7 +4799,9 @@ const SWIGLU_F32_SHADER: &str = r#"
 using namespace metal;
 
 // Element-wise SwiGLU: y[i] = silu(gate[i]) * up[i] where
-// silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
+// silu(x) = x / (1 + exp(-x)).
+// (T99 float4 attempt regressed slightly — divergence between vec/scalar
+// paths costs more than the saved load count at this dispatch granularity.)
 kernel void swiglu_f32(
     device const float* gate [[buffer(0)]],
     device const float* up   [[buffer(1)]],
