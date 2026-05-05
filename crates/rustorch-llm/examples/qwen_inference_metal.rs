@@ -1086,6 +1086,153 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
     dot / n
 }
 
+// T127 — Per-layer block cos(input, output) profile. T125 augmenting showed
+// hidden states rotate more in late layers (~3%/layer past K=28) than middle
+// layers (~0.7%/layer at K=16-24). T127 measures the per-block contribution
+// directly: for each layer li, capture the residual stream at three points
+// — pre-attention, mid-block (post-attention residual), post-FFN residual —
+// then compute cos(pre, mid), cos(mid, post), cos(pre, post). A block with
+// cos(in, out) > 0.99 is essentially identity and can be skipped at runtime
+// (T128 — cosine-gated layer skipping) without quality loss.
+//
+// The cosine is computed over the raw residual stream (pre any norm), since
+// that's what the next layer reads. Snapshots cost ~3 GPU drains per layer
+// + 3 d-sized memcpys; profile-only.
+struct LayerCosStats {
+    n_layers: usize,
+    /// Per layer accumulators: (Σ cos_attn, Σ cos_ffn, Σ cos_full).
+    sums: Vec<(f64, f64, f64)>,
+    counts: Vec<u64>,
+    /// Per-layer min cos seen (worst case — a single token where the block
+    /// rotates the most). High min cos is required for safe skip.
+    mins: Vec<(f64, f64, f64)>,
+}
+
+impl LayerCosStats {
+    fn new(n_layers: usize) -> Self {
+        Self {
+            n_layers,
+            sums: vec![(0.0, 0.0, 0.0); n_layers],
+            counts: vec![0u64; n_layers],
+            mins: vec![(1.0, 1.0, 1.0); n_layers],
+        }
+    }
+
+    fn record(&mut self, li: usize, c_attn: f64, c_ffn: f64, c_full: f64) {
+        let s = &mut self.sums[li];
+        s.0 += c_attn;
+        s.1 += c_ffn;
+        s.2 += c_full;
+        self.counts[li] += 1;
+        let m = &mut self.mins[li];
+        if c_attn < m.0 {
+            m.0 = c_attn;
+        }
+        if c_ffn < m.1 {
+            m.1 = c_ffn;
+        }
+        if c_full < m.2 {
+            m.2 = c_full;
+        }
+    }
+
+    fn print_breakdown(&self) {
+        println!(
+            "\n=== T127 per-layer block cos(input, output) profile ({} layers) ===",
+            self.n_layers
+        );
+        println!(
+            "  {:<6} {:>8} {:>11} {:>11} {:>11} {:>11}",
+            "layer", "n_smp", "mean_attn", "mean_ffn", "mean_full", "min_full"
+        );
+        let mut attn_skip_candidates: Vec<usize> = Vec::new();
+        let mut ffn_skip_candidates: Vec<usize> = Vec::new();
+        let mut full_skip_candidates: Vec<usize> = Vec::new();
+        for li in 0..self.n_layers {
+            let c = self.counts[li] as f64;
+            if c == 0.0 {
+                continue;
+            }
+            let mean_attn = self.sums[li].0 / c;
+            let mean_ffn = self.sums[li].1 / c;
+            let mean_full = self.sums[li].2 / c;
+            let min_full = self.mins[li].2;
+            println!(
+                "  {:<6} {:>8} {:>11.5} {:>11.5} {:>11.5} {:>11.5}",
+                li, self.counts[li], mean_attn, mean_ffn, mean_full, min_full
+            );
+            // Candidate criteria — both mean AND min above 0.99 (every token
+            // sees a near-identity block).
+            if mean_attn >= 0.995 && self.mins[li].0 >= 0.99 {
+                attn_skip_candidates.push(li);
+            }
+            if mean_ffn >= 0.995 && self.mins[li].1 >= 0.99 {
+                ffn_skip_candidates.push(li);
+            }
+            if mean_full >= 0.995 && self.mins[li].2 >= 0.99 {
+                full_skip_candidates.push(li);
+            }
+        }
+
+        println!("\n=== T127 skip candidates (mean cos ≥ 0.995, min cos ≥ 0.99) ===");
+        println!(
+            "  attention-only skip ({} layers): {:?}",
+            attn_skip_candidates.len(),
+            attn_skip_candidates
+        );
+        println!(
+            "  ffn-only skip       ({} layers): {:?}",
+            ffn_skip_candidates.len(),
+            ffn_skip_candidates
+        );
+        println!(
+            "  full-layer skip     ({} layers): {:?}",
+            full_skip_candidates.len(),
+            full_skip_candidates
+        );
+
+        // Decision verdict
+        let total_attn = attn_skip_candidates.len();
+        let total_ffn = ffn_skip_candidates.len();
+        let total_full = full_skip_candidates.len();
+        // attention block is ~25% of layer cost (Q+K+V matmuls + W_O matmul +
+        // GQA + 1 RMSNorm), FFN block is ~75% (gate+up+down + 1 RMSNorm + SwiGLU).
+        // Skipping a full layer = 100% of that layer's work.
+        let saved_frac_attn = total_attn as f64 * 0.25 / self.n_layers as f64;
+        let saved_frac_ffn = total_ffn as f64 * 0.75 / self.n_layers as f64;
+        let saved_frac_full = total_full as f64 / self.n_layers as f64;
+        let total_savings = saved_frac_attn + saved_frac_ffn + saved_frac_full;
+        let speedup = 1.0 / (1.0 - total_savings).max(0.01);
+
+        println!("\nDecision criteria for cosine-gated layer skipping (T128):");
+        println!(
+            "  Estimated decode-time savings: attn={:.1}% + ffn={:.1}% + full={:.1}% = {:.1}%",
+            100.0 * saved_frac_attn,
+            100.0 * saved_frac_ffn,
+            100.0 * saved_frac_full,
+            100.0 * total_savings
+        );
+        println!("  Theoretical decode speedup: {:.2}×", speedup);
+        if total_savings >= 0.10 {
+            println!("  ✓ VIABLE — combined savings ≥ 10%. Proceed to T128 — wire skip logic.");
+        } else if total_savings >= 0.05 {
+            println!(
+                "  ~ MARGINAL — combined savings {:.1}% (between 5% and 10%). Worth implementing if cheap.",
+                100.0 * total_savings
+            );
+        } else {
+            println!(
+                "  ✗ NOT VIABLE — combined savings {:.1}% < 5%. Skipping individual blocks doesn't pay; pivot.",
+                100.0 * total_savings
+            );
+            println!("    → Pivot: head-level pruning (T129 — within high-cos blocks, are some heads near-zero?)");
+            println!(
+                "              or trajectory predictor (T130 — h_t+1 ≈ A·h_t + B·emb(tok_t))."
+            );
+        }
+    }
+}
+
 // T88a — N-gram hit rate analysis on a generated sequence. Replays the
 // decode step by step, maintaining a trigram → continuations cache built
 // from the tokens generated so far. At each step ≥ 3 we look up whether
@@ -2514,6 +2661,265 @@ fn forward_token_entropy(
     argmax_full
 }
 
+// T127 — Per-layer block cos(input, output) profile. Same residual stream
+// dynamics as forward_token, plus 3 GPU drains + memcpys per layer to
+// snapshot the residual stream pre-attn / mid-block / post-FFN. Computes
+// per-block cos and feeds into stats. The drains serialize execution and
+// inflate decode time vs the chained path, but the relative cos breakdown
+// is exact. Profile-only.
+fn forward_token_layer_cos(
+    backend: &MetalBackend,
+    model: &ModelMetal,
+    token_id: u32,
+    position: usize,
+    scratch: &mut Scratch,
+    stats: &mut LayerCosStats,
+) -> u32 {
+    let cfg = model.cfg;
+    let d = cfg.d;
+    let f = cfg.f;
+    let n_heads = cfg.n_heads;
+    let n_kv = cfg.n_kv_heads;
+    let head_dim = cfg.head_dim;
+    let max_seq = cfg.max_seq;
+
+    let off = (token_id as usize) * d;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            model.token_emb.as_ptr().add(off),
+            scratch.xd_buf.contents() as *mut f32,
+            d,
+        );
+    }
+
+    // Reusable host snapshots.
+    let mut x_pre = vec![0.0f32; d];
+    let mut x_mid = vec![0.0f32; d];
+    let mut x_post = vec![0.0f32; d];
+
+    let read_xd = |scratch: &Scratch, dst: &mut [f32]| unsafe {
+        std::ptr::copy_nonoverlapping(scratch.xd_buf.contents() as *const f32, dst.as_mut_ptr(), d);
+    };
+
+    for (li, layer) in model.layers.iter().enumerate() {
+        // Snapshot 1: pre-attn residual stream.
+        backend.drain();
+        read_xd(scratch, &mut x_pre);
+
+        // ---------- Attention block ----------
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.attn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &scratch.q_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
+                layer.w_k.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_v.buffer,
+                &scratch.v_buf,
+                layer.w_v.k,
+                layer.w_v.n,
+            )
+            .unwrap();
+        } else {
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &scratch.q_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
+                layer.w_k.n,
+            )
+            .unwrap();
+            layer
+                .w_v
+                .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        }
+        if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
+            rms_norm_per_head_f32(
+                backend,
+                &scratch.q_buf,
+                qn_buf,
+                n_heads,
+                head_dim,
+                cfg.rms_eps,
+            )
+            .unwrap();
+        }
+        if let Some(kn_buf) = layer.attn_k_norm_buf.as_ref() {
+            rms_norm_per_head_f32(backend, &scratch.k_buf, kn_buf, n_kv, head_dim, cfg.rms_eps)
+                .unwrap();
+        }
+        rope_half_split_f32(
+            backend,
+            &scratch.q_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_heads,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        rope_half_split_f32(
+            backend,
+            &scratch.k_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_kv,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.k_buf,
+            &scratch.k_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.v_buf,
+            &scratch.v_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        let kv_len = position + 1;
+        gqa_decode_f32(
+            backend,
+            &scratch.q_buf,
+            &scratch.k_caches[li],
+            &scratch.v_caches[li],
+            &scratch.attn_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            kv_len,
+            max_seq,
+        )
+        .unwrap();
+        layer
+            .w_o
+            .matmul_into(backend, &scratch.attn_buf, &scratch.o_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.o_buf, d).unwrap();
+
+        // Snapshot 2: post-attn residual stream (mid-block).
+        backend.drain();
+        read_xd(scratch, &mut x_mid);
+
+        // ---------- FFN block ----------
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.ffn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_lcpp_nr2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_gate.buffer,
+            &scratch.gate_buf,
+            layer.w_gate.k,
+            layer.w_gate.n,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_lcpp_nr2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_up.buffer,
+            &scratch.up_buf,
+            layer.w_up.k,
+            layer.w_up.n,
+        )
+        .unwrap();
+        swiglu_f32(
+            backend,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            &scratch.fd_buf,
+            f,
+        )
+        .unwrap();
+        layer
+            .w_down
+            .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
+
+        // Snapshot 3: post-FFN residual stream (block output).
+        backend.drain();
+        read_xd(scratch, &mut x_post);
+
+        let c_attn = cosine(&x_pre, &x_mid);
+        let c_ffn = cosine(&x_mid, &x_post);
+        let c_full = cosine(&x_pre, &x_post);
+        stats.record(li, c_attn, c_ffn, c_full);
+    }
+
+    rms_norm_f32(
+        backend,
+        &scratch.xd_buf,
+        &model.final_norm_buf,
+        &scratch.h_buf,
+        cfg.d,
+        cfg.rms_eps,
+    )
+    .unwrap();
+    model
+        .lm_head
+        .matmul_into(backend, &scratch.h_buf, &scratch.logits_buf);
+    backend.drain();
+    let mut logits = vec![0.0_f32; cfg.vocab];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.logits_buf.contents() as *const f32,
+            logits.as_mut_ptr(),
+            cfg.vocab,
+        );
+    }
+    argmax(&logits)
+}
+
 // T121 — Multi-token forward. Processes B input tokens at consecutive
 // sequence positions [pos_base, pos_base+1, ..., pos_base+B-1] in a single
 // pass through the model, using the batched kernels (T92, T106-T109,
@@ -3078,6 +3484,7 @@ fn main() -> ExitCode {
     let mut ngram_profile = false;
     let mut rank_profile = false;
     let mut entropy_profile = false;
+    let mut layer_cos_profile = false;
     let mut batch_test = false;
     let mut speculative_b: usize = 0; // 0 = off; 2..=4 = enable with B candidates
     let mut i = 0;
@@ -3135,6 +3542,11 @@ fn main() -> ExitCode {
                 args.remove(i);
                 continue;
             },
+            "--layer-cos-profile" => {
+                layer_cos_profile = true;
+                args.remove(i);
+                continue;
+            },
             "--batch-test" => {
                 batch_test = true;
                 args.remove(i);
@@ -3168,6 +3580,7 @@ fn main() -> ExitCode {
     let mut sparsity = SparsityStats::new(model.cfg.n_layers, model.cfg.f);
     let mut rank_stats = RankStats::new(model.cfg.n_layers, model.cfg.d, 100);
     let mut entropy_stats = EntropyStats::new();
+    let mut layer_cos_stats = LayerCosStats::new(model.cfg.n_layers);
     // T125 auxiliary buffers — allocated once, reused for every entropy snapshot.
     // d-sized for final_norm output, vocab-sized for the lm_head logits.
     let entropy_aux_h = backend.alloc_shared(model.cfg.d * 4).unwrap();
@@ -3193,6 +3606,15 @@ fn main() -> ExitCode {
                 &entropy_aux_h,
                 &entropy_aux_logits,
                 &mut entropy_stats,
+            )
+        } else if layer_cos_profile {
+            forward_token_layer_cos(
+                backend,
+                &model,
+                tok,
+                cur_pos,
+                &mut scratch,
+                &mut layer_cos_stats,
             )
         } else if batch_test {
             // T121 — forward_batch with B=1, parity test vs forward_token
@@ -3225,6 +3647,9 @@ fn main() -> ExitCode {
     }
     if entropy_profile {
         entropy_stats = EntropyStats::new();
+    }
+    if layer_cos_profile {
+        layer_cos_stats = LayerCosStats::new(model.cfg.n_layers);
     }
     let t_dec = Instant::now();
     let mut spec_total_drafts = 0usize;
@@ -3337,6 +3762,15 @@ fn main() -> ExitCode {
                     &entropy_aux_logits,
                     &mut entropy_stats,
                 )
+            } else if layer_cos_profile {
+                forward_token_layer_cos(
+                    backend,
+                    &model,
+                    last,
+                    cur_pos,
+                    &mut scratch,
+                    &mut layer_cos_stats,
+                )
             } else if batch_test {
                 let outs = forward_batch(backend, &model, &[last], cur_pos, &mut scratch);
                 outs[0]
@@ -3369,6 +3803,9 @@ fn main() -> ExitCode {
     }
     if entropy_profile {
         entropy_stats.print_breakdown();
+    }
+    if layer_cos_profile {
+        layer_cos_stats.print_breakdown();
     }
     if speculative_b >= 2 {
         let accept_rate = if spec_total_drafts > 0 {
