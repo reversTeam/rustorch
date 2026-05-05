@@ -399,6 +399,127 @@ impl SparsityStats {
     }
 }
 
+// T88a — N-gram hit rate analysis on a generated sequence. Replays the
+// decode step by step, maintaining a trigram → continuations cache built
+// from the tokens generated so far. At each step ≥ 3 we look up whether
+// the cache (using the trigram of the 3 previous tokens) would have
+// predicted the next K tokens correctly, simulating Lookahead Jacobi
+// without actually running batched forwards.
+//
+// Pure CPU offline analysis on a Vec<u32> — adds no runtime cost to the
+// decode itself. The result tells us empirically what acceptance rate
+// Lookahead Jacobi would deliver on this exact workload.
+fn analyze_ngram_hit_rate(generated: &[u32], max_n: usize) {
+    use std::collections::HashMap;
+    if generated.len() < 4 + max_n {
+        println!(
+            "\n=== T88a n-gram hit rate ===\n  Sequence too short ({} tokens), need ≥ {} for max_n={}",
+            generated.len(),
+            4 + max_n,
+            max_n
+        );
+        return;
+    }
+
+    // Cache: trigram (a, b, c) → HashMap<next_token, count>.
+    // Top-1 prediction is the argmax of the inner counts.
+    let mut cache: HashMap<(u32, u32, u32), HashMap<u32, u32>> = HashMap::new();
+    let mut hits_at_n = vec![0u64; max_n];
+    let mut coverage = 0u64;
+    let mut total_lookups = 0u64;
+    let mut accepted_lengths: Vec<u32> = Vec::with_capacity(generated.len());
+
+    for i in 3..generated.len().saturating_sub(max_n) {
+        let trigram = (generated[i - 3], generated[i - 2], generated[i - 1]);
+        total_lookups += 1;
+        if let Some(continuations) = cache.get(&trigram) {
+            coverage += 1;
+            // Top-1 next prediction
+            let next_pred = continuations
+                .iter()
+                .max_by_key(|(_, &c)| c)
+                .map(|(&tok, _)| tok);
+            let mut accepted = 0u32;
+            if let Some(p0) = next_pred {
+                if p0 == generated[i] {
+                    accepted = 1;
+                    hits_at_n[0] += 1;
+                    // Continue speculative chain: at each step, build trigram from
+                    // (prev_2, prev_1, accepted_token) and look up next.
+                    let mut t1 = generated[i - 2];
+                    let mut t2 = generated[i - 1];
+                    let mut t3 = generated[i];
+                    for n in 1..max_n {
+                        let next_trigram = (t1, t2, t3);
+                        let Some(conts) = cache.get(&next_trigram) else {
+                            break;
+                        };
+                        let Some((&p, _)) = conts.iter().max_by_key(|(_, &c)| c) else {
+                            break;
+                        };
+                        if p == generated[i + n] {
+                            accepted += 1;
+                            hits_at_n[n] += 1;
+                            t1 = t2;
+                            t2 = t3;
+                            t3 = p;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            accepted_lengths.push(accepted);
+        } else {
+            accepted_lengths.push(0);
+        }
+
+        // Update cache with the actual observed continuation.
+        let entry = cache.entry(trigram).or_default();
+        *entry.entry(generated[i]).or_insert(0) += 1;
+    }
+
+    let n = total_lookups.max(1) as f64;
+    let cov_pct = 100.0 * coverage as f64 / n;
+    let mean_accept = accepted_lengths.iter().map(|&v| v as f64).sum::<f64>()
+        / accepted_lengths.len().max(1) as f64;
+    let max_accept = accepted_lengths.iter().copied().max().unwrap_or(0);
+    println!(
+        "\n=== T88a n-gram hit rate ({} steps analysed, max_n={}) ===",
+        total_lookups, max_n
+    );
+    println!("  coverage (cached trigram)  : {:>6.2}%", cov_pct);
+    println!("  mean accepted length       : {:>6.2}", mean_accept);
+    println!("  max accepted length        : {:>6}", max_accept);
+    println!("  hit@N (% of all lookups, cumulative as accept length grows):");
+    for (n_idx, hits) in hits_at_n.iter().enumerate().take(max_n) {
+        let pct = 100.0 * *hits as f64 / total_lookups.max(1) as f64;
+        println!("    accepted ≥ {:<3} : {:>6.2}%", n_idx + 1, pct);
+    }
+    println!("\nDecision criteria for Lookahead Jacobi (T88):");
+    let hit_4 = if max_n >= 4 {
+        100.0 * hits_at_n[3] as f64 / total_lookups.max(1) as f64
+    } else {
+        0.0
+    };
+    if hit_4 >= 40.0 {
+        println!(
+            "  ✓ CONFIRMED — hit@4 = {:.1}% ≥ 40%. Lookahead Jacobi paie. Procéder T88 full sprint.",
+            hit_4
+        );
+    } else if hit_4 >= 20.0 {
+        println!(
+            "  ~ MARGINAL — hit@4 = {:.1}%. Plain trigram cache trop simple. Considérer REST (chunk-level retrieval).",
+            hit_4
+        );
+    } else {
+        println!(
+            "  ✗ FAILED — hit@4 = {:.1}% < 20%. Lookahead Jacobi écarté. Pivot direct vers HSTC ou external chunk store.",
+            hit_4
+        );
+    }
+}
+
 fn forward_token(
     backend: &MetalBackend,
     model: &ModelMetal,
@@ -1311,6 +1432,7 @@ fn main() -> ExitCode {
     let mut max_seq: usize = 256;
     let mut profile = false;
     let mut sparsity_profile = false;
+    let mut ngram_profile = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1348,6 +1470,11 @@ fn main() -> ExitCode {
             },
             "--sparsity-profile" => {
                 sparsity_profile = true;
+                args.remove(i);
+                continue;
+            },
+            "--ngram-profile" => {
+                ngram_profile = true;
                 args.remove(i);
                 continue;
             },
@@ -1426,6 +1553,9 @@ fn main() -> ExitCode {
     }
     if sparsity_profile {
         sparsity.print_breakdown();
+    }
+    if ngram_profile {
+        analyze_ngram_hit_rate(&generated, 16);
     }
     println!("\ngenerated: {:?}", generated);
     ExitCode::SUCCESS
