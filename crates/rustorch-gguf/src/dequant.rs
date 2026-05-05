@@ -63,6 +63,19 @@ pub const Q4_K_BYTES: usize = 2 + 2 + 12 + 128;
 pub const Q5_K_BYTES: usize = 2 + 2 + 12 + 32 + 128;
 /// Wire-format size of one Q6_K super-block (210 bytes: 128 ql + 64 qh + 16 i8 scales + 2 d_f16).
 pub const Q6_K_BYTES: usize = 128 + 64 + 16 + 2;
+/// Wire-format size of one Q3_K super-block (110 bytes: 32 hmask + 64 qs + 12 scales + 2 d).
+/// 3.4375 bpw effective. Format from ggml-quants.h:
+/// ```text
+/// struct block_q3_K {
+///     uint8_t     hmask[32];   // bit 2 (high bit) of each weight, packed 8 per byte
+///     uint8_t     qs[64];      // bits 0..1 (low 2 bits), packed 4 per byte (8 sub-blocks of 8 bytes)
+///     uint8_t     scales[12];  // 8 sub-block scales, 6 bits signed each, complex packing
+///     ggml_fp16_t d;           // super-block scale (half float)
+/// };
+/// ```
+/// Per-weight value: `w = d × (sc[sub_block] - 32) × ((qs_low2 + (hmask_bit ? 0 : -4)))`
+/// where `sc` is the 6-bit signed scale unpacked from `scales[]` (range [-32, 31]).
+pub const Q3_K_BYTES: usize = 32 + 64 + 12 + 2;
 
 /// Total number of f32 elements produced for a tensor of given shape.
 pub fn num_elements(t: &TensorInfo) -> usize {
@@ -89,6 +102,7 @@ pub fn dequantize_block_chunk(
         GgmlType::F16 => dequant_f16(src, dst),
         GgmlType::BF16 => dequant_bf16(src, dst),
         GgmlType::Q8_0 => dequant_q8_0(src, dst),
+        GgmlType::Q3_K => dequant_q3_k(src, dst),
         GgmlType::Q4_K => dequant_q4_k(src, dst),
         GgmlType::Q5_K => dequant_q5_k(src, dst),
         GgmlType::Q6_K => dequant_q6_k(src, dst),
@@ -374,6 +388,119 @@ fn dequant_q5_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
 //       # then subtract 32 and multiply by per-sub-block scale.
 // =============================================================================
 
+/// T158 Phase 1 — Q3_K dequant CPU reference. Port direct de
+/// `dequantize_row_q3_K` dans ggml-quants.c.
+///
+/// Per-block (256 weights, 110 bytes) :
+///   - `hmask[32]` : high bit (bit 2) de chaque weight, 8 weights/byte
+///   - `qs[64]` : low 2 bits par weight, 4 weights/byte. Organisé en 2 groupes
+///     de 32 bytes (= 128 weights chacun). Dans chaque groupe, on lit 32 bytes
+///     successifs en faisant 4 passes de shift (0, 2, 4, 6) — chaque passe
+///     extrait 32 weights pour 1 sub-block de 32 weights.
+///   - `scales[12]` : 8 sub-block scales 6-bit signed (range [-32, 31]),
+///     packing complexe via XOR de 4 bits low + 2 bits high de scales[8..12].
+///   - `d` : f16 super-block scale.
+///
+/// Per-weight : `out = d × (sc - 32) × (q_low2 - (hmask_bit ? 0 : 4))`.
+/// Le `(... ? 0 : 4)` rend la valeur dans [-4, 3] selon hmask.
+fn dequant_q3_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
+    if dst.len() % QK_K != 0 {
+        return Err(DequantError::OutputSize {
+            expected: dst.len() / QK_K * QK_K,
+            got: dst.len(),
+        });
+    }
+    let nb = dst.len() / QK_K;
+    let needed = nb * Q3_K_BYTES;
+    if src.len() < needed {
+        return Err(DequantError::BufferTooSmall {
+            needed,
+            have: src.len(),
+        });
+    }
+
+    const KMASK1: u32 = 0x03030303;
+    const KMASK2: u32 = 0x0f0f0f0f;
+
+    for b in 0..nb {
+        let off = b * Q3_K_BYTES;
+        let hmask = &src[off..off + 32];
+        let qs = &src[off + 32..off + 32 + 64];
+        let sc_raw = &src[off + 96..off + 96 + 12];
+        let d_all = f16::from_le_bytes([src[off + 108], src[off + 109]]).to_f32();
+
+        // Unpack 8 × 6-bit signed scales depuis 12 bytes.
+        // Format ggml-quants.c :
+        //   aux[0..2] = scales[0..8] (low 4 bits par scale × 8 = 32 bits = 4 bytes)
+        //   aux[2]    = scales[8..12] (high 2 bits de chaque scale × 8 = 16 bits)
+        // Reconstruit ensuite via XOR/shifts pour donner 8 entiers signés sur i8.
+        let aux0 = u32::from_le_bytes([sc_raw[0], sc_raw[1], sc_raw[2], sc_raw[3]]);
+        let aux1 = u32::from_le_bytes([sc_raw[4], sc_raw[5], sc_raw[6], sc_raw[7]]);
+        let aux2_raw = u32::from_le_bytes([sc_raw[8], sc_raw[9], sc_raw[10], sc_raw[11]]);
+        let aux2 = ((aux0 >> 4) & KMASK2) | (((aux2_raw >> 4) & KMASK1) << 4);
+        let aux3 = ((aux1 >> 4) & KMASK2) | (((aux2_raw >> 6) & KMASK1) << 4);
+        let aux0 = (aux0 & KMASK2) | ((aux2_raw & KMASK1) << 4);
+        let aux1 = (aux1 & KMASK2) | (((aux2_raw >> 2) & KMASK1) << 4);
+        let scales_u8 = [
+            (aux0 & 0xff) as u8,
+            ((aux0 >> 8) & 0xff) as u8,
+            ((aux0 >> 16) & 0xff) as u8,
+            ((aux0 >> 24) & 0xff) as u8,
+            (aux1 & 0xff) as u8,
+            ((aux1 >> 8) & 0xff) as u8,
+            ((aux1 >> 16) & 0xff) as u8,
+            ((aux1 >> 24) & 0xff) as u8,
+            (aux2 & 0xff) as u8,
+            ((aux2 >> 8) & 0xff) as u8,
+            ((aux2 >> 16) & 0xff) as u8,
+            ((aux2 >> 24) & 0xff) as u8,
+            (aux3 & 0xff) as u8,
+            ((aux3 >> 8) & 0xff) as u8,
+            ((aux3 >> 16) & 0xff) as u8,
+            ((aux3 >> 24) & 0xff) as u8,
+        ];
+
+        let out = &mut dst[b * QK_K..(b + 1) * QK_K];
+
+        // 2 demis de 128 weights. Dans chaque demi : 4 sub-blocks via shifts
+        // 0, 2, 4, 6 sur qs[l+0..l+16] et qs[l+16..l+32]. hmask reste indexé
+        // par l et l+16 dans chaque demi — c'est `m <<= 1` qui sélectionne
+        // le bit haut de hmask pour chaque sub-block (1, 2, 4, 8, 16, 32, 64, 128).
+        let mut is = 0_usize;
+        let mut m: u8 = 1;
+        let mut out_idx = 0_usize;
+        for n in (0..QK_K).step_by(128) {
+            let q_chunk = &qs[(n / 4)..(n / 4 + 32)];
+            let mut shift = 0_u8;
+            for _ in 0..4 {
+                // Sub-block bas : 16 weights via shift sur q[l+0..l+16].
+                let dl = d_all * (scales_u8[is] as i8 as i32 - 32) as f32;
+                is += 1;
+                for l in 0..16 {
+                    let q_lo = ((q_chunk[l] >> shift) & 0x03) as i32;
+                    let h_bit = (hmask[l] & m) != 0;
+                    let v = q_lo - if h_bit { 0 } else { 4 };
+                    out[out_idx] = dl * v as f32;
+                    out_idx += 1;
+                }
+                // Sub-block haut : 16 weights via shift sur q[l+16..l+32].
+                let dl = d_all * (scales_u8[is] as i8 as i32 - 32) as f32;
+                is += 1;
+                for l in 0..16 {
+                    let q_lo = ((q_chunk[l + 16] >> shift) & 0x03) as i32;
+                    let h_bit = (hmask[l + 16] & m) != 0;
+                    let v = q_lo - if h_bit { 0 } else { 4 };
+                    out[out_idx] = dl * v as f32;
+                    out_idx += 1;
+                }
+                shift += 2;
+                m <<= 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn dequant_q6_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
     if dst.len() % QK_K != 0 {
         return Err(DequantError::OutputSize {
@@ -518,6 +645,70 @@ mod tests {
         let (sc, m) = unpack_q4_k_sc_m(&packed);
         assert_eq!(sc, sc_in);
         assert_eq!(m, m_in);
+    }
+
+    #[test]
+    fn dequant_q3_k_zero_block_is_zero() {
+        // Bloc Q3_K avec d=0 → all output 0 quel que soit hmask/qs/scales.
+        let mut buf = vec![0u8; Q3_K_BYTES];
+        // Données non triviales pour vraiment exercer l'unpacking.
+        for i in 0..32 {
+            buf[i] = 0xAA; // hmask
+        }
+        for i in 32..32 + 64 {
+            buf[i] = 0x33; // qs
+        }
+        for i in 96..96 + 12 {
+            buf[i] = 0x55; // scales
+        }
+        // d (offsets 108..110) reste 0 → sortie nulle.
+        let mut out = vec![0f32; QK_K];
+        dequant_q3_k(&buf, &mut out).unwrap();
+        for v in &out {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn dequant_q3_k_known_value_centered_scale() {
+        // Bloc avec :
+        //   d = 1.0 (half-float = 0x3C00)
+        //   tous scales encodés à 32 (= signed 0 après offset). Dans le packing,
+        //     scale = 32 signifie "low 4 bits = 0, high 2 bits = 0b10" → packed
+        //     low nibble = 0, packed high 2 bits = 2.
+        //   hmask tout à 0xFF (high bit = 1 partout → h_bit = true → offset 0)
+        //   qs tout à 0x55 (chaque byte = 0b01010101 → low2 weight = 0b01 = 1
+        //     pour les 4 paires)
+        //
+        // Per-weight: dl = d × (sc - 32) = 1.0 × 0 = 0 → all output = 0.
+        // Pas le test le plus serré, mais valide le path "scale exactement 32".
+        let mut buf = vec![0u8; Q3_K_BYTES];
+        for i in 0..32 {
+            buf[i] = 0xFF;
+        }
+        for i in 32..32 + 64 {
+            buf[i] = 0x55;
+        }
+        // d = f16(1.0) = 0x3C00 little-endian = [0x00, 0x3C]
+        buf[108] = 0x00;
+        buf[109] = 0x3C;
+        // Encoder scales = 32 pour tous les 8 sub-blocks. Le scale 32 (signed)
+        // est représenté en non-signé sur 6 bits comme 32 = 0b100000.
+        // Packing : sc[0..4].low4 = 0, sc[4..8].low4 = 0, et les high 2 bits
+        // de chaque scale dans aux2_raw. Les bits high de "32" sont 0b10 → 2.
+        // Pour scales[8..12], chaque byte encode 4× 2-bit high : 0b10101010 = 0xAA.
+        buf[96 + 8] = 0xAA;
+        buf[96 + 9] = 0xAA;
+        buf[96 + 10] = 0xAA;
+        buf[96 + 11] = 0xAA;
+        let mut out = vec![0f32; QK_K];
+        dequant_q3_k(&buf, &mut out).unwrap();
+        for v in &out {
+            assert_eq!(
+                *v, 0.0,
+                "with scale=32 (post-offset signed=0), all weights should be 0"
+            );
+        }
     }
 
     #[test]
