@@ -1233,6 +1233,161 @@ impl LayerCosStats {
     }
 }
 
+// T129 — Per-head attention contribution profile. T127 showed mean_attn
+// ≈ 0.97-0.99 across most layers — attention block per-layer adds little
+// rotation. The question: within those blocks, are individual heads even
+// less active? If 200+ of 40×40 = 1600 (layer, head) slots have ||head
+// output||_2 ≈ 0, head-pruning is viable.
+//
+// Signal per (li, h_i): mean and max of ||attn_out_slice_h_i||_2 across
+// all observed tokens. The slice is attn_out[h_i * head_dim..(h_i+1) *
+// head_dim]. Heads with consistently small relative contribution
+// (||head_i_out|| / ||attn_out|| < 0.01) are candidates for runtime skip.
+struct HeadStats {
+    n_layers: usize,
+    n_heads: usize,
+    /// Per (layer × head) sums: (Σ ||head_out||_2, Σ rel_contribution^2).
+    /// Index = li * n_heads + h_i.
+    norm_sum: Vec<f64>,
+    rel_sq_sum: Vec<f64>,
+    max_rel: Vec<f64>,
+    counts: Vec<u64>,
+}
+
+impl HeadStats {
+    fn new(n_layers: usize, n_heads: usize) -> Self {
+        let n = n_layers * n_heads;
+        Self {
+            n_layers,
+            n_heads,
+            norm_sum: vec![0.0; n],
+            rel_sq_sum: vec![0.0; n],
+            max_rel: vec![0.0; n],
+            counts: vec![0; n],
+        }
+    }
+
+    /// `attn_out` is the d-sized output of the GQA decode kernel for one
+    /// token at one layer. We split it into n_heads slices of head_dim and
+    /// measure the L2 contribution of each slice.
+    fn record(&mut self, li: usize, attn_out: &[f32], head_dim: usize) {
+        debug_assert_eq!(attn_out.len(), self.n_heads * head_dim);
+        // Total norm of the attention output (all heads).
+        let mut total_sq = 0.0f64;
+        for &v in attn_out {
+            total_sq += (v as f64) * (v as f64);
+        }
+        let total = total_sq.sqrt().max(1e-30);
+        for h_i in 0..self.n_heads {
+            let slice = &attn_out[h_i * head_dim..(h_i + 1) * head_dim];
+            let mut sq = 0.0f64;
+            for &v in slice {
+                sq += (v as f64) * (v as f64);
+            }
+            let norm = sq.sqrt();
+            let rel = norm / total;
+            let idx = li * self.n_heads + h_i;
+            self.norm_sum[idx] += norm;
+            self.rel_sq_sum[idx] += rel * rel;
+            if rel > self.max_rel[idx] {
+                self.max_rel[idx] = rel;
+            }
+            self.counts[idx] += 1;
+        }
+    }
+
+    fn print_breakdown(&self) {
+        println!(
+            "\n=== T129 per-head attention contribution profile ({} layers × {} heads) ===",
+            self.n_layers, self.n_heads
+        );
+
+        // Per-layer summary: number of "weak" heads with mean_rel < 0.01
+        // (contribute < 1% of attention output).
+        println!(
+            "  {:<6} {:>10} {:>10} {:>10} {:>10}",
+            "layer", "mean_rel", "max_rel", "min_rel", "n_weak"
+        );
+        let mut total_weak = 0usize;
+        let weak_threshold = 0.01;
+        for li in 0..self.n_layers {
+            let mut sum_mean = 0.0;
+            let mut sum_max = 0.0;
+            let mut min_mean: f64 = 1.0;
+            let mut weak = 0;
+            for h_i in 0..self.n_heads {
+                let idx = li * self.n_heads + h_i;
+                let c = self.counts[idx] as f64;
+                if c == 0.0 {
+                    continue;
+                }
+                let mean_rel = (self.rel_sq_sum[idx] / c).sqrt();
+                sum_mean += mean_rel;
+                sum_max += self.max_rel[idx];
+                if mean_rel < min_mean {
+                    min_mean = mean_rel;
+                }
+                if mean_rel < weak_threshold && self.max_rel[idx] < weak_threshold * 2.0 {
+                    weak += 1;
+                }
+            }
+            let nh = self.n_heads as f64;
+            println!(
+                "  {:<6} {:>10.4} {:>10.4} {:>10.4} {:>10}",
+                li,
+                sum_mean / nh,
+                sum_max / nh,
+                min_mean,
+                weak
+            );
+            total_weak += weak;
+        }
+        let total_slots = self.n_layers * self.n_heads;
+        println!(
+            "\nWeak heads (mean_rel < 0.01 AND max_rel < 0.02): {} / {} ({:.1}%)",
+            total_weak,
+            total_slots,
+            100.0 * total_weak as f64 / total_slots as f64
+        );
+
+        println!("\nDecision criteria for head-level pruning (T128b):");
+        // Cost estimate: each pruned head saves us 1 head's worth of GQA
+        // decode + 1 head's slice in W_O matmul. GQA is ~5% of layer cost,
+        // W_O matmul is ~12% of layer cost. Per pruned head: ~17% / n_heads
+        // savings within the layer = 0.42% per head with n_heads=40. So
+        // skipping 200 heads = 84% × layer_cost / 40 layers = 2.1% total.
+        // (These are rough — actual GQA kernel cost is dominated by KV scan.)
+        let layer_attn_frac = 0.30; // attention block ~30% of total layer cost
+        let head_frac_in_attn = 1.0 / self.n_heads as f64;
+        let estimated_savings =
+            total_weak as f64 * layer_attn_frac * head_frac_in_attn / self.n_layers as f64;
+        let speedup = 1.0 / (1.0 - estimated_savings).max(0.01);
+        println!(
+            "  Estimated decode-time savings: {:.1}% (from {} pruned heads)",
+            100.0 * estimated_savings,
+            total_weak
+        );
+        println!("  Theoretical decode speedup: {:.2}×", speedup);
+        if estimated_savings >= 0.10 {
+            println!(
+                "  ✓ VIABLE — combined savings ≥ 10%. Proceed to T128b — wire head-skip mask."
+            );
+        } else if estimated_savings >= 0.03 {
+            println!(
+                "  ~ MARGINAL — savings {:.1}%. Worth implementing if cheap.",
+                100.0 * estimated_savings
+            );
+        } else {
+            println!(
+                "  ✗ NOT VIABLE — savings {:.1}% < 3%. Pivot to non-subtraction strategies.",
+                100.0 * estimated_savings
+            );
+            println!("    → External-draft speculative (T128 — Qwen3-0.5B as draft) or");
+            println!("      trajectory predictor (T130 — h_t+1 ≈ Φ(h_t, emb(tok_t))).");
+        }
+    }
+}
+
 // T88a — N-gram hit rate analysis on a generated sequence. Replays the
 // decode step by step, maintaining a trigram → continuations cache built
 // from the tokens generated so far. At each step ≥ 3 we look up whether
@@ -2920,6 +3075,247 @@ fn forward_token_layer_cos(
     argmax(&logits)
 }
 
+// T129 — Per-head attention output profile. Same residual stream as
+// forward_token, plus 1 GPU drain + memcpy of attn_buf per layer (already
+// d-sized, like other intermediates). Profile-only.
+fn forward_token_head_stats(
+    backend: &MetalBackend,
+    model: &ModelMetal,
+    token_id: u32,
+    position: usize,
+    scratch: &mut Scratch,
+    stats: &mut HeadStats,
+) -> u32 {
+    let cfg = model.cfg;
+    let d = cfg.d;
+    let f = cfg.f;
+    let n_heads = cfg.n_heads;
+    let n_kv = cfg.n_kv_heads;
+    let head_dim = cfg.head_dim;
+    let max_seq = cfg.max_seq;
+
+    let off = (token_id as usize) * d;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            model.token_emb.as_ptr().add(off),
+            scratch.xd_buf.contents() as *mut f32,
+            d,
+        );
+    }
+
+    let mut attn_host = vec![0.0f32; d];
+
+    for (li, layer) in model.layers.iter().enumerate() {
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.attn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &scratch.q_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
+                layer.w_k.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_v.buffer,
+                &scratch.v_buf,
+                layer.w_v.k,
+                layer.w_v.n,
+            )
+            .unwrap();
+        } else {
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &scratch.q_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
+                layer.w_k.n,
+            )
+            .unwrap();
+            layer
+                .w_v
+                .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        }
+        if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
+            rms_norm_per_head_f32(
+                backend,
+                &scratch.q_buf,
+                qn_buf,
+                n_heads,
+                head_dim,
+                cfg.rms_eps,
+            )
+            .unwrap();
+        }
+        if let Some(kn_buf) = layer.attn_k_norm_buf.as_ref() {
+            rms_norm_per_head_f32(backend, &scratch.k_buf, kn_buf, n_kv, head_dim, cfg.rms_eps)
+                .unwrap();
+        }
+        rope_half_split_f32(
+            backend,
+            &scratch.q_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_heads,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        rope_half_split_f32(
+            backend,
+            &scratch.k_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_kv,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.k_buf,
+            &scratch.k_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.v_buf,
+            &scratch.v_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        let kv_len = position + 1;
+        gqa_decode_f32(
+            backend,
+            &scratch.q_buf,
+            &scratch.k_caches[li],
+            &scratch.v_caches[li],
+            &scratch.attn_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            kv_len,
+            max_seq,
+        )
+        .unwrap();
+
+        // T129 — drain & sample attn_buf per-layer.
+        backend.drain();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scratch.attn_buf.contents() as *const f32,
+                attn_host.as_mut_ptr(),
+                d,
+            );
+        }
+        stats.record(li, &attn_host, head_dim);
+
+        layer
+            .w_o
+            .matmul_into(backend, &scratch.attn_buf, &scratch.o_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.o_buf, d).unwrap();
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.ffn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_lcpp_nr2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_gate.buffer,
+            &scratch.gate_buf,
+            layer.w_gate.k,
+            layer.w_gate.n,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_lcpp_nr2_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_up.buffer,
+            &scratch.up_buf,
+            layer.w_up.k,
+            layer.w_up.n,
+        )
+        .unwrap();
+        swiglu_f32(
+            backend,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            &scratch.fd_buf,
+            f,
+        )
+        .unwrap();
+        layer
+            .w_down
+            .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
+    }
+
+    rms_norm_f32(
+        backend,
+        &scratch.xd_buf,
+        &model.final_norm_buf,
+        &scratch.h_buf,
+        cfg.d,
+        cfg.rms_eps,
+    )
+    .unwrap();
+    model
+        .lm_head
+        .matmul_into(backend, &scratch.h_buf, &scratch.logits_buf);
+    backend.drain();
+    let mut logits = vec![0.0_f32; cfg.vocab];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.logits_buf.contents() as *const f32,
+            logits.as_mut_ptr(),
+            cfg.vocab,
+        );
+    }
+    argmax(&logits)
+}
+
 // T121 — Multi-token forward. Processes B input tokens at consecutive
 // sequence positions [pos_base, pos_base+1, ..., pos_base+B-1] in a single
 // pass through the model, using the batched kernels (T92, T106-T109,
@@ -3485,6 +3881,7 @@ fn main() -> ExitCode {
     let mut rank_profile = false;
     let mut entropy_profile = false;
     let mut layer_cos_profile = false;
+    let mut head_stats_profile = false;
     let mut batch_test = false;
     let mut speculative_b: usize = 0; // 0 = off; 2..=4 = enable with B candidates
     let mut i = 0;
@@ -3547,6 +3944,11 @@ fn main() -> ExitCode {
                 args.remove(i);
                 continue;
             },
+            "--head-stats-profile" => {
+                head_stats_profile = true;
+                args.remove(i);
+                continue;
+            },
             "--batch-test" => {
                 batch_test = true;
                 args.remove(i);
@@ -3581,6 +3983,7 @@ fn main() -> ExitCode {
     let mut rank_stats = RankStats::new(model.cfg.n_layers, model.cfg.d, 100);
     let mut entropy_stats = EntropyStats::new();
     let mut layer_cos_stats = LayerCosStats::new(model.cfg.n_layers);
+    let mut head_stats = HeadStats::new(model.cfg.n_layers, model.cfg.n_heads);
     // T125 auxiliary buffers — allocated once, reused for every entropy snapshot.
     // d-sized for final_norm output, vocab-sized for the lm_head logits.
     let entropy_aux_h = backend.alloc_shared(model.cfg.d * 4).unwrap();
@@ -3616,6 +4019,8 @@ fn main() -> ExitCode {
                 &mut scratch,
                 &mut layer_cos_stats,
             )
+        } else if head_stats_profile {
+            forward_token_head_stats(backend, &model, tok, cur_pos, &mut scratch, &mut head_stats)
         } else if batch_test {
             // T121 — forward_batch with B=1, parity test vs forward_token
             let outs = forward_batch(backend, &model, &[tok], cur_pos, &mut scratch);
@@ -3650,6 +4055,9 @@ fn main() -> ExitCode {
     }
     if layer_cos_profile {
         layer_cos_stats = LayerCosStats::new(model.cfg.n_layers);
+    }
+    if head_stats_profile {
+        head_stats = HeadStats::new(model.cfg.n_layers, model.cfg.n_heads);
     }
     let t_dec = Instant::now();
     let mut spec_total_drafts = 0usize;
@@ -3771,6 +4179,15 @@ fn main() -> ExitCode {
                     &mut scratch,
                     &mut layer_cos_stats,
                 )
+            } else if head_stats_profile {
+                forward_token_head_stats(
+                    backend,
+                    &model,
+                    last,
+                    cur_pos,
+                    &mut scratch,
+                    &mut head_stats,
+                )
             } else if batch_test {
                 let outs = forward_batch(backend, &model, &[last], cur_pos, &mut scratch);
                 outs[0]
@@ -3806,6 +4223,9 @@ fn main() -> ExitCode {
     }
     if layer_cos_profile {
         layer_cos_stats.print_breakdown();
+    }
+    if head_stats_profile {
+        head_stats.print_breakdown();
     }
     if speculative_b >= 2 {
         let accept_rate = if spec_total_drafts > 0 {
