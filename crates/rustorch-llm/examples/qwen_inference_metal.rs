@@ -285,6 +285,120 @@ impl Stages {
     }
 }
 
+// T87 — Per-layer FFN sparsity statistics. After each SwiGLU dispatch we
+// drain the GPU and read fd_buf (length f=17408 in Qwen3-14B), counting
+// how many elements are |x| < threshold for thresholds 1e-3, 1e-2, 1e-1.
+// Aggregated over all tokens × all layers to validate the DejaVu
+// hypothesis that 70-90% of FFN neurons are quasi-zero.
+#[derive(Default, Debug)]
+struct SparsityStats {
+    /// Per-layer counts indexed by layer_idx. Each tuple is
+    /// (count_lt_1e3, count_lt_1e2, count_lt_1e1, total_samples_for_this_layer).
+    /// total_samples = f × n_tokens_observed.
+    per_layer: Vec<(u64, u64, u64, u64)>,
+    f: usize,
+}
+
+impl SparsityStats {
+    fn new(n_layers: usize, f: usize) -> Self {
+        Self {
+            per_layer: vec![(0, 0, 0, 0); n_layers],
+            f,
+        }
+    }
+
+    fn record(&mut self, layer_idx: usize, fd_data: &[f32]) {
+        debug_assert_eq!(fd_data.len(), self.f);
+        let mut c1 = 0u64;
+        let mut c2 = 0u64;
+        let mut c3 = 0u64;
+        for &v in fd_data {
+            let av = v.abs();
+            if av < 1e-3 {
+                c1 += 1;
+            }
+            if av < 1e-2 {
+                c2 += 1;
+            }
+            if av < 1e-1 {
+                c3 += 1;
+            }
+        }
+        let entry = &mut self.per_layer[layer_idx];
+        entry.0 += c1;
+        entry.1 += c2;
+        entry.2 += c3;
+        entry.3 += self.f as u64;
+    }
+
+    fn print_breakdown(&self) {
+        println!(
+            "\n=== T87 FFN sparsity breakdown ({} layers, f={}) ===",
+            self.per_layer.len(),
+            self.f
+        );
+        println!(
+            "  {:<6} {:>12} {:>12} {:>12}",
+            "layer", "%<1e-3", "%<1e-2", "%<1e-1"
+        );
+        let mut sum1 = 0.0f64;
+        let mut sum2 = 0.0f64;
+        let mut sum3 = 0.0f64;
+        let mut max1 = 0.0f64;
+        let mut max2 = 0.0f64;
+        let mut max3 = 0.0f64;
+        let mut min1 = 100.0f64;
+        let mut min2 = 100.0f64;
+        let mut min3 = 100.0f64;
+        for (li, &(c1, c2, c3, total)) in self.per_layer.iter().enumerate() {
+            if total == 0 {
+                continue;
+            }
+            let p1 = 100.0 * c1 as f64 / total as f64;
+            let p2 = 100.0 * c2 as f64 / total as f64;
+            let p3 = 100.0 * c3 as f64 / total as f64;
+            sum1 += p1;
+            sum2 += p2;
+            sum3 += p3;
+            max1 = max1.max(p1);
+            max2 = max2.max(p2);
+            max3 = max3.max(p3);
+            min1 = min1.min(p1);
+            min2 = min2.min(p2);
+            min3 = min3.min(p3);
+            println!("  {:<6} {:>11.2}% {:>11.2}% {:>11.2}%", li, p1, p2, p3);
+        }
+        let n = self.per_layer.len() as f64;
+        println!(
+            "  {:<6} {:>11.2}% {:>11.2}% {:>11.2}% (mean)",
+            "----",
+            sum1 / n,
+            sum2 / n,
+            sum3 / n
+        );
+        println!(
+            "  {:<6} {:>11.2}% {:>11.2}% {:>11.2}% (min)",
+            "min", min1, min2, min3
+        );
+        println!(
+            "  {:<6} {:>11.2}% {:>11.2}% {:>11.2}% (max)",
+            "max", max1, max2, max3
+        );
+        println!("\nDejaVu hypothesis check (threshold 1e-2):");
+        let mean_p2 = sum2 / n;
+        if mean_p2 >= 70.0 {
+            println!(
+                "  ✓ CONFIRMED — mean sparsity {:.1}% ≥ 70%. Proceed to T88 sparse FFN kernel.",
+                mean_p2
+            );
+        } else if mean_p2 >= 50.0 {
+            println!("  ~ MARGINAL — mean sparsity {:.1}%. Sparse FFN may pay off but proceed cautiously.", mean_p2);
+        } else {
+            println!("  ✗ FAILED — mean sparsity {:.1}% < 50%. DejaVu approach unlikely to help; pivot to lookahead.", mean_p2);
+        }
+    }
+}
+
 fn forward_token(
     backend: &MetalBackend,
     model: &ModelMetal,
@@ -782,6 +896,223 @@ fn forward_token_profiled(
     next
 }
 
+// T87 — Sparsity-instrumented forward. Identical to forward_token except
+// after each SwiGLU we drain the GPU and read fd_buf to record the FFN
+// sparsity at this layer. Drains are expensive (~100 µs each, 40 per
+// token) — total inference ~3-4× slower than chained, fine for offline
+// profiling. Only the SwiGLU output is sampled; the rest of the forward
+// uses the chained path.
+fn forward_token_sparsity(
+    backend: &MetalBackend,
+    model: &ModelMetal,
+    token_id: u32,
+    position: usize,
+    scratch: &mut Scratch,
+    stats: &mut SparsityStats,
+) -> u32 {
+    let cfg = model.cfg;
+    let d = cfg.d;
+    let f = cfg.f;
+    let n_heads = cfg.n_heads;
+    let n_kv = cfg.n_kv_heads;
+    let head_dim = cfg.head_dim;
+    let max_seq = cfg.max_seq;
+
+    let off = (token_id as usize) * d;
+    scratch.x.copy_from_slice(&model.token_emb[off..off + d]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(scratch.x.as_ptr(), scratch.xd_buf.contents() as *mut f32, d);
+    }
+
+    let mut fd_scratch = vec![0.0_f32; f];
+
+    for (li, layer) in model.layers.iter().enumerate() {
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.attn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
+            sgemv_q4_k_f32_triple_quadcoop_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &layer.w_k.buffer,
+                &layer.w_v.buffer,
+                &scratch.q_buf,
+                &scratch.k_buf,
+                &scratch.v_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+                layer.w_k.n,
+                layer.w_v.n,
+            )
+            .unwrap();
+        } else {
+            sgemv_q4_k_f32_pair_quadcoop_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_q.buffer,
+                &layer.w_k.buffer,
+                &scratch.q_buf,
+                &scratch.k_buf,
+                layer.w_q.k,
+                layer.w_q.n,
+                layer.w_k.n,
+            )
+            .unwrap();
+            layer
+                .w_v
+                .matmul_into(backend, &scratch.h_buf, &scratch.v_buf);
+        }
+
+        if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
+            rms_norm_per_head_f32(
+                backend,
+                &scratch.q_buf,
+                qn_buf,
+                n_heads,
+                head_dim,
+                cfg.rms_eps,
+            )
+            .unwrap();
+        }
+        if let Some(kn_buf) = layer.attn_k_norm_buf.as_ref() {
+            rms_norm_per_head_f32(backend, &scratch.k_buf, kn_buf, n_kv, head_dim, cfg.rms_eps)
+                .unwrap();
+        }
+        rope_half_split_f32(
+            backend,
+            &scratch.q_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_heads,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        rope_half_split_f32(
+            backend,
+            &scratch.k_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_kv,
+            head_dim,
+            position,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.k_buf,
+            &scratch.k_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        kv_append_f32(
+            backend,
+            &scratch.v_buf,
+            &scratch.v_caches[li],
+            n_kv,
+            head_dim,
+            position,
+            max_seq,
+        )
+        .unwrap();
+        let kv_len = position + 1;
+        gqa_decode_f32(
+            backend,
+            &scratch.q_buf,
+            &scratch.k_caches[li],
+            &scratch.v_caches[li],
+            &scratch.attn_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            kv_len,
+            max_seq,
+        )
+        .unwrap();
+        layer
+            .w_o
+            .matmul_into(backend, &scratch.attn_buf, &scratch.o_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.o_buf, d).unwrap();
+        rms_norm_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.ffn_norm_buf,
+            &scratch.h_buf,
+            d,
+            cfg.rms_eps,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_pair_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_gate.buffer,
+            &layer.w_up.buffer,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            layer.w_gate.k,
+            layer.w_gate.n,
+            layer.w_up.n,
+        )
+        .unwrap();
+        swiglu_f32(
+            backend,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            &scratch.fd_buf,
+            f,
+        )
+        .unwrap();
+        // T87 — drain & sample fd_buf for sparsity stats.
+        backend.drain();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scratch.fd_buf.contents() as *const f32,
+                fd_scratch.as_mut_ptr(),
+                f,
+            );
+        }
+        stats.record(li, &fd_scratch);
+
+        layer
+            .w_down
+            .matmul_into(backend, &scratch.fd_buf, &scratch.fc2_buf);
+        add_inplace_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d).unwrap();
+    }
+
+    rms_norm_f32(
+        backend,
+        &scratch.xd_buf,
+        &model.final_norm_buf,
+        &scratch.h_buf,
+        cfg.d,
+        cfg.rms_eps,
+    )
+    .unwrap();
+    model
+        .lm_head
+        .matmul_into(backend, &scratch.h_buf, &scratch.logits_buf);
+    backend.drain();
+    let mut logits = vec![0.0_f32; cfg.vocab];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            scratch.logits_buf.contents() as *const f32,
+            logits.as_mut_ptr(),
+            cfg.vocab,
+        );
+    }
+    argmax(&logits)
+}
+
 struct Scratch {
     x: Vec<f32>,
     h: Vec<f32>,
@@ -979,6 +1310,7 @@ fn main() -> ExitCode {
     let mut n: usize = 50;
     let mut max_seq: usize = 256;
     let mut profile = false;
+    let mut sparsity_profile = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1014,6 +1346,11 @@ fn main() -> ExitCode {
                 args.remove(i);
                 continue;
             },
+            "--sparsity-profile" => {
+                sparsity_profile = true;
+                args.remove(i);
+                continue;
+            },
             _ => {},
         }
         i += 1;
@@ -1033,6 +1370,7 @@ fn main() -> ExitCode {
     let mut scratch = Scratch::new(backend, &model.cfg);
 
     let mut stages = Stages::default();
+    let mut sparsity = SparsityStats::new(model.cfg.n_layers, model.cfg.f);
     println!("\n→ prefill {} tokens", prompt_ids.len());
     let t_pre = Instant::now();
     let mut last = 0u32;
@@ -1040,6 +1378,8 @@ fn main() -> ExitCode {
     for &tok in prompt_ids.iter() {
         last = if profile {
             forward_token_profiled(backend, &model, tok, cur_pos, &mut scratch, &mut stages)
+        } else if sparsity_profile {
+            forward_token_sparsity(backend, &model, tok, cur_pos, &mut scratch, &mut sparsity)
         } else {
             forward_token(backend, &model, tok, cur_pos, &mut scratch)
         };
@@ -1059,10 +1399,15 @@ fn main() -> ExitCode {
     if profile {
         stages = Stages::default();
     }
+    if sparsity_profile {
+        sparsity = SparsityStats::new(model.cfg.n_layers, model.cfg.f);
+    }
     let t_dec = Instant::now();
     for _ in 1..n {
         last = if profile {
             forward_token_profiled(backend, &model, last, cur_pos, &mut scratch, &mut stages)
+        } else if sparsity_profile {
+            forward_token_sparsity(backend, &model, last, cur_pos, &mut scratch, &mut sparsity)
         } else {
             forward_token(backend, &model, last, cur_pos, &mut scratch)
         };
@@ -1078,6 +1423,9 @@ fn main() -> ExitCode {
     );
     if profile {
         stages.print_breakdown(n - 1);
+    }
+    if sparsity_profile {
+        sparsity.print_breakdown();
     }
     println!("\ngenerated: {:?}", generated);
     ExitCode::SUCCESS
