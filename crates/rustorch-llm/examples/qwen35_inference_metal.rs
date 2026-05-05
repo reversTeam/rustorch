@@ -49,9 +49,10 @@ use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_f32, delta_net_step_f32, gqa_decode_f32, kv_append_f32, l2_norm_per_head_f32,
     rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
-    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_mul_inplace_f32, split_qg_per_head_f32,
-    ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32, weighted_add_inplace_f32, zero_f32,
+    sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_mul_inplace_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
+    weighted_add_inplace_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -94,27 +95,15 @@ impl HybridMetalWeight {
                 sgemv_q8_0_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
             },
             GgmlType::F32 => {
-                // Small F32 projections (e.g. ssm_alpha, ssm_beta) — CPU matmul
-                // since both src and dst are in unified memory. Fast for the
-                // sizes we hit (5120 × 48 = 245K mults).
-                backend.drain(); // ensure prior writes to x_buf landed
-                unsafe {
-                    let w = std::slice::from_raw_parts(
-                        self.buffer.contents() as *const f32,
-                        self.n * self.k,
-                    );
-                    let x = std::slice::from_raw_parts(x_buf.contents() as *const f32, self.k);
-                    let y = std::slice::from_raw_parts_mut(out_buf.contents() as *mut f32, self.n);
-                    for i in 0..self.n {
-                        let row = &w[i * self.k..(i + 1) * self.k];
-                        let mut acc = 0.0_f32;
-                        for j in 0..self.k {
-                            acc += row[j] * x[j];
-                        }
-                        y[i] = acc;
-                    }
-                }
-                Ok(())
+                // T151 — Small F32 projections (e.g. ssm_alpha, ssm_beta) now
+                // run on GPU via `sgemv_f32_lcpp_simd_into` (1 simdgroup per
+                // output column). The previous path was CPU naive matmul +
+                // `backend.drain()`, costing ~250 µs/call × 64 calls/token
+                // (= 32 SSM layers × 2 F32 projections) = ~16 ms/token =
+                // ~23% of the 27B decode budget. The new path keeps the
+                // matmul on the same Metal command buffer, no host-side
+                // synchronisation needed.
+                sgemv_f32_lcpp_simd_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
             },
             other => Err(MetalError::Unsupported(format!(
                 "HybridMetalWeight::matmul_into: dtype {:?} not supported by any sgemv kernel",
@@ -1050,20 +1039,25 @@ fn ssm_block_forward(
         &format!("{dump_prefix}/ssm/08_conv_out"),
     );
     // 5. (SiLU was fused into ssm_conv1d_step_f32 in T144b — no CPU pass.)
-    // 6. Split q, k, v from conv_out into separate Metal buffers.
+    // 6. T151 — GPU-side three-way split of conv_out → (q, k, v). Replaces
+    //    the old CPU `drain + ptr::copy_nonoverlapping` path: 32 SSM layers
+    //    × 1 drain/token were a major decode bottleneck. The kernel keeps
+    //    everything in the same Metal command buffer so commit_async every
+    //    5 layers can coalesce GPU work cleanly.
     //    Both 27B and 35B use n_v_heads = repeat * n_k_heads (27B: 48 = 3 × 16,
-    //    35B-A3B: 32 = 2 × 16), so we keep q,k at length [n_k_heads, head_dim] and
-    //    let delta_net_step broadcast inline. Only v needs to be n_v_heads-wide.
-    backend.drain();
-    unsafe {
-        let conv_p = scratch.conv_out.contents() as *const f32;
-        let q_p = scratch.q_ssm.contents() as *mut f32;
-        let k_p = scratch.k_ssm.contents() as *mut f32;
-        let v_p = scratch.v_ssm.contents() as *mut f32;
-        std::ptr::copy_nonoverlapping(conv_p, q_p, key_dim); // [n_k, head_dim]
-        std::ptr::copy_nonoverlapping(conv_p.add(key_dim), k_p, key_dim); // [n_k, head_dim]
-        std::ptr::copy_nonoverlapping(conv_p.add(2 * key_dim), v_p, value_dim); // [n_v, head_dim]
-    }
+    //    35B-A3B: 32 = 2 × 16), so we keep q,k at length [n_k_heads, head_dim]
+    //    (key_dim each) and let delta_net_step broadcast inline. Only v is
+    //    n_v_heads-wide (value_dim).
+    split_qkv_f32(
+        backend,
+        &scratch.conv_out,
+        &scratch.q_ssm,
+        &scratch.k_ssm,
+        &scratch.v_ssm,
+        key_dim,
+        key_dim,
+        value_dim,
+    )?;
     dump_buf(
         backend,
         &scratch.q_ssm,

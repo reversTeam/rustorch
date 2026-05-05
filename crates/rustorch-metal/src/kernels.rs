@@ -2229,6 +2229,90 @@ pub fn sgemv_f32_simd(
 }
 
 // =============================================================================
+// T151 — sgemv_f32_lcpp_simd_into — F32 sgemv `y = W @ x` for the GGUF
+// Linear-weight layout (output rows of input columns, i.e. data is laid out
+// as `w[n_idx * K + k]`). Used by `HybridMetalWeight::matmul_into` for the
+// F32 fallback case (ssm_alpha / ssm_beta on Qwen3.5/3.6 are stored as F32
+// because they are not large enough to be quantised). Replaces the previous
+// `backend.drain() + CPU naive matmul` path which incurred ~250 µs per
+// matmul × 64 calls/token = ~16 ms/token = ~23% of the 27B decode budget.
+//
+// One simdgroup (32 threads) per output. Each lane strides over K with step
+// 32 and accumulates a partial sum, then `simd_sum` reduces across the lanes.
+// W is read with row-of-output stride: `w[n_idx * K + k]` — same layout as
+// the CPU fallback (and matches the GGUF Linear-weight convention where
+// shape `[K_in, N_out]` stores data with output as the slow axis).
+//
+// No drain is required: caller passes a pre-allocated `out_buf`, and the
+// kernel issues into the current command buffer like every other sgemv.
+// =============================================================================
+
+const SGEMV_F32_LCPP_SIMD_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void sgemv_f32_lcpp_simd(
+    device const float*  x      [[buffer(0)]],   // [K] activation
+    device const float*  w      [[buffer(1)]],   // [N, K] row-major (output is slow axis)
+    device float*        y      [[buffer(2)]],   // [N] output
+    constant uint2&      dims   [[buffer(3)]],   // (K, N)
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               lane   [[thread_index_in_simdgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint n_idx = tg_id;
+    if (n_idx >= N) return;
+
+    uint base = n_idx * K;
+    float partial = 0.0;
+    for (uint k = lane; k < K; k += 32u) {
+        partial += w[base + k] * x[k];
+    }
+    float sum = simd_sum(partial);
+    if (lane == 0) {
+        y[n_idx] = sum;
+    }
+}
+"#;
+
+/// T151 — F32 sgemv `y = W @ x` for GGUF Linear-weight layout (output rows
+/// of input columns). One simdgroup per output column; no drain needed.
+/// Used as the GPU replacement for the prior CPU F32 fallback in
+/// `HybridMetalWeight::matmul_into`.
+pub fn sgemv_f32_lcpp_simd_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if k == 0 || n == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_f32_lcpp_simd_into: K, N must be > 0 (got K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_f32_lcpp_simd",
+        SGEMV_F32_LCPP_SIMD_SHADER,
+        "sgemv_f32_lcpp_simd",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // sgemv_q4_k_f32 — direct sgemv on Q4_K-quantised weights, no f32 expansion.
 //
 // Reads 144-byte Q4_K super-blocks straight from the GPU buffer, dequantises
@@ -7879,6 +7963,75 @@ pub fn split_qg_per_head_f32(
         encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
         let tg = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(head_dim as u64, n_q as u64, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// T151 — Split a contiguous `[q_len + k_len + v_len]` source buffer into
+// three destination buffers on GPU. Replaces the CPU `ptr::copy_nonoverlapping`
+// path in `ssm_block_forward` which required a `backend.drain()` to make the
+// conv1d output visible to the CPU. With this kernel the SSM block stays
+// fully on GPU, eliminating 32 drains/token on Qwen3.6-27B (and ~64 on the
+// 35B-A3B's MoE+SSM path).
+const SPLIT_QKV_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void split_qkv_f32(
+    device const float* src    [[buffer(0)]],   // [q_len + k_len + v_len]
+    device float*       q_dst  [[buffer(1)]],   // [q_len]
+    device float*       k_dst  [[buffer(2)]],   // [k_len]
+    device float*       v_dst  [[buffer(3)]],   // [v_len]
+    constant uint3&     dims   [[buffer(4)]],   // (q_len, k_len, v_len)
+    uint                gid    [[thread_position_in_grid]]
+) {
+    uint q_len = dims.x;
+    uint k_len = dims.y;
+    uint v_len = dims.z;
+    uint total = q_len + k_len + v_len;
+    if (gid >= total) return;
+    float v = src[gid];
+    if (gid < q_len) {
+        q_dst[gid] = v;
+    } else if (gid < q_len + k_len) {
+        k_dst[gid - q_len] = v;
+    } else {
+        v_dst[gid - q_len - k_len] = v;
+    }
+}
+"#;
+
+/// T151 — three-way split of a `[q_len + k_len + v_len]` source buffer
+/// into separate `q`, `k`, `v` destination buffers on GPU. Eliminates
+/// the CPU `drain + memcpy` pass formerly used in `ssm_block_forward`.
+pub fn split_qkv_f32(
+    backend: &MetalBackend,
+    src_buf: &Buffer,
+    q_buf: &Buffer,
+    k_buf: &Buffer,
+    v_buf: &Buffer,
+    q_len: usize,
+    k_len: usize,
+    v_len: usize,
+) -> Result<(), MetalError> {
+    if q_len == 0 || k_len == 0 || v_len == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "split_qkv_f32: q_len={q_len}, k_len={k_len}, v_len={v_len} all must be > 0"
+        )));
+    }
+    let pipeline = backend.pipeline("split_qkv_f32", SPLIT_QKV_F32_SHADER, "split_qkv_f32")?;
+    let dims = [q_len as u32, k_len as u32, v_len as u32];
+    let total = (q_len + k_len + v_len) as u64;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src_buf), 0);
+        encoder.set_buffer(1, Some(q_buf), 0);
+        encoder.set_buffer(2, Some(k_buf), 0);
+        encoder.set_buffer(3, Some(v_buf), 0);
+        encoder.set_bytes(4, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(total, 1, 1);
         encoder.dispatch_threads(grid, tg);
     });
     Ok(())
