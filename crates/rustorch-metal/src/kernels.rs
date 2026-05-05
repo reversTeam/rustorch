@@ -3291,6 +3291,168 @@ kernel void sgemv_q4_k_f32_lcpp_nsg2(
 }
 "#;
 
+// T156 — Q4_K sgemv variant with NR0=4 (8 rows per threadgroup, 4 par
+// simdgroup). Réutilise les yl/yh chargés (32 floats de x) sur 4 rows de
+// poids au lieu de 2, doublant l'intensité ALU/byte. Sur shape FFN dense
+// 14B (K=5120, N=14336) on attend +5-15 % vs NR0=2 si on est ALU-bound.
+//
+// Register pressure : sumf[4] f32 + 4× les loops dequant. M4 Max simdgroup
+// a 32 lanes × 64-128 regs, OK pour ce surcoût. Si spill, perf se dégrade.
+const SGEMV_Q4_K_F32_LCPP_NSG2_NR4_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+constant short NR0 = 4;
+constant short NSG = 2;
+constant ushort KMASK1 = 0x3f3f;
+constant ushort KMASK2 = 0x0f0f;
+constant ushort KMASK3 = 0xc0c0;
+
+kernel void sgemv_q4_k_f32_lcpp_nsg2_nr4(
+    device const float*  x      [[buffer(0)]],
+    device const uchar*  w_q4k  [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint2&      dims   [[buffer(3)]],
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+
+    uint first_row = (tg_id * (uint)NSG + (uint)sgitg) * (uint)NR0;
+    if (first_row >= N) return;
+
+    short ix = (short)(tiisg / 8u);
+    short it = (short)(tiisg % 8u);
+    short iq = it / 4;
+    short ir = it % 4;
+
+    int nb = (int)blocks_per_row;
+    device const float* y4 = x + ix * 256 + 64 * iq + 8 * ir;
+
+    float yl[16];
+    float yh[16];
+    float sumf[4] = {0.0, 0.0, 0.0, 0.0};
+
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+    uint row_stride = blocks_per_row * BLOCK_BYTES;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.0, 0.0, 0.0, 0.0};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+            device const uchar* block = w_q4k + (uint64_t)nrow * row_stride + (uint)ib * BLOCK_BYTES;
+            device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+            float d    = float(as_type<half>(dh_ptr[0]));
+            float dmin = float(as_type<half>(dh_ptr[1]));
+
+            device const uint16_t* sc = (device const uint16_t*)(block + 4) + iq;
+            device const uint16_t* q1 = (device const uint16_t*)(block + 16) + 16 * iq + 4 * ir;
+            device const uint16_t* q2 = q1 + 32;
+
+            sc16[0] = sc[0] & KMASK1;
+            sc16[1] = sc[2] & KMASK1;
+            sc16[2] = ((sc[4] >> 0) & KMASK2) | ((sc[0] & KMASK3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & KMASK2) | ((sc[2] & KMASK3) >> 2);
+
+            float4 acc1 = {0.0, 0.0, 0.0, 0.0};
+            float4 acc2 = {0.0, 0.0, 0.0, 0.0};
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[row] += d * ((acc1[0] + 1.0f/256.0f * acc1[1]) * float(sc8[0]) +
+                              (acc1[2] + 1.0f/256.0f * acc1[3]) * float(sc8[1]) * 1.0f/16.0f +
+                              (acc2[0] + 1.0f/256.0f * acc2[1]) * float(sc8[4]) +
+                              (acc2[2] + 1.0f/256.0f * acc2[3]) * float(sc8[5]) * 1.0f/16.0f) -
+                       dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                               sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        y4 += 4 * (int)BLOCK_WEIGHTS;
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y[nrow] = sum_all;
+        }
+    }
+}
+"#;
+
+/// T156 — Q4_K sgemv NSG=2 NR0=4 (8 rows / threadgroup).
+/// Auto-falls back to NR0=2 (`sgemv_q4_k_f32_lcpp_nsg2_into`) si N%8 != 0.
+///
+/// Note : testé sur Qwen3-14B Q4_K_M, **régresse de -2.3 %** (decode 41.97
+/// → 40.99 t/s). La pression registre due à `sumf[4]` et 4× les loops de
+/// dequant l'emporte sur le gain ALU/byte. Conservé pour expérimentation
+/// future (peut-être utile pour des shapes plus larges en prefill batched).
+#[allow(dead_code)]
+pub fn sgemv_q4_k_f32_lcpp_nsg2_nr4_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32_lcpp_nsg2_nr4 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_lcpp_nsg2_nr4: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    if n % 8 != 0 {
+        return sgemv_q4_k_f32_lcpp_nsg2_into(backend, x_buf, w_q4k_buf, out_buf, k, n);
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_lcpp_nsg2_nr4",
+        SGEMV_Q4_K_F32_LCPP_NSG2_NR4_SHADER,
+        "sgemv_q4_k_f32_lcpp_nsg2_nr4",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        // 8 rows per threadgroup
+        let n_tg = (n as u64).div_ceil(8);
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T132 — lcpp_nr2 with NSG=2 (two simdgroups per threadgroup). Matches
 /// llama.cpp's `N_SG_Q4_K = 2` dispatch, which yields better memory latency
 /// hiding by interleaving compute & memory ops across the two simdgroups
