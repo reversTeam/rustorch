@@ -5088,12 +5088,19 @@ kernel void gqa_decode_f32(
     device const float* q_h_ptr = q + q_h * head_dim;
     device const float* k_h_base = k_cache + kv_h * max_seq * head_dim;
 
-    // Compute all scores; each thread writes a slice.
+    // T100 — float4 vectorized dot product. head_dim must be %4.
+    uint hd4 = head_dim / 4u;
+    device const float4* q_h_ptr4 = (device const float4*)q_h_ptr;
     for (uint p = tid; p < kv_len; p += sg_size) {
-        device const float* k_p = k_h_base + p * head_dim;
-        float dot = 0.0;
-        for (uint d = 0; d < head_dim; ++d) {
-            dot += q_h_ptr[d] * k_p[d];
+        device const float4* k_p4 = (device const float4*)(k_h_base + p * head_dim);
+        float4 acc4 = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint d4 = 0; d4 < hd4; ++d4) {
+            acc4 += q_h_ptr4[d4] * k_p4[d4];
+        }
+        // Scalar tail
+        float dot = acc4.x + acc4.y + acc4.z + acc4.w;
+        for (uint d = hd4 * 4u; d < head_dim; ++d) {
+            dot += q_h_ptr[d] * k_h_base[p * head_dim + d];
         }
         shared[p] = dot * inv_sqrt_d;
     }
@@ -5119,13 +5126,18 @@ kernel void gqa_decode_f32(
     // Phase D: weighted sum of V vectors. Each thread accumulates one
     // dim of out. With sg_size=32 and head_dim=128 each thread handles
     // 4 dims via stride loop.
+    // T101 — pre-multiply shared[p] *= inv_sum cooperatively, eliminates
+    // kv_len multiplies in the inner accumulation loop.
+    for (uint p = tid; p < kv_len; p += sg_size) {
+        shared[p] *= inv_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const float* v_h_base = v_cache + kv_h * max_seq * head_dim;
     device float* out_h = out + q_h * head_dim;
     for (uint d = tid; d < head_dim; d += sg_size) {
         float acc = 0.0;
         for (uint p = 0; p < kv_len; ++p) {
-            acc += shared[p] * inv_sum * v_h_base[p * head_dim + d];
+            acc += shared[p] * v_h_base[p * head_dim + d];
         }
         out_h[d] = acc;
     }
