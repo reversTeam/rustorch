@@ -29,11 +29,13 @@ use rustorch_gguf::{GgmlType, GgufFile};
 use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::kernels::{
-    add_inplace_f32, gqa_decode_f32, kv_append_f32, rms_norm_f32, rms_norm_per_head_f32,
-    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_lcpp_nr2_into,
-    sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
-    sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_lcpp_nr2_into,
-    swiglu_f32,
+    add_inplace_batched_f32, add_inplace_f32, gqa_decode_batched_f32, gqa_decode_f32,
+    kv_append_batched_f32, kv_append_f32, rms_norm_batched_f32, rms_norm_f32,
+    rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rope_half_split_batched_f32,
+    rope_half_split_f32, sgemv_q4_k_f32_batch_into, sgemv_q4_k_f32_into,
+    sgemv_q4_k_f32_lcpp_nr2_into, sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
+    sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_batch_into, sgemv_q6_k_f32_into,
+    sgemv_q6_k_f32_lcpp_nr2_into, swiglu_batched_f32, swiglu_f32,
 };
 
 use metal::Buffer;
@@ -1896,6 +1898,362 @@ fn forward_token_rank(
     argmax(&logits)
 }
 
+// T121 — Multi-token forward. Processes B input tokens at consecutive
+// sequence positions [pos_base, pos_base+1, ..., pos_base+B-1] in a single
+// pass through the model, using the batched kernels (T92, T106-T109,
+// T119-T120). KV cache is populated for all B positions. Returns B output
+// token argmaxes.
+//
+// The unique strength of forward_batch vs B sequential forward_tokens:
+// W weights are read ONCE per dispatch and reused across all B batches via
+// the GPU cache. Memory bandwidth per output reduces by ~B. So if speculative
+// candidates accept rate K/B, effective speedup ≈ K (per accepted token,
+// no extra W reads).
+//
+// Used by speculative decoding: input = [last_real_token, draft_1, ..., draft_{B-1}].
+// Verifier runs forward_batch, then we accept the longest matching prefix.
+fn forward_batch(
+    backend: &MetalBackend,
+    model: &ModelMetal,
+    tokens: &[u32],
+    pos_base: usize,
+    scratch: &mut Scratch,
+) -> Vec<u32> {
+    let b = tokens.len();
+    assert!(
+        b > 0 && b <= B_MAX,
+        "forward_batch: B must be in 1..={B_MAX}"
+    );
+    let cfg = model.cfg;
+    let d = cfg.d;
+    let f = cfg.f;
+    let n_heads = cfg.n_heads;
+    let n_kv = cfg.n_kv_heads;
+    let head_dim = cfg.head_dim;
+    let max_seq = cfg.max_seq;
+
+    // 0. Embed B tokens directly into xd_buf [B, d]
+    unsafe {
+        let dst_base = scratch.xd_buf.contents() as *mut f32;
+        for (bi, &tok) in tokens.iter().enumerate() {
+            let off = (tok as usize) * d;
+            std::ptr::copy_nonoverlapping(
+                model.token_emb.as_ptr().add(off),
+                dst_base.add(bi * d),
+                d,
+            );
+        }
+    }
+
+    for (li, layer) in model.layers.iter().enumerate() {
+        // 1. Batched RMSNorm (attn_norm) into h_buf [B, d]
+        rms_norm_batched_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.attn_norm_buf,
+            &scratch.h_buf,
+            d,
+            b,
+            cfg.rms_eps,
+        )
+        .unwrap();
+
+        // 2. QKV: 3 batched sgemv (Q4_K or Q6_K depending on dtype)
+        sgemv_q4_k_f32_batch_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_q.buffer,
+            &scratch.q_buf,
+            layer.w_q.k,
+            layer.w_q.n,
+            b,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_batch_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_k.buffer,
+            &scratch.k_buf,
+            layer.w_k.k,
+            layer.w_k.n,
+            b,
+        )
+        .unwrap();
+        match layer.w_v.dtype {
+            GgmlType::Q4_K => sgemv_q4_k_f32_batch_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_v.buffer,
+                &scratch.v_buf,
+                layer.w_v.k,
+                layer.w_v.n,
+                b,
+            )
+            .unwrap(),
+            GgmlType::Q6_K => sgemv_q6_k_f32_batch_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_v.buffer,
+                &scratch.v_buf,
+                layer.w_v.k,
+                layer.w_v.n,
+                b,
+            )
+            .unwrap(),
+            _ => panic!(
+                "forward_batch: unsupported w_v dtype: {:?}",
+                layer.w_v.dtype
+            ),
+        }
+
+        // 3. Batched QK norm + RoPE
+        if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
+            rms_norm_per_head_batched_f32(
+                backend,
+                &scratch.q_buf,
+                qn_buf,
+                n_heads,
+                head_dim,
+                b,
+                cfg.rms_eps,
+            )
+            .unwrap();
+        }
+        if let Some(kn_buf) = layer.attn_k_norm_buf.as_ref() {
+            rms_norm_per_head_batched_f32(
+                backend,
+                &scratch.k_buf,
+                kn_buf,
+                n_kv,
+                head_dim,
+                b,
+                cfg.rms_eps,
+            )
+            .unwrap();
+        }
+        rope_half_split_batched_f32(
+            backend,
+            &scratch.q_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_heads,
+            head_dim,
+            pos_base,
+            b,
+        )
+        .unwrap();
+        rope_half_split_batched_f32(
+            backend,
+            &scratch.k_buf,
+            &model.rope_cos_buf,
+            &model.rope_sin_buf,
+            n_kv,
+            head_dim,
+            pos_base,
+            b,
+        )
+        .unwrap();
+
+        // 4. Batched KV cache append
+        kv_append_batched_f32(
+            backend,
+            &scratch.k_buf,
+            &scratch.k_caches[li],
+            n_kv,
+            head_dim,
+            pos_base,
+            b,
+            max_seq,
+        )
+        .unwrap();
+        kv_append_batched_f32(
+            backend,
+            &scratch.v_buf,
+            &scratch.v_caches[li],
+            n_kv,
+            head_dim,
+            pos_base,
+            b,
+            max_seq,
+        )
+        .unwrap();
+
+        // 5. Batched GQA decode (causal mask multi-position)
+        gqa_decode_batched_f32(
+            backend,
+            &scratch.q_buf,
+            &scratch.k_caches[li],
+            &scratch.v_caches[li],
+            &scratch.attn_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            pos_base,
+            b,
+            max_seq,
+        )
+        .unwrap();
+
+        // 6. W_O batched sgemv + residual add
+        match layer.w_o.dtype {
+            GgmlType::Q4_K => sgemv_q4_k_f32_batch_into(
+                backend,
+                &scratch.attn_buf,
+                &layer.w_o.buffer,
+                &scratch.o_buf,
+                layer.w_o.k,
+                layer.w_o.n,
+                b,
+            )
+            .unwrap(),
+            GgmlType::Q6_K => sgemv_q6_k_f32_batch_into(
+                backend,
+                &scratch.attn_buf,
+                &layer.w_o.buffer,
+                &scratch.o_buf,
+                layer.w_o.k,
+                layer.w_o.n,
+                b,
+            )
+            .unwrap(),
+            _ => panic!(
+                "forward_batch: unsupported w_o dtype: {:?}",
+                layer.w_o.dtype
+            ),
+        }
+        add_inplace_batched_f32(backend, &scratch.xd_buf, &scratch.o_buf, d, b).unwrap();
+
+        // 7. Batched ffn_norm
+        rms_norm_batched_f32(
+            backend,
+            &scratch.xd_buf,
+            &layer.ffn_norm_buf,
+            &scratch.h_buf,
+            d,
+            b,
+            cfg.rms_eps,
+        )
+        .unwrap();
+
+        // 8. Gate + Up (batched Q4_K sgemv)
+        sgemv_q4_k_f32_batch_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_gate.buffer,
+            &scratch.gate_buf,
+            layer.w_gate.k,
+            layer.w_gate.n,
+            b,
+        )
+        .unwrap();
+        sgemv_q4_k_f32_batch_into(
+            backend,
+            &scratch.h_buf,
+            &layer.w_up.buffer,
+            &scratch.up_buf,
+            layer.w_up.k,
+            layer.w_up.n,
+            b,
+        )
+        .unwrap();
+
+        // 9. Batched SwiGLU
+        swiglu_batched_f32(
+            backend,
+            &scratch.gate_buf,
+            &scratch.up_buf,
+            &scratch.fd_buf,
+            f,
+            b,
+        )
+        .unwrap();
+
+        // 10. W_down batched sgemv + residual add
+        match layer.w_down.dtype {
+            GgmlType::Q4_K => sgemv_q4_k_f32_batch_into(
+                backend,
+                &scratch.fd_buf,
+                &layer.w_down.buffer,
+                &scratch.fc2_buf,
+                layer.w_down.k,
+                layer.w_down.n,
+                b,
+            )
+            .unwrap(),
+            GgmlType::Q6_K => sgemv_q6_k_f32_batch_into(
+                backend,
+                &scratch.fd_buf,
+                &layer.w_down.buffer,
+                &scratch.fc2_buf,
+                layer.w_down.k,
+                layer.w_down.n,
+                b,
+            )
+            .unwrap(),
+            _ => panic!(
+                "forward_batch: unsupported w_down dtype: {:?}",
+                layer.w_down.dtype
+            ),
+        }
+        add_inplace_batched_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d, b).unwrap();
+    }
+
+    // Final norm + lm_head batched
+    rms_norm_batched_f32(
+        backend,
+        &scratch.xd_buf,
+        &model.final_norm_buf,
+        &scratch.h_buf,
+        d,
+        b,
+        cfg.rms_eps,
+    )
+    .unwrap();
+    match model.lm_head.dtype {
+        GgmlType::Q4_K => sgemv_q4_k_f32_batch_into(
+            backend,
+            &scratch.h_buf,
+            &model.lm_head.buffer,
+            &scratch.logits_buf,
+            model.lm_head.k,
+            model.lm_head.n,
+            b,
+        )
+        .unwrap(),
+        GgmlType::Q6_K => sgemv_q6_k_f32_batch_into(
+            backend,
+            &scratch.h_buf,
+            &model.lm_head.buffer,
+            &scratch.logits_buf,
+            model.lm_head.k,
+            model.lm_head.n,
+            b,
+        )
+        .unwrap(),
+        _ => panic!(
+            "forward_batch: unsupported lm_head dtype: {:?}",
+            model.lm_head.dtype
+        ),
+    }
+
+    backend.drain();
+
+    // Argmax for each batch position
+    let mut next_tokens = Vec::with_capacity(b);
+    let mut logits = vec![0.0_f32; cfg.vocab];
+    for bi in 0..b {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (scratch.logits_buf.contents() as *const f32).add(bi * cfg.vocab),
+                logits.as_mut_ptr(),
+                cfg.vocab,
+            );
+        }
+        next_tokens.push(argmax(&logits));
+    }
+    next_tokens
+}
+
 struct Scratch {
     x: Vec<f32>,
     h: Vec<f32>,
@@ -1931,6 +2289,11 @@ struct Scratch {
     v_caches: Vec<Buffer>,
 }
 
+/// T121 — Maximum batch size for forward_batch (multi-token forward).
+/// Scratch buffers are pre-allocated for B_MAX tokens; smaller B uses
+/// only the relevant slice.
+const B_MAX: usize = 4;
+
 impl Scratch {
     fn new(backend: &MetalBackend, cfg: &ModelCfg) -> Self {
         let d = cfg.d;
@@ -1950,18 +2313,20 @@ impl Scratch {
             fc2_out: vec![0.0; d],
             k_trim: vec![0.0; max_kv],
             v_trim: vec![0.0; max_kv],
-            xd_buf: backend.alloc_shared(d * 4).unwrap(),
-            h_buf: backend.alloc_shared(d * 4).unwrap(),
-            fd_buf: backend.alloc_shared(f * 4).unwrap(),
-            q_buf: backend.alloc_shared(d * 4).unwrap(),
-            k_buf: backend.alloc_shared(kv_dim * 4).unwrap(),
-            v_buf: backend.alloc_shared(kv_dim * 4).unwrap(),
-            o_buf: backend.alloc_shared(d * 4).unwrap(),
-            attn_buf: backend.alloc_shared(d * 4).unwrap(),
-            gate_buf: backend.alloc_shared(f * 4).unwrap(),
-            up_buf: backend.alloc_shared(f * 4).unwrap(),
-            fc2_buf: backend.alloc_shared(d * 4).unwrap(),
-            logits_buf: backend.alloc_shared(cfg.vocab * 4).unwrap(),
+            // T121 — pre-allocate B_MAX × per-token-size for forward_batch.
+            // Single-token paths use only the first slice (b=0).
+            xd_buf: backend.alloc_shared(d * B_MAX * 4).unwrap(),
+            h_buf: backend.alloc_shared(d * B_MAX * 4).unwrap(),
+            fd_buf: backend.alloc_shared(f * B_MAX * 4).unwrap(),
+            q_buf: backend.alloc_shared(d * B_MAX * 4).unwrap(),
+            k_buf: backend.alloc_shared(kv_dim * B_MAX * 4).unwrap(),
+            v_buf: backend.alloc_shared(kv_dim * B_MAX * 4).unwrap(),
+            o_buf: backend.alloc_shared(d * B_MAX * 4).unwrap(),
+            attn_buf: backend.alloc_shared(d * B_MAX * 4).unwrap(),
+            gate_buf: backend.alloc_shared(f * B_MAX * 4).unwrap(),
+            up_buf: backend.alloc_shared(f * B_MAX * 4).unwrap(),
+            fc2_buf: backend.alloc_shared(d * B_MAX * 4).unwrap(),
+            logits_buf: backend.alloc_shared(cfg.vocab * B_MAX * 4).unwrap(),
             k_caches: (0..cfg.n_layers)
                 .map(|_| backend.alloc_shared(max_kv * 4).unwrap())
                 .collect(),
@@ -2096,6 +2461,7 @@ fn main() -> ExitCode {
     let mut sparsity_profile = false;
     let mut ngram_profile = false;
     let mut rank_profile = false;
+    let mut batch_test = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2146,6 +2512,11 @@ fn main() -> ExitCode {
                 args.remove(i);
                 continue;
             },
+            "--batch-test" => {
+                batch_test = true;
+                args.remove(i);
+                continue;
+            },
             _ => {},
         }
         i += 1;
@@ -2178,6 +2549,10 @@ fn main() -> ExitCode {
             forward_token_sparsity(backend, &model, tok, cur_pos, &mut scratch, &mut sparsity)
         } else if rank_profile {
             forward_token_rank(backend, &model, tok, cur_pos, &mut scratch, &mut rank_stats)
+        } else if batch_test {
+            // T121 — forward_batch with B=1, parity test vs forward_token
+            let outs = forward_batch(backend, &model, &[tok], cur_pos, &mut scratch);
+            outs[0]
         } else {
             forward_token(backend, &model, tok, cur_pos, &mut scratch)
         };
@@ -2218,6 +2593,9 @@ fn main() -> ExitCode {
                 &mut scratch,
                 &mut rank_stats,
             )
+        } else if batch_test {
+            let outs = forward_batch(backend, &model, &[last], cur_pos, &mut scratch);
+            outs[0]
         } else {
             forward_token(backend, &model, last, cur_pos, &mut scratch)
         };
