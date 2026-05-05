@@ -5577,15 +5577,26 @@ const ADD_INPLACE_F32_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// In-place residual add: x[i] += y[i].
+// T114 — In-place residual add with float4 vectorization.
+// 1 thread = 4 elements via float4. d=5120 → 1280 threads instead of 5120.
 kernel void add_inplace_f32(
     device float* x       [[buffer(0)]],
     device const float* y [[buffer(1)]],
     constant uint& d      [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= d) return;
-    x[gid] += y[gid];
+    uint d4 = d / 4u;
+    if (gid < d4) {
+        device float4* x4       = (device float4*)x;
+        device const float4* y4 = (device const float4*)y;
+        x4[gid] += y4[gid];
+        return;
+    }
+    // Scalar tail
+    uint i = d4 * 4u + (gid - d4);
+    if (i < d) {
+        x[i] += y[i];
+    }
 }
 "#;
 
@@ -5605,7 +5616,10 @@ pub fn add_inplace_f32(
         encoder.set_buffer(1, Some(y_buf), 0);
         encoder.set_bytes(2, 4, &d_u as *const u32 as *const std::ffi::c_void);
         let tg_size = MTLSize::new(256, 1, 1);
-        let grid = MTLSize::new(d as u64, 1, 1);
+        // T114 — float4 vectorized: d/4 threads + tail
+        let d4 = (d / 4) as u64;
+        let tail = (d % 4) as u64;
+        let grid = MTLSize::new(d4 + tail, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
     });
     Ok(())
