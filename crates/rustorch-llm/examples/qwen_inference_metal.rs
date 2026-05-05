@@ -928,9 +928,13 @@ fn forward_token(
 
     // Embed (CPU lookup, written into xd_buf as residual stream).
     let off = (token_id as usize) * d;
-    scratch.x.copy_from_slice(&model.token_emb[off..off + d]);
+    // T117 — direct copy from token_emb into xd_buf (skip scratch.x intermediate)
     unsafe {
-        std::ptr::copy_nonoverlapping(scratch.x.as_ptr(), scratch.xd_buf.contents() as *mut f32, d);
+        std::ptr::copy_nonoverlapping(
+            model.token_emb.as_ptr().add(off),
+            scratch.xd_buf.contents() as *mut f32,
+            d,
+        );
     }
 
     for (li, layer) in model.layers.iter().enumerate() {
@@ -1193,9 +1197,13 @@ fn forward_token_profiled(
     // 0. Embed (CPU memcpy).
     let t = Instant::now();
     let off = (token_id as usize) * d;
-    scratch.x.copy_from_slice(&model.token_emb[off..off + d]);
+    // T117 — direct copy from token_emb into xd_buf (skip scratch.x intermediate)
     unsafe {
-        std::ptr::copy_nonoverlapping(scratch.x.as_ptr(), scratch.xd_buf.contents() as *mut f32, d);
+        std::ptr::copy_nonoverlapping(
+            model.token_emb.as_ptr().add(off),
+            scratch.xd_buf.contents() as *mut f32,
+            d,
+        );
     }
     stages.embed += t.elapsed();
 
@@ -1459,9 +1467,13 @@ fn forward_token_sparsity(
     let max_seq = cfg.max_seq;
 
     let off = (token_id as usize) * d;
-    scratch.x.copy_from_slice(&model.token_emb[off..off + d]);
+    // T117 — direct copy from token_emb into xd_buf (skip scratch.x intermediate)
     unsafe {
-        std::ptr::copy_nonoverlapping(scratch.x.as_ptr(), scratch.xd_buf.contents() as *mut f32, d);
+        std::ptr::copy_nonoverlapping(
+            model.token_emb.as_ptr().add(off),
+            scratch.xd_buf.contents() as *mut f32,
+            d,
+        );
     }
 
     let mut fd_scratch = vec![0.0_f32; f];
@@ -1673,9 +1685,13 @@ fn forward_token_rank(
     let max_seq = cfg.max_seq;
 
     let off = (token_id as usize) * d;
-    scratch.x.copy_from_slice(&model.token_emb[off..off + d]);
+    // T117 — direct copy from token_emb into xd_buf (skip scratch.x intermediate)
     unsafe {
-        std::ptr::copy_nonoverlapping(scratch.x.as_ptr(), scratch.xd_buf.contents() as *mut f32, d);
+        std::ptr::copy_nonoverlapping(
+            model.token_emb.as_ptr().add(off),
+            scratch.xd_buf.contents() as *mut f32,
+            d,
+        );
     }
 
     let mut h_scratch = vec![0.0_f32; d];
