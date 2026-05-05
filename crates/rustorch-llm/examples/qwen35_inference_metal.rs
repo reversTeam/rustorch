@@ -49,7 +49,7 @@ use rustorch_metal::kernels::{
     add_inplace_f32, delta_net_step_f32, gqa_decode_f32, kv_append_f32, l2_norm_per_head_f32,
     rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
     sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q8_0_f32_lcpp_nsg2_into, ssm_conv1d_step_f32, swiglu_f32,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_mul_inplace_f32, ssm_conv1d_step_f32, swiglu_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -809,6 +809,7 @@ fn attn_block_forward(
     rope_sin: &Buffer,
     cfg: &Qwen35Config,
     position: usize,
+    max_seq: usize,
 ) -> Result<(), MetalError> {
     let d = cfg.d;
     let head_dim = cfg.attn_head_dim;
@@ -874,7 +875,7 @@ fn attn_block_forward(
         n_kv,
         head_dim,
         position,
-        cfg.max_context.min(2048), // cap by max_seq the cache was sized to
+        max_seq,
     )?;
     kv_append_f32(
         backend,
@@ -883,7 +884,7 @@ fn attn_block_forward(
         n_kv,
         head_dim,
         position,
-        cfg.max_context.min(2048),
+        max_seq,
     )?;
 
     // 8. GQA decode → attn_out (q_dim).
@@ -897,13 +898,12 @@ fn attn_block_forward(
         n_kv,
         head_dim,
         position + 1,
-        cfg.max_context.min(2048),
+        max_seq,
     )?;
 
-    // 9. Apply sigmoid(gate) on attention output (Qwen3Next gate).
-    backend.drain();
-    sigmoid_inplace_cpu(&scratch.gate_attn, q_dim);
-    mul_inplace_cpu(&scratch.attn_out, &scratch.gate_attn, q_dim);
+    // 9. Apply sigmoid(gate) on attention output (Qwen3Next gate) — fused
+    //    Metal kernel `attn_out *= sigmoid(gate_attn)` (T144c). No drain.
+    sigmoid_mul_inplace_f32(backend, &scratch.attn_out, &scratch.gate_attn, q_dim)?;
     let _ = kv_dim; // silence unused
 
     // 10. W_O @ attn_out → o, then xd += o.
@@ -972,81 +972,28 @@ fn ssm_block_forward(
         cfg.ssm_conv_kernel,
         conv_dim,
     )?;
+    // 5. (SiLU was fused into ssm_conv1d_step_f32 in T144b — no CPU pass.)
+    // 6. Split q, k, v from conv_out into separate Metal buffers.
+    //    Both 27B and 35B use n_v_heads = repeat * n_k_heads (27B: 48 = 3 × 16,
+    //    35B-A3B: 32 = 2 × 16), so we keep q,k at length [n_k_heads, head_dim] and
+    //    let delta_net_step broadcast inline. Only v needs to be n_v_heads-wide.
     backend.drain();
-
-    // 5. SiLU(conv_out) — CPU since we don't have an in-place SiLU kernel
-    // and conv_dim is modest (10240 for 27B).
-    silu_inplace_cpu(&scratch.conv_out, conv_dim);
-
-    // 6. Split q, k, v from conv_out (GPU buffer; CPU views).
     unsafe {
         let conv_p = scratch.conv_out.contents() as *const f32;
-        // q at offset 0 (length key_dim), k at offset key_dim, v at offset 2*key_dim.
         let q_p = scratch.q_ssm.contents() as *mut f32;
         let k_p = scratch.k_ssm.contents() as *mut f32;
         let v_p = scratch.v_ssm.contents() as *mut f32;
-        // For now copy q,k into staging buffers of size [n_k, head_v_dim],
-        // l2-norm them, then broadcast into [n_v, head_v_dim] in q_ssm/k_ssm.
-        // We use scratch.q (q_dim-sized) as a temporary for q_pre/k_pre — it's
-        // big enough since q_dim >= key_dim in the 27B (12288 > 2048).
-        let _ = q_p;
-        let _ = k_p;
-        std::ptr::copy_nonoverlapping(conv_p.add(2 * key_dim), v_p, value_dim);
-        // Copy q,k into the front of scratch.q (used as a temporary).
-        let tmp_qk = scratch.q.contents() as *mut f32;
-        std::ptr::copy_nonoverlapping(conv_p, tmp_qk, key_dim);
-        std::ptr::copy_nonoverlapping(conv_p.add(key_dim), tmp_qk.add(key_dim), key_dim);
+        std::ptr::copy_nonoverlapping(conv_p, q_p, key_dim); // [n_k, head_dim]
+        std::ptr::copy_nonoverlapping(conv_p.add(key_dim), k_p, key_dim); // [n_k, head_dim]
+        std::ptr::copy_nonoverlapping(conv_p.add(2 * key_dim), v_p, value_dim); // [n_v, head_dim]
     }
 
-    // 7. Per-head L2 norm on q (n_k heads) and k (n_k heads) — operate on
-    // the staging buffer (scratch.q) at offsets [0..key_dim] for q and
-    // [key_dim..2*key_dim] for k. Easiest: split scratch.q into two views
-    // by passing offset buffers — but our l2_norm_per_head_f32 takes a
-    // single buffer at offset 0. So we call it twice on different regions
-    // by using sub-buffers... Metal doesn't support sub-buffers ergonomically
-    // here. Instead, copy q to scratch.q_ssm (no broadcast yet, just length
-    // key_dim) and k to scratch.k_ssm (length key_dim), call L2 norm on
-    // each, then broadcast to value_dim.
-    unsafe {
-        let tmp_qk = scratch.q.contents() as *const f32;
-        let q_p = scratch.q_ssm.contents() as *mut f32;
-        let k_p = scratch.k_ssm.contents() as *mut f32;
-        std::ptr::copy_nonoverlapping(tmp_qk, q_p, key_dim);
-        std::ptr::copy_nonoverlapping(tmp_qk.add(key_dim), k_p, key_dim);
-    }
+    // 7. Per-head L2 norm on q,k (n_k heads each).
     l2_norm_per_head_f32(backend, &scratch.q_ssm, n_k, head_v_dim, eps)?;
     l2_norm_per_head_f32(backend, &scratch.k_ssm, n_k, head_v_dim, eps)?;
-    backend.drain();
 
-    // 8. Broadcast q,k from n_k heads to n_v heads (CPU, n_v*head_v_dim is small).
-    if n_v != n_k {
-        // Broadcast in place: we read scratch.q_ssm[..key_dim] and rewrite
-        // it to scratch.q_ssm[..value_dim]. Since broadcast expands, do it
-        // back-to-front to avoid clobber.
-        unsafe {
-            let q_p = scratch.q_ssm.contents() as *mut f32;
-            let k_p = scratch.k_ssm.contents() as *mut f32;
-            let repeat = n_v / n_k;
-            // Read source first (n_k * head_v_dim small)
-            let mut q_src = vec![0.0_f32; key_dim];
-            let mut k_src = vec![0.0_f32; key_dim];
-            std::ptr::copy_nonoverlapping(q_p, q_src.as_mut_ptr(), key_dim);
-            std::ptr::copy_nonoverlapping(k_p, k_src.as_mut_ptr(), key_dim);
-            for h_v in 0..n_v {
-                let h_k = h_v / repeat;
-                std::ptr::copy_nonoverlapping(
-                    q_src.as_ptr().add(h_k * head_v_dim),
-                    q_p.add(h_v * head_v_dim),
-                    head_v_dim,
-                );
-                std::ptr::copy_nonoverlapping(
-                    k_src.as_ptr().add(h_k * head_v_dim),
-                    k_p.add(h_v * head_v_dim),
-                    head_v_dim,
-                );
-            }
-        }
-    }
+    // 8. (Broadcast q,k from n_k → n_v eliminated — delta_net_step handles
+    //    the broadcast inline via integer division of head_v.)
 
     // 9. Delta-net step: state := exp(gate_h) * state + beta * outer(v, k); out = state @ q.
     delta_net_step_f32(
@@ -1060,6 +1007,7 @@ fn ssm_block_forward(
         &scratch.ssm_out_buf,
         n_v,
         head_v_dim,
+        n_k,
     )?;
 
     // 10. Per-head RMSNorm gated by silu(z).
@@ -1150,6 +1098,7 @@ fn forward_token(
                     &state.rope_sin,
                     cfg,
                     position,
+                    state.max_seq,
                 )
                 .map_err(|e| format!("layer {li} attn: {e:?}"))?;
                 // Post-attention norm (h := norm(xd, attn_post_norm)) for FFN input.

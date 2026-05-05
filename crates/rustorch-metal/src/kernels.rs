@@ -7335,7 +7335,9 @@ kernel void ssm_conv1d_step_f32(
     // Add current input × kernel[K-1].
     float xv = x_in[gid];
     acc += conv1d_w[(kernel_size - 1) * conv_dim + gid] * xv;
-    y_out[gid] = acc;
+    // T144b — fuse SiLU on conv output (was a separate CPU pass).
+    float sig = 1.0 / (1.0 + exp(-acc));
+    y_out[gid] = acc * sig;
 
     // Update ring buffer: shift left by one timestep, append current input
     // at last history slot. Each thread handles its own channel — no race.
@@ -7490,30 +7492,33 @@ const DELTA_NET_STEP_F32_SHADER: &str = r#"
 using namespace metal;
 
 kernel void delta_net_step_f32(
-    device const float*  q          [[buffer(0)]],   // [n_v_heads, head_dim]
-    device const float*  k          [[buffer(1)]],   // [n_v_heads, head_dim]
+    device const float*  q          [[buffer(0)]],   // [n_k_heads, head_dim] — broadcast inline
+    device const float*  k          [[buffer(1)]],   // [n_k_heads, head_dim] — broadcast inline
     device const float*  v          [[buffer(2)]],   // [n_v_heads, head_dim]
-    device const float*  gate_h     [[buffer(3)]],   // [n_v_heads] — already softplus*ssm_a
-    device const float*  beta       [[buffer(4)]],   // [n_v_heads] — already sigmoid'd
-    device float*        state      [[buffer(5)]],   // [n_v_heads, head_dim, head_dim] — read+write
+    device const float*  gate_h     [[buffer(3)]],   // [n_v_heads]
+    device const float*  beta       [[buffer(4)]],   // [n_v_heads]
+    device float*        state      [[buffer(5)]],   // [n_v_heads, head_dim, head_dim]
     device float*        out        [[buffer(6)]],   // [n_v_heads, head_dim]
-    constant uint2&      dims       [[buffer(7)]],   // (n_v_heads, head_dim)
+    constant uint4&      dims       [[buffer(7)]],   // (n_v_heads, head_dim, n_k_heads, repeat)
     uint2                tg_id      [[threadgroup_position_in_grid]],
     ushort               tiisg      [[thread_index_in_simdgroup]]
 ) {
     uint n_v_heads = dims.x;
     uint head_dim  = dims.y;
-    uint head = tg_id.y;
-    uint row  = tg_id.x;
-    if (head >= n_v_heads || row >= head_dim) return;
+    uint repeat    = dims.w;   // n_v_heads / n_k_heads
+    uint head_v = tg_id.y;
+    uint row    = tg_id.x;
+    if (head_v >= n_v_heads || row >= head_dim) return;
 
-    float gate_val = exp(gate_h[head]);
-    float beta_val = beta[head];
-    float v_r = v[head * head_dim + row];
+    // Broadcast Q,K from n_k_heads to n_v_heads via integer division.
+    uint head_k = head_v / repeat;
 
-    // Each thread handles columns [tiisg, tiisg+32, ...]
-    uint state_off = head * head_dim * head_dim + row * head_dim;
-    uint qk_off    = head * head_dim;
+    float gate_val = exp(gate_h[head_v]);
+    float beta_val = beta[head_v];
+    float v_r = v[head_v * head_dim + row];
+
+    uint state_off = head_v * head_dim * head_dim + row * head_dim;
+    uint qk_off    = head_k * head_dim;
 
     float out_partial = 0.0;
     for (uint c = tiisg; c < head_dim; c += 32u) {
@@ -7524,10 +7529,9 @@ kernel void delta_net_step_f32(
         out_partial += updated * q_c;
     }
 
-    // Reduce across the 32 simdgroup threads → one output per (head, row).
     float row_sum = simd_sum(out_partial);
     if (tiisg == 0) {
-        out[head * head_dim + row] = row_sum;
+        out[head_v * head_dim + row] = row_sum;
     }
 }
 "#;
@@ -7542,6 +7546,11 @@ kernel void delta_net_step_f32(
 /// to have applied L2 norm to q/k and broadcast from n_k_heads to n_v_heads.
 /// `gate_h` is `[n_v_heads]` (already softplus(alpha + dt_bias) * ssm_a).
 /// `beta` is `[n_v_heads]` (already sigmoid).
+///
+/// `q_buf` and `k_buf` are stored as `[n_k_heads, head_dim]` and the kernel
+/// broadcasts each Q/K head to `n_v_heads / n_k_heads` consecutive value
+/// heads via integer division. This eliminates the prior CPU broadcast pass.
+/// `n_v_heads` must be a multiple of `n_k_heads`.
 #[allow(clippy::too_many_arguments)]
 pub fn delta_net_step_f32(
     backend: &MetalBackend,
@@ -7554,10 +7563,12 @@ pub fn delta_net_step_f32(
     out_buf: &Buffer,
     n_v_heads: usize,
     head_dim: usize,
+    n_k_heads: usize,
 ) -> Result<(), MetalError> {
-    if n_v_heads == 0 || head_dim == 0 {
+    if n_v_heads == 0 || head_dim == 0 || n_k_heads == 0 || n_v_heads % n_k_heads != 0 {
         return Err(MetalError::ShapeMismatch(format!(
-            "delta_net_step_f32: n_v_heads={n_v_heads}, head_dim={head_dim}"
+            "delta_net_step_f32: n_v_heads={n_v_heads} must be a multiple of \
+             n_k_heads={n_k_heads}, head_dim={head_dim}"
         )));
     }
     let pipeline = backend.pipeline(
@@ -7565,7 +7576,8 @@ pub fn delta_net_step_f32(
         DELTA_NET_STEP_F32_SHADER,
         "delta_net_step_f32",
     )?;
-    let dims = [n_v_heads as u32, head_dim as u32];
+    let repeat = (n_v_heads / n_k_heads) as u32;
+    let dims = [n_v_heads as u32, head_dim as u32, n_k_heads as u32, repeat];
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(q_buf), 0);
@@ -7575,7 +7587,7 @@ pub fn delta_net_step_f32(
         encoder.set_buffer(4, Some(beta_buf), 0);
         encoder.set_buffer(5, Some(state_buf), 0);
         encoder.set_buffer(6, Some(out_buf), 0);
-        encoder.set_bytes(7, 8, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(7, 16, dims.as_ptr() as *const std::ffi::c_void);
         let tg = MTLSize::new(32, 1, 1);
         // Grid: x = row index (head_dim values), y = head index, z = 1.
         let grid = MTLSize::new(32 * head_dim as u64, n_v_heads as u64, 1);
@@ -7656,6 +7668,58 @@ pub fn rms_norm_per_head_gated_f32(
         encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
         let tg = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32, n_heads as u64, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// T144c — Fused `out *= sigmoid(gate)` in place. Used by Qwen3Next
+// attention to apply the per-head gate to the post-GQA output before the
+// W_O projection. Eliminates one drain + CPU pass per attention layer
+// (16 layers × 1 drain ≈ 1.5 ms per token saved on the 27B).
+const SIGMOID_MUL_INPLACE_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void sigmoid_mul_inplace_f32(
+    device float*        x       [[buffer(0)]],   // out, in place
+    device const float*  gate    [[buffer(1)]],
+    constant uint&       n       [[buffer(2)]],
+    uint                 gid     [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float g = gate[gid];
+    float sig = 1.0 / (1.0 + exp(-g));
+    x[gid] = x[gid] * sig;
+}
+"#;
+
+/// `x[i] *= sigmoid(gate[i])` for `i` in `0..n`. Both buffers must be
+/// `n` f32s long. Used by Qwen3Next attention's per-head gating.
+pub fn sigmoid_mul_inplace_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    gate_buf: &Buffer,
+    n: usize,
+) -> Result<(), MetalError> {
+    if n == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "sigmoid_mul_inplace_f32: n must be > 0".to_string(),
+        ));
+    }
+    let pipeline = backend.pipeline(
+        "sigmoid_mul_inplace_f32",
+        SIGMOID_MUL_INPLACE_F32_SHADER,
+        "sigmoid_mul_inplace_f32",
+    )?;
+    let n_u = n as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(gate_buf), 0);
+        encoder.set_bytes(2, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, 1, 1);
         encoder.dispatch_threads(grid, tg);
     });
     Ok(())
