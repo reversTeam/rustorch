@@ -572,34 +572,53 @@ fn forward_token(
         // attention layer instead of 3 — still a clear win over the
         // pre-T80 split path.
         // T84: quadcoop-fused QKV. With Q4_K K=5120 (bpr=20),
-        // 4-output-per-simdgroup beats both simple (under-saturates GPU)
-        // and simdcoop (wastes 32-bpr=12 threads per group).
+        // T95 — QKV via 3× lcpp_nr2 dispatches (replaces triple_quadcoop).
+        // Same chained-encoder amortization argument as T94 for gate+up.
+        // For Q4_K W_v case: 3 separate lcpp_nr2 calls. Else: 2 + matmul_into.
         if matches!(layer.w_v.dtype, GgmlType::Q4_K) {
-            sgemv_q4_k_f32_triple_quadcoop_into(
+            sgemv_q4_k_f32_lcpp_nr2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
-                &layer.w_k.buffer,
-                &layer.w_v.buffer,
                 &scratch.q_buf,
-                &scratch.k_buf,
-                &scratch.v_buf,
                 layer.w_q.k,
                 layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
                 layer.w_k.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_v.buffer,
+                &scratch.v_buf,
+                layer.w_v.k,
                 layer.w_v.n,
             )
             .unwrap();
         } else {
-            sgemv_q4_k_f32_pair_quadcoop_into(
+            sgemv_q4_k_f32_lcpp_nr2_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_q.buffer,
-                &layer.w_k.buffer,
                 &scratch.q_buf,
-                &scratch.k_buf,
                 layer.w_q.k,
                 layer.w_q.n,
+            )
+            .unwrap();
+            sgemv_q4_k_f32_lcpp_nr2_into(
+                backend,
+                &scratch.h_buf,
+                &layer.w_k.buffer,
+                &scratch.k_buf,
+                layer.w_k.k,
                 layer.w_k.n,
             )
             .unwrap();
