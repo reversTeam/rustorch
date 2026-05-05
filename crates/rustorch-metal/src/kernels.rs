@@ -4982,6 +4982,70 @@ pub fn kv_append_f32(
     Ok(())
 }
 
+// T108 — Batched K-only or V-only append. Writes B sequential positions
+// (pos_base, pos_base+1, ..., pos_base+B-1) into the cache from a packed
+// source [B, n_kv * head_dim].
+const KV_APPEND_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void kv_append_batched_f32(
+    device const float* src  [[buffer(0)]],   // [B, n_kv * head_dim]
+    device float* dst        [[buffer(1)]],   // [n_kv, max_seq, head_dim]
+    constant uint4& dims     [[buffer(2)]],   // (n_kv, head_dim, pos_base, B)
+    constant uint& max_seq   [[buffer(3)]],
+    uint gid                 [[thread_position_in_grid]]
+) {
+    uint n_kv     = dims.x;
+    uint head_dim = dims.y;
+    uint pos_base = dims.z;
+    uint B        = dims.w;
+    uint per_token = n_kv * head_dim;
+    uint total = B * per_token;
+    if (gid >= total) return;
+
+    uint b   = gid / per_token;
+    uint flat = gid % per_token;
+    uint kvh = flat / head_dim;
+    uint dd  = flat % head_dim;
+    uint dst_off = kvh * max_seq * head_dim + (pos_base + b) * head_dim + dd;
+    dst[dst_off] = src[gid];
+}
+"#;
+
+/// T108 — Batched KV append. Writes B sequential positions into the cache.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_append_batched_f32(
+    backend: &MetalBackend,
+    src_buf: &Buffer,
+    dst_cache_buf: &Buffer,
+    n_kv: usize,
+    head_dim: usize,
+    position_base: usize,
+    b: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "kv_append_batched_f32",
+        KV_APPEND_BATCHED_F32_SHADER,
+        "kv_append_batched_f32",
+    )?;
+    let dims = [n_kv as u32, head_dim as u32, position_base as u32, b as u32];
+    let ms = max_seq as u32;
+    let total = b * n_kv * head_dim;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src_buf), 0);
+        encoder.set_buffer(1, Some(dst_cache_buf), 0);
+        encoder.set_bytes(2, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(3, 4, &ms as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(total as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 // T96 — Fused K+V append. 1 dispatch instead of 2 per layer × 40 layers.
 const KV_APPEND_KV_F32_SHADER: &str = r#"
 #include <metal_stdlib>
@@ -5119,6 +5183,87 @@ pub fn rope_half_split_f32(
         encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
         let tg_size = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new(total as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+// T107 — Batched RoPE. Process B rows of [n_heads * head_dim] in parallel,
+// each row at a distinct sequence position position_base + b. Same cos/sin
+// tables shared. 1 thread per (batch, head, k_in_half_dim).
+const ROPE_HALF_SPLIT_BATCHED_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rope_half_split_batched_f32(
+    device float* x              [[buffer(0)]],   // [B, n_heads * head_dim]
+    device const float* cos_tab  [[buffer(1)]],
+    device const float* sin_tab  [[buffer(2)]],
+    constant uint4& dims         [[buffer(3)]],   // (n_heads, head_dim, position_base, B)
+    uint2 gid                    [[thread_position_in_grid]]
+) {
+    uint n_heads  = dims.x;
+    uint head_dim = dims.y;
+    uint pos_base = dims.z;
+    uint B        = dims.w;
+
+    uint b = gid.y;
+    if (b >= B) return;
+
+    uint half_dim = head_dim / 2u;
+    uint flat = gid.x;
+    uint total = n_heads * half_dim;
+    if (flat >= total) return;
+
+    uint h = flat / half_dim;
+    uint k = flat % half_dim;
+    uint row_off = b * (n_heads * head_dim);
+    uint i0 = row_off + h * head_dim + k;
+    uint i1 = row_off + h * head_dim + k + half_dim;
+
+    uint position = pos_base + b;
+    uint tab_off = position * half_dim + k;
+    float c = cos_tab[tab_off];
+    float s = sin_tab[tab_off];
+    float x0 = x[i0];
+    float x1 = x[i1];
+    x[i0] = x0 * c - x1 * s;
+    x[i1] = x1 * c + x0 * s;
+}
+"#;
+
+/// T107 — Batched RoPE. Apply half-split RoPE in place to B rows of
+/// [n_heads * head_dim], each at sequence position `position_base + b`.
+pub fn rope_half_split_batched_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    cos_buf: &Buffer,
+    sin_buf: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    position_base: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "rope_half_split_batched_f32",
+        ROPE_HALF_SPLIT_BATCHED_SHADER,
+        "rope_half_split_batched_f32",
+    )?;
+    let dims = [
+        n_heads as u32,
+        head_dim as u32,
+        position_base as u32,
+        b as u32,
+    ];
+    let total = n_heads * (head_dim / 2);
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(cos_buf), 0);
+        encoder.set_buffer(2, Some(sin_buf), 0);
+        encoder.set_bytes(3, 16, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(total as u64, b as u64, 1);
         encoder.dispatch_threads(grid, tg_size);
     });
     Ok(())
@@ -6480,6 +6625,226 @@ mod tests {
                     "batch={batch} i={i} mismatch: seq={a} batch={bv} (rel {r:.3e})"
                 );
             }
+        }
+    }
+
+    /// T107 — Batched RoPE must match B sequential rope_half_split calls
+    /// at consecutive positions (pos_base + b for b in 0..B).
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn rope_half_split_batched_f32_matches_singles() {
+        let backend = metal_backend();
+        let n_heads = 4usize;
+        let head_dim = 64usize;
+        let max_seq = 32usize;
+        let pos_base = 5usize;
+        let b = 4usize;
+        let row_size = n_heads * head_dim;
+
+        // Build B different rows
+        let mut x_all = vec![0.0f32; b * row_size];
+        for batch in 0..b {
+            for i in 0..row_size {
+                x_all[batch * row_size + i] = ((i as f32 + 1.0 + batch as f32) * 0.01).sin();
+            }
+        }
+        // Build cos/sin tables [max_seq, head_dim/2]
+        let half_dim = head_dim / 2;
+        let mut cos_tab = vec![0.0f32; max_seq * half_dim];
+        let mut sin_tab = vec![0.0f32; max_seq * half_dim];
+        for p in 0..max_seq {
+            for k in 0..half_dim {
+                let theta = (p as f32) * 0.001 * ((k + 1) as f32);
+                cos_tab[p * half_dim + k] = theta.cos();
+                sin_tab[p * half_dim + k] = theta.sin();
+            }
+        }
+
+        let cos_buf = backend.alloc_shared(max_seq * half_dim * 4).unwrap();
+        let sin_buf = backend.alloc_shared(max_seq * half_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cos_tab.as_ptr(),
+                cos_buf.contents() as *mut f32,
+                max_seq * half_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                sin_tab.as_ptr(),
+                sin_buf.contents() as *mut f32,
+                max_seq * half_dim,
+            );
+        }
+
+        // Reference: B sequential calls
+        let mut x_seq = vec![0.0f32; b * row_size];
+        for batch in 0..b {
+            let xb_buf = backend.alloc_shared(row_size * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    x_all[batch * row_size..(batch + 1) * row_size].as_ptr(),
+                    xb_buf.contents() as *mut f32,
+                    row_size,
+                );
+            }
+            rope_half_split_f32(
+                backend,
+                &xb_buf,
+                &cos_buf,
+                &sin_buf,
+                n_heads,
+                head_dim,
+                pos_base + batch,
+            )
+            .unwrap();
+            backend.drain();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    xb_buf.contents() as *const f32,
+                    x_seq[batch * row_size..(batch + 1) * row_size].as_mut_ptr(),
+                    row_size,
+                );
+            }
+        }
+
+        // Batched call
+        let x_batch_buf = backend.alloc_shared(b * row_size * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                x_all.as_ptr(),
+                x_batch_buf.contents() as *mut f32,
+                b * row_size,
+            );
+        }
+        rope_half_split_batched_f32(
+            backend,
+            &x_batch_buf,
+            &cos_buf,
+            &sin_buf,
+            n_heads,
+            head_dim,
+            pos_base,
+            b,
+        )
+        .unwrap();
+        backend.drain();
+        let x_batch = unsafe {
+            std::slice::from_raw_parts(x_batch_buf.contents() as *const f32, b * row_size).to_vec()
+        };
+
+        for batch in 0..b {
+            for i in 0..row_size {
+                let a = x_seq[batch * row_size + i];
+                let bv = x_batch[batch * row_size + i];
+                let r = (a - bv).abs() / a.abs().max(1e-4);
+                assert!(
+                    r < 1e-4,
+                    "batch={batch} i={i} mismatch: seq={a} batch={bv} (rel {r:.3e})"
+                );
+            }
+        }
+    }
+
+    /// T108 — Batched KV append must match B sequential kv_append calls.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn kv_append_batched_f32_matches_singles() {
+        let backend = metal_backend();
+        let n_kv = 4usize;
+        let head_dim = 64usize;
+        let max_seq = 32usize;
+        let pos_base = 3usize;
+        let b = 4usize;
+        let per_token = n_kv * head_dim;
+
+        // Source data
+        let mut src_all = vec![0.0f32; b * per_token];
+        for batch in 0..b {
+            for i in 0..per_token {
+                src_all[batch * per_token + i] =
+                    ((i as f32 + 1.0 + batch as f32 * 7.0) * 0.01).sin();
+            }
+        }
+
+        // Reference: B sequential calls
+        let dst_cache_seq = backend.alloc_shared(n_kv * max_seq * head_dim * 4).unwrap();
+        // Zero-fill the cache
+        unsafe {
+            let p = dst_cache_seq.contents() as *mut f32;
+            for i in 0..(n_kv * max_seq * head_dim) {
+                *p.add(i) = 0.0;
+            }
+        }
+        for batch in 0..b {
+            let src_b = backend.alloc_shared(per_token * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_all[batch * per_token..(batch + 1) * per_token].as_ptr(),
+                    src_b.contents() as *mut f32,
+                    per_token,
+                );
+            }
+            kv_append_f32(
+                backend,
+                &src_b,
+                &dst_cache_seq,
+                n_kv,
+                head_dim,
+                pos_base + batch,
+                max_seq,
+            )
+            .unwrap();
+            backend.drain();
+        }
+
+        // Batched call
+        let dst_cache_batch = backend.alloc_shared(n_kv * max_seq * head_dim * 4).unwrap();
+        unsafe {
+            let p = dst_cache_batch.contents() as *mut f32;
+            for i in 0..(n_kv * max_seq * head_dim) {
+                *p.add(i) = 0.0;
+            }
+        }
+        let src_buf = backend.alloc_shared(b * per_token * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_all.as_ptr(),
+                src_buf.contents() as *mut f32,
+                b * per_token,
+            );
+        }
+        kv_append_batched_f32(
+            backend,
+            &src_buf,
+            &dst_cache_batch,
+            n_kv,
+            head_dim,
+            pos_base,
+            b,
+            max_seq,
+        )
+        .unwrap();
+        backend.drain();
+
+        let seq = unsafe {
+            std::slice::from_raw_parts(
+                dst_cache_seq.contents() as *const f32,
+                n_kv * max_seq * head_dim,
+            )
+            .to_vec()
+        };
+        let bat = unsafe {
+            std::slice::from_raw_parts(
+                dst_cache_batch.contents() as *const f32,
+                n_kv * max_seq * head_dim,
+            )
+            .to_vec()
+        };
+        for i in 0..(n_kv * max_seq * head_dim) {
+            assert_eq!(
+                seq[i], bat[i],
+                "kv_append cache mismatch at flat idx {i}: seq={} batch={}",
+                seq[i], bat[i]
+            );
         }
     }
 }
