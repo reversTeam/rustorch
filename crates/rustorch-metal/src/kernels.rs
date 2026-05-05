@@ -5417,6 +5417,150 @@ pub fn gqa_decode_f32(
     Ok(())
 }
 
+// T109 — Batched GQA decode. B queries at consecutive positions
+// [pos_base, pos_base+1, ..., pos_base+B-1], each attending to KV cache
+// up to its own position (causal mask). Threadgroup mapping: (q_h, b).
+//
+// Shared memory: kv_len_max = pos_base + B floats per threadgroup, used
+// for softmax score scratch.
+const GQA_DECODE_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_decode_batched_f32(
+    device const float* q       [[buffer(0)]],
+    device const float* k_cache [[buffer(1)]],
+    device const float* v_cache [[buffer(2)]],
+    device float* out           [[buffer(3)]],
+    constant uint4& dims_a      [[buffer(4)]],   // (n_heads, n_kv, head_dim, B)
+    constant uint2& dims_b      [[buffer(5)]],   // (max_seq, pos_base)
+    constant float& inv_sqrt_d  [[buffer(6)]],
+    threadgroup float* shared   [[threadgroup(0)]],
+    uint tg_flat                [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]],
+    uint sg_size                [[threads_per_simdgroup]]
+) {
+    uint n_heads  = dims_a.x;
+    uint n_kv     = dims_a.y;
+    uint head_dim = dims_a.z;
+    uint B        = dims_a.w;
+    uint max_seq  = dims_b.x;
+    uint pos_base = dims_b.y;
+
+    // Flat tg id → (q_h, b) via row-major
+    uint q_h = tg_flat % n_heads;
+    uint b   = tg_flat / n_heads;
+    if (q_h >= n_heads || b >= B) return;
+
+    uint group_size = n_heads / n_kv;
+    uint kv_h = q_h / group_size;
+    uint kv_len = pos_base + b + 1u; // causal: include self at position pos_base+b
+
+    // q location for this (b, q_h)
+    device const float* q_h_ptr = q + b * (n_heads * head_dim) + q_h * head_dim;
+    device const float* k_h_base = k_cache + kv_h * max_seq * head_dim;
+
+    uint hd4 = head_dim / 4u;
+    device const float4* q_h_ptr4 = (device const float4*)q_h_ptr;
+
+    // Phase A: scores
+    for (uint p = tid; p < kv_len; p += sg_size) {
+        device const float4* k_p4 = (device const float4*)(k_h_base + p * head_dim);
+        float4 acc4 = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint d4i = 0; d4i < hd4; ++d4i) {
+            acc4 += q_h_ptr4[d4i] * k_p4[d4i];
+        }
+        float dot = acc4.x + acc4.y + acc4.z + acc4.w;
+        for (uint d = hd4 * 4u; d < head_dim; ++d) {
+            dot += q_h_ptr[d] * k_h_base[p * head_dim + d];
+        }
+        shared[p] = dot * inv_sqrt_d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase B: max-shift
+    float local_max = -INFINITY;
+    for (uint p = tid; p < kv_len; p += sg_size) {
+        local_max = max(local_max, shared[p]);
+    }
+    float max_score = simd_max(local_max);
+
+    // Phase C: exp + sum
+    float local_sum = 0.0;
+    for (uint p = tid; p < kv_len; p += sg_size) {
+        float e = exp(shared[p] - max_score);
+        shared[p] = e;
+        local_sum += e;
+    }
+    float sum = simd_sum(local_sum);
+    float inv_sum = 1.0 / sum;
+
+    // Pre-multiply
+    for (uint p = tid; p < kv_len; p += sg_size) {
+        shared[p] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase D: weighted sum of V
+    device const float* v_h_base = v_cache + kv_h * max_seq * head_dim;
+    device float* out_h = out + b * (n_heads * head_dim) + q_h * head_dim;
+    for (uint d = tid; d < head_dim; d += sg_size) {
+        float acc = 0.0;
+        for (uint p = 0; p < kv_len; ++p) {
+            acc += shared[p] * v_h_base[p * head_dim + d];
+        }
+        out_h[d] = acc;
+    }
+}
+"#;
+
+/// T109 — Batched GQA decode. Computes attention for B consecutive query
+/// positions [pos_base, pos_base+1, ..., pos_base+B-1] in a single dispatch,
+/// each with causal mask.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_decode_batched_f32(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    k_cache: &Buffer,
+    v_cache: &Buffer,
+    out_buf: &Buffer,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    pos_base: usize,
+    b: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "gqa_decode_batched_f32",
+        GQA_DECODE_BATCHED_F32_SHADER,
+        "gqa_decode_batched_f32",
+    )?;
+    let dims_a = [n_heads as u32, n_kv as u32, head_dim as u32, b as u32];
+    let dims_b = [max_seq as u32, pos_base as u32];
+    let inv_sqrt_d: f32 = 1.0 / (head_dim as f32).sqrt();
+    // Max kv_len across batches = pos_base + b
+    let kv_len_max = pos_base + b;
+    let shared_bytes = (kv_len_max * 4) as u64;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache), 0);
+        encoder.set_buffer(2, Some(v_cache), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 16, dims_a.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 8, dims_b.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(6, 4, &inv_sqrt_d as *const f32 as *const std::ffi::c_void);
+        encoder.set_threadgroup_memory_length(0, shared_bytes);
+        let tg_size = MTLSize::new(32, 1, 1);
+        // Flat 1D dispatch over (q_h, b) tuples; 32 threads per tg.
+        let n_tg = (n_heads * b) as u64;
+        let grid = MTLSize::new(32 * n_tg, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 const ADD_INPLACE_F32_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -6845,6 +6989,113 @@ mod tests {
                 "kv_append cache mismatch at flat idx {i}: seq={} batch={}",
                 seq[i], bat[i]
             );
+        }
+    }
+
+    /// T109 — Batched GQA decode must match B sequential gqa_decode calls
+    /// (each at pos_base+b with kv_len=pos_base+b+1).
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn gqa_decode_batched_f32_matches_singles() {
+        let backend = metal_backend();
+        let n_heads = 4usize;
+        let n_kv = 2usize;
+        let head_dim = 64usize;
+        let max_seq = 32usize;
+        let pos_base = 5usize;
+        let b = 4usize;
+        let q_size = n_heads * head_dim;
+        let kv_size = n_kv * max_seq * head_dim;
+
+        // Build B different Q rows
+        let mut q_all = vec![0.0f32; b * q_size];
+        for batch in 0..b {
+            for i in 0..q_size {
+                q_all[batch * q_size + i] = ((i as f32 + 1.0 + batch as f32 * 3.0) * 0.01).sin();
+            }
+        }
+        // Pre-fill K and V cache (positions 0..pos_base+b populated)
+        let kv_total = pos_base + b;
+        let mut k_cache = vec![0.0f32; kv_size];
+        let mut v_cache = vec![0.0f32; kv_size];
+        for kvh in 0..n_kv {
+            for p in 0..kv_total {
+                for d in 0..head_dim {
+                    let idx = kvh * max_seq * head_dim + p * head_dim + d;
+                    k_cache[idx] = ((kvh + 1) as f32 + p as f32 * 0.7 + d as f32 * 0.01).cos();
+                    v_cache[idx] = ((kvh + 1) as f32 + p as f32 * 0.5 + d as f32 * 0.02).sin();
+                }
+            }
+        }
+
+        let q_buf = backend.alloc_shared(b * q_size * 4).unwrap();
+        let k_buf = backend.alloc_shared(kv_size * 4).unwrap();
+        let v_buf = backend.alloc_shared(kv_size * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(q_all.as_ptr(), q_buf.contents() as *mut f32, b * q_size);
+            std::ptr::copy_nonoverlapping(k_cache.as_ptr(), k_buf.contents() as *mut f32, kv_size);
+            std::ptr::copy_nonoverlapping(v_cache.as_ptr(), v_buf.contents() as *mut f32, kv_size);
+        }
+
+        // Reference: B sequential gqa_decode calls
+        let mut out_seq = vec![0.0f32; b * q_size];
+        for batch in 0..b {
+            let q_b_buf = backend.alloc_shared(q_size * 4).unwrap();
+            let out_b_buf = backend.alloc_shared(q_size * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    q_all[batch * q_size..(batch + 1) * q_size].as_ptr(),
+                    q_b_buf.contents() as *mut f32,
+                    q_size,
+                );
+            }
+            let kv_len = pos_base + batch + 1;
+            gqa_decode_f32(
+                backend, &q_b_buf, &k_buf, &v_buf, &out_b_buf, n_heads, n_kv, head_dim, kv_len,
+                max_seq,
+            )
+            .unwrap();
+            backend.drain();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out_b_buf.contents() as *const f32,
+                    out_seq[batch * q_size..(batch + 1) * q_size].as_mut_ptr(),
+                    q_size,
+                );
+            }
+        }
+
+        // Batched call
+        let out_batch_buf = backend.alloc_shared(b * q_size * 4).unwrap();
+        gqa_decode_batched_f32(
+            backend,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &out_batch_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            pos_base,
+            b,
+            max_seq,
+        )
+        .unwrap();
+        backend.drain();
+        let out_batch = unsafe {
+            std::slice::from_raw_parts(out_batch_buf.contents() as *const f32, b * q_size).to_vec()
+        };
+
+        for batch in 0..b {
+            for i in 0..q_size {
+                let a = out_seq[batch * q_size + i];
+                let bv = out_batch[batch * q_size + i];
+                let r = (a - bv).abs() / a.abs().max(1e-4);
+                assert!(
+                    r < 1e-3,
+                    "batch={batch} i={i} mismatch: seq={a} batch={bv} (rel {r:.3e})"
+                );
+            }
         }
     }
 }
