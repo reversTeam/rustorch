@@ -2462,6 +2462,7 @@ fn main() -> ExitCode {
     let mut ngram_profile = false;
     let mut rank_profile = false;
     let mut batch_test = false;
+    let mut speculative_b: usize = 0; // 0 = off; 2..=4 = enable with B candidates
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2514,6 +2515,12 @@ fn main() -> ExitCode {
             },
             "--batch-test" => {
                 batch_test = true;
+                args.remove(i);
+                continue;
+            },
+            "--speculative" => {
+                speculative_b = args[i + 1].parse().unwrap_or(2);
+                args.remove(i + 1);
                 args.remove(i);
                 continue;
             },
@@ -2579,28 +2586,114 @@ fn main() -> ExitCode {
         rank_stats = RankStats::new(model.cfg.n_layers, model.cfg.d, 100);
     }
     let t_dec = Instant::now();
-    for _ in 1..n {
-        last = if profile {
-            forward_token_profiled(backend, &model, last, cur_pos, &mut scratch, &mut stages)
-        } else if sparsity_profile {
-            forward_token_sparsity(backend, &model, last, cur_pos, &mut scratch, &mut sparsity)
-        } else if rank_profile {
-            forward_token_rank(
-                backend,
-                &model,
-                last,
-                cur_pos,
-                &mut scratch,
-                &mut rank_stats,
-            )
-        } else if batch_test {
-            let outs = forward_batch(backend, &model, &[last], cur_pos, &mut scratch);
-            outs[0]
-        } else {
-            forward_token(backend, &model, last, cur_pos, &mut scratch)
-        };
-        cur_pos += 1;
-        generated.push(last);
+    let mut spec_total_drafts = 0usize;
+    let mut spec_accepted = 0usize;
+    let mut spec_rounds = 0usize;
+    if (2..=B_MAX).contains(&speculative_b) {
+        // T122 — Speculative decoding loop with bigram-cache draft generator.
+        //
+        // Bigram cache: HashMap<u32, u32> = last_token -> most_common_next.
+        // Built online from generated tokens. T88a showed online cache has
+        // low hit on diverse prompts but can get traction on repetitive
+        // patterns (lists, code, integer sequences).
+        //
+        // Loop:
+        //   1. Build candidates [last_real, draft_1, ..., draft_{B-1}]
+        //      where draft_i comes from chained bigram lookups (or fallback
+        //      to last_real if cache empty).
+        //   2. forward_batch(candidates, pos_base) → B output logits.
+        //   3. Walk: find longest matching prefix where output[i] == draft_{i+1}.
+        //   4. Accepted_count drafts confirmed + 1 bonus token (output[K]).
+        //   5. Update bigram cache from observed transitions.
+        let b_total = speculative_b;
+        use std::collections::HashMap;
+        let mut bigram: HashMap<u32, u32> = HashMap::new();
+        // Seed bigram from prefill prompt
+        for w in prompt_ids.windows(2) {
+            bigram.insert(w[0], w[1]);
+        }
+        if !generated.is_empty() {
+            // Last token from prefill is `generated[0]`; seed bigram from prompt → first generated
+            if let Some(&prev) = prompt_ids.last() {
+                bigram.insert(prev, generated[0]);
+            }
+        }
+
+        while generated.len() < n {
+            // Build candidates
+            let mut candidates: Vec<u32> = Vec::with_capacity(b_total);
+            candidates.push(last);
+            let mut draft_seed = last;
+            for _ in 1..b_total {
+                let next = *bigram.get(&draft_seed).unwrap_or(&draft_seed);
+                candidates.push(next);
+                draft_seed = next;
+            }
+
+            let outs = forward_batch(backend, &model, &candidates, cur_pos, &mut scratch);
+            spec_rounds += 1;
+            spec_total_drafts += b_total - 1;
+
+            // Walk: how many drafts match the model's predictions?
+            let mut accepted_count = 0usize;
+            for i in 0..(b_total - 1) {
+                if outs[i] == candidates[i + 1] {
+                    accepted_count += 1;
+                } else {
+                    break;
+                }
+            }
+            spec_accepted += accepted_count;
+
+            // Tokens to commit:
+            //   accepted drafts at positions [pos+1..pos+accepted_count]
+            //   + bonus token at position [pos+accepted_count+1] = outs[accepted_count]
+            for i in 0..accepted_count {
+                generated.push(candidates[i + 1]);
+                if generated.len() >= n {
+                    break;
+                }
+            }
+            if generated.len() < n {
+                let bonus = outs[accepted_count];
+                generated.push(bonus);
+                last = bonus;
+            } else {
+                last = candidates[accepted_count];
+            }
+            cur_pos += accepted_count + 1;
+
+            // Update bigram cache with the actually-confirmed transitions
+            for w in candidates[..=accepted_count].windows(2) {
+                bigram.insert(w[0], w[1]);
+            }
+            // Last accepted → bonus
+            bigram.insert(candidates[accepted_count], last);
+        }
+    } else {
+        for _ in 1..n {
+            last = if profile {
+                forward_token_profiled(backend, &model, last, cur_pos, &mut scratch, &mut stages)
+            } else if sparsity_profile {
+                forward_token_sparsity(backend, &model, last, cur_pos, &mut scratch, &mut sparsity)
+            } else if rank_profile {
+                forward_token_rank(
+                    backend,
+                    &model,
+                    last,
+                    cur_pos,
+                    &mut scratch,
+                    &mut rank_stats,
+                )
+            } else if batch_test {
+                let outs = forward_batch(backend, &model, &[last], cur_pos, &mut scratch);
+                outs[0]
+            } else {
+                forward_token(backend, &model, last, cur_pos, &mut scratch)
+            };
+            cur_pos += 1;
+            generated.push(last);
+        }
     }
     let decode_d = t_dec.elapsed();
     println!(
@@ -2621,6 +2714,20 @@ fn main() -> ExitCode {
     if rank_profile {
         rank_stats.print_breakdown();
         rank_stats.print_active_subspace_validation();
+    }
+    if speculative_b >= 2 {
+        let accept_rate = if spec_total_drafts > 0 {
+            100.0 * spec_accepted as f64 / spec_total_drafts as f64
+        } else {
+            0.0
+        };
+        let avg_per_round = (spec_accepted + spec_rounds) as f64 / spec_rounds.max(1) as f64;
+        println!("\n=== T122 speculative B={} stats ===", speculative_b);
+        println!("  rounds            : {}", spec_rounds);
+        println!("  drafts proposed   : {}", spec_total_drafts);
+        println!("  drafts accepted   : {}", spec_accepted);
+        println!("  accept rate       : {:.2}%", accept_rate);
+        println!("  avg tokens/round  : {:.3}", avg_per_round);
     }
     println!("\ngenerated: {:?}", generated);
     ExitCode::SUCCESS
