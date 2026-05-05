@@ -45,8 +45,13 @@ use serde::Deserialize;
 
 pub mod gguf_loader;
 pub mod model;
+pub mod qwen35;
 pub use gguf_loader::{GgufBlockWeights, GgufWeights};
 pub use model::LlamaModel;
+pub use qwen35::{
+    describe_model, full_inventory, layer_kind_for_index, missing_tensors, parse_config, LayerKind,
+    Qwen35Config, Qwen35LoadError, Qwen35Variant, TensorRef,
+};
 
 /// Errors raised by this crate.
 #[derive(Debug)]

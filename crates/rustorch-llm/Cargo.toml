@@ -39,3 +39,7 @@ path = "examples/inspect_qnorm.rs"
 name = "qwen_inference_metal"
 path = "examples/qwen_inference_metal.rs"
 required-features = []
+
+[[example]]
+name = "qwen35_inspect"
+path = "examples/qwen35_inspect.rs"
