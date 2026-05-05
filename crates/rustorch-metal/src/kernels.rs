@@ -4872,6 +4872,74 @@ pub fn kv_append_f32(
     Ok(())
 }
 
+// T96 — Fused K+V append. 1 dispatch instead of 2 per layer × 40 layers.
+const KV_APPEND_KV_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void kv_append_kv_f32(
+    device const float* src_k  [[buffer(0)]],   // [n_kv * head_dim]
+    device const float* src_v  [[buffer(1)]],
+    device float* dst_k        [[buffer(2)]],
+    device float* dst_v        [[buffer(3)]],
+    constant uint3& dims       [[buffer(4)]],   // (n_kv, head_dim, position)
+    constant uint& max_seq     [[buffer(5)]],
+    uint gid                   [[thread_position_in_grid]]
+) {
+    uint n_kv     = dims.x;
+    uint head_dim = dims.y;
+    uint position = dims.z;
+    uint total    = n_kv * head_dim;
+    if (gid >= 2u * total) return;
+    bool is_v = gid >= total;
+    uint flat = is_v ? (gid - total) : gid;
+    uint kvh = flat / head_dim;
+    uint dd  = flat % head_dim;
+    uint dst_off = kvh * max_seq * head_dim + position * head_dim + dd;
+    if (is_v) {
+        dst_v[dst_off] = src_v[flat];
+    } else {
+        dst_k[dst_off] = src_k[flat];
+    }
+}
+"#;
+
+/// T96 — Fused K and V cache append in 1 dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_append_kv_f32(
+    backend: &MetalBackend,
+    src_k: &Buffer,
+    src_v: &Buffer,
+    dst_k: &Buffer,
+    dst_v: &Buffer,
+    n_kv: usize,
+    head_dim: usize,
+    position: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "kv_append_kv_f32",
+        KV_APPEND_KV_F32_SHADER,
+        "kv_append_kv_f32",
+    )?;
+    let dims = [n_kv as u32, head_dim as u32, position as u32];
+    let ms = max_seq as u32;
+    let total = n_kv * head_dim;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src_k), 0);
+        encoder.set_buffer(1, Some(src_v), 0);
+        encoder.set_buffer(2, Some(dst_k), 0);
+        encoder.set_buffer(3, Some(dst_v), 0);
+        encoder.set_bytes(4, 12, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &ms as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new((2 * total) as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 const ROPE_HALF_SPLIT_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

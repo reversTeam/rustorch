@@ -667,6 +667,8 @@ fn forward_token(
         .unwrap();
 
         // 4. KV cache append — pure GPU kernel, no drain needed.
+        // (T96 fused variant tried, regressed -2.9% due to thread divergence;
+        // see kv_append_kv_f32 in kernels.rs, kept as research artifact.)
         kv_append_f32(
             backend,
             &scratch.k_buf,
