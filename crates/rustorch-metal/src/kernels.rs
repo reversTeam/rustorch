@@ -3122,6 +3122,175 @@ pub fn sgemv_q4_k_f32_lcpp_nr2_into(
     Ok(())
 }
 
+// T123 — Batched lcpp_nr2 Q4_K sgemv. Same pattern as T91 lcpp_nr2 (preload
+// x in registers, factored Q4_K formula d*(...) - dmin*(sumy*sc_odd), 2
+// rows per simdgroup) but with batch dimension B.
+//
+// Each threadgroup = 1 simdgroup × NR0=2 rows × 1 batch. Grid indexed
+// by tg_flat = batch * n_sg_pairs + sg_pair (row-major batch-then-pairs).
+// W weight buffer is shared across all B batches via cache.
+//
+// CRITICAL: this is the kernel that unlocks speculative decoding speedup.
+// The simple T92 batched kernel was 1.8× slower than lcpp_nr2 single-token.
+// This batched lcpp_nr2 should match single-token throughput per output.
+const SGEMV_Q4_K_F32_LCPP_NR2_BATCH_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+constant short NR0 = 2;
+constant ushort KMASK1 = 0x3f3f;
+constant ushort KMASK2 = 0x0f0f;
+constant ushort KMASK3 = 0xc0c0;
+
+kernel void sgemv_q4_k_f32_lcpp_nr2_batch(
+    device const float*  x      [[buffer(0)]],   // [B, K]
+    device const uchar*  w_q4k  [[buffer(1)]],   // [N, K] Q4_K row-major
+    device float*        y      [[buffer(2)]],   // [B, N]
+    constant uint3&      dims   [[buffer(3)]],   // (K, N, B)
+    uint                 tg_flat [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B = dims.z;
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    uint n_sg_pairs = (N + (uint)NR0 - 1u) / (uint)NR0;
+
+    // Decompose flat tg_id into (batch, sg_pair)
+    uint b = tg_flat / n_sg_pairs;
+    uint sg_pair = tg_flat % n_sg_pairs;
+    if (b >= B) return;
+
+    uint first_row = sg_pair * (uint)NR0;
+    if (first_row >= N) return;
+
+    short ix = (short)(tiisg / 8u);    // 0..3
+    short it = (short)(tiisg % 8u);    // 0..7
+    short iq = it / 4;                 // 0 or 1
+    short ir = it % 4;                 // 0..3
+
+    int nb = (int)blocks_per_row;
+
+    // x partition for this batch
+    device const float* xb = x + b * K;
+    device const float* y4 = xb + ix * 256 + 64 * iq + 8 * ir;
+
+    float yl[16];
+    float yh[16];
+    float sumf[2] = {0.0, 0.0};
+
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    uint row_stride = blocks_per_row * BLOCK_BYTES;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.0, 0.0, 0.0, 0.0};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_q4k + (uint64_t)nrow * row_stride + (uint)ib * BLOCK_BYTES;
+            device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+            float d    = float(as_type<half>(dh_ptr[0]));
+            float dmin = float(as_type<half>(dh_ptr[1]));
+
+            device const uint16_t* sc = (device const uint16_t*)(block + 4) + iq;
+            device const uint16_t* q1 = (device const uint16_t*)(block + 16) + 16 * iq + 4 * ir;
+            device const uint16_t* q2 = q1 + 32;
+
+            sc16[0] = sc[0] & KMASK1;
+            sc16[1] = sc[2] & KMASK1;
+            sc16[2] = ((sc[4] >> 0) & KMASK2) | ((sc[0] & KMASK3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & KMASK2) | ((sc[2] & KMASK3) >> 2);
+
+            float4 acc1 = {0.0, 0.0, 0.0, 0.0};
+            float4 acc2 = {0.0, 0.0, 0.0, 0.0};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[row] += d * ((acc1[0] + 1.0f/256.0f * acc1[1]) * float(sc8[0]) +
+                              (acc1[2] + 1.0f/256.0f * acc1[3]) * float(sc8[1]) * 1.0f/16.0f +
+                              (acc2[0] + 1.0f/256.0f * acc2[1]) * float(sc8[4]) +
+                              (acc2[2] + 1.0f/256.0f * acc2[3]) * float(sc8[5]) * 1.0f/16.0f) -
+                       dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                               sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        y4 += 4 * (int)BLOCK_WEIGHTS;
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y[b * N + nrow] = sum_all;
+        }
+    }
+}
+"#;
+
+/// T123 — Batched lcpp_nr2 Q4_K sgemv. Critical kernel for speculative
+/// decoding speedup — matches single-token lcpp_nr2 throughput per output.
+pub fn sgemv_q4_k_f32_lcpp_nr2_batch_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_f32_lcpp_nr2_batch needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || b == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_f32_lcpp_nr2_batch: K%256==0 required (K={k}, N={n}, B={b})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_f32_lcpp_nr2_batch",
+        SGEMV_Q4_K_F32_LCPP_NR2_BATCH_SHADER,
+        "sgemv_q4_k_f32_lcpp_nr2_batch",
+    )?;
+    let dims = [k as u32, n as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let n_sg_pairs = (n as u64).div_ceil(2);
+        let n_tg = n_sg_pairs * b as u64;
+        let grid = MTLSize::new(32 * n_tg, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 // T84 — quad-cooperative Q4_K sgemv. The 32 threads of a simdgroup are
 // split into 4 "quarters" of 8 threads each; each quarter computes one
 // output by K-cooperating across blocks_per_row blocks. Reduction stays
@@ -3525,6 +3694,146 @@ kernel void sgemv_q6_k_f32_simdcoop(
     }
 }
 "#;
+
+// T123 — Batched lcpp_nr2 Q6_K sgemv. Same pattern as T93 lcpp_nr2 Q6_K
+// but with batch dimension B. Used by forward_batch for W_down.
+const SGEMV_Q6_K_F32_LCPP_NR2_BATCH_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q6K_BYTES = 210u;
+constant uint Q6K_WEIGHTS = 256u;
+constant short NR0_Q6_BATCH = 2;
+
+kernel void sgemv_q6_k_f32_lcpp_nr2_batch(
+    device const float*  x      [[buffer(0)]],   // [B, K]
+    device const uchar*  w_q6k  [[buffer(1)]],   // [N, K] Q6_K row-major
+    device float*        y      [[buffer(2)]],   // [B, N]
+    constant uint3&      dims   [[buffer(3)]],   // (K, N, B)
+    uint                 tg_flat [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]]
+) {
+    constexpr uchar KMASK1 = 0x03;
+    constexpr uchar KMASK2 = 0x0C;
+    constexpr uchar KMASK3 = 0x30;
+    constexpr uchar KMASK4 = 0xC0;
+
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B = dims.z;
+    int nb = (int)(K / Q6K_WEIGHTS);
+    uint n_sg_pairs = (N + (uint)NR0_Q6_BATCH - 1u) / (uint)NR0_Q6_BATCH;
+
+    uint b = tg_flat / n_sg_pairs;
+    uint sg_pair = tg_flat % n_sg_pairs;
+    if (b >= B) return;
+
+    uint first_row = sg_pair * (uint)NR0_Q6_BATCH;
+    if (first_row >= N) return;
+
+    short tid = (short)(tiisg / 2u);   // 0..15
+    short ix  = (short)(tiisg % 2u);   // 0 or 1
+    short ip  = tid / 8;                // 0 or 1
+    short il  = tid % 8;                // 0..7
+    short l0  = 4 * il;
+    short is  = 8 * ip + l0 / 16;
+
+    short y_offset   = 128 * ip + l0;
+    short q_offset_l = 64 * ip + l0;
+    short q_offset_h = 32 * ip + l0;
+
+    float sumf[2] = {0.0, 0.0};
+    float yl[16];
+
+    uint row_stride = (uint)nb * Q6K_BYTES;
+    device const float* xb = x + b * K;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const float* yptr = xb + i * (int)Q6K_WEIGHTS + (int)y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = yptr[l +  0];
+            yl[4*l + 1] = yptr[l + 32];
+            yl[4*l + 2] = yptr[l + 64];
+            yl[4*l + 3] = yptr[l + 96];
+        }
+
+        for (short row = 0; row < NR0_Q6_BATCH; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_q6k + (uint64_t)nrow * row_stride + (uint)i * Q6K_BYTES;
+            device const uchar* q1 = block + 0   + (uint)q_offset_l;
+            device const uchar* q2 = q1 + 32;
+            device const uchar* qh = block + 128 + (uint)q_offset_h;
+            device const char*  sc = (device const char*)(block + 192) + (int)is;
+            device const uint16_t* dh = (device const uint16_t*)(block + 208);
+
+            float d_val = float(as_type<half>(dh[0]));
+
+            float4 sums = {0.0, 0.0, 0.0, 0.0};
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * (float)((int)((q1[l] & 0xF) | ((qh[l] & KMASK1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * (float)((int)((q2[l] & 0xF) | ((qh[l] & KMASK2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * (float)((int)((q1[l]  >> 4) | ((qh[l] & KMASK3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * (float)((int)((q2[l]  >> 4) | ((qh[l] & KMASK4) >> 2)) - 32);
+            }
+
+            sumf[row] += d_val * (sums[0] * float(sc[0]) + sums[1] * float(sc[2])
+                                + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
+        }
+    }
+
+    for (short row = 0; row < NR0_Q6_BATCH; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y[b * N + nrow] = sum_all;
+        }
+    }
+}
+"#;
+
+/// T123 — Batched lcpp_nr2 Q6_K sgemv. Mirror of T93 with batch dim B.
+pub fn sgemv_q6_k_f32_lcpp_nr2_batch_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q6k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_f32_lcpp_nr2_batch needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || b == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_f32_lcpp_nr2_batch: K%256==0 required (K={k}, N={n}, B={b})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q6_k_f32_lcpp_nr2_batch",
+        SGEMV_Q6_K_F32_LCPP_NR2_BATCH_SHADER,
+        "sgemv_q6_k_f32_lcpp_nr2_batch",
+    )?;
+    let dims = [k as u32, n as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let n_sg_pairs = (n as u64).div_ceil(2);
+        let n_tg = n_sg_pairs * b as u64;
+        let grid = MTLSize::new(32 * n_tg, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
 
 // T93 — Faithful port of llama.cpp's kernel_mul_mv_q6_K_f32_impl with
 // N_R0_Q6_K = 2. Differences from T90 (which regressed -23%):

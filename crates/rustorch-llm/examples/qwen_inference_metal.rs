@@ -32,9 +32,9 @@ use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, gqa_decode_batched_f32, gqa_decode_f32,
     kv_append_batched_f32, kv_append_f32, rms_norm_batched_f32, rms_norm_f32,
     rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rope_half_split_batched_f32,
-    rope_half_split_f32, sgemv_q4_k_f32_batch_into, sgemv_q4_k_f32_into,
+    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_lcpp_nr2_batch_into,
     sgemv_q4_k_f32_lcpp_nr2_into, sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
-    sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_batch_into, sgemv_q6_k_f32_into,
+    sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_lcpp_nr2_batch_into,
     sgemv_q6_k_f32_lcpp_nr2_into, swiglu_batched_f32, swiglu_f32,
 };
 
@@ -1959,7 +1959,7 @@ fn forward_batch(
         .unwrap();
 
         // 2. QKV: 3 batched sgemv (Q4_K or Q6_K depending on dtype)
-        sgemv_q4_k_f32_batch_into(
+        sgemv_q4_k_f32_lcpp_nr2_batch_into(
             backend,
             &scratch.h_buf,
             &layer.w_q.buffer,
@@ -1969,7 +1969,7 @@ fn forward_batch(
             b,
         )
         .unwrap();
-        sgemv_q4_k_f32_batch_into(
+        sgemv_q4_k_f32_lcpp_nr2_batch_into(
             backend,
             &scratch.h_buf,
             &layer.w_k.buffer,
@@ -1980,7 +1980,7 @@ fn forward_batch(
         )
         .unwrap();
         match layer.w_v.dtype {
-            GgmlType::Q4_K => sgemv_q4_k_f32_batch_into(
+            GgmlType::Q4_K => sgemv_q4_k_f32_lcpp_nr2_batch_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_v.buffer,
@@ -1990,7 +1990,7 @@ fn forward_batch(
                 b,
             )
             .unwrap(),
-            GgmlType::Q6_K => sgemv_q6_k_f32_batch_into(
+            GgmlType::Q6_K => sgemv_q6_k_f32_lcpp_nr2_batch_into(
                 backend,
                 &scratch.h_buf,
                 &layer.w_v.buffer,
@@ -2096,7 +2096,7 @@ fn forward_batch(
 
         // 6. W_O batched sgemv + residual add
         match layer.w_o.dtype {
-            GgmlType::Q4_K => sgemv_q4_k_f32_batch_into(
+            GgmlType::Q4_K => sgemv_q4_k_f32_lcpp_nr2_batch_into(
                 backend,
                 &scratch.attn_buf,
                 &layer.w_o.buffer,
@@ -2106,7 +2106,7 @@ fn forward_batch(
                 b,
             )
             .unwrap(),
-            GgmlType::Q6_K => sgemv_q6_k_f32_batch_into(
+            GgmlType::Q6_K => sgemv_q6_k_f32_lcpp_nr2_batch_into(
                 backend,
                 &scratch.attn_buf,
                 &layer.w_o.buffer,
@@ -2136,7 +2136,7 @@ fn forward_batch(
         .unwrap();
 
         // 8. Gate + Up (batched Q4_K sgemv)
-        sgemv_q4_k_f32_batch_into(
+        sgemv_q4_k_f32_lcpp_nr2_batch_into(
             backend,
             &scratch.h_buf,
             &layer.w_gate.buffer,
@@ -2146,7 +2146,7 @@ fn forward_batch(
             b,
         )
         .unwrap();
-        sgemv_q4_k_f32_batch_into(
+        sgemv_q4_k_f32_lcpp_nr2_batch_into(
             backend,
             &scratch.h_buf,
             &layer.w_up.buffer,
@@ -2170,7 +2170,7 @@ fn forward_batch(
 
         // 10. W_down batched sgemv + residual add
         match layer.w_down.dtype {
-            GgmlType::Q4_K => sgemv_q4_k_f32_batch_into(
+            GgmlType::Q4_K => sgemv_q4_k_f32_lcpp_nr2_batch_into(
                 backend,
                 &scratch.fd_buf,
                 &layer.w_down.buffer,
@@ -2180,7 +2180,7 @@ fn forward_batch(
                 b,
             )
             .unwrap(),
-            GgmlType::Q6_K => sgemv_q6_k_f32_batch_into(
+            GgmlType::Q6_K => sgemv_q6_k_f32_lcpp_nr2_batch_into(
                 backend,
                 &scratch.fd_buf,
                 &layer.w_down.buffer,
@@ -2210,7 +2210,7 @@ fn forward_batch(
     )
     .unwrap();
     match model.lm_head.dtype {
-        GgmlType::Q4_K => sgemv_q4_k_f32_batch_into(
+        GgmlType::Q4_K => sgemv_q4_k_f32_lcpp_nr2_batch_into(
             backend,
             &scratch.h_buf,
             &model.lm_head.buffer,
@@ -2220,7 +2220,7 @@ fn forward_batch(
             b,
         )
         .unwrap(),
-        GgmlType::Q6_K => sgemv_q6_k_f32_batch_into(
+        GgmlType::Q6_K => sgemv_q6_k_f32_lcpp_nr2_batch_into(
             backend,
             &scratch.h_buf,
             &model.lm_head.buffer,
