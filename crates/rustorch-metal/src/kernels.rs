@@ -3346,6 +3346,425 @@ pub fn sgemv_q4_k_f32_lcpp_nsg2_into(
     Ok(())
 }
 
+// T152 — Q4_K gather sgemv : sgemv « avec indirection sur expert » pour MoE.
+//
+// Une variante du kernel `sgemv_q4_k_f32_lcpp_nsg2` qui lit un index d'expert
+// par token d'output et offset le pointeur de poids en conséquence. Permet
+// d'effectuer en UN SEUL dispatch ce que le forward MoE faisait en
+// `top_k * 1` dispatchs (un par expert sélectionné), en s'inspirant du
+// pattern `gather_qmm_rhs` de MLX (`mlx/backend/metal/kernels/quantized.h`).
+//
+// Layouts supportés :
+//   - x_stride_floats == 0  : input partagé, x lu comme [K] (gate_proj, up_proj
+//     en decode où la même `h` est routée vers chaque expert top-k).
+//   - x_stride_floats == K  : input par-row, x lu comme [B, K] (down_proj
+//     où chaque expert a son propre hidden state silu(gate)*up).
+//
+// Dispatch :
+//   threadgroup = 64 threads (NSG=2 × 32) ; grid = (N/4 threadgroups, B, 1).
+//   Une threadgroup couvre 4 lignes de sortie pour UN token d'output (b).
+//
+// Buffers :
+//   buf 0 : x       — `[K]` ou `[B, K]` f32 selon x_stride_floats
+//   buf 1 : w_q4k   — `[E, N, K_q4k_bytes]` Q4_K stacked, contiguous
+//   buf 2 : indices — `[B]` u32, expert id par token d'output
+//   buf 3 : y       — `[B, N]` f32
+//   buf 4 : dims    — uint4 = (K, N, B, expert_stride_bytes)
+//   buf 5 : opts    — uint  = x_stride_floats (0 ou K)
+const SGEMV_Q4_K_GATHER_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES = 144u;
+constant uint BLOCK_WEIGHTS = 256u;
+constant short NR0 = 2;
+constant short NSG = 2;
+constant ushort KMASK1 = 0x3f3f;
+constant ushort KMASK2 = 0x0f0f;
+constant ushort KMASK3 = 0xc0c0;
+
+kernel void sgemv_q4_k_gather_f32_lcpp_nsg2(
+    device const float*  x         [[buffer(0)]],
+    device const uchar*  w_q4k     [[buffer(1)]],
+    device const uint*   indices   [[buffer(2)]],
+    device float*        y         [[buffer(3)]],
+    constant uint4&      dims      [[buffer(4)]],
+    constant uint&       x_stride  [[buffer(5)]],
+    uint2                tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiisg     [[thread_index_in_simdgroup]],
+    ushort               sgitg     [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B = dims.z;
+    uint expert_stride = dims.w;
+    uint b = tg_id.y;
+    if (b >= B) return;
+
+    uint expert = indices[b];
+
+    // Per-expert base of weights, x and y.
+    device const uchar* w_base = w_q4k + (uint64_t)expert * (uint64_t)expert_stride;
+    // x_stride==0 → broadcast (read x[k] for every b) ; ==K → per-row.
+    device const float* x_base = x + (uint64_t)b * (uint64_t)x_stride;
+    device       float* y_base = y + (uint64_t)b * (uint64_t)N;
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS;
+    uint first_row = (tg_id.x * (uint)NSG + (uint)sgitg) * (uint)NR0;
+    if (first_row >= N) return;
+
+    short ix = (short)(tiisg / 8u);
+    short it = (short)(tiisg % 8u);
+    short iq = it / 4;
+    short ir = it % 4;
+
+    int nb = (int)blocks_per_row;
+
+    device const float* y4 = x_base + ix * 256 + 64 * iq + 8 * ir;
+
+    float yl[16];
+    float yh[16];
+    float sumf[2] = {0.0, 0.0};
+
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    uint row_stride = blocks_per_row * BLOCK_BYTES;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.0, 0.0, 0.0, 0.0};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_base + (uint64_t)nrow * row_stride + (uint)ib * BLOCK_BYTES;
+            device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+            float d    = float(as_type<half>(dh_ptr[0]));
+            float dmin = float(as_type<half>(dh_ptr[1]));
+
+            device const uint16_t* sc = (device const uint16_t*)(block + 4) + iq;
+            device const uint16_t* q1 = (device const uint16_t*)(block + 16) + 16 * iq + 4 * ir;
+            device const uint16_t* q2 = q1 + 32;
+
+            sc16[0] = sc[0] & KMASK1;
+            sc16[1] = sc[2] & KMASK1;
+            sc16[2] = ((sc[4] >> 0) & KMASK2) | ((sc[0] & KMASK3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & KMASK2) | ((sc[2] & KMASK3) >> 2);
+
+            float4 acc1 = {0.0, 0.0, 0.0, 0.0};
+            float4 acc2 = {0.0, 0.0, 0.0, 0.0};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[row] += d * ((acc1[0] + 1.0f/256.0f * acc1[1]) * float(sc8[0]) +
+                              (acc1[2] + 1.0f/256.0f * acc1[3]) * float(sc8[1]) * 1.0f/16.0f +
+                              (acc2[0] + 1.0f/256.0f * acc2[1]) * float(sc8[4]) +
+                              (acc2[2] + 1.0f/256.0f * acc2[3]) * float(sc8[5]) * 1.0f/16.0f) -
+                       dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                               sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        y4 += 4 * (int)BLOCK_WEIGHTS;
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y_base[nrow] = sum_all;
+        }
+    }
+}
+"#;
+
+/// T152 — Q4_K gather sgemv : `y[b, :] = W[indices[b], :, :] @ x[b * x_stride .. + K]`.
+/// Source d'inspiration : `affine_gather_qmm_rhs` de MLX. Permet d'évaluer en
+/// UN SEUL dispatch les `top_k` experts sélectionnés au lieu de `top_k`
+/// dispatchs séparés. `expert_stride_bytes` = `N * (K/256) * 144` bytes
+/// (= taille en Q4_K d'une matrice `[N, K]` complète).
+///
+/// `x_stride_floats == 0` : input partagé broadcast (gate_proj, up_proj).
+/// `x_stride_floats == K` : input par-row (down_proj).
+///
+/// Indices passés en `set_bytes` (≤ 4 KB → ok pour B ≤ 1024). Si jamais un
+/// caller veut plus, basculer vers un buffer device.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemv_q4_k_gather_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_stacked_buf: &Buffer,
+    indices: &[u32],
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    expert_stride_bytes: usize,
+    x_stride_floats: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_gather_f32_lcpp_nsg2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 || n % 4 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_gather: K%256==0 && N%4==0 required (K={k}, N={n})"
+        )));
+    }
+    let b = indices.len();
+    if b == 0 {
+        return Ok(());
+    }
+    if b > 1024 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_gather: B={b} too large for set_bytes path (max 1024)"
+        )));
+    }
+    if x_stride_floats != 0 && x_stride_floats != k {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_gather: x_stride_floats must be 0 (broadcast) or K={k}, got {x_stride_floats}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_gather_f32_lcpp_nsg2",
+        SGEMV_Q4_K_GATHER_F32_LCPP_NSG2_SHADER,
+        "sgemv_q4_k_gather_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32, b as u32, expert_stride_bytes as u32];
+    let x_stride_u32 = x_stride_floats as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_stacked_buf), 0);
+        encoder.set_bytes(
+            2,
+            (b * 4) as u64,
+            indices.as_ptr() as *const std::ffi::c_void,
+        );
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &x_stride_u32 as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(4);
+        let groups = MTLSize::new(n_tg, b as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// T152 — Q5_K gather sgemv : variante gather du `sgemv_q5_k_f32_lcpp_nsg2`.
+// Utilisé pour `down_exps` du Qwen3.6-35B-A3B (Q5_K, alors que gate/up
+// sont en Q4_K). Même logique que la variante Q4_K : indirection sur expert
+// id + broadcast/per-row sur l'input.
+const SGEMV_Q5_K_GATHER_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q5K_BYTES = 176u;
+constant uint Q5K_WEIGHTS = 256u;
+constant short NR0_Q5K = 1;
+constant short NSG_Q5K = 2;
+constant ushort KMASK1 = 0x3f3f;
+constant ushort KMASK2 = 0x0f0f;
+constant ushort KMASK3 = 0xc0c0;
+
+kernel void sgemv_q5_k_gather_f32_lcpp_nsg2(
+    device const float*  x         [[buffer(0)]],
+    device const uchar*  w_q5k     [[buffer(1)]],
+    device const uint*   indices   [[buffer(2)]],
+    device float*        y         [[buffer(3)]],
+    constant uint4&      dims      [[buffer(4)]],   // (K, N, B, expert_stride_bytes)
+    constant uint&       x_stride  [[buffer(5)]],
+    uint2                tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiisg     [[thread_index_in_simdgroup]],
+    ushort               sgitg     [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B = dims.z;
+    uint expert_stride = dims.w;
+    uint b = tg_id.y;
+    if (b >= B) return;
+
+    uint expert = indices[b];
+    device const uchar* w_base = w_q5k + (uint64_t)expert * (uint64_t)expert_stride;
+    device const float* x_base = x + (uint64_t)b * (uint64_t)x_stride;
+    device       float* y_base = y + (uint64_t)b * (uint64_t)N;
+
+    uint blocks_per_row = K / Q5K_WEIGHTS;
+    uint first_row = (tg_id.x * (uint)NSG_Q5K + (uint)sgitg) * (uint)NR0_Q5K;
+    if (first_row >= N) return;
+
+    short tid = (short)(tiisg / 4u);
+    short ix  = (short)(tiisg % 4u);
+    short iq  = tid / 4;
+    short ir  = tid % 4;
+
+    short l0 = 8 * ir;
+    short q_offset = 32 * iq + l0;
+    short y_offset = 64 * iq + l0;
+
+    uchar hm1 = 1u << (2*iq);
+    uchar hm2 = hm1 << 1;
+    uchar hm3 = hm1 << 4;
+    uchar hm4 = hm2 << 4;
+
+    int nb = (int)blocks_per_row;
+    uint row_stride = blocks_per_row * Q5K_BYTES;
+
+    float sumf = 0.0;
+    float yl[16];
+    float yh[16];
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    device const float* y1 = x_base + (uint)ix * Q5K_WEIGHTS + (uint)y_offset;
+
+    for (int i = ix; i < nb; i += 4) {
+        device const float* y2 = y1 + 128;
+        float4 sumy = {0.0, 0.0, 0.0, 0.0};
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l + 0];   sumy[0] += yl[l + 0];
+            yl[l + 8] = y1[l + 32];  sumy[1] += yl[l + 8];
+            yh[l + 0] = y2[l + 0];   sumy[2] += yh[l + 0];
+            yh[l + 8] = y2[l + 32];  sumy[3] += yh[l + 8];
+        }
+
+        device const uchar* block = w_base + (uint64_t)first_row * row_stride + (uint)i * Q5K_BYTES;
+        device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+        float d    = float(as_type<half>(dh_ptr[0]));
+        float dmin = float(as_type<half>(dh_ptr[1]));
+
+        device const uint16_t* a = (device const uint16_t*)(block + 4) + iq;
+        sc16[0] = a[0] & KMASK1;
+        sc16[1] = a[2] & KMASK1;
+        sc16[2] = ((a[4] >> 0) & KMASK2) | ((a[0] & KMASK3) >> 2);
+        sc16[3] = ((a[4] >> 4) & KMASK2) | ((a[2] & KMASK3) >> 2);
+
+        device const uchar* qh = (device const uchar*)(block + 16) + (uint)l0;
+        device const uchar* q1 = (device const uchar*)(block + 48) + (uint)q_offset;
+        device const uchar* q2 = q1 + 64;
+
+        float4 acc1 = {0.0, 0.0, 0.0, 0.0};
+        float4 acc2 = {0.0, 0.0, 0.0, 0.0};
+        for (short l = 0; l < 8; ++l) {
+            uchar h = qh[l];
+            acc1[0] += yl[l + 0] * (float)(q1[l] & 0x0F);
+            acc1[1] += yl[l + 8] * (float)(q1[l] & 0xF0);
+            acc1[2] += yh[l + 0] * (float)(q2[l] & 0x0F);
+            acc1[3] += yh[l + 8] * (float)(q2[l] & 0xF0);
+            acc2[0] += (h & hm1) ? yl[l + 0] : 0.0;
+            acc2[1] += (h & hm2) ? yl[l + 8] : 0.0;
+            acc2[2] += (h & hm3) ? yh[l + 0] : 0.0;
+            acc2[3] += (h & hm4) ? yh[l + 8] : 0.0;
+        }
+
+        sumf += d * (
+            float(sc8[0]) * (acc1[0]        + 16.0 * acc2[0]) +
+            float(sc8[1]) * (acc1[1]/16.0   + 16.0 * acc2[1]) +
+            float(sc8[4]) * (acc1[2]        + 16.0 * acc2[2]) +
+            float(sc8[5]) * (acc1[3]/16.0   + 16.0 * acc2[3])
+        ) - dmin * (
+            sumy[0] * float(sc8[2]) +
+            sumy[1] * float(sc8[3]) +
+            sumy[2] * float(sc8[6]) +
+            sumy[3] * float(sc8[7])
+        );
+
+        y1 += 4 * (int)Q5K_WEIGHTS;
+    }
+
+    if (first_row < N) {
+        float row_sum = simd_sum(sumf);
+        if (tiisg == 0) {
+            y_base[first_row] = row_sum;
+        }
+    }
+}
+"#;
+
+/// T152 — Q5_K gather sgemv. Mêmes paramètres et sémantique que
+/// `sgemv_q4_k_gather_f32_lcpp_nsg2_into`, juste un format de quantization
+/// différent. Utilisé pour `down_exps` du Qwen3.6-35B-A3B.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemv_q5_k_gather_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q5k_stacked_buf: &Buffer,
+    indices: &[u32],
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    expert_stride_bytes: usize,
+    x_stride_floats: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q5_k_gather_f32_lcpp_nsg2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q5_k_gather: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let b = indices.len();
+    if b == 0 {
+        return Ok(());
+    }
+    if b > 1024 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q5_k_gather: B={b} too large for set_bytes path (max 1024)"
+        )));
+    }
+    if x_stride_floats != 0 && x_stride_floats != k {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q5_k_gather: x_stride_floats must be 0 or K={k}, got {x_stride_floats}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q5_k_gather_f32_lcpp_nsg2",
+        SGEMV_Q5_K_GATHER_F32_LCPP_NSG2_SHADER,
+        "sgemv_q5_k_gather_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32, b as u32, expert_stride_bytes as u32];
+    let x_stride_u32 = x_stride_floats as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q5k_stacked_buf), 0);
+        encoder.set_bytes(
+            2,
+            (b * 4) as u64,
+            indices.as_ptr() as *const std::ffi::c_void,
+        );
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &x_stride_u32 as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(2);
+        let groups = MTLSize::new(n_tg, b as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T142 — Q5_K matmul-vec kernel.
 //
 // Q5_K format: 256 weights / 176-byte super-block.
@@ -4603,6 +5022,176 @@ kernel void sgemv_q6_k_f32_lcpp_nsg2(
     }
 }
 "#;
+
+// T152 — Q6_K gather sgemv : variante gather du `sgemv_q6_k_f32_lcpp_nsg2`.
+// Utilisé pour les `down_exps` Q6_K du Qwen3.6-35B-A3B (layers 34, 38, 39).
+const SGEMV_Q6_K_GATHER_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q6K_BYTES = 210u;
+constant uint Q6K_WEIGHTS = 256u;
+constant short NR0_Q6 = 2;
+constant short NSG_Q6 = 2;
+
+kernel void sgemv_q6_k_gather_f32_lcpp_nsg2(
+    device const float*  x         [[buffer(0)]],
+    device const uchar*  w_q6k     [[buffer(1)]],
+    device const uint*   indices   [[buffer(2)]],
+    device float*        y         [[buffer(3)]],
+    constant uint4&      dims      [[buffer(4)]],   // (K, N, B, expert_stride_bytes)
+    constant uint&       x_stride  [[buffer(5)]],
+    uint2                tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiisg     [[thread_index_in_simdgroup]],
+    ushort               sgitg     [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uchar KMASK1 = 0x03;
+    constexpr uchar KMASK2 = 0x0C;
+    constexpr uchar KMASK3 = 0x30;
+    constexpr uchar KMASK4 = 0xC0;
+
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B = dims.z;
+    uint expert_stride = dims.w;
+    uint b = tg_id.y;
+    if (b >= B) return;
+
+    uint expert = indices[b];
+    device const uchar* w_base = w_q6k + (uint64_t)expert * (uint64_t)expert_stride;
+    device const float* x_base = x + (uint64_t)b * (uint64_t)x_stride;
+    device       float* y_base = y + (uint64_t)b * (uint64_t)N;
+
+    int nb = (int)(K / Q6K_WEIGHTS);
+    uint first_row = (tg_id.x * (uint)NSG_Q6 + (uint)sgitg) * (uint)NR0_Q6;
+    if (first_row >= N) return;
+
+    short tid = (short)(tiisg / 2u);
+    short ix  = (short)(tiisg % 2u);
+    short ip  = tid / 8;
+    short il  = tid % 8;
+    short l0  = 4 * il;
+    short is  = 8 * ip + l0 / 16;
+
+    short y_offset   = 128 * ip + l0;
+    short q_offset_l = 64 * ip + l0;
+    short q_offset_h = 32 * ip + l0;
+
+    float sumf[2] = {0.0, 0.0};
+    float yl[16];
+
+    uint row_stride = (uint)nb * Q6K_BYTES;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const float* yptr = x_base + i * (int)Q6K_WEIGHTS + (int)y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = yptr[l +  0];
+            yl[4*l + 1] = yptr[l + 32];
+            yl[4*l + 2] = yptr[l + 64];
+            yl[4*l + 3] = yptr[l + 96];
+        }
+
+        for (short row = 0; row < NR0_Q6; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_base + (uint64_t)nrow * row_stride + (uint)i * Q6K_BYTES;
+            device const uchar* q1 = block + 0   + (uint)q_offset_l;
+            device const uchar* q2 = q1 + 32;
+            device const uchar* qh = block + 128 + (uint)q_offset_h;
+            device const char*  sc = (device const char*)(block + 192) + (int)is;
+            device const uint16_t* dh = (device const uint16_t*)(block + 208);
+
+            float d_val = float(as_type<half>(dh[0]));
+
+            float4 sums = {0.0, 0.0, 0.0, 0.0};
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * (float)((int)((q1[l] & 0xF) | ((qh[l] & KMASK1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * (float)((int)((q2[l] & 0xF) | ((qh[l] & KMASK2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * (float)((int)((q1[l]  >> 4) | ((qh[l] & KMASK3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * (float)((int)((q2[l]  >> 4) | ((qh[l] & KMASK4) >> 2)) - 32);
+            }
+
+            sumf[row] += d_val * (sums[0] * float(sc[0]) + sums[1] * float(sc[2])
+                                + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
+        }
+    }
+
+    for (short row = 0; row < NR0_Q6; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y_base[nrow] = sum_all;
+        }
+    }
+}
+"#;
+
+/// T152 — Q6_K gather sgemv. Mêmes paramètres que `sgemv_q4_k_gather_*` /
+/// `sgemv_q5_k_gather_*`. Utilisé pour les 3 layers Q6_K du Qwen3.6-35B-A3B.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemv_q6_k_gather_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q6k_stacked_buf: &Buffer,
+    indices: &[u32],
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    expert_stride_bytes: usize,
+    x_stride_floats: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_gather_f32_lcpp_nsg2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 || n % 4 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_gather: K%256==0 && N%4==0 required (K={k}, N={n})"
+        )));
+    }
+    let b = indices.len();
+    if b == 0 {
+        return Ok(());
+    }
+    if b > 1024 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_gather: B={b} too large for set_bytes path"
+        )));
+    }
+    if x_stride_floats != 0 && x_stride_floats != k {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_gather: x_stride_floats must be 0 or K={k}, got {x_stride_floats}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q6_k_gather_f32_lcpp_nsg2",
+        SGEMV_Q6_K_GATHER_F32_LCPP_NSG2_SHADER,
+        "sgemv_q6_k_gather_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32, b as u32, expert_stride_bytes as u32];
+    let x_stride_u32 = x_stride_floats as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_stacked_buf), 0);
+        encoder.set_bytes(
+            2,
+            (b * 4) as u64,
+            indices.as_ptr() as *const std::ffi::c_void,
+        );
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &x_stride_u32 as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(4);
+        let groups = MTLSize::new(n_tg, b as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
 
 /// T132 — Q6_K version of the NSG=2 kernel. Mirror of `sgemv_q4_k_f32_lcpp_nsg2_into`
 /// for Q6_K weights (lm_head, some W_V). Each threadgroup processes 4 rows.
@@ -7824,6 +8413,67 @@ pub fn rms_norm_per_head_gated_f32(
         encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
         let tg = MTLSize::new(32, 1, 1);
         let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// T152 — somme pondérée multi-row : `acc[d] += sum_b weights[b] * src[b, d]`.
+// Remplace la boucle de `weighted_add_inplace_f32` après le path MoE gather.
+// Sans ça on aurait `n_used` dispatchs séparés ; avec ça, un seul.
+const WEIGHTED_REDUCE_ADD_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void weighted_reduce_add_f32(
+    device const float* src      [[buffer(0)]],   // [B, D]
+    device const float* weights  [[buffer(1)]],   // [B]
+    device       float* acc      [[buffer(2)]],   // [D] in/out
+    constant uint2&     dims     [[buffer(3)]],   // (B, D)
+    uint                gid      [[thread_position_in_grid]]
+) {
+    uint B = dims.x;
+    uint D = dims.y;
+    if (gid >= D) return;
+    float s = 0.0;
+    for (uint b = 0; b < B; b++) {
+        s += weights[b] * src[b * D + gid];
+    }
+    acc[gid] += s;
+}
+"#;
+
+/// T152 — `acc[d] += sum_b weights[b] * src[b, d]` en un seul dispatch.
+/// Utilisé après les 3 gather sgemv MoE pour combiner les `n_used` outputs
+/// experts en un accumulateur de taille `d`. Remplace la boucle
+/// `for k in 0..n_used { weighted_add_inplace_f32(...) }`.
+pub fn weighted_reduce_add_f32(
+    backend: &MetalBackend,
+    src_buf: &Buffer,
+    weights_buf: &Buffer,
+    acc_buf: &Buffer,
+    b: usize,
+    d: usize,
+) -> Result<(), MetalError> {
+    if b == 0 || d == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "weighted_reduce_add_f32: B={b}, D={d} must be > 0"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "weighted_reduce_add_f32",
+        WEIGHTED_REDUCE_ADD_F32_SHADER,
+        "weighted_reduce_add_f32",
+    )?;
+    let dims = [b as u32, d as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src_buf), 0);
+        encoder.set_buffer(1, Some(weights_buf), 0);
+        encoder.set_buffer(2, Some(acc_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(d as u64, 1, 1);
         encoder.dispatch_threads(grid, tg);
     });
     Ok(())

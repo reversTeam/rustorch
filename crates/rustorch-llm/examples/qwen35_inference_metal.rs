@@ -49,10 +49,12 @@ use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_f32, delta_net_step_f32, gqa_decode_f32, kv_append_f32, l2_norm_per_head_f32,
     rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
-    sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_mul_inplace_f32,
-    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
-    weighted_add_inplace_f32, zero_f32,
+    sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_mul_inplace_f32, split_qg_per_head_f32, split_qkv_f32,
+    ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32, weighted_add_inplace_f32,
+    weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -197,8 +199,42 @@ pub struct SsmLayerMetal {
     pub ssm_out: HybridMetalWeight,   // [value_dim, d]
 }
 
+/// T152 — Bloc d'experts MoE stocké en UN SEUL buffer Metal Q4_K.
+///
+/// La forme GGUF est `[k=in_dim, n=out_dim, n_experts]` (les 3 axes dans
+/// l'ordre fast→slow). Stockée contiguë en Metal, l'ordre des bytes est
+/// `expert.row.col_super_block` (l'expert est l'axe le plus lent), ce qui
+/// est ce que le kernel `sgemv_q4_k_gather_f32_lcpp_nsg2` attend.
+///
+/// Inspiration : MLX `SwitchLinear.weight` (forme `[E, N, K]` quantifiée
+/// d'un bloc) ; `affine_gather_qmm_rhs` lit `weight + idx*stride_w`.
+pub struct StackedQuantizedExperts {
+    /// Tous les bytes des `n_experts` matrices Q-quantisées, contigus.
+    pub buffer: Buffer,
+    /// Type de quantization (Q4_K typiquement).
+    pub dtype: GgmlType,
+    /// Nombre d'experts.
+    pub n_experts: usize,
+    /// Dimension d'entrée par expert (K, p.ex. d=5120 pour gate/up,
+    /// expert_f=1024 pour down).
+    pub k: usize,
+    /// Dimension de sortie par expert (N, p.ex. expert_f=1024 pour
+    /// gate/up, d=5120 pour down).
+    pub n: usize,
+    /// Taille d'un expert en bytes — `n * (k/256) * 144` pour Q4_K.
+    /// C'est aussi le `expert_stride_bytes` à passer au kernel gather.
+    pub bytes_per_expert: usize,
+    /// Nom du tensor GGUF.
+    pub name: String,
+}
+
 /// FFN sub-block — dense or MoE.
 #[allow(missing_docs)]
+// T152 — Moe variant is much larger than Dense (3 stacked buffers + 4
+// HybridMetalWeights + 1 router buffer vs 3 HybridMetalWeights). Clippy
+// suggests boxing — but each layer holds only one variant and they're
+// never moved post-load, so the size penalty is inert.
+#[allow(clippy::large_enum_variant)]
 pub enum FfnLayerMetal {
     Dense {
         w_gate: HybridMetalWeight, // [d, f]
@@ -206,17 +242,18 @@ pub enum FfnLayerMetal {
         w_down: HybridMetalWeight, // [f, d]
     },
     Moe {
-        // For the loader smoke test we just count and store. The actual
-        // forward (T145) needs to dispatch per-expert based on a top-K
-        // router output.
         gate_inp: HybridMetalWeight,
         gate_inp_shexp: Buffer, // f32 [d]
         gate_shexp: HybridMetalWeight,
         up_shexp: HybridMetalWeight,
         down_shexp: HybridMetalWeight,
-        gate_exps: Vec<HybridMetalWeight>,
-        up_exps: Vec<HybridMetalWeight>,
-        down_exps: Vec<HybridMetalWeight>,
+        // T152 — un seul buffer stacked par projection au lieu de
+        // `Vec<HybridMetalWeight>` à n_experts entrées. Permet le path
+        // gather sgemv (1 dispatch / projection / layer au lieu de
+        // top_k = 8 dispatchs).
+        gate_exps_stacked: StackedQuantizedExperts,
+        up_exps_stacked: StackedQuantizedExperts,
+        down_exps_stacked: StackedQuantizedExperts,
     },
 }
 
@@ -289,11 +326,13 @@ pub fn load_metal_model(
         visit_tensor(info, stats);
         load_quant_2d(backend, &file, info)
     };
-    let load_3d_stacked =
-        |name: &str, stats: &mut LoadStats| -> Result<Vec<HybridMetalWeight>, String> {
-            // Stacked-expert tensors: GGUF shape [d, ef, n_experts] for gate/up,
-            // [ef, d, n_experts] for down. We split into n_experts 2-D weights,
-            // each placed in its own Metal buffer.
+    let load_stacked_one_buffer =
+        |name: &str, stats: &mut LoadStats| -> Result<StackedQuantizedExperts, String> {
+            // T152 — Stacked expert tensors: GGUF shape `[k, n, n_experts]`
+            // (les 3 axes dans l'ordre fast → slow). On les charge dans UN
+            // SEUL Metal buffer contigu (l'expert est l'axe le plus lent),
+            // ce qui est exactement ce que le kernel `sgemv_q4_k_gather_*`
+            // attend pour offset = `expert_id * bytes_per_expert`.
             let info = file
                 .tensor(name)
                 .ok_or_else(|| format!("missing tensor: {name}"))?;
@@ -301,33 +340,31 @@ pub fn load_metal_model(
             if info.shape.len() != 3 {
                 return Err(format!("{name}: expected 3-D, got {:?}", info.shape));
             }
-            let dim0 = info.shape[0] as usize;
-            let dim1 = info.shape[1] as usize;
+            let k = info.shape[0] as usize;
+            let n = info.shape[1] as usize;
             let n_experts = info.shape[2] as usize;
-            let bytes_per_expert = info.byte_size() as usize / n_experts;
+            let total_bytes = info.byte_size() as usize;
+            let bytes_per_expert = total_bytes / n_experts;
             let bytes = file.tensor_bytes(info);
-            let mut out = Vec::with_capacity(n_experts);
-            for e in 0..n_experts {
-                let buffer = backend
-                    .alloc_shared(bytes_per_expert)
-                    .map_err(|e2| format!("alloc {name}[{e}]: {e2:?}"))?;
-                let src = &bytes[e * bytes_per_expert..(e + 1) * bytes_per_expert];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src.as_ptr(),
-                        buffer.contents() as *mut u8,
-                        bytes_per_expert,
-                    );
-                }
-                out.push(HybridMetalWeight {
-                    buffer,
-                    dtype: info.dtype,
-                    k: dim0,
-                    n: dim1,
-                    name: format!("{name}[{e}]"),
-                });
+            let buffer = backend
+                .alloc_shared(total_bytes)
+                .map_err(|e| format!("alloc {name}: {e:?}"))?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    buffer.contents() as *mut u8,
+                    total_bytes,
+                );
             }
-            Ok(out)
+            Ok(StackedQuantizedExperts {
+                buffer,
+                dtype: info.dtype,
+                n_experts,
+                k,
+                n,
+                bytes_per_expert,
+                name: name.to_string(),
+            })
         };
     let load_1d_f32 = |name: &str, stats: &mut LoadStats| -> Result<Buffer, String> {
         let info = file
@@ -368,20 +405,21 @@ pub fn load_metal_model(
                 let gate_shexp = load_2d(&format!("blk.{li}.ffn_gate_shexp.weight"), &mut stats)?;
                 let up_shexp = load_2d(&format!("blk.{li}.ffn_up_shexp.weight"), &mut stats)?;
                 let down_shexp = load_2d(&format!("blk.{li}.ffn_down_shexp.weight"), &mut stats)?;
-                let gate_exps =
-                    load_3d_stacked(&format!("blk.{li}.ffn_gate_exps.weight"), &mut stats)?;
-                let up_exps = load_3d_stacked(&format!("blk.{li}.ffn_up_exps.weight"), &mut stats)?;
-                let down_exps =
-                    load_3d_stacked(&format!("blk.{li}.ffn_down_exps.weight"), &mut stats)?;
+                let gate_exps_stacked =
+                    load_stacked_one_buffer(&format!("blk.{li}.ffn_gate_exps.weight"), &mut stats)?;
+                let up_exps_stacked =
+                    load_stacked_one_buffer(&format!("blk.{li}.ffn_up_exps.weight"), &mut stats)?;
+                let down_exps_stacked =
+                    load_stacked_one_buffer(&format!("blk.{li}.ffn_down_exps.weight"), &mut stats)?;
                 FfnLayerMetal::Moe {
                     gate_inp,
                     gate_inp_shexp,
                     gate_shexp,
                     up_shexp,
                     down_shexp,
-                    gate_exps,
-                    up_exps,
-                    down_exps,
+                    gate_exps_stacked,
+                    up_exps_stacked,
+                    down_exps_stacked,
                 }
             },
         };
@@ -518,6 +556,14 @@ struct Scratch {
     moe_up: Buffer,          // expert_f
     moe_fd: Buffer,          // expert_f
     moe_shared_gate: Buffer, // 1 (scalar — shared expert gate)
+    // T152 — gather buffers : `[n_used, ef]` pour gate/up/fd, `[n_used, d]`
+    // pour down. Permettent au path MoE gather (1 dispatch / projection /
+    // layer) de stocker les outputs des `n_used` experts en parallèle.
+    moe_gate_gather: Buffer, // n_used * expert_f
+    moe_up_gather: Buffer,   // n_used * expert_f
+    moe_fd_gather: Buffer,   // n_used * expert_f
+    moe_down_gather: Buffer, // n_used * d
+    moe_topw_buf: Buffer,    // n_used (top-K weights f32, GPU-side for reduce)
     // logits
     logits: Buffer, // vocab
 }
@@ -565,6 +611,14 @@ impl Scratch {
             moe_logits: alloc(cfg.n_experts.max(1) * 4),
             moe_acc: alloc(d * 4),
             moe_expert_out: alloc(d * 4),
+            // T152 — gather buffers (sized for n_experts_used × {ef, d}).
+            // Pour les variants non-MoE, n_experts_used=0 → max(1) pour
+            // que l'alloc soit valide.
+            moe_gate_gather: alloc(cfg.n_experts_used.max(1) * cfg.expert_f.max(1) * 4),
+            moe_up_gather: alloc(cfg.n_experts_used.max(1) * cfg.expert_f.max(1) * 4),
+            moe_fd_gather: alloc(cfg.n_experts_used.max(1) * cfg.expert_f.max(1) * 4),
+            moe_down_gather: alloc(cfg.n_experts_used.max(1) * d * 4),
+            moe_topw_buf: alloc(cfg.n_experts_used.max(1) * 4),
             moe_gate: alloc(cfg.expert_f.max(1) * 4),
             moe_up: alloc(cfg.expert_f.max(1) * 4),
             moe_fd: alloc(cfg.expert_f.max(1) * 4),
@@ -1179,9 +1233,9 @@ fn ffn_dense_forward(
             gate_shexp,
             up_shexp,
             down_shexp,
-            gate_exps,
-            up_exps,
-            down_exps,
+            gate_exps_stacked,
+            up_exps_stacked,
+            down_exps_stacked,
         } => {
             let n_experts = cfg.n_experts;
             let n_used = cfg.n_experts_used;
@@ -1230,33 +1284,125 @@ fn ffn_dense_forward(
                 (top, w)
             };
 
+            // T152 — Upload top-K weights + indices for the gather kernel.
+            // top_w sur GPU pour weighted_reduce_add_f32 ; indices sur CPU,
+            // passés via set_bytes au kernel gather (n_used ≤ 8, fits in 4 KB).
+            let indices_u32: Vec<u32> = top_idx.iter().map(|&i| i as u32).collect();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    top_w.as_ptr(),
+                    scratch.moe_topw_buf.contents() as *mut f32,
+                    n_used,
+                );
+            }
+
             // 3. T147a — zero the accumulator on GPU (no drain).
             zero_f32(backend, &scratch.moe_acc, d)?;
 
-            // 4. For each top-K expert: compute expert FFN output and
-            //    GPU-weighted-add into the accumulator. No drain between
-            //    experts — chained encoder serialises through buffer deps.
-            for k in 0..n_used {
-                let e = top_idx[k];
-                let w_e = top_w[k];
-                gate_exps[e].matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
-                up_exps[e].matmul_into(backend, &scratch.h, &scratch.moe_up)?;
-                swiglu_f32(
-                    backend,
-                    &scratch.moe_gate,
-                    &scratch.moe_up,
-                    &scratch.moe_fd,
-                    ef,
-                )?;
-                down_exps[e].matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
-                weighted_add_inplace_f32(
-                    backend,
-                    &scratch.moe_acc,
-                    &scratch.moe_expert_out,
-                    w_e,
-                    d,
-                )?;
-            }
+            // 4. T152 — gather sgemv path (1 dispatch / projection au lieu de
+            //    n_used dispatchs). Inspired by MLX `affine_gather_qmm_rhs`.
+            //    Dispatch dynamique selon dtype (Q4_K, Q5_K) — Qwen3.6-35B-A3B
+            //    a gate/up=Q4_K et down=Q5_K.
+            let gather_dispatch = |stacked: &StackedQuantizedExperts,
+                                   x: &Buffer,
+                                   out: &Buffer,
+                                   k: usize,
+                                   n: usize,
+                                   x_stride: usize|
+             -> Result<(), MetalError> {
+                match stacked.dtype {
+                    GgmlType::Q4_K => sgemv_q4_k_gather_f32_lcpp_nsg2_into(
+                        backend,
+                        x,
+                        &stacked.buffer,
+                        &indices_u32,
+                        out,
+                        k,
+                        n,
+                        stacked.bytes_per_expert,
+                        x_stride,
+                    ),
+                    GgmlType::Q5_K => sgemv_q5_k_gather_f32_lcpp_nsg2_into(
+                        backend,
+                        x,
+                        &stacked.buffer,
+                        &indices_u32,
+                        out,
+                        k,
+                        n,
+                        stacked.bytes_per_expert,
+                        x_stride,
+                    ),
+                    GgmlType::Q6_K => sgemv_q6_k_gather_f32_lcpp_nsg2_into(
+                        backend,
+                        x,
+                        &stacked.buffer,
+                        &indices_u32,
+                        out,
+                        k,
+                        n,
+                        stacked.bytes_per_expert,
+                        x_stride,
+                    ),
+                    other => Err(MetalError::Unsupported(format!(
+                        "T152 gather: dtype {:?} not yet supported (only Q4_K/Q5_K/Q6_K)",
+                        other
+                    ))),
+                }
+            };
+
+            // gate_proj : [n_used, ef] = stacked_gate[indices, :, :] @ h (broadcast)
+            gather_dispatch(
+                gate_exps_stacked,
+                &scratch.h,
+                &scratch.moe_gate_gather,
+                d,
+                ef,
+                0, // x_stride_floats=0 → broadcast
+            )
+            .map_err(|e| MetalError::Unsupported(format!("moe gate gather: {e:?}")))?;
+
+            // up_proj : [n_used, ef] = stacked_up[indices, :, :] @ h (broadcast)
+            gather_dispatch(
+                up_exps_stacked,
+                &scratch.h,
+                &scratch.moe_up_gather,
+                d,
+                ef,
+                0,
+            )
+            .map_err(|e| MetalError::Unsupported(format!("moe up gather: {e:?}")))?;
+
+            // swiglu : fd_gather[b, i] = silu(gate[b, i]) * up[b, i] sur n_used*ef
+            // éléments traités comme un tableau 1D (kernel élément-wise pur).
+            swiglu_f32(
+                backend,
+                &scratch.moe_gate_gather,
+                &scratch.moe_up_gather,
+                &scratch.moe_fd_gather,
+                n_used * ef,
+            )?;
+
+            // down_proj : [n_used, d] = stacked_down[indices, :, :] @ fd_gather (per-row)
+            gather_dispatch(
+                down_exps_stacked,
+                &scratch.moe_fd_gather,
+                &scratch.moe_down_gather,
+                ef,
+                d,
+                ef, // x_stride_floats=ef → per-row input
+            )
+            .map_err(|e| MetalError::Unsupported(format!("moe down gather: {e:?}")))?;
+
+            // T152 — somme pondérée multi-row : moe_acc += sum_b top_w[b] * down_gather[b, :]
+            weighted_reduce_add_f32(
+                backend,
+                &scratch.moe_down_gather,
+                &scratch.moe_topw_buf,
+                &scratch.moe_acc,
+                n_used,
+                d,
+            )?;
 
             // 5. Shared expert: standard SwiGLU FFN with sigmoid gate scalar.
             //    shared_gate is a vector of size d (per-element gate, not scalar).
