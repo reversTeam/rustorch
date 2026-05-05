@@ -5010,6 +5010,120 @@ pub fn kv_append_f32(
     Ok(())
 }
 
+// T119 — Batched Q6_K sgemv. B independent (x_b @ W_q6k) computed in
+// 1 dispatch. Same Q6_K weight buffer shared across all B batches via
+// cache; only x reads scale with B. Mirror of T92 for Q6_K.
+const SGEMV_Q6_K_F32_BATCH_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q6K_BYTES = 210u;
+constant uint Q6K_WEIGHTS = 256u;
+
+kernel void sgemv_q6_k_f32_batch(
+    device const float* x       [[buffer(0)]],   // [B, K]
+    device const uchar* w_q6k   [[buffer(1)]],   // [N, K] Q6_K row-major
+    device float* y             [[buffer(2)]],   // [B, N]
+    constant uint3& dims        [[buffer(3)]],   // (K, N, B)
+    uint2 gid                   [[thread_position_in_grid]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B = dims.z;
+    uint n_idx = gid.x;
+    uint batch_idx = gid.y;
+    if (n_idx >= N || batch_idx >= B) return;
+
+    uint blocks_per_row = K / Q6K_WEIGHTS;
+    uint row_off = n_idx * blocks_per_row * Q6K_BYTES;
+    device const float* xb = x + batch_idx * K;
+
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < blocks_per_row; ++blk) {
+        device const uchar* block = w_q6k + row_off + blk * Q6K_BYTES;
+        device const uchar* ql = block;
+        device const uchar* qh = block + 128;
+        device const char*  sc = (device const char*)(block + 192);
+        ushort d_bits = ((ushort)block[209] << 8) | (ushort)block[208];
+        float d = float(as_type<half>(d_bits));
+
+        for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+            device const uchar* ql_h = ql + half_idx * 64u;
+            device const uchar* qh_h = qh + half_idx * 32u;
+            device const char*  sc_h = sc + half_idx * 8;
+            uint x_h_off = blk * Q6K_WEIGHTS + half_idx * 128u;
+
+            float s1_lo = d * float(sc_h[0]);
+            float s1_hi = d * float(sc_h[1]);
+            float s2_lo = d * float(sc_h[2]);
+            float s2_hi = d * float(sc_h[3]);
+            float s3_lo = d * float(sc_h[4]);
+            float s3_hi = d * float(sc_h[5]);
+            float s4_lo = d * float(sc_h[6]);
+            float s4_hi = d * float(sc_h[7]);
+
+            for (uint l = 0; l < 32u; ++l) {
+                uchar qhh = qh_h[l];
+                int q1 = (int)(ql_h[l]      & 0x0F) | ((int)((qhh >> 0) & 0x03) << 4);
+                int q2 = (int)(ql_h[l + 32] & 0x0F) | ((int)((qhh >> 2) & 0x03) << 4);
+                int q3 = (int)(ql_h[l]      >> 4)   | ((int)((qhh >> 4) & 0x03) << 4);
+                int q4 = (int)(ql_h[l + 32] >> 4)   | ((int)((qhh >> 6) & 0x03) << 4);
+                float s1 = (l < 16u) ? s1_lo : s1_hi;
+                float s2 = (l < 16u) ? s2_lo : s2_hi;
+                float s3 = (l < 16u) ? s3_lo : s3_hi;
+                float s4 = (l < 16u) ? s4_lo : s4_hi;
+                acc += xb[x_h_off + l]      * (s1 * float(q1 - 32));
+                acc += xb[x_h_off + l + 32] * (s2 * float(q2 - 32));
+                acc += xb[x_h_off + l + 64] * (s3 * float(q3 - 32));
+                acc += xb[x_h_off + l + 96] * (s4 * float(q4 - 32));
+            }
+        }
+    }
+
+    y[batch_idx * N + n_idx] = acc;
+}
+"#;
+
+/// T119 — Batched Q6_K sgemv: B independent (x_b @ W_q6k) in 1 dispatch.
+pub fn sgemv_q6_k_f32_batch_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q6k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q6_k_f32_batch needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || b == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q6_k_f32_batch: K%256==0 required (K={k}, N={n}, B={b})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q6_k_f32_batch",
+        SGEMV_Q6_K_F32_BATCH_SHADER,
+        "sgemv_q6_k_f32_batch",
+    )?;
+    let dims = [k as u32, n as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q6k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, b as u64, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 // T108 — Batched K-only or V-only append. Writes B sequential positions
 // (pos_base, pos_base+1, ..., pos_base+B-1) into the cache from a packed
 // source [B, n_kv * head_dim].
@@ -5137,6 +5251,99 @@ pub fn kv_append_kv_f32(
         encoder.set_bytes(5, 4, &ms as *const u32 as *const std::ffi::c_void);
         let tg_size = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new((2 * total) as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+// T118 — Fused rms_norm_per_head + rope_half_split. 1 dispatch instead
+// of 2 (saves 80 dispatches/token: 40 layers × 2 for Q and K). Each
+// threadgroup = 1 head: 32 threads cooperate on RMSNorm reduction, then
+// each thread does its rope rotation in-place.
+const RMS_NORM_PER_HEAD_THEN_ROPE_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rms_norm_per_head_then_rope_f32(
+    device float* x              [[buffer(0)]],   // [n_heads * head_dim]
+    device const float* gamma    [[buffer(1)]],   // [head_dim]
+    device const float* cos_tab  [[buffer(2)]],   // [max_seq, head_dim/2]
+    device const float* sin_tab  [[buffer(3)]],
+    constant uint3& dims         [[buffer(4)]],   // (n_heads, head_dim, position)
+    constant float& eps          [[buffer(5)]],
+    uint h                       [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_position_in_threadgroup]],
+    uint sg_size                 [[threads_per_simdgroup]]
+) {
+    uint n_heads  = dims.x;
+    uint head_dim = dims.y;
+    uint position = dims.z;
+    if (h >= n_heads) return;
+
+    device float* head = x + h * head_dim;
+
+    // Phase 1: RMSNorm (compute inv_rms, normalize + multiply by gamma)
+    float partial = 0.0;
+    for (uint i = tid; i < head_dim; i += sg_size) {
+        float v = head[i];
+        partial += v * v;
+    }
+    float total = simd_sum(partial);
+    float inv_rms = 1.0 / sqrt(total / float(head_dim) + eps);
+    for (uint i = tid; i < head_dim; i += sg_size) {
+        head[i] = head[i] * inv_rms * gamma[i];
+    }
+
+    // Phase 2: RoPE in-place. Each thread handles its (k, k+half_dim) pair
+    // for k in [tid, tid + sg_size, tid + 2*sg_size, ...] up to half_dim-1.
+    // No barrier needed since all threads have written their normalized
+    // values; the rope reads we do here only access positions written by
+    // this same threadgroup.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint half_dim = head_dim / 2u;
+    for (uint k = tid; k < half_dim; k += sg_size) {
+        uint i0 = k;
+        uint i1 = k + half_dim;
+        uint tab_off = position * half_dim + k;
+        float c = cos_tab[tab_off];
+        float s = sin_tab[tab_off];
+        float x0 = head[i0];
+        float x1 = head[i1];
+        head[i0] = x0 * c - x1 * s;
+        head[i1] = x1 * c + x0 * s;
+    }
+}
+"#;
+
+/// T118 — Fused per-head RMSNorm + RoPE. Saves 1 dispatch per call.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_per_head_then_rope_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    gamma_buf: &Buffer,
+    cos_buf: &Buffer,
+    sin_buf: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    position: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "rms_norm_per_head_then_rope_f32",
+        RMS_NORM_PER_HEAD_THEN_ROPE_F32_SHADER,
+        "rms_norm_per_head_then_rope_f32",
+    )?;
+    let dims = [n_heads as u32, head_dim as u32, position as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(gamma_buf), 0);
+        encoder.set_buffer(2, Some(cos_buf), 0);
+        encoder.set_buffer(3, Some(sin_buf), 0);
+        encoder.set_bytes(4, 12, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
         encoder.dispatch_threads(grid, tg_size);
     });
     Ok(())
