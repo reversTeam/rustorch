@@ -4731,6 +4731,94 @@ pub fn rms_norm_f32(
     Ok(())
 }
 
+// T106 — Batched RMSNorm. B rows of size d processed in parallel.
+// Each threadgroup handles one row (B threadgroups total). Same gamma
+// shared across all rows. Used by forward_batch (multi-token forward).
+const RMS_NORM_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rms_norm_batched_f32(
+    device const float* x     [[buffer(0)]],   // [B, d]
+    device const float* gamma [[buffer(1)]],   // [d]
+    device float* y           [[buffer(2)]],   // [B, d]
+    constant uint2& dims      [[buffer(3)]],   // (d, B)
+    constant float& eps       [[buffer(4)]],
+    uint b                    [[threadgroup_position_in_grid]],
+    uint tid                  [[thread_position_in_threadgroup]],
+    uint sg_size              [[threads_per_simdgroup]]
+) {
+    uint d = dims.x;
+    uint B = dims.y;
+    if (b >= B) return;
+
+    device const float* xb = x + b * d;
+    device float* yb       = y + b * d;
+    uint d4 = d / 4u;
+
+    float partial = 0.0;
+    device const float4* xb4 = (device const float4*)xb;
+    for (uint i = tid; i < d4; i += sg_size) {
+        float4 v = xb4[i];
+        partial += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    uint tail_start = d4 * 4u;
+    for (uint i = tail_start + tid; i < d; i += sg_size) {
+        float v = xb[i];
+        partial += v * v;
+    }
+
+    float total = simd_sum(partial);
+    float inv_rms = 1.0 / sqrt(total / float(d) + eps);
+
+    device const float4* g4 = (device const float4*)gamma;
+    device float4* yb4 = (device float4*)yb;
+    for (uint i = tid; i < d4; i += sg_size) {
+        float4 v = xb4[i];
+        float4 g = g4[i];
+        yb4[i] = float4(v.x * inv_rms * g.x,
+                        v.y * inv_rms * g.y,
+                        v.z * inv_rms * g.z,
+                        v.w * inv_rms * g.w);
+    }
+    for (uint i = tail_start + tid; i < d; i += sg_size) {
+        yb[i] = xb[i] * inv_rms * gamma[i];
+    }
+}
+"#;
+
+/// T106 — Batched RMSNorm: process B rows of size d in parallel.
+/// Used by multi-token forward (forward_batch). Same gamma shared across
+/// all rows. Output identical to B sequential rms_norm_f32 calls.
+pub fn rms_norm_batched_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    gamma_buf: &Buffer,
+    y_buf: &Buffer,
+    d: usize,
+    b: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "rms_norm_batched_f32",
+        RMS_NORM_BATCHED_F32_SHADER,
+        "rms_norm_batched_f32",
+    )?;
+    let dims = [d as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(gamma_buf), 0);
+        encoder.set_buffer(2, Some(y_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * b as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 const RMS_NORM_PER_HEAD_F32_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -6320,6 +6408,76 @@ mod tests {
                 assert!(
                     r < 1e-3,
                     "batch={batch} j={j} mismatch: single={a} batch={b_val} (rel {r:.3e})"
+                );
+            }
+        }
+    }
+
+    /// T106 — Batched RMSNorm must match B sequential rms_norm_f32 calls.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn rms_norm_batched_f32_matches_singles() {
+        let backend = metal_backend();
+        let d = 5120usize;
+        let b = 4usize;
+        let eps = 1e-6_f32;
+
+        // Build B different x rows
+        let mut x_all = vec![0.0f32; b * d];
+        for batch in 0..b {
+            for i in 0..d {
+                x_all[batch * d + i] = ((i as f32 + 1.0) * 0.001 * (batch as f32 + 1.0)).sin();
+            }
+        }
+        let gamma: Vec<f32> = (0..d)
+            .map(|i| 0.5 + ((i as f32 * 0.001).cos()) * 0.5)
+            .collect();
+
+        let x_buf = backend.alloc_shared(b * d * 4).unwrap();
+        let gamma_buf = backend.alloc_shared(d * 4).unwrap();
+        let y_seq = backend.alloc_shared(b * d * 4).unwrap();
+        let y_batch = backend.alloc_shared(b * d * 4).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(x_all.as_ptr(), x_buf.contents() as *mut f32, b * d);
+            std::ptr::copy_nonoverlapping(gamma.as_ptr(), gamma_buf.contents() as *mut f32, d);
+        }
+
+        // Reference: B sequential calls
+        for batch in 0..b {
+            let xb_buf = backend.alloc_shared(d * 4).unwrap();
+            let yb_buf = backend.alloc_shared(d * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    x_all[batch * d..(batch + 1) * d].as_ptr(),
+                    xb_buf.contents() as *mut f32,
+                    d,
+                );
+            }
+            rms_norm_f32(backend, &xb_buf, &gamma_buf, &yb_buf, d, eps).unwrap();
+            backend.drain();
+            unsafe {
+                let dst = (y_seq.contents() as *mut f32).add(batch * d);
+                std::ptr::copy_nonoverlapping(yb_buf.contents() as *const f32, dst, d);
+            }
+        }
+
+        // Batched call
+        rms_norm_batched_f32(backend, &x_buf, &gamma_buf, &y_batch, d, b, eps).unwrap();
+        backend.drain();
+
+        let seq =
+            unsafe { std::slice::from_raw_parts(y_seq.contents() as *const f32, b * d).to_vec() };
+        let bat =
+            unsafe { std::slice::from_raw_parts(y_batch.contents() as *const f32, b * d).to_vec() };
+        for batch in 0..b {
+            for i in 0..d {
+                let a = seq[batch * d + i];
+                let bv = bat[batch * d + i];
+                let r = (a - bv).abs() / a.abs().max(1e-4);
+                assert!(
+                    r < 1e-3,
+                    "batch={batch} i={i} mismatch: seq={a} batch={bv} (rel {r:.3e})"
                 );
             }
         }
