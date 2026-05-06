@@ -32,11 +32,66 @@ use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, gqa_decode_batched_f32, gqa_decode_f32,
     kv_append_batched_f32, kv_append_f32, rms_norm_batched_f32, rms_norm_f32,
     rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rope_half_split_batched_f32,
-    rope_half_split_f32, sgemv_q4_k_f32_into, sgemv_q4_k_f32_lcpp_nr2_batch_into,
+    rope_half_split_f32, sgemm_q4_k_f32_simdgroup_matrix_64_into,
+    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
+    sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_q4_k_f32_into, sgemv_q4_k_f32_lcpp_nr2_batch_into,
     sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
     sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_lcpp_nr2_batch_into,
     sgemv_q6_k_f32_lcpp_nsg2_into, swiglu_batched_f32, swiglu_f32,
 };
+
+/// T162 phase 4-bis : dispatcher SGEMM batched. Choisit le kernel optimal
+/// selon shape et dtype, et fallback vers sgemv_*_lcpp_nr2_batch_into si non
+/// éligible (alignement / dtype non supporté).
+///
+/// Hierarchie :
+///   M ≥ 64 et N % 64 == 0 et K % 256 == 0 → sgemm_*_simdgroup_matrix_64
+///     (multi-warp 64×64, ×4-10 vs sgemv loop sur shapes 14B FFN)
+///   M ≥ 8  et N % 8  == 0 et K % 256 == 0 → sgemm_*_simdgroup_matrix
+///     (single-tile 8×8, ×2-3 vs sgemv loop)
+///   sinon → sgemv_*_lcpp_nr2_batch (path existant)
+fn dispatch_batched_matmul(
+    backend: &MetalBackend,
+    h_buf: &Buffer,
+    w_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    m: usize,
+    dtype: GgmlType,
+) -> Result<(), String> {
+    let aligned_64 = m >= 64 && m % 64 == 0 && n % 64 == 0 && k % 256 == 0;
+    let aligned_8 = m >= 8 && m % 8 == 0 && n % 8 == 0 && k % 256 == 0;
+    match dtype {
+        GgmlType::Q4_K => {
+            if aligned_64 {
+                sgemm_q4_k_f32_simdgroup_matrix_64_into(backend, h_buf, w_buf, out_buf, m, n, k)
+                    .map_err(|e| format!("sgemm_q4_k_64: {e:?}"))
+            } else if aligned_8 {
+                sgemm_q4_k_f32_simdgroup_matrix_into(backend, h_buf, w_buf, out_buf, m, n, k)
+                    .map_err(|e| format!("sgemm_q4_k_8: {e:?}"))
+            } else {
+                sgemv_q4_k_f32_lcpp_nr2_batch_into(backend, h_buf, w_buf, out_buf, k, n, m)
+                    .map_err(|e| format!("sgemv_q4_k_batch: {e:?}"))
+            }
+        },
+        GgmlType::Q6_K => {
+            if aligned_64 {
+                sgemm_q6_k_f32_simdgroup_matrix_64_into(backend, h_buf, w_buf, out_buf, m, n, k)
+                    .map_err(|e| format!("sgemm_q6_k_64: {e:?}"))
+            } else if aligned_8 {
+                sgemm_q6_k_f32_simdgroup_matrix_into(backend, h_buf, w_buf, out_buf, m, n, k)
+                    .map_err(|e| format!("sgemm_q6_k_8: {e:?}"))
+            } else {
+                sgemv_q6_k_f32_lcpp_nr2_batch_into(backend, h_buf, w_buf, out_buf, k, n, m)
+                    .map_err(|e| format!("sgemv_q6_k_batch: {e:?}"))
+            }
+        },
+        other => Err(format!(
+            "dispatch_batched_matmul: dtype {other:?} not supported"
+        )),
+    }
+}
 
 use metal::Buffer;
 
@@ -3641,8 +3696,8 @@ fn forward_batch(
         )
         .unwrap();
 
-        // 2. QKV: 3 batched sgemv (Q4_K or Q6_K depending on dtype)
-        sgemv_q4_k_f32_lcpp_nr2_batch_into(
+        // 2. QKV: 3 batched matmul (T162 phase 4-bis : SGEMM si éligible).
+        dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
             &layer.w_q.buffer,
@@ -3650,9 +3705,10 @@ fn forward_batch(
             layer.w_q.k,
             layer.w_q.n,
             b,
+            layer.w_q.dtype,
         )
         .unwrap();
-        sgemv_q4_k_f32_lcpp_nr2_batch_into(
+        dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
             &layer.w_k.buffer,
@@ -3660,34 +3716,20 @@ fn forward_batch(
             layer.w_k.k,
             layer.w_k.n,
             b,
+            layer.w_k.dtype,
         )
         .unwrap();
-        match layer.w_v.dtype {
-            GgmlType::Q4_K => sgemv_q4_k_f32_lcpp_nr2_batch_into(
-                backend,
-                &scratch.h_buf,
-                &layer.w_v.buffer,
-                &scratch.v_buf,
-                layer.w_v.k,
-                layer.w_v.n,
-                b,
-            )
-            .unwrap(),
-            GgmlType::Q6_K => sgemv_q6_k_f32_lcpp_nr2_batch_into(
-                backend,
-                &scratch.h_buf,
-                &layer.w_v.buffer,
-                &scratch.v_buf,
-                layer.w_v.k,
-                layer.w_v.n,
-                b,
-            )
-            .unwrap(),
-            _ => panic!(
-                "forward_batch: unsupported w_v dtype: {:?}",
-                layer.w_v.dtype
-            ),
-        }
+        dispatch_batched_matmul(
+            backend,
+            &scratch.h_buf,
+            &layer.w_v.buffer,
+            &scratch.v_buf,
+            layer.w_v.k,
+            layer.w_v.n,
+            b,
+            layer.w_v.dtype,
+        )
+        .unwrap();
 
         // 3. Batched QK norm + RoPE
         if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
@@ -3777,33 +3819,18 @@ fn forward_batch(
         )
         .unwrap();
 
-        // 6. W_O batched sgemv + residual add
-        match layer.w_o.dtype {
-            GgmlType::Q4_K => sgemv_q4_k_f32_lcpp_nr2_batch_into(
-                backend,
-                &scratch.attn_buf,
-                &layer.w_o.buffer,
-                &scratch.o_buf,
-                layer.w_o.k,
-                layer.w_o.n,
-                b,
-            )
-            .unwrap(),
-            GgmlType::Q6_K => sgemv_q6_k_f32_lcpp_nr2_batch_into(
-                backend,
-                &scratch.attn_buf,
-                &layer.w_o.buffer,
-                &scratch.o_buf,
-                layer.w_o.k,
-                layer.w_o.n,
-                b,
-            )
-            .unwrap(),
-            _ => panic!(
-                "forward_batch: unsupported w_o dtype: {:?}",
-                layer.w_o.dtype
-            ),
-        }
+        // 6. W_O batched matmul + residual add (T162 phase 4-bis : SGEMM si éligible).
+        dispatch_batched_matmul(
+            backend,
+            &scratch.attn_buf,
+            &layer.w_o.buffer,
+            &scratch.o_buf,
+            layer.w_o.k,
+            layer.w_o.n,
+            b,
+            layer.w_o.dtype,
+        )
+        .unwrap();
         add_inplace_batched_f32(backend, &scratch.xd_buf, &scratch.o_buf, d, b).unwrap();
 
         // 7. Batched ffn_norm
@@ -3818,8 +3845,8 @@ fn forward_batch(
         )
         .unwrap();
 
-        // 8. Gate + Up (batched Q4_K sgemv)
-        sgemv_q4_k_f32_lcpp_nr2_batch_into(
+        // 8. Gate + Up (T162 phase 4-bis : SGEMM si éligible).
+        dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
             &layer.w_gate.buffer,
@@ -3827,9 +3854,10 @@ fn forward_batch(
             layer.w_gate.k,
             layer.w_gate.n,
             b,
+            layer.w_gate.dtype,
         )
         .unwrap();
-        sgemv_q4_k_f32_lcpp_nr2_batch_into(
+        dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
             &layer.w_up.buffer,
@@ -3837,6 +3865,7 @@ fn forward_batch(
             layer.w_up.k,
             layer.w_up.n,
             b,
+            layer.w_up.dtype,
         )
         .unwrap();
 
@@ -3851,33 +3880,18 @@ fn forward_batch(
         )
         .unwrap();
 
-        // 10. W_down batched sgemv + residual add
-        match layer.w_down.dtype {
-            GgmlType::Q4_K => sgemv_q4_k_f32_lcpp_nr2_batch_into(
-                backend,
-                &scratch.fd_buf,
-                &layer.w_down.buffer,
-                &scratch.fc2_buf,
-                layer.w_down.k,
-                layer.w_down.n,
-                b,
-            )
-            .unwrap(),
-            GgmlType::Q6_K => sgemv_q6_k_f32_lcpp_nr2_batch_into(
-                backend,
-                &scratch.fd_buf,
-                &layer.w_down.buffer,
-                &scratch.fc2_buf,
-                layer.w_down.k,
-                layer.w_down.n,
-                b,
-            )
-            .unwrap(),
-            _ => panic!(
-                "forward_batch: unsupported w_down dtype: {:?}",
-                layer.w_down.dtype
-            ),
-        }
+        // 10. W_down batched matmul + residual add (T162 phase 4-bis : SGEMM).
+        dispatch_batched_matmul(
+            backend,
+            &scratch.fd_buf,
+            &layer.w_down.buffer,
+            &scratch.fc2_buf,
+            layer.w_down.k,
+            layer.w_down.n,
+            b,
+            layer.w_down.dtype,
+        )
+        .unwrap();
         add_inplace_batched_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d, b).unwrap();
     }
 
@@ -3977,10 +3991,12 @@ struct Scratch {
 /// only the relevant slice.
 ///
 /// T162 phase 4 : bumped from 4 to 32 to enable chunked prefill batching.
-/// With our SGEMM kernels (phases 2/3-bis/5/5-bis/7/7-bis), batched matmul
+/// T162 phase 4-bis : bumped to 128 since SGEMM kernels (phase 3-bis 64×64
+/// multi-warp) hit ×4-10 sur les vraies shapes FFN 14B à M=64-128.
+/// Avec our SGEMM kernels (phases 2/3-bis/5/5-bis/7/7-bis), batched matmul
 /// hits ×4-10 vs sgemv loop sur shapes 14B prefill. Chunking prefill_ids
 /// par B_MAX accélère le prefill end-to-end.
-const B_MAX: usize = 32;
+const B_MAX: usize = 128;
 
 impl Scratch {
     fn new(backend: &MetalBackend, cfg: &ModelCfg) -> Self {
