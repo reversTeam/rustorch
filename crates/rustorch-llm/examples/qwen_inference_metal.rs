@@ -33,13 +33,14 @@ use rustorch_metal::kernels::{
     kv_append_batched_f32, kv_append_f32, rms_norm_batched_f32, rms_norm_f32,
     rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rope_half_split_batched_f32,
     rope_half_split_f32, sgemm_q3_k_f32_simdgroup_matrix_64_into,
-    sgemm_q3_k_f32_simdgroup_matrix_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
-    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
-    sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_into,
-    sgemv_q4_k_f32_lcpp_nr2_batch_into, sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_pair_into,
-    sgemv_q4_k_f32_pair_quadcoop_into, sgemv_q4_k_f32_triple_quadcoop_into,
-    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_lcpp_nr2_batch_into,
-    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, swiglu_batched_f32, swiglu_f32,
+    sgemm_q3_k_f32_simdgroup_matrix_into, sgemm_q4_k_f32_lcpp_ported_into,
+    sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
+    sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
+    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_into, sgemv_q4_k_f32_lcpp_nr2_batch_into,
+    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
+    sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_into,
+    sgemv_q6_k_f32_lcpp_nr2_batch_into, sgemv_q6_k_f32_lcpp_nsg2_into,
+    sgemv_q8_0_f32_lcpp_nsg2_into, swiglu_batched_f32, swiglu_f32,
 };
 
 /// T162 phase 4-bis : dispatcher SGEMM batched. Choisit le kernel optimal
@@ -66,7 +67,14 @@ fn dispatch_batched_matmul(
     let aligned_8 = m >= 8 && m % 8 == 0 && n % 8 == 0 && k % 256 == 0;
     match dtype {
         GgmlType::Q4_K => {
-            if aligned_64 {
+            // T162 phase 9h : tile 32×64 (lcpp_ported) si M%32 et N%64 alignés.
+            // Sinon fallback 64×64 multi-warp ou 8×8 single-warp ou sgemv_batch.
+            // Activable via env var pour A/B test (RUSTORCH_Q4K_LCPP_PORTED=1).
+            let use_lcpp_ported = std::env::var("RUSTORCH_Q4K_LCPP_PORTED").is_ok();
+            if use_lcpp_ported && m >= 32 && m % 32 == 0 && n % 64 == 0 && k % 256 == 0 {
+                sgemm_q4_k_f32_lcpp_ported_into(backend, h_buf, w_buf, out_buf, m, n, k)
+                    .map_err(|e| format!("sgemm_q4_k_lcpp_ported: {e:?}"))
+            } else if aligned_64 {
                 sgemm_q4_k_f32_simdgroup_matrix_64_into(backend, h_buf, w_buf, out_buf, m, n, k)
                     .map_err(|e| format!("sgemm_q4_k_64: {e:?}"))
             } else if aligned_8 {
@@ -4097,7 +4105,7 @@ struct Scratch {
 /// Avec our SGEMM kernels (phases 2/3-bis/5/5-bis/7/7-bis), batched matmul
 /// hits ×4-10 vs sgemv loop sur shapes 14B prefill. Chunking prefill_ids
 /// par B_MAX accélère le prefill end-to-end.
-const B_MAX: usize = 128;
+const B_MAX: usize = 256;
 
 impl Scratch {
     fn new(backend: &MetalBackend, cfg: &ModelCfg) -> Self {

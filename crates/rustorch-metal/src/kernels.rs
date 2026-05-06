@@ -2874,6 +2874,325 @@ pub fn sgemm_q4_k_f32_simdgroup_matrix_64_into(
 }
 
 // =============================================================================
+// T162 phase 9h — port complet du kernel llama.cpp::kernel_mul_mm fallback Q4_K.
+//
+// Port direct de ggml-metal.metal::kernel_mul_mm template fallback (pre-M5 path).
+// Différences clés vs notre `sgemm_q4_k_f32_simdgroup_matrix_64` :
+//
+// 1. **Tile aspect 64×32 (vs 64×64)** : NRA=64 rows of A, NRB=NK1=32 rows of B.
+//    Per SG : 8 fragments (4 along A, 2 along B) au lieu de 16. Moins de
+//    register pressure.
+//
+// 2. **Swizzled SHM layout 8x8 blocks** : `sa[ib*64 + ly*8 + lx]` au lieu de
+//    `Ws[row*BK + col]`. simdgroup_load avec stride=8, no transpose au lieu
+//    de stride=BK=32 transpose=true. Hardware-friendly.
+//
+// 3. **Outer product mc[i] = mb[i/4] @ ma[i%4]** : 8 frags par SG, structuré
+//    pour minimiser les dépendances entre MMAs successives.
+//
+// 4. **Conventions** : llama.cpp utilise A=quantized weight [M=N_out, K=K_in]
+//    et B=activations [K=K_in, N=M_tokens]. Pour matcher notre kernel
+//    (A=activations [M_tok, K], W=weights [N_out, K], C=A @ W^T = [M_tok, N_out]),
+//    on swap : la dimension M de llama.cpp = N_out chez nous, leur N = M_tok.
+//    Donc tile produit M_tok=32 × N_out=64 par TG.
+//
+// Pré-conditions :
+// - Metal3 (Apple7+)
+// - M (= M_tok) multiple de 32 ; N (= N_out) multiple de 64 ; K multiple de 256
+//
+// Cible : closer le gap 14B Q4 prefill avec llama.cpp 454 t/s (vs 211 actuels).
+const SGEMM_Q4_K_F32_LCPP_PORTED_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q4K_BYTES = 144u;
+constant uint Q4K_WEIGHTS = 256u;
+
+// Tile constants — match llama.cpp NR0=64 NR1=32 NK=32, swapped pour notre conv.
+constant uint NR_W = 64u;     // BN : output rows = N_out per TG (= leur NRA=NR0)
+constant uint NR_A = 32u;     // BM : tokens per TG (= leur NRB=NR1)
+constant uint NK   = 32u;     // K tile per loop iter
+constant uint NL_Q4K = 8u;    // 256 weights / 16 / 2 = 8 (Q4_K nl pour dequant)
+constant uint NL0 = NK / 16u; // = 2 (work items per row in cooperative load)
+constant uint NL1 = NK / 8u;  // = 4 (used in B load layout)
+
+kernel void sgemm_q4_k_f32_lcpp_ported(
+    device const float*  A      [[buffer(0)]],   // activations [M, K]
+    device const uchar*  W_q4k  [[buffer(1)]],   // weights [N, K] Q4_K
+    device float*        C      [[buffer(2)]],   // output [M, N]
+    constant uint3&      dims   [[buffer(3)]],   // (M, N, K)
+    uint3                tgpig  [[threadgroup_position_in_grid]],
+    ushort               tiitg  [[thread_index_in_threadgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    // T162 phase 9h-bis : SHM en HALF (vs float). Réduit la BP SHM 2× et active
+    // les MMAs simdgroup_half8x8 qui sont 2× plus rapides que float8x8 sur Apple
+    // GPU. C'est CE qui fait la différence entre llama.cpp's 454 t/s et notre
+    // 211 t/s sur 14B Q4 prefill (les opérateurs MMA half ont throughput double).
+    //
+    // sa : NR_W × NK = 64×32 = 2048 halves = 4KB (vs 8KB en float)
+    // sb : NR_A × NK = 32×32 = 1024 halves = 2KB (vs 4KB en float)
+    threadgroup half sa[64 * 32];
+    threadgroup half sb[32 * 32];
+
+    // Tile offsets (M_tok = activations row, N_out = output col).
+    // tgpig.y = m-block index (0..M/NR_A), tgpig.x = n-block index (0..N/NR_W)
+    uint m_tile = tgpig.y * NR_A;       // M-position (token index)
+    uint n_tile = tgpig.x * NR_W;       // N-position (output dim)
+
+    // Cooperative load layout — 128 threads (4 SG × 32).
+    uint blocks_per_row_q4k = K / Q4K_WEIGHTS;
+    uint w_row_stride_bytes = blocks_per_row_q4k * Q4K_BYTES;
+
+    // For sa load (W dequant) : 128 threads × 16 elements = 2048 = NR_W × NK.
+    // tiitg/NL0 = row index in tile (0..NR_W=64), tiitg%NL0 = k_chunk (0..1).
+    uint sa_row = tiitg / NL0;          // 0..63 (within tile, = w_row_within_tile)
+    uint sa_chunk = tiitg % NL0;        // 0..1 (k_chunk = 16 K-positions)
+
+    // For sb load (A direct read) : same 128 threads × 8 elements = 1024 = NR_A × NK.
+    // tiitg/NL1 = row index (0..NR_A=32), tiitg%NL1 = k_chunk_a (0..3).
+    uint sb_row = tiitg / NL1;          // 0..31 (m_tok within tile)
+    uint sb_chunk = tiitg % NL1;        // 0..3 (k_chunk = 8 K-positions)
+
+    // 8 C fragments per SG : 4 along NR_W (sga axis), 2 along NR_A (sgb axis).
+    // sgitg layout: sgitg%2 = a_block_idx (0..1, selects M-half), sgitg/2 = b_block_idx (0..1, selects N-half)
+    simdgroup_matrix<float, 8, 8> mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = simdgroup_matrix<float, 8, 8>(0.0);
+    }
+
+    // Bounds clamps.
+    uint nr_w_eff = (n_tile + NR_W < N) ? NR_W : (N - n_tile);
+    uint nr_a_eff = (m_tile + NR_A < M) ? NR_A : (M - m_tile);
+
+    for (uint k_offset = 0; k_offset < K; k_offset += NK) {
+        // ============ Phase 1 : load+dequant W → sa swizzled (block 8x8 contigus) ============
+        // sa[ib * 64 + ly*8 + lx], ib = 8*sx + sy, sx ∈ [0, NK/8=4), sy ∈ [0, NR_W/8=8)
+        // Each thread (sa_row, sa_chunk) writes 16 floats : the 16 K-positions
+        // for output row sa_row, K-positions [sa_chunk*16 .. sa_chunk*16+16).
+        if (sa_row < nr_w_eff) {
+            uint w_row_global = n_tile + sa_row;
+            uint k_pos_base = k_offset + sa_chunk * 16u;
+
+            // Q4_K block math : super-block = 256 weights.
+            uint super_block_idx = k_pos_base / Q4K_WEIGHTS;
+            uint sb_in_super = (k_pos_base % Q4K_WEIGHTS) / 32u;  // 0..7
+            uint pair_idx = sb_in_super / 2u;                      // 0..3
+            bool is_high = (sb_in_super & 1u) != 0u;
+
+            device const uchar* row_block = W_q4k
+                + (uint64_t)w_row_global * w_row_stride_bytes
+                + (uint64_t)super_block_idx * Q4K_BYTES;
+            device const half* d_ptr = (device const half*)(row_block);
+            float d    = float(d_ptr[0]);
+            float dmin = float(d_ptr[1]);
+
+            device const uchar* sc_raw = row_block + 4;
+            uchar sc6, m6;
+            if (sb_in_super < 4u) {
+                sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+                m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+            } else {
+                uint i = sb_in_super - 4u;
+                sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+                m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+            }
+            float scale   = d    * float(sc6);
+            float min_val = dmin * float(m6);
+
+            device const uchar* qs_ptr = row_block + 16u + pair_idx * 32u;
+            // sa stored as W^T (K rows × N_out cols swizzled, matching llama.cpp pattern).
+            // Block layout : sx = K-block (0..NK/8=4), sy = N_out-block (0..NR_W/8=8).
+            // ib = 8*sx + sy (sx outer, sy inner). Within block : ly = K%8, lx = N_out%8.
+            // Each iter of K-loop advances `lsma += 8*64` (8 blocks = 8 sy values = next sx).
+            //
+            // Per-thread (sa_row=N_out_row, sa_chunk=K_chunk) : 16 elements at varying K-pos.
+            //   sy = sa_row / 8     (0..7)
+            //   lx = sa_row % 8     (col within block)
+            //   For c in 0..16 : k_pos = sa_chunk*16+c → sx = k_pos/8, ly = k_pos%8
+            uint sy = sa_row / 8u;
+            uint lx = sa_row % 8u;
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < 16u; ++c) {
+                uint k_in_tile = sa_chunk * 16u + c;
+                uint sx = k_in_tile / 8u;
+                uint ly = k_in_tile % 8u;
+                uint ib = 8u * sx + sy;
+
+                uchar byte_val = qs_ptr[k_in_tile];
+                uchar nibble = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+                sa[ib * 64u + ly * 8u + lx] = scale * float(nibble) - min_val;
+            }
+        } else {
+            uint sy = sa_row / 8u;
+            uint lx = sa_row % 8u;
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < 16u; ++c) {
+                uint k_in_tile = sa_chunk * 16u + c;
+                uint sx = k_in_tile / 8u;
+                uint ly = k_in_tile % 8u;
+                uint ib = 8u * sx + sy;
+                sa[ib * 64u + ly * 8u + lx] = 0.0;
+            }
+        }
+
+        // ============ Phase 2 : load A → sb swizzled (block 8x8 contigus) ============
+        // sb[ib * 64 + ly*8 + lx], ib = 4*sx + sy, sx ∈ [0, NK/8=4), sy ∈ [0, NR_A/8=4)
+        // Each thread (sb_row, sb_chunk) loads 8 floats (one row of an 8x8 block).
+        if (sb_row < nr_a_eff) {
+            uint a_row_global = m_tile + sb_row;
+            uint k_pos = k_offset + sb_chunk * 8u;
+            uint sx = sb_chunk;                  // 0..3
+            uint sy = sb_row / 8u;                // 0..3
+            uint ly = sb_row % 8u;
+            uint ib = 4u * sx + sy;
+            #pragma clang loop unroll(full)
+            for (uint lx = 0; lx < 8u; ++lx) {
+                if (k_pos + lx < K) {
+                    sb[ib * 64u + ly * 8u + lx] = A[a_row_global * K + k_pos + lx];
+                } else {
+                    sb[ib * 64u + ly * 8u + lx] = 0.0;
+                }
+            }
+        } else {
+            uint sx = sb_chunk;
+            uint sy = sb_row / 8u;
+            uint ly = sb_row % 8u;
+            uint ib = 4u * sx + sy;
+            #pragma clang loop unroll(full)
+            for (uint lx = 0; lx < 8u; ++lx) {
+                sb[ib * 64u + ly * 8u + lx] = 0.0;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ============ Phase 3 : MMAs (half precision sur Apple GPU = 2× throughput) ============
+        // ma et mb en simdgroup_matrix<half, 8, 8>. mc reste float pour precision
+        // d'accumulation (multiply_accumulate accepte mixed half×half→float).
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);  // 0 ou 256
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);  // 0 ou 128
+
+        #pragma clang loop unroll(full)
+        for (uint ik = 0; ik < NK / 8u; ++ik) {
+            simdgroup_matrix<half, 8, 8> ma[4];
+            simdgroup_matrix<half, 8, 8> mb[2];
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4u; ++i) {
+                simdgroup_load(ma[i], lsma + 64u * i, 8);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2u; ++i) {
+                simdgroup_load(mb[i], lsmb + 64u * i, 8);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            // Outer product : mc[i] = mb[i/4] @ ma[i%4] (mais avec 4*2=8 frags,
+            // i/4 ∈ {0,1} sélectionne mb, i%4 ∈ {0..3} sélectionne ma).
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8u; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4u], ma[i % 4u], mc[i]);
+            }
+
+            // Advance to next K-block (sx+1) : 8 blocks for sa (8 sy values),
+            // 4 blocks for sb (4 sy values).
+            lsma += 8u * 64u;
+            lsmb += 4u * 64u;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ============ Store mc to C ============
+    // Per SG :
+    //   a_block_idx = sgitg % 2 (selects 32-row M-half of W)
+    //   b_block_idx = sgitg / 2 (selects 16-col M-half of activations)
+    // Each frag mc[i] : i%4 = ma slot (0..3, W-row offset), i/4 = mb slot (0..1, M-token offset).
+    //
+    // Output row in C : c_row = m_tile + (sgitg / 2) * 16 + (i / 4) * 8
+    // Output col in C : c_col = n_tile + (sgitg % 2) * 32 + (i % 4) * 8
+    // Wait — the result of mb @ ma is 8x8 with rows = M_tokens, cols = W_rows.
+    // C[m_tok, n_out] = Σ_k A[m_tok, k] * W[n_out, k] = mb[m_tok-frag] @ ma[n_out-frag]^T... hmm.
+    //
+    // Actually simdgroup_multiply_accumulate(mc, mb, ma, mc) computes mc = mb @ ma + mc.
+    // mb is 8x8 (rows from sb = M tokens × cols from sb K-direction).
+    // ma is 8x8 (rows from sa = W K-direction × cols from sa W-direction).
+    // mb @ ma → (8 M_tok rows × 8 K cols) @ (8 K rows × 8 W cols) = 8 M_tok × 8 W cols.
+    // So mc has rows = M tokens, cols = W output rows = N_out.
+    //
+    // C[m_tok, n_out] storage : standard row-major [M, N].
+    //   c_row = m_tile + (sgitg / 2) * 16 + (i / 4) * 8     (M token coordinate)
+    //   c_col = n_tile + (sgitg % 2) * 32 + (i % 4) * 8     (N output dim coordinate)
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8u; ++i) {
+        uint c_row = m_tile + (uint)(sgitg / 2u) * 16u + (i / 4u) * 8u;
+        uint c_col = n_tile + (uint)(sgitg % 2u) * 32u + (i % 4u) * 8u;
+        if (c_row + 7u < M && c_col + 7u < N) {
+            device float* C_ptr = C + (uint64_t)c_row * N + (uint64_t)c_col;
+            simdgroup_store(mc[i], C_ptr, N);
+        }
+    }
+}
+"#;
+
+/// T162 phase 9h — port complet du kernel llama.cpp::kernel_mul_mm fallback Q4_K.
+///
+/// Pré-conditions :
+/// - Metal3 (Apple7+)
+/// - M multiple de 32 ; N multiple de 64 ; K multiple de 256
+///
+/// Cible : 14B Q4 prefill 211 → 350+ t/s (gap llama.cpp 454).
+pub fn sgemm_q4_k_f32_lcpp_ported_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    c_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q4_k_f32_lcpp_ported needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 32 != 0 || n % 64 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q4_k_f32_lcpp_ported: M%32==0, N%64==0, K%256==0 required (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q4_k_f32_lcpp_ported",
+        SGEMM_Q4_K_F32_LCPP_PORTED_SHADER,
+        "sgemm_q4_k_f32_lcpp_ported",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(c_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1); // 4 SG × 32 threads
+                                               // Grid : tgpig.x = n-block (N/64), tgpig.y = m-block (M/32).
+        let n_tg_x = (n / 64) as u64;
+        let n_tg_y = (m / 32) as u64;
+        let groups = MTLSize::new(n_tg_x, n_tg_y, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T162 phase 5 — Q6_K SGEMM avec simdgroup_matrix + dequant inline.
 //
 // Port du pattern phase 2 (Q4_K tile 8×8) vers Q6_K. Le format Q6_K stocke
@@ -12560,6 +12879,106 @@ mod tests {
             assert!(
                 rel < 1e-2,
                 "Q4_K SGEMM 64×64 mismatch at {i}: ref={} metal={} (rel {:.3e})",
+                c_ref[i],
+                c_metal[i],
+                rel
+            );
+        }
+    }
+
+    /// T162 phase 9h — Q4_K SGEMM port complet llama.cpp::kernel_mul_mm vs CPU.
+    /// Tile 32×64 (M_tok × N_out), 4 SG/TG, swizzled SHM 8x8 blocks,
+    /// outer product mc[i] = mb[i/4] @ ma[i%4].
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemm_q4_k_f32_lcpp_ported_matches_cpu() {
+        use rustorch_gguf::dequant::dequant_q4_k;
+
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[sgemm_q4_k_lcpp_ported] skipping: no Metal3");
+            return;
+        }
+
+        // Shape : M=32 (1 m-tile), N=64 (1 n-tile), K=512 (2 super-blocks).
+        let m = 32_usize;
+        let n = 64_usize;
+        let k = 512_usize;
+        let blocks_per_row = k / 256;
+
+        let mut w_bytes = vec![0u8; n * blocks_per_row * 144];
+        for nrow in 0..n {
+            for ib in 0..blocks_per_row {
+                let off = (nrow * blocks_per_row + ib) * 144;
+                let d_val = ((nrow as f32 + 1.0) * 0.005) + (ib as f32) * 0.001;
+                let dmin_val = ((nrow as f32) * 0.002) + (ib as f32) * 0.0005;
+                let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                let dmin_h = half::f16::from_f32(dmin_val).to_le_bytes();
+                w_bytes[off] = d_h[0];
+                w_bytes[off + 1] = d_h[1];
+                w_bytes[off + 2] = dmin_h[0];
+                w_bytes[off + 3] = dmin_h[1];
+                for i in 0..12 {
+                    w_bytes[off + 4 + i] =
+                        (0x12_u8.wrapping_add((nrow as u8) ^ (i as u8) ^ (ib as u8))) | 0x05;
+                }
+                for i in 0..128 {
+                    w_bytes[off + 16 + i] =
+                        ((nrow as u8) ^ (i as u8) ^ (ib as u8)).wrapping_add(0x29);
+                }
+            }
+        }
+
+        let a = det_vec(m * k, 1.5);
+        let mut w_f32 = vec![0.0_f32; n * k];
+        for nrow in 0..n {
+            let row_off = nrow * blocks_per_row * 144;
+            let row_bytes = &w_bytes[row_off..row_off + blocks_per_row * 144];
+            let row_dst = &mut w_f32[nrow * k..(nrow + 1) * k];
+            dequant_q4_k(row_bytes, row_dst).unwrap();
+        }
+
+        let mut c_ref = vec![0.0_f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0_f32;
+                for l in 0..k {
+                    s += a[i * k + l] * w_f32[j * k + l];
+                }
+                c_ref[i * n + j] = s;
+            }
+        }
+
+        let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        let c_buf = backend.alloc_shared(m * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+        }
+        sgemm_q4_k_f32_lcpp_ported_into(backend, &a_buf, &w_buf, &c_buf, m, n, k).unwrap();
+        backend.drain();
+
+        let mut c_metal = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_buf.contents() as *const f32,
+                c_metal.as_mut_ptr(),
+                m * n,
+            );
+        }
+
+        for i in 0..(m * n) {
+            let abs_err = (c_ref[i] - c_metal[i]).abs();
+            let denom = c_ref[i].abs().max(1e-3);
+            let rel = abs_err / denom;
+            assert!(
+                rel < 1e-2,
+                "Q4_K SGEMM lcpp_ported mismatch at {i}: ref={} metal={} (rel {:.3e})",
                 c_ref[i],
                 c_metal[i],
                 rel
