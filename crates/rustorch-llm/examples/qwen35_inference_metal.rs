@@ -47,25 +47,42 @@ use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
-    add_inplace_batched_f32, add_inplace_f32, delta_net_step_f32, delta_net_step_with_l2_f32,
+    add_inplace_batched_f32, add_inplace_f32, build_em_perm_f32_into, delta_net_step_f32,
+    delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets, gather_pack_rows_f32,
     gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32, kv_append_f32,
     l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
-    rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
-    rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
+    rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets,
+    rope_half_split_f32, rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
+    sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
     sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
+    sgemm_q5_k_f32_expert_major_8x64_half_into, sgemm_q5_k_f32_expert_major_8x8_into,
     sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
-    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into,
-    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
-    sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32,
-    sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
-    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_batched_f32,
-    swiglu_f32, topk_softmax_norm_batched_f32, topk_softmax_norm_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, zero_f32,
+    sgemm_q8_0_f32_8x64_half_into, sgemm_q8_0_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into,
+    sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+    sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into,
+    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32,
+    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
+    ssm_conv1d_step_f32, ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32,
+    topk_softmax_norm_batched_f32, topk_softmax_norm_f32, unpermute_rows_f32,
+    weighted_add_inplace_f32, weighted_reduce_add_batched_f32, weighted_reduce_add_f32,
+    weighted_scatter_add_f32, zero_f32,
 };
+
+/// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
+/// Created on first access (when RUSTORCH_AMX_ROUTING_ASYNC=1 triggers the
+/// hybrid path). Spawns one CPU worker thread that lives for the process.
+fn amx_executor(backend: &MetalBackend) -> &'static rustorch_metal::async_amx::AsyncAmxExecutor {
+    use std::sync::OnceLock;
+    static EXEC: OnceLock<rustorch_metal::async_amx::AsyncAmxExecutor> = OnceLock::new();
+    EXEC.get_or_init(|| {
+        let event = backend.device.new_shared_event();
+        rustorch_metal::async_amx::AsyncAmxExecutor::with_event(event)
+    })
+}
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
 /// its dtype so [`HybridMetalWeight::matmul_into`] can dispatch to the
@@ -303,6 +320,72 @@ impl HybridMetalWeight {
                 } else {
                     Err(MetalError::Unsupported(format!(
                         "HybridMetalWeight::matmul_batched_into: F32 SGEMM requires M%8, N%8, K%8 (got M={m}, N={}, K={})",
+                        self.n, self.k
+                    )))
+                }
+            },
+            GgmlType::Q5_K => {
+                // T175 P2 — Q5_K SGEMM batched via expert_major kernel en mode
+                // "single-expert" : tile_expert_ids = [0, ...] et expert_stride
+                // = 0. Le kernel calcule W = W_stacked + 0 × 0 = W_stacked
+                // (matrice unique). Élimine le fallback drain×M qui coûtait
+                // 128 × 250 µs = 32 ms / matmul sur prefill 35B-A3B.
+                if m >= 8 && m % 8 == 0 && self.n % 8 == 0 && self.k % 256 == 0 {
+                    let n_tiles = m / 8;
+                    let zeros = vec![0u32; n_tiles];
+                    let tile_buf = backend.alloc_shared(n_tiles * 4)?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            zeros.as_ptr(),
+                            tile_buf.contents() as *mut u32,
+                            n_tiles,
+                        );
+                    }
+                    sgemm_q5_k_f32_expert_major_8x8_into(
+                        backend,
+                        x_batched,
+                        &self.buffer,
+                        &tile_buf,
+                        out_batched,
+                        m,
+                        self.n,
+                        self.k,
+                        0, // expert_stride_bytes = 0 → single-expert mode
+                    )
+                } else {
+                    Err(MetalError::Unsupported(format!(
+                        "HybridMetalWeight::matmul_batched_into: Q5_K SGEMM requires M%8, N%8, K%256 (got M={m}, N={}, K={})",
+                        self.n, self.k
+                    )))
+                }
+            },
+            GgmlType::Q8_0 => {
+                // T175 — Q8_0 SGEMM batched. Critical for shared expert weights
+                // and attn projections on Qwen3.6 35B-A3B (Q8_0 = 9% of model).
+                // 8×64 multi-warp half MMA when N%64 (1.25× vs 8×8), fallback 8×8.
+                if m >= 8 && m % 8 == 0 && self.n % 64 == 0 && self.k % 32 == 0 {
+                    sgemm_q8_0_f32_8x64_half_into(
+                        backend,
+                        x_batched,
+                        &self.buffer,
+                        out_batched,
+                        m,
+                        self.n,
+                        self.k,
+                    )
+                } else if m >= 8 && m % 8 == 0 && self.n % 8 == 0 && self.k % 32 == 0 {
+                    sgemm_q8_0_f32_simdgroup_matrix_into(
+                        backend,
+                        x_batched,
+                        &self.buffer,
+                        out_batched,
+                        m,
+                        self.n,
+                        self.k,
+                    )
+                } else {
+                    Err(MetalError::Unsupported(format!(
+                        "HybridMetalWeight::matmul_batched_into: Q8_0 SGEMM requires M%8, N%8, K%32 (got M={m}, N={}, K={})",
                         self.n, self.k
                     )))
                 }
@@ -576,7 +659,14 @@ pub fn load_metal_model(
 
     let tok_embd = load_2d("token_embd.weight", &mut stats)?;
     let output_norm = load_1d_f32("output_norm.weight", &mut stats)?;
-    let output = load_2d("output.weight", &mut stats)?;
+    // Some Qwen models (small variants like Qwen3.5-4B) tie the output to the
+    // token embedding (no separate output.weight). Detect & reuse.
+    let output = if file.tensor("output.weight").is_some() {
+        load_2d("output.weight", &mut stats)?
+    } else {
+        eprintln!("  [tied embeddings detected — reusing token_embd as output]");
+        load_2d("token_embd.weight", &mut stats)?
+    };
 
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for li in 0..cfg.n_layers {
@@ -1292,49 +1382,32 @@ fn ssm_block_forward_batch(
         b,
     )?;
 
-    // 4. Per-token scan (recurrent). Drain pour que les batched dispatches
-    //    soient visibles avant CPU memcpy slice.
-    backend.drain();
+    // 4. Per-token scan (recurrent). T175 P0 — drain-free path : on bind les
+    //    inputs `qkv_mixed` / `gate_h` / `beta_sig` / `z` directement à
+    //    `batch_scratch.*` avec offset bi via les variantes `_with_offsets`,
+    //    et on écrit l'output directement dans `batch_scratch.ssm_out_buf[bi]`.
+    //    Élimine 4 memcpy CPU + 1 drain par token (scaling B × N_layers
+    //    × 250 µs sur 35B-A3B).
+    //
+    //    Le scan reste séquentiel (s.state et s.conv_state sont read+write par
+    //    iter), mais les hazards mémoire sont gérés automatiquement par Metal
+    //    intra-CB ; pas besoin de drain pour les sérialiser.
+    let conv_off_stride = conv_dim * 4;
+    let value_off_stride = value_dim * 4;
+    let n_v_off_stride = n_v * 4;
     for bi in 0..b {
-        // Slice les inputs depuis batch_scratch → scratch (per-token buffers).
-        unsafe {
-            // qkv_mixed [conv_dim]
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.qkv_mixed.contents() as *const f32).add(bi * conv_dim),
-                scratch.qkv_mixed.contents() as *mut f32,
-                conv_dim,
-            );
-            // z [value_dim]
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.z.contents() as *const f32).add(bi * value_dim),
-                scratch.z.contents() as *mut f32,
-                value_dim,
-            );
-            // gate_h [n_v]
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.gate_h.contents() as *const f32).add(bi * n_v),
-                scratch.gate_h.contents() as *mut f32,
-                n_v,
-            );
-            // beta_sig [n_v]
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.beta_sig.contents() as *const f32).add(bi * n_v),
-                scratch.beta_sig.contents() as *mut f32,
-                n_v,
-            );
-        }
-
-        // Conv1d step + ring buffer update (mutates s.conv_state).
-        ssm_conv1d_step_f32(
+        // Conv1d step lit batch_scratch.qkv_mixed[bi*conv_dim..] directement.
+        ssm_conv1d_step_f32_with_offset(
             backend,
-            &scratch.qkv_mixed,
+            &batch_scratch.qkv_mixed,
+            bi * conv_off_stride,
             &ssm.conv1d,
             &s.conv_state,
             &scratch.conv_out,
             cfg.ssm_conv_kernel,
             conv_dim,
         )?;
-        // GPU split q/k/v (réutilise le path T154-fast — fused L2 + delta_net).
+        // GPU split q/k/v (single-token scratch, pas d'offset).
         split_qkv_f32(
             backend,
             &scratch.conv_out,
@@ -1345,40 +1418,38 @@ fn ssm_block_forward_batch(
             key_dim,
             value_dim,
         )?;
-        // T154-fast — fused L2 + delta_net (mutates s.state).
-        delta_net_step_with_l2_f32(
+        // delta_net : lit gate_h[bi*n_v..] et beta_sig[bi*n_v..] depuis batch,
+        // écrit directement dans batch_scratch.ssm_out_buf[bi*value_dim..].
+        delta_net_step_with_l2_f32_with_offsets(
             backend,
             &scratch.q_ssm,
             &scratch.k_ssm,
             &scratch.v_ssm,
-            &scratch.gate_h,
-            &scratch.beta_sig,
+            &batch_scratch.gate_h,
+            bi * n_v_off_stride,
+            &batch_scratch.beta_sig,
+            bi * n_v_off_stride,
             &s.state,
-            &scratch.ssm_out_buf,
+            &batch_scratch.ssm_out_buf,
+            bi * value_off_stride,
             n_v,
             head_v_dim,
             n_k,
             eps,
         )?;
-        // Per-head RMSNorm gated by silu(z).
-        rms_norm_per_head_gated_f32(
+        // RMS norm gated by silu(z) : in-place sur batch_scratch.ssm_out_buf[bi]
+        // avec gating depuis batch_scratch.z[bi].
+        rms_norm_per_head_gated_f32_with_offsets(
             backend,
-            &scratch.ssm_out_buf,
+            &batch_scratch.ssm_out_buf,
+            bi * value_off_stride,
             &ssm.ssm_norm,
-            &scratch.z,
+            &batch_scratch.z,
+            bi * value_off_stride,
             n_v,
             head_v_dim,
             eps,
         )?;
-        backend.drain();
-        // Copy scratch.ssm_out_buf → batch_scratch.ssm_out_buf[bi].
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.ssm_out_buf.contents() as *const f32,
-                (batch_scratch.ssm_out_buf.contents() as *mut f32).add(bi * value_dim),
-                value_dim,
-            );
-        }
     }
 
     // 5. Batched output projection ssm_out_buf → o.
@@ -1413,6 +1484,18 @@ struct BatchScratchMoe {
     shexp_fd: Buffer,     // [B_MAX, ef] post-SwiGLU
     shexp_out: Buffer,    // [B_MAX, d] shared expert down proj
     shexp_scalar: Buffer, // [B_MAX] gate_inp_shexp · h scalar gate
+
+    // T163 phase 9f-quater — expert-major MoE pipeline buffers.
+    // M_padded worst case = B_MAX*n_used + 7*n_experts (each expert pads ≤ 7 rows).
+    em_src_indices: Buffer, // [M_padded] u32 = src token (b*n_used+k_slot) or sentinel
+    em_gather_src: Buffer,  // [M_padded] u32 = b for gather (or sentinel)
+    em_tile_expert_ids: Buffer, // [M_padded/8] u32 = expert per M-tile
+    em_x_packed: Buffer,    // [M_padded, d] gathered+padded x for expert_major
+    em_out_ef_gate: Buffer, // [M_padded, ef] expert_major output (gate)
+    em_out_ef_up: Buffer,   // [M_padded, ef] expert_major output (up)
+    em_fd: Buffer,          // [M_padded, ef] post-swiglu
+    em_out_d: Buffer,       // [M_padded, d] expert_major down output
+    em_m_padded: Buffer,    // T175 P0' — [1] u32, m_padded computed by GPU sort kernel
 }
 
 impl BatchScratchMoe {
@@ -1439,8 +1522,60 @@ impl BatchScratchMoe {
             shexp_fd: alloc(b * ef * 4),
             shexp_out: alloc(b * d * 4),
             shexp_scalar: alloc(b * 4),
+
+            // M_padded worst case for expert_major pipeline.
+            em_src_indices: alloc((b * n_used + 7 * n_experts) * 4),
+            em_gather_src: alloc((b * n_used + 7 * n_experts) * 4),
+            em_tile_expert_ids: alloc(((b * n_used + 7 * n_experts) / 8 + 1) * 4),
+            em_x_packed: alloc((b * n_used + 7 * n_experts) * d * 4),
+            em_out_ef_gate: alloc((b * n_used + 7 * n_experts) * ef * 4),
+            em_out_ef_up: alloc((b * n_used + 7 * n_experts) * ef * 4),
+            em_fd: alloc((b * n_used + 7 * n_experts) * ef * 4),
+            em_out_d: alloc((b * n_used + 7 * n_experts) * d * 4),
+            em_m_padded: alloc(4),
         }
     }
+}
+
+/// T163 phase 9f-quater — sort tokens par expert + pad mult-8.
+fn build_expert_major_perm(
+    indices_cpu: &[u32],
+    n_used: usize,
+    n_experts: usize,
+    src_indices_out: &mut Vec<u32>,
+    gather_src_out: &mut Vec<u32>,
+    tile_expert_ids_out: &mut Vec<u32>,
+) -> usize {
+    src_indices_out.clear();
+    gather_src_out.clear();
+    tile_expert_ids_out.clear();
+    const SENTINEL: u32 = 0xFFFFFFFFu32;
+
+    let mut buckets: Vec<Vec<u32>> = (0..n_experts).map(|_| Vec::new()).collect();
+    for (i, &expert) in indices_cpu.iter().enumerate() {
+        let e = expert as usize;
+        if e < n_experts {
+            buckets[e].push(i as u32);
+        }
+    }
+    for (e, bucket) in buckets.iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        for &idx in bucket {
+            src_indices_out.push(idx);
+            gather_src_out.push(idx / n_used as u32);
+        }
+        let padded = bucket.len().div_ceil(8) * 8;
+        for _ in bucket.len()..padded {
+            src_indices_out.push(SENTINEL);
+            gather_src_out.push(SENTINEL);
+        }
+        for _ in 0..(padded / 8) {
+            tile_expert_ids_out.push(e as u32);
+        }
+    }
+    src_indices_out.len()
 }
 
 /// T162 phase 9f — gather dispatch helper (Q4_K/Q5_K/Q6_K stacked experts).
@@ -1542,6 +1677,7 @@ fn ffn_moe_forward_batch(
     let b_eff = b * n_used; // total expert evaluations across all tokens
 
     // 1. Batched post-attn norm (xd → h_post, gamma=ffn_norm).
+    let _t_rmsn = std::time::Instant::now();
     rms_norm_batched_f32(
         backend,
         xd_batched,
@@ -1551,8 +1687,10 @@ fn ffn_moe_forward_batch(
         b,
         eps,
     )?;
+    profile_drain_record(backend, "  fbm.pre_norm", _t_rmsn);
 
     // 2. Batched routing logits : gate_inp_batched @ h_post → logits [B, n_experts].
+    let _t_logits = std::time::Instant::now();
     dispatch_batched_attn_matmul(
         backend,
         gate_inp,
@@ -1560,10 +1698,15 @@ fn ffn_moe_forward_batch(
         &batch_scratch.h_post,
         &batch_scratch.logits,
     )?;
-    backend.drain();
+    profile_drain_record(backend, "  fbm.logits", _t_logits);
+    // T175 P1 — drain supprimé : `topk_softmax_norm_batched_f32` lit
+    // `batch_scratch.logits` qui vient d'être écrit par le dispatch précédent.
+    // Metal sérialise via memory hazards intra-CB ; le drain de 250 µs était
+    // pur gaspillage. (Coût total éliminé : 30 layers × 250 µs = 7.5 ms/chunk.)
 
     // 3. Batched top-K + softmax + renormalize : 1 dispatch (B threadgroups)
     //    au lieu de B per-token loops + drains.
+    let _t_topk = std::time::Instant::now();
     topk_softmax_norm_batched_f32(
         backend,
         &batch_scratch.logits,
@@ -1573,72 +1716,279 @@ fn ffn_moe_forward_batch(
         n_used,
         b,
     )?;
+    profile_drain_record(backend, "  fbm.topk", _t_topk);
 
-    // 4-7. T162 phase 9f-bis : gather PER-TOKEN dans le kernel (b_token = b/n_used).
-    //      Tous les B*n_used = b_eff expert-evals en 1 dispatch / projection.
-    //      Pas de memcpy h_repl (économie 128MB/layer) ni de boucle CPU per-token.
-    zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
+    // 4-7. T163 phase 9f-quater + 9f-cinq : EXPERT-MAJOR pipeline étendu Q4_K + Q5_K.
+    //      Dispatch SGEMM expert_major selon dtype par projection (gate/up/down).
+    //
+    // **DÉCOUVERTE CRITIQUE T163 phase 9f-six** : la stratégie expert_major avec
+    // padding mult-8 par expert SE DÉGRADE QUAND n_experts >> B*n_used. Pour
+    // 35B-A3B (n_experts=256, B*n_used=256 avec B=32), chaque expert reçoit en
+    // moyenne 1 eval → padded à 8 rows = 87% de padding wasted. Le SGEMM fait
+    // alors ~8× plus de compute que nécessaire, devenant plus lent que per-token.
+    //
+    // GUARD : expert_major rentable seulement quand B*n_used >> n_experts (i.e.,
+    // experts répétés en moyenne). Heuristique : `b_eff >= n_experts`.
+    let gate_em = matches!(gate_exps_stacked.dtype, GgmlType::Q4_K | GgmlType::Q5_K);
+    let up_em = matches!(up_exps_stacked.dtype, GgmlType::Q4_K | GgmlType::Q5_K);
+    let down_em = matches!(down_exps_stacked.dtype, GgmlType::Q4_K | GgmlType::Q5_K);
+    // T169 (Voie D) — guard threshold relaxable via env. Default keeps the
+    // T163 phase 9f-six behavior (b_eff >= n_experts). Setting RUSTORCH_EM_THRESHOLD
+    // to a smaller value (e.g. 8) enables expert_major at smaller batches to
+    // measure whether the BlockMMA gain offsets the padding waste at B<n_experts.
+    let em_threshold: usize = std::env::var("RUSTORCH_EM_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(n_experts);
+    let all_em = gate_em && up_em && down_em && b_eff >= em_threshold;
 
-    // Gate gather : Q4_K, lit h_post[b_token, :] via b_token=b/n_used in-kernel.
-    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
-        backend,
-        &batch_scratch.h_post,
-        &gate_exps_stacked.buffer,
-        &batch_scratch.indices,
-        b_eff,
-        n_used,
-        &batch_scratch.gate_gather,
-        d,
-        ef,
-        gate_exps_stacked.bytes_per_expert,
-    )?;
-    // Up gather : Q4_K, idem.
-    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
-        backend,
-        &batch_scratch.h_post,
-        &up_exps_stacked.buffer,
-        &batch_scratch.indices,
-        b_eff,
-        n_used,
-        &batch_scratch.up_gather,
-        d,
-        ef,
-        up_exps_stacked.bytes_per_expert,
-    )?;
-    // SwiGLU : element-wise sur b_eff*ef floats.
-    swiglu_f32(
-        backend,
-        &batch_scratch.gate_gather,
-        &batch_scratch.up_gather,
-        &batch_scratch.fd_gather,
-        b_eff * ef,
-    )?;
-    // Down gather : input = fd_gather [b_eff, ef] (per-row, déjà packed),
-    // donc x_stride=ef et le standard gather kernel suffit (pas per-token).
-    dispatch_gather_sgemv(
-        backend,
-        down_exps_stacked,
-        &batch_scratch.fd_gather,
-        &batch_scratch.down_gather,
-        &batch_scratch.indices,
-        b_eff,
-        ef,
-        d,
-        ef,
-    )?;
+    let dispatch_em_sgemm = |stacked: &StackedQuantizedExperts,
+                             a_buf: &Buffer,
+                             c_buf: &Buffer,
+                             m: usize,
+                             n: usize,
+                             k: usize|
+     -> Result<(), MetalError> {
+        match stacked.dtype {
+            GgmlType::Q4_K => {
+                // T175 Day 5 wire-up : préfère le tile 8×64 half MMA quand
+                // N est aligné sur 64 (1.25× speedup vs 8×8 sur 35B-A3B).
+                // Fallback 8×8 sinon (e.g. shared expert avec N petit).
+                if n % 64 == 0 {
+                    sgemm_q4_k_f32_expert_major_8x64_half_into(
+                        backend,
+                        a_buf,
+                        &stacked.buffer,
+                        &batch_scratch.em_tile_expert_ids,
+                        c_buf,
+                        m,
+                        n,
+                        k,
+                        stacked.bytes_per_expert,
+                    )
+                } else {
+                    sgemm_q4_k_f32_expert_major_8x8_into(
+                        backend,
+                        a_buf,
+                        &stacked.buffer,
+                        &batch_scratch.em_tile_expert_ids,
+                        c_buf,
+                        m,
+                        n,
+                        k,
+                        stacked.bytes_per_expert,
+                    )
+                }
+            },
+            GgmlType::Q5_K => {
+                // T175 — Same 8×64 wire-up as Q4_K. Q5_K down_proj on 35B-A3B
+                // is ~33% of MoE compute → 1.25× speedup expected.
+                if n % 64 == 0 {
+                    sgemm_q5_k_f32_expert_major_8x64_half_into(
+                        backend,
+                        a_buf,
+                        &stacked.buffer,
+                        &batch_scratch.em_tile_expert_ids,
+                        c_buf,
+                        m,
+                        n,
+                        k,
+                        stacked.bytes_per_expert,
+                    )
+                } else {
+                    sgemm_q5_k_f32_expert_major_8x8_into(
+                        backend,
+                        a_buf,
+                        &stacked.buffer,
+                        &batch_scratch.em_tile_expert_ids,
+                        c_buf,
+                        m,
+                        n,
+                        k,
+                        stacked.bytes_per_expert,
+                    )
+                }
+            },
+            other => Err(MetalError::Unsupported(format!(
+                "expert_major SGEMM: dtype {other:?} not yet ported"
+            ))),
+        }
+    };
 
-    // 8. Batched weighted reduce : moe_acc[t, d] += sum_k topw[t, k] * down_gather[t, k, d].
-    weighted_reduce_add_batched_f32(
-        backend,
-        &batch_scratch.down_gather,
-        &batch_scratch.topw,
-        &batch_scratch.moe_acc,
-        n_used,
-        d,
-        b,
-    )?;
+    if all_em {
+        // CPU sort indices.
+        let _t_drain = std::time::Instant::now();
+        backend.drain();
+        profile_drain_record(backend, "  fbm.cpu_drain", _t_drain);
+        let _t_sort = std::time::Instant::now();
+        let mut src_indices_vec: Vec<u32> = Vec::with_capacity(b_eff + 7 * n_experts);
+        let mut gather_src_vec: Vec<u32> = Vec::with_capacity(b_eff + 7 * n_experts);
+        let mut tile_expert_ids_vec: Vec<u32> = Vec::with_capacity(b_eff / 8 + n_experts);
+        let indices_cpu = unsafe {
+            std::slice::from_raw_parts(batch_scratch.indices.contents() as *const u32, b * n_used)
+        };
+        let m_padded = build_expert_major_perm(
+            indices_cpu,
+            n_used,
+            n_experts,
+            &mut src_indices_vec,
+            &mut gather_src_vec,
+            &mut tile_expert_ids_vec,
+        );
+
+        // Upload to GPU.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_indices_vec.as_ptr(),
+                batch_scratch.em_src_indices.contents() as *mut u32,
+                m_padded,
+            );
+            std::ptr::copy_nonoverlapping(
+                gather_src_vec.as_ptr(),
+                batch_scratch.em_gather_src.contents() as *mut u32,
+                m_padded,
+            );
+            std::ptr::copy_nonoverlapping(
+                tile_expert_ids_vec.as_ptr(),
+                batch_scratch.em_tile_expert_ids.contents() as *mut u32,
+                tile_expert_ids_vec.len(),
+            );
+        }
+        profile_drain_record(backend, "  fbm.cpu_sort", _t_sort);
+
+        // GPU pipeline expert-major.
+        let _t_zero = std::time::Instant::now();
+        zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
+        profile_drain_record(backend, "  fbm.zero", _t_zero);
+        let _t_pack = std::time::Instant::now();
+        gather_pack_rows_f32(
+            backend,
+            &batch_scratch.h_post,
+            &batch_scratch.em_gather_src,
+            &batch_scratch.em_x_packed,
+            d,
+            m_padded,
+        )?;
+        profile_drain_record(backend, "  fbm.pack", _t_pack);
+        let _t_gate = std::time::Instant::now();
+        dispatch_em_sgemm(
+            gate_exps_stacked,
+            &batch_scratch.em_x_packed,
+            &batch_scratch.em_out_ef_gate,
+            m_padded,
+            ef,
+            d,
+        )?;
+        profile_drain_record(backend, "  fbm.em_gate", _t_gate);
+        let _t_up = std::time::Instant::now();
+        dispatch_em_sgemm(
+            up_exps_stacked,
+            &batch_scratch.em_x_packed,
+            &batch_scratch.em_out_ef_up,
+            m_padded,
+            ef,
+            d,
+        )?;
+        profile_drain_record(backend, "  fbm.em_up", _t_up);
+        let _t_silu = std::time::Instant::now();
+        swiglu_f32(
+            backend,
+            &batch_scratch.em_out_ef_gate,
+            &batch_scratch.em_out_ef_up,
+            &batch_scratch.em_fd,
+            m_padded * ef,
+        )?;
+        profile_drain_record(backend, "  fbm.swiglu", _t_silu);
+        let _t_down = std::time::Instant::now();
+        dispatch_em_sgemm(
+            down_exps_stacked,
+            &batch_scratch.em_fd,
+            &batch_scratch.em_out_d,
+            m_padded,
+            d,
+            ef,
+        )?;
+        profile_drain_record(backend, "  fbm.em_down", _t_down);
+        let _t_unp = std::time::Instant::now();
+        unpermute_rows_f32(
+            backend,
+            &batch_scratch.em_out_d,
+            &batch_scratch.em_src_indices,
+            &batch_scratch.down_gather,
+            d,
+            m_padded,
+        )?;
+        profile_drain_record(backend, "  fbm.unpermute", _t_unp);
+        let _t_red = std::time::Instant::now();
+        weighted_reduce_add_batched_f32(
+            backend,
+            &batch_scratch.down_gather,
+            &batch_scratch.topw,
+            &batch_scratch.moe_acc,
+            n_used,
+            d,
+            b,
+        )?;
+        profile_drain_record(backend, "  fbm.reduce", _t_red);
+    } else {
+        // Fallback : gather_per_token (T162 phase 9f-bis) pour les modèles
+        // mixed-dtype (e.g., 35B-A3B Q4_K gate/up + Q5_K down).
+        zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
+        sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
+            backend,
+            &batch_scratch.h_post,
+            &gate_exps_stacked.buffer,
+            &batch_scratch.indices,
+            b_eff,
+            n_used,
+            &batch_scratch.gate_gather,
+            d,
+            ef,
+            gate_exps_stacked.bytes_per_expert,
+        )?;
+        sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
+            backend,
+            &batch_scratch.h_post,
+            &up_exps_stacked.buffer,
+            &batch_scratch.indices,
+            b_eff,
+            n_used,
+            &batch_scratch.up_gather,
+            d,
+            ef,
+            up_exps_stacked.bytes_per_expert,
+        )?;
+        swiglu_f32(
+            backend,
+            &batch_scratch.gate_gather,
+            &batch_scratch.up_gather,
+            &batch_scratch.fd_gather,
+            b_eff * ef,
+        )?;
+        dispatch_gather_sgemv(
+            backend,
+            down_exps_stacked,
+            &batch_scratch.fd_gather,
+            &batch_scratch.down_gather,
+            &batch_scratch.indices,
+            b_eff,
+            ef,
+            d,
+            ef,
+        )?;
+        weighted_reduce_add_batched_f32(
+            backend,
+            &batch_scratch.down_gather,
+            &batch_scratch.topw,
+            &batch_scratch.moe_acc,
+            n_used,
+            d,
+            b,
+        )?;
+    }
 
     // 9. Shared expert pipeline (BATCHED dense FFN).
+    let _t_sh_gate = std::time::Instant::now();
     dispatch_batched_attn_matmul(
         backend,
         gate_shexp,
@@ -1646,6 +1996,8 @@ fn ffn_moe_forward_batch(
         &batch_scratch.h_post,
         &batch_scratch.shexp_gate,
     )?;
+    profile_drain_record(backend, "  fbm.sh_gate", _t_sh_gate);
+    let _t_sh_up = std::time::Instant::now();
     dispatch_batched_attn_matmul(
         backend,
         up_shexp,
@@ -1653,6 +2005,7 @@ fn ffn_moe_forward_batch(
         &batch_scratch.h_post,
         &batch_scratch.shexp_up,
     )?;
+    profile_drain_record(backend, "  fbm.sh_up", _t_sh_up);
     swiglu_batched_f32(
         backend,
         &batch_scratch.shexp_gate,
@@ -1661,6 +2014,7 @@ fn ffn_moe_forward_batch(
         ef,
         b,
     )?;
+    let _t_sh_down = std::time::Instant::now();
     dispatch_batched_attn_matmul(
         backend,
         down_shexp,
@@ -1668,11 +2022,10 @@ fn ffn_moe_forward_batch(
         &batch_scratch.shexp_fd,
         &batch_scratch.shexp_out,
     )?;
-    backend.drain();
+    profile_drain_record(backend, "  fbm.sh_down", _t_sh_down);
 
     // 10. Batched fused gate-scalar + sigmoid_add_moe (final residual).
-    //     1 dispatch (B threadgroups, 4 simdgroups each) au lieu de B per-token
-    //     loops avec 2 sgemv + 1 sigmoid_add. Économise B drains + 4*B alloc.
+    let _t_sigmadd = std::time::Instant::now();
     sigmoid_add_moe_batched_f32(
         backend,
         &batch_scratch.moe_acc,
@@ -1683,6 +2036,7 @@ fn ffn_moe_forward_batch(
         d,
         b,
     )?;
+    profile_drain_record(backend, "  fbm.sigmadd", _t_sigmadd);
 
     // Silence unused warning on scratch (kept in signature for future direct use).
     let _ = scratch;
@@ -2071,7 +2425,10 @@ fn ssm_block_forward(
     let conv_dim = 2 * key_dim + value_dim;
 
     // 1. RMSNorm on residual stream.
+    let _ssm_t0 = std::time::Instant::now();
     rms_norm_f32(backend, &scratch.xd, &ssm.attn_norm, &scratch.h, d, eps)?;
+    profile_drain_record(backend, "  ssm.in_norm", _ssm_t0);
+    let _ssm_t0_proj = std::time::Instant::now();
     dump_buf(
         backend,
         &scratch.h,
@@ -2111,9 +2468,11 @@ fn ssm_block_forward(
         n_v,
         &format!("{dump_prefix}/ssm/05_beta"),
     );
+    profile_drain_record(backend, "  ssm.in_proj", _ssm_t0_proj);
 
     // 3. T146a — fused GPU kernel: gate_h = softplus(alpha + dt_bias) * ssm_a,
     //    beta_sig = sigmoid(beta). No drain needed.
+    let _ssm_t0_gate = std::time::Instant::now();
     ssm_apply_gate_f32(
         backend,
         &scratch.alpha,
@@ -2136,8 +2495,10 @@ fn ssm_block_forward(
         n_v,
         &format!("{dump_prefix}/ssm/07_beta_sig"),
     );
+    profile_drain_record(backend, "  ssm.gate_apply", _ssm_t0_gate);
 
     // 4. Conv1d step + ring-buffer update.
+    let _ssm_t0_conv = std::time::Instant::now();
     ssm_conv1d_step_f32(
         backend,
         &scratch.qkv_mixed,
@@ -2163,6 +2524,8 @@ fn ssm_block_forward(
     //    35B-A3B: 32 = 2 × 16), so we keep q,k at length [n_k_heads, head_dim]
     //    (key_dim each) and let delta_net_step broadcast inline. Only v is
     //    n_v_heads-wide (value_dim).
+    profile_drain_record(backend, "  ssm.conv1d", _ssm_t0_conv);
+    let _ssm_t0_split = std::time::Instant::now();
     split_qkv_f32(
         backend,
         &scratch.conv_out,
@@ -2173,6 +2536,8 @@ fn ssm_block_forward(
         key_dim,
         value_dim,
     )?;
+    profile_drain_record(backend, "  ssm.split_qkv", _ssm_t0_split);
+    let _ssm_t0_dnet = std::time::Instant::now();
     dump_buf(
         backend,
         &scratch.q_ssm,
@@ -2256,8 +2621,10 @@ fn ssm_block_forward(
         value_dim,
         &format!("{dump_prefix}/ssm/14_dnet_out"),
     );
+    profile_drain_record(backend, "  ssm.delta_net", _ssm_t0_dnet);
 
     // 10. Per-head RMSNorm gated by silu(z).
+    let _ssm_t0_gnorm = std::time::Instant::now();
     rms_norm_per_head_gated_f32(
         backend,
         &scratch.ssm_out_buf,
@@ -2274,11 +2641,15 @@ fn ssm_block_forward(
         &format!("{dump_prefix}/ssm/15_gated_norm"),
     );
 
+    profile_drain_record(backend, "  ssm.gated_norm", _ssm_t0_gnorm);
+
     // 11. ssm_out @ out_gated → result, then xd += result.
+    let _ssm_t0_out = std::time::Instant::now();
     ssm.ssm_out
         .matmul_into(backend, &scratch.ssm_out_buf, &scratch.o)?;
     dump_buf(backend, &scratch.o, d, &format!("{dump_prefix}/ssm/16_o"));
     add_inplace_f32(backend, &scratch.xd, &scratch.o, d)?;
+    profile_drain_record(backend, "  ssm.out_proj", _ssm_t0_out);
     Ok(())
 }
 
@@ -2328,13 +2699,125 @@ fn ffn_dense_forward(
             let ef = cfg.expert_f;
 
             // 1. Routing logits = gate_inp @ h  → [n_experts]
-            gate_inp.matmul_into(backend, &scratch.h, &scratch.moe_logits)?;
+            // T171 — Sync AMX (Apple Accelerate) offload for routing matmul.
+            // Opt-in via RUSTORCH_AMX_ROUTING=1.
+            //
+            // **EXPERIMENTAL VALIDATION RESULT (negative for sync, validates
+            // need for async)**:
+            //   Standalone bench : AMX 9.4 µs/call vs GPU 50-70 µs (5-7× speedup).
+            //   Sync end-to-end on 35B-A3B Qwen3.6 :
+            //     baseline (no AMX)        : 39.48 t/s prefill, 41.80 t/s decode
+            //     RUSTORCH_AMX_ROUTING=1   : 29.58 t/s prefill (-25%), 34.60 t/s (-17%)
+            //   Quality : bit-identical greedy output.
+            //
+            // The drain cost (~250 µs × 40 layers = 10 ms/token) eats the AMX
+            // savings (~1.6 ms compute saved). ASYNC pattern (MTLEvent + CPU
+            // thread) is required to actually exploit AMX. See note 1ce4dd46
+            // for the future async design and 3a0040ea for the full Innovation 1
+            // RFC.
+            //
+            // Code kept as opt-in for validation point; env-gated so default
+            // runs unaffected.
+            let _moe_t0_routing = std::time::Instant::now();
+            let use_amx_sync = std::env::var("RUSTORCH_AMX_ROUTING").is_ok()
+                && matches!(gate_inp.dtype, GgmlType::F32);
+            let use_amx_async = std::env::var("RUSTORCH_AMX_ROUTING_ASYNC").is_ok()
+                && matches!(gate_inp.dtype, GgmlType::F32);
+            if use_amx_async {
+                // T172 Day 5 + T173 amortization — async hybrid GPU+CPU routing.
+                // GPU produced h. Encode signal_event, submit AMX, do GPU work
+                // INDEPENDENT of routing (shared expert path + zero(moe_acc) +
+                // dot_scalar) in the gap, then encode_wait_for_event.
+                // The GPU work between submit and wait amortizes the encoder-break
+                // overhead, hiding the AMX 9 µs entirely behind ~80-150 µs of
+                // shared-expert GPU compute.
+                //
+                // Day 5 was: submit + immediate wait → -10/-14% (overhead > savings).
+                // T173 reorders to put shared expert + dot_scalar + zero(moe_acc)
+                // BETWEEN submit and wait, expecting net positive gain.
+                let exec = amx_executor(backend);
+                let (wait_v, signal_v) = exec.next_event_pair();
+                backend.encode_signal_event(exec.event(), wait_v);
+                exec.submit_with_sync(
+                    rustorch_metal::async_amx::AmxJob {
+                        h_ptr: scratch.h.contents() as *const f32,
+                        w_ptr: gate_inp.buffer.contents() as *const f32,
+                        out_ptr: scratch.moe_logits.contents() as *mut f32,
+                        k: gate_inp.k,
+                        n: gate_inp.n,
+                    },
+                    wait_v,
+                    signal_v,
+                );
+
+                // === GPU work in PARALLEL with CPU AMX (no read of moe_logits here) ===
+                // 1. Zero accumulator early (otherwise done later at line ~2678)
+                zero_f32(backend, &scratch.moe_acc, d)?;
+                // 2. Shared expert path (independent of routing)
+                gate_shexp.matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
+                up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
+                swiglu_f32(
+                    backend,
+                    &scratch.moe_gate,
+                    &scratch.moe_up,
+                    &scratch.moe_fd,
+                    ef,
+                )?;
+                down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
+                // 3. Dot scalar for shared gate
+                sgemv_f32_lcpp_simd_into(
+                    backend,
+                    &scratch.h,
+                    gate_inp_shexp,
+                    &scratch.moe_dot_scalar,
+                    d,
+                    1,
+                )?;
+                // === All this GPU work overlapped with CPU AMX routing ===
+
+                backend.encode_wait_for_event(exec.event(), signal_v);
+                // Sigmoid_add_moe needs both moe_acc (filled by gather chain
+                // below) and moe_expert_out (already done above) — but it must
+                // run AFTER the gather chain. Skip the redundant later
+                // shared+dot calls by setting a flag.
+            } else if use_amx_sync {
+                // Drain GPU so h is fully written before CPU AMX reads it.
+                backend.drain();
+                let k = gate_inp.k;
+                let n = gate_inp.n;
+                unsafe {
+                    let h_ptr = scratch.h.contents() as *const f32;
+                    let w_ptr = gate_inp.buffer.contents() as *const f32;
+                    let y_ptr = scratch.moe_logits.contents() as *mut f32;
+                    rustorch_cpu::accelerate::cblas_sgemv(
+                        rustorch_cpu::accelerate::CBLAS_ROW_MAJOR,
+                        rustorch_cpu::accelerate::CBLAS_NO_TRANS,
+                        n as i32, // m of A
+                        k as i32, // n of A
+                        1.0,
+                        w_ptr,
+                        k as i32, // lda
+                        h_ptr,
+                        1,
+                        0.0,
+                        y_ptr,
+                        1,
+                    );
+                }
+            } else {
+                gate_inp.matmul_into(backend, &scratch.h, &scratch.moe_logits)?;
+            }
 
             // 2. T152.1b — Top-K + softmax + renormalize 100% GPU.
             //    Avant : drain + CPU softmax + argsort + renormalize. Maintenant :
             //    1 dispatch d'un threadgroup unique 256 threads qui produit
             //    `moe_indices_buf [n_used] u32` + `moe_topw_buf [n_used] f32`.
             //    Économie : 1 drain × 16 MoE layers = 16 drains/token sur 35B-A3B.
+            //
+            // Note T165 (negative result) : tentative de fusion en 1 kernel
+            // (routing_topk_softmax_norm_f32) régresse -50% car le matmul
+            // perd son parallélisme massif (256 sgs //) en se contractant à
+            // 1 TG (8 sgs serial). Voir gotcha pour le détail.
             topk_softmax_norm_f32(
                 backend,
                 &scratch.moe_logits,
@@ -2343,9 +2826,13 @@ fn ffn_dense_forward(
                 n_experts,
                 n_used,
             )?;
+            profile_drain_record(backend, "  moe.routing", _moe_t0_routing);
 
             // 3. T147a — zero the accumulator on GPU (no drain).
-            zero_f32(backend, &scratch.moe_acc, d)?;
+            // T173 : skip if async path already zeroed it during AMX overlap.
+            if !use_amx_async {
+                zero_f32(backend, &scratch.moe_acc, d)?;
+            }
 
             // 4. T152 — gather sgemv path (1 dispatch / projection au lieu de
             //    n_used dispatchs). Inspired by MLX `affine_gather_qmm_rhs`.
@@ -2405,6 +2892,7 @@ fn ffn_dense_forward(
             };
 
             // gate_proj : [n_used, ef] = stacked_gate[indices, :, :] @ h (broadcast)
+            let _moe_t0_gate = std::time::Instant::now();
             gather_dispatch(
                 gate_exps_stacked,
                 &scratch.h,
@@ -2414,8 +2902,10 @@ fn ffn_dense_forward(
                 0, // x_stride_floats=0 → broadcast
             )
             .map_err(|e| MetalError::Unsupported(format!("moe gate gather: {e:?}")))?;
+            profile_drain_record(backend, "  moe.gather_gate", _moe_t0_gate);
 
             // up_proj : [n_used, ef] = stacked_up[indices, :, :] @ h (broadcast)
+            let _moe_t0_up = std::time::Instant::now();
             gather_dispatch(
                 up_exps_stacked,
                 &scratch.h,
@@ -2425,9 +2915,11 @@ fn ffn_dense_forward(
                 0,
             )
             .map_err(|e| MetalError::Unsupported(format!("moe up gather: {e:?}")))?;
+            profile_drain_record(backend, "  moe.gather_up", _moe_t0_up);
 
             // swiglu : fd_gather[b, i] = silu(gate[b, i]) * up[b, i] sur n_used*ef
             // éléments traités comme un tableau 1D (kernel élément-wise pur).
+            let _moe_t0_swiglu = std::time::Instant::now();
             swiglu_f32(
                 backend,
                 &scratch.moe_gate_gather,
@@ -2435,8 +2927,10 @@ fn ffn_dense_forward(
                 &scratch.moe_fd_gather,
                 n_used * ef,
             )?;
+            profile_drain_record(backend, "  moe.swiglu_top", _moe_t0_swiglu);
 
             // down_proj : [n_used, d] = stacked_down[indices, :, :] @ fd_gather (per-row)
+            let _moe_t0_down = std::time::Instant::now();
             gather_dispatch(
                 down_exps_stacked,
                 &scratch.moe_fd_gather,
@@ -2446,8 +2940,10 @@ fn ffn_dense_forward(
                 ef, // x_stride_floats=ef → per-row input
             )
             .map_err(|e| MetalError::Unsupported(format!("moe down gather: {e:?}")))?;
+            profile_drain_record(backend, "  moe.gather_down", _moe_t0_down);
 
             // T152 — somme pondérée multi-row : moe_acc += sum_b top_w[b] * down_gather[b, :]
+            let _moe_t0_reduce = std::time::Instant::now();
             weighted_reduce_add_f32(
                 backend,
                 &scratch.moe_down_gather,
@@ -2456,6 +2952,7 @@ fn ffn_dense_forward(
                 n_used,
                 d,
             )?;
+            profile_drain_record(backend, "  moe.reduce_top", _moe_t0_reduce);
 
             // 5. Shared expert: standard SwiGLU FFN with sigmoid gate scalar.
             //    shared_gate is a vector of size d (per-element gate, not scalar).
@@ -2465,16 +2962,21 @@ fn ffn_dense_forward(
             //    `shared_gate = build_lora_mm(ffn_gate_inp_shexp, cur)` with
             //    ffn_gate_inp_shexp of shape [d] would imply a 1×d matrix → output
             //    is a scalar per token. So a dot product.
-            gate_shexp.matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
-            up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
-            swiglu_f32(
-                backend,
-                &scratch.moe_gate,
-                &scratch.moe_up,
-                &scratch.moe_fd,
-                ef,
-            )?;
-            down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
+            // T173 : skip if async path already ran shared expert during AMX overlap.
+            let _moe_t0_shared = std::time::Instant::now();
+            if !use_amx_async {
+                gate_shexp.matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
+                up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
+                swiglu_f32(
+                    backend,
+                    &scratch.moe_gate,
+                    &scratch.moe_up,
+                    &scratch.moe_fd,
+                    ef,
+                )?;
+                down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
+            }
+            profile_drain_record(backend, "  moe.shared", _moe_t0_shared);
 
             // T152.1 — Shared expert gating + final add ENTIÈREMENT GPU.
             // Avant : drain + CPU dot + CPU sigmoid + CPU add. Maintenant :
@@ -2483,14 +2985,18 @@ fn ffn_dense_forward(
             //   `xd[i] += moe_acc[i] + sigmoid(scalar) * moe_expert_out[i]`
             // 1 dispatch GPU au lieu de 1 drain + 2 CPU loops sur d éléments.
             // Économie : 1 drain × 16 MoE layers = 16 drains/token sur 35B-A3B.
-            sgemv_f32_lcpp_simd_into(
-                backend,
-                &scratch.h,
-                gate_inp_shexp,
-                &scratch.moe_dot_scalar,
-                d,
-                1,
-            )?;
+            // T173 : skip dot_scalar if async path already computed it.
+            let _moe_t0_final = std::time::Instant::now();
+            if !use_amx_async {
+                sgemv_f32_lcpp_simd_into(
+                    backend,
+                    &scratch.h,
+                    gate_inp_shexp,
+                    &scratch.moe_dot_scalar,
+                    d,
+                    1,
+                )?;
+            }
             sigmoid_add_moe_f32(
                 backend,
                 &scratch.moe_acc,
@@ -2499,6 +3005,7 @@ fn ffn_dense_forward(
                 &scratch.xd,
                 d,
             )?;
+            profile_drain_record(backend, "  moe.final_add", _moe_t0_final);
             Ok(())
         },
     }
@@ -2898,15 +3405,33 @@ fn forward_batch(
     let d = cfg.d;
     let max_seq = state.max_seq;
 
-    // 1. Embed B tokens into xd_batched [B, d]. Reuse embed_token by
-    //    creating a per-token view (allocates a small temp f32 row).
-    for (bi, &tok) in tokens.iter().enumerate() {
-        let row_buf = backend.alloc_shared(d * 4).unwrap();
-        embed_token(file, tok, &row_buf, cfg)?;
-        unsafe {
-            let src = row_buf.contents() as *const f32;
-            let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
-            std::ptr::copy_nonoverlapping(src, dst, d);
+    // 1. Embed B tokens into xd_batched [B, d]. T175 P3 — write directly into
+    //    batch_scratch.xd[bi*d..] via dequant + raw ptr, eliminating
+    //    `backend.alloc_shared(d*4)` per token (was ~6 ms/chunk at B=128).
+    {
+        let info = file
+            .tensor("token_embd.weight")
+            .ok_or_else(|| "missing token_embd.weight".to_string())?;
+        let row_bytes = info.byte_size() as usize / cfg.vocab;
+        let bytes = file.tensor_bytes(info);
+        let mut row_info = info.clone();
+        row_info.shape = vec![cfg.d as u64];
+        for (bi, &tok) in tokens.iter().enumerate() {
+            let row_start = (tok as usize) * row_bytes;
+            let row_end = row_start + row_bytes;
+            let f32_row = dequant_to_f32(&row_info, &bytes[row_start..row_end])
+                .map_err(|e| format!("token_embd dequant: {e:?}"))?;
+            if f32_row.len() != cfg.d {
+                return Err(format!(
+                    "token_embd: expected {} f32, got {}",
+                    cfg.d,
+                    f32_row.len()
+                ));
+            }
+            unsafe {
+                let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
+                std::ptr::copy_nonoverlapping(f32_row.as_ptr(), dst, d);
+            }
         }
     }
 
@@ -2927,6 +3452,7 @@ fn forward_batch(
                 LayerState::Attn(cache),
             ) => {
                 // Full batched : Attn + FFN dense.
+                let _t0_ab = std::time::Instant::now();
                 attn_block_forward_batch(
                     backend,
                     attn,
@@ -2941,6 +3467,8 @@ fn forward_batch(
                     max_seq,
                 )
                 .map_err(|e| format!("L{li} attn batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.attn_block_batched", _t0_ab);
+                let _t0_fb = std::time::Instant::now();
                 ffn_dense_forward_batch(
                     backend,
                     &attn.attn_post_norm,
@@ -2953,19 +3481,29 @@ fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("L{li} ffn batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.ffn_dense_batched", _t0_fb);
             },
             (
                 LayerMetal::Attn {
                     attn,
-                    ffn: ffn @ FfnLayerMetal::Moe { .. },
+                    ffn:
+                        FfnLayerMetal::Moe {
+                            gate_inp,
+                            gate_inp_shexp,
+                            gate_shexp,
+                            up_shexp,
+                            down_shexp,
+                            gate_exps_stacked,
+                            up_exps_stacked,
+                            down_exps_stacked,
+                        },
                 },
                 LayerState::Attn(cache),
             ) => {
-                // T162 phase 9f-hybrid : Attn block batched, MoE FFN per-token.
-                // Le gather_sgemv MoE est fast à n_used=8 rows/dispatch ; batcher
-                // ce kernel introduirait soit memcpy 128MB (replication) soit
-                // saturation GPU (256 rows × 256 N/4 TG = 65K TG > occupancy).
-                // Per-token reste la voie optimale en attendant gather_sgemm_q4_k.
+                // T170 — Attn batched + MoE FFN BATCHED (was per-token loop with
+                // drain × B that ate 1.28s for B=128 on 35B-A3B prefill).
+                // Replaces dead-code ffn_moe_forward_batch entry into the path.
+                let _t0_ab = std::time::Instant::now();
                 attn_block_forward_batch(
                     backend,
                     attn,
@@ -2980,33 +3518,27 @@ fn forward_batch(
                     state.max_seq,
                 )
                 .map_err(|e| format!("L{li} attn batched: {e:?}"))?;
-                // MoE FFN per-token : copy xd_batched[bi] → scratch.xd, run
-                // post-norm + ffn_moe (per-token gather), copy back.
-                backend.drain();
-                for bi in 0..b {
-                    unsafe {
-                        let src = (batch_scratch.xd.contents() as *const f32).add(bi * d);
-                        let dst = state.scratch.xd.contents() as *mut f32;
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                    rms_norm_f32(
-                        backend,
-                        &state.scratch.xd,
-                        &attn.attn_post_norm,
-                        &state.scratch.h,
-                        d,
-                        cfg.rms_eps,
-                    )
-                    .map_err(|e| format!("L{li}/{bi} post norm: {e:?}"))?;
-                    ffn_dense_forward(backend, ffn, &state.scratch, cfg)
-                        .map_err(|e| format!("L{li}/{bi} moe: {e:?}"))?;
-                    backend.drain();
-                    unsafe {
-                        let src = state.scratch.xd.contents() as *const f32;
-                        let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                }
+                profile_drain_record(backend, "  fb.attn_block_batched", _t0_ab);
+                let _t0_fbm = std::time::Instant::now();
+                ffn_moe_forward_batch(
+                    backend,
+                    &attn.attn_post_norm,
+                    gate_inp,
+                    gate_inp_shexp,
+                    gate_shexp,
+                    up_shexp,
+                    down_shexp,
+                    gate_exps_stacked,
+                    up_exps_stacked,
+                    down_exps_stacked,
+                    &batch_scratch.xd,
+                    &state.scratch,
+                    &batch_scratch.moe,
+                    cfg,
+                    b,
+                )
+                .map_err(|e| format!("L{li} moe batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.ffn_moe_batched", _t0_fbm);
             },
             (
                 LayerMetal::Ssm {
@@ -3022,6 +3554,7 @@ fn forward_batch(
             ) => {
                 // T162 phase 9e — SSM block batched (projections + apply_gate
                 // batched, scan séquentiel, output proj batched).
+                let _t0_sb = std::time::Instant::now();
                 ssm_block_forward_batch(
                     backend,
                     ssm,
@@ -3033,7 +3566,9 @@ fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("L{li} ssm batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.ssm_block_batched", _t0_sb);
                 // FFN dense batched (post-attn norm + gate/up/swiglu/down + residual).
+                let _t0_fb = std::time::Instant::now();
                 ffn_dense_forward_batch(
                     backend,
                     &ssm.attn_post_norm,
@@ -3046,15 +3581,30 @@ fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("L{li} ssm-ffn batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.ffn_dense_batched", _t0_fb);
             },
             (
                 LayerMetal::Ssm {
                     ssm,
-                    ffn: ffn @ FfnLayerMetal::Moe { .. },
+                    ffn:
+                        FfnLayerMetal::Moe {
+                            gate_inp,
+                            gate_inp_shexp,
+                            gate_shexp,
+                            up_shexp,
+                            down_shexp,
+                            gate_exps_stacked,
+                            up_exps_stacked,
+                            down_exps_stacked,
+                        },
                 },
                 LayerState::Ssm(s),
             ) => {
-                // T162 phase 9f-hybrid : SSM batched, MoE FFN per-token.
+                // T170 — SSM batched + MoE FFN BATCHED. Identical fix to the
+                // Attn+MoE branch above: removes per-token drain loop that ate
+                // most of the prefill time on 35B-A3B (30 SSM+MoE layers × B
+                // drains = 38400 drains for B=128).
+                let _t0_sb = std::time::Instant::now();
                 ssm_block_forward_batch(
                     backend,
                     ssm,
@@ -3066,31 +3616,27 @@ fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("L{li} ssm batched: {e:?}"))?;
-                backend.drain();
-                for bi in 0..b {
-                    unsafe {
-                        let src = (batch_scratch.xd.contents() as *const f32).add(bi * d);
-                        let dst = state.scratch.xd.contents() as *mut f32;
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                    rms_norm_f32(
-                        backend,
-                        &state.scratch.xd,
-                        &ssm.attn_post_norm,
-                        &state.scratch.h,
-                        d,
-                        cfg.rms_eps,
-                    )
-                    .map_err(|e| format!("L{li}/{bi} post norm: {e:?}"))?;
-                    ffn_dense_forward(backend, ffn, &state.scratch, cfg)
-                        .map_err(|e| format!("L{li}/{bi} moe: {e:?}"))?;
-                    backend.drain();
-                    unsafe {
-                        let src = state.scratch.xd.contents() as *const f32;
-                        let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                }
+                profile_drain_record(backend, "  fb.ssm_block_batched", _t0_sb);
+                let _t0_fbm = std::time::Instant::now();
+                ffn_moe_forward_batch(
+                    backend,
+                    &ssm.attn_post_norm,
+                    gate_inp,
+                    gate_inp_shexp,
+                    gate_shexp,
+                    up_shexp,
+                    down_shexp,
+                    gate_exps_stacked,
+                    up_exps_stacked,
+                    down_exps_stacked,
+                    &batch_scratch.xd,
+                    &state.scratch,
+                    &batch_scratch.moe,
+                    cfg,
+                    b,
+                )
+                .map_err(|e| format!("L{li} ssm+moe batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.ffn_moe_batched", _t0_fbm);
             },
             _ => return Err(format!("L{li}: kind/state mismatch")),
         }

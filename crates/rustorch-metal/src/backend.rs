@@ -327,6 +327,60 @@ impl MetalBackend {
         }
     }
 
+    /// T172 Day 4 — Encode `signal_event(value)` on the pending command
+    /// buffer. Ends the chained encoder so the signal happens AFTER all
+    /// previously-encoded kernels complete on the GPU. The next
+    /// `with_encoder` call will lazily reopen a new encoder on the same
+    /// command buffer (no commit yet).
+    ///
+    /// Used to coordinate with `AsyncAmxExecutor` : after encoding a kernel
+    /// that produces some buffer (e.g. h post-norm), call this to signal
+    /// the CPU AMX worker that the input is ready.
+    pub fn encode_signal_event(&self, event: &metal::SharedEventRef, value: u64) {
+        // Close the chained encoder so the signal lands AFTER all current
+        // kernels in command-buffer order.
+        {
+            let mut enc_guard = self
+                .pending_encoder
+                .lock()
+                .expect("metal pending encoder lock");
+            if let Some(enc) = enc_guard.take() {
+                enc.end_encoding();
+            }
+        }
+        // Ensure we have a command buffer to encode the signal on.
+        let mut cb_guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
+        if cb_guard.is_none() {
+            *cb_guard = Some(self.queue.new_command_buffer().to_owned());
+        }
+        let cb = cb_guard.as_ref().expect("just created");
+        cb.encode_signal_event(event, value);
+        // Encoder will be reopened lazily on next `with_encoder`.
+    }
+
+    /// T172 Day 4 — Encode `wait_for_event(value)` on the pending command
+    /// buffer. Subsequent dispatches will not start until the event is
+    /// signaled to the given value. Used to wait for `AsyncAmxExecutor`
+    /// to finish an AMX matmul before reading its output on GPU.
+    pub fn encode_wait_for_event(&self, event: &metal::SharedEventRef, value: u64) {
+        {
+            let mut enc_guard = self
+                .pending_encoder
+                .lock()
+                .expect("metal pending encoder lock");
+            if let Some(enc) = enc_guard.take() {
+                enc.end_encoding();
+            }
+        }
+        let mut cb_guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
+        if cb_guard.is_none() {
+            *cb_guard = Some(self.queue.new_command_buffer().to_owned());
+        }
+        let cb = cb_guard.as_ref().expect("just created");
+        cb.encode_wait_for_event(event, value);
+        // Encoder will be reopened lazily on next `with_encoder`.
+    }
+
     /// **Commit without waiting.** Closes the pending encoder and commits
     /// the current command buffer to the queue, then immediately returns.
     /// The GPU starts executing the committed work asynchronously while

@@ -25,6 +25,7 @@ serde_json         = { version = "1" }
 # Q4_K / Q6_K kernels into the rustorch-llm decode loop and measure
 # end-to-end tok/s on Apple Silicon.
 rustorch-metal = { workspace = true }
+rustorch-cpu   = { workspace = true } # T171 — AMX (Accelerate) path for F32 small matmul
 metal          = "0.29"
 
 [[example]]

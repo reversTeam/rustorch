@@ -3784,6 +3784,7 @@ version = "0.0.1"
 dependencies = [
  "metal",
  "rustorch-core",
+ "rustorch-cpu",
  "rustorch-fusion",
  "rustorch-gguf",
  "rustorch-metal",

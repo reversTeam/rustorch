@@ -3759,6 +3759,69 @@ fn forward_token_head_stats(
 //
 // Used by speculative decoding: input = [last_real_token, draft_1, ..., draft_{B-1}].
 // Verifier runs forward_batch, then we accept the longest matching prefix.
+// T163 phase 10 — per-phase timing instrumentation pour identifier le goulot
+// d'étranglement dans forward_batch (cible : closer le gap 14B Q4 prefill 50%
+// vs llama.cpp). Activé via env var RUSTORCH_FBATCH_PROFILE=1.
+//
+// Mesure : RMSNorm pré-attn, Q proj, K proj, V proj, QK norm + RoPE, KV append,
+// GQA decode, W_O, residual, ffn_norm, gate, up, swiglu, w_down, residual.
+// Drains après chaque phase pour timing exact.
+struct PhaseTimer {
+    enabled: bool,
+    timings: std::collections::HashMap<&'static str, std::time::Duration>,
+    last: std::time::Instant,
+    backend_drain_fn: fn(&MetalBackend),
+}
+
+fn drain_backend(backend: &MetalBackend) {
+    backend.drain();
+}
+
+impl PhaseTimer {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            timings: std::collections::HashMap::new(),
+            last: std::time::Instant::now(),
+            backend_drain_fn: drain_backend,
+        }
+    }
+    fn mark(&mut self, backend: &MetalBackend, label: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        (self.backend_drain_fn)(backend);
+        let dt = self.last.elapsed();
+        *self
+            .timings
+            .entry(label)
+            .or_insert(std::time::Duration::ZERO) += dt;
+        self.last = std::time::Instant::now();
+    }
+    fn print(&self, label: &str) {
+        if !self.enabled || self.timings.is_empty() {
+            return;
+        }
+        let total: std::time::Duration = self.timings.values().sum();
+        let mut entries: Vec<_> = self.timings.iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(a.1));
+        println!(
+            "\n=== {} per-phase timings (total {:.3}s) ===",
+            label,
+            total.as_secs_f64()
+        );
+        for (name, dt) in entries {
+            let pct = dt.as_secs_f64() / total.as_secs_f64() * 100.0;
+            println!(
+                "  {:<24} {:>8.3} ms  {:>5.1}%",
+                name,
+                dt.as_secs_f64() * 1000.0,
+                pct
+            );
+        }
+    }
+}
+
 fn forward_batch(
     backend: &MetalBackend,
     model: &ModelMetal,
@@ -3766,6 +3829,7 @@ fn forward_batch(
     pos_base: usize,
     scratch: &mut Scratch,
 ) -> Vec<u32> {
+    let mut timer = PhaseTimer::new(std::env::var("RUSTORCH_FBATCH_PROFILE").is_ok());
     let b = tokens.len();
     assert!(
         b > 0 && b <= B_MAX,
@@ -3791,8 +3855,10 @@ fn forward_batch(
             );
         }
     }
+    timer.mark(backend, "embed");
 
     for (li, layer) in model.layers.iter().enumerate() {
+        let _ = li;
         // 1. Batched RMSNorm (attn_norm) into h_buf [B, d]
         rms_norm_batched_f32(
             backend,
@@ -3804,6 +3870,7 @@ fn forward_batch(
             cfg.rms_eps,
         )
         .unwrap();
+        timer.mark(backend, "rmsnorm_attn");
 
         // 2. QKV: 3 batched matmul (T162 phase 4-bis : SGEMM si éligible).
         dispatch_batched_matmul(
@@ -3817,6 +3884,7 @@ fn forward_batch(
             layer.w_q.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_q");
         dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
@@ -3828,6 +3896,7 @@ fn forward_batch(
             layer.w_k.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_k");
         dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
@@ -3839,6 +3908,7 @@ fn forward_batch(
             layer.w_v.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_v");
 
         // 3. Batched QK norm + RoPE
         if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
@@ -3887,6 +3957,7 @@ fn forward_batch(
             b,
         )
         .unwrap();
+        timer.mark(backend, "qknorm_rope");
 
         // 4. Batched KV cache append
         kv_append_batched_f32(
@@ -3911,6 +3982,7 @@ fn forward_batch(
             max_seq,
         )
         .unwrap();
+        timer.mark(backend, "kv_append");
 
         // 5. Batched GQA decode (causal mask multi-position)
         gqa_decode_batched_f32(
@@ -3927,6 +3999,7 @@ fn forward_batch(
             max_seq,
         )
         .unwrap();
+        timer.mark(backend, "gqa_decode");
 
         // 6. W_O batched matmul + residual add (T162 phase 4-bis : SGEMM si éligible).
         dispatch_batched_matmul(
@@ -3940,7 +4013,9 @@ fn forward_batch(
             layer.w_o.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_o");
         add_inplace_batched_f32(backend, &scratch.xd_buf, &scratch.o_buf, d, b).unwrap();
+        timer.mark(backend, "residual_attn");
 
         // 7. Batched ffn_norm
         rms_norm_batched_f32(
@@ -3953,6 +4028,7 @@ fn forward_batch(
             cfg.rms_eps,
         )
         .unwrap();
+        timer.mark(backend, "rmsnorm_ffn");
 
         // 8. Gate + Up (T162 phase 4-bis : SGEMM si éligible).
         dispatch_batched_matmul(
@@ -3966,6 +4042,7 @@ fn forward_batch(
             layer.w_gate.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_gate");
         dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
@@ -3977,6 +4054,7 @@ fn forward_batch(
             layer.w_up.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_up");
 
         // 9. Batched SwiGLU
         swiglu_batched_f32(
@@ -3988,6 +4066,7 @@ fn forward_batch(
             b,
         )
         .unwrap();
+        timer.mark(backend, "swiglu");
 
         // 10. W_down batched matmul + residual add (T162 phase 4-bis : SGEMM).
         dispatch_batched_matmul(
@@ -4001,7 +4080,9 @@ fn forward_batch(
             layer.w_down.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_down");
         add_inplace_batched_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d, b).unwrap();
+        timer.mark(backend, "residual_ffn");
     }
 
     // Final norm + lm_head batched
@@ -4015,34 +4096,25 @@ fn forward_batch(
         cfg.rms_eps,
     )
     .unwrap();
-    match model.lm_head.dtype {
-        GgmlType::Q4_K => sgemv_q4_k_f32_lcpp_nr2_batch_into(
-            backend,
-            &scratch.h_buf,
-            &model.lm_head.buffer,
-            &scratch.logits_buf,
-            model.lm_head.k,
-            model.lm_head.n,
-            b,
-        )
-        .unwrap(),
-        GgmlType::Q6_K => sgemv_q6_k_f32_lcpp_nr2_batch_into(
-            backend,
-            &scratch.h_buf,
-            &model.lm_head.buffer,
-            &scratch.logits_buf,
-            model.lm_head.k,
-            model.lm_head.n,
-            b,
-        )
-        .unwrap(),
-        _ => panic!(
-            "forward_batch: unsupported lm_head dtype: {:?}",
-            model.lm_head.dtype
-        ),
-    }
+    // T163 phase 10 — lm_head via SGEMM batched (était sgemv-loop per-token,
+    // 28% du temps prefill total). N=151936 vocab → tile 64×64 alignment :
+    // 151936 % 64 = 0 ✓. SGEMM 64×64 multi-warp ≈ 3× plus rapide que sgemv loop
+    // sur cette shape M=256 N=151936 K=5120.
+    dispatch_batched_matmul(
+        backend,
+        &scratch.h_buf,
+        &model.lm_head.buffer,
+        &scratch.logits_buf,
+        model.lm_head.k,
+        model.lm_head.n,
+        b,
+        model.lm_head.dtype,
+    )
+    .unwrap();
+    timer.mark(backend, "lm_head");
 
     backend.drain();
+    timer.print(&format!("forward_batch B={b}"));
 
     // Argmax for each batch position
     let mut next_tokens = Vec::with_capacity(b);
@@ -4530,54 +4602,119 @@ fn main() -> ExitCode {
     let mut spec_total_drafts = 0usize;
     let mut spec_accepted = 0usize;
     let mut spec_rounds = 0usize;
+    let mut spec_total_skipped = 0usize;
     if (2..=B_MAX).contains(&speculative_b) {
-        // T122 — Speculative decoding loop with bigram-cache draft generator.
+        // T167 — Lookahead decoding with N-gram cache (upgrade T122).
         //
-        // Bigram cache: HashMap<u32, u32> = last_token -> most_common_next.
-        // Built online from generated tokens. T88a showed online cache has
-        // low hit on diverse prompts but can get traction on repetitive
-        // patterns (lists, code, integer sequences).
+        // Replaces T122's 1-gram bigram (HashMap<u32, u32>, ~1% acceptance) with
+        // a 2-gram → multi-candidate cache (HashMap<(u32, u32), Vec<u32>>).
+        // Last 2 tokens lookup → list of K-token continuations seen previously.
+        // Pick the most-recent continuation as the draft sequence.
+        //
+        // Built from BOTH prefill prompt + generated tokens — prompt context is
+        // a strong predictor for repetitive/structured outputs.
         //
         // Loop:
-        //   1. Build candidates [last_real, draft_1, ..., draft_{B-1}]
-        //      where draft_i comes from chained bigram lookups (or fallback
-        //      to last_real if cache empty).
-        //   2. forward_batch(candidates, pos_base) → B output logits.
-        //   3. Walk: find longest matching prefix where output[i] == draft_{i+1}.
-        //   4. Accepted_count drafts confirmed + 1 bonus token (output[K]).
-        //   5. Update bigram cache from observed transitions.
+        //   1. Lookup (prev2, prev1) → continuation [c0, c1, ..., c_{B-2}]
+        //      Pad with last token if cache miss.
+        //   2. forward_batch([last, c0, ..., c_{B-2}], cur_pos) → B output argmax.
+        //   3. Walk : longest prefix where output[i] == candidates[i+1].
+        //   4. Emit accepted + 1 bonus.
+        //   5. Update 2-gram cache from accepted sequence + history.
         let b_total = speculative_b;
+        let k_draft = b_total - 1; // K = drafts to verify (B = K + 1)
         use std::collections::HashMap;
-        let mut bigram: HashMap<u32, u32> = HashMap::new();
-        // Seed bigram from prefill prompt
-        for w in prompt_ids.windows(2) {
-            bigram.insert(w[0], w[1]);
-        }
-        if !generated.is_empty() {
-            // Last token from prefill is `generated[0]`; seed bigram from prompt → first generated
-            if let Some(&prev) = prompt_ids.last() {
-                bigram.insert(prev, generated[0]);
-            }
+        // 2-gram cache: (token_{n-1}, token_n) → continuation [token_{n+1}, token_{n+2}, ...]
+        // Most-recent-first ordering preserved.
+        let mut ngram: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+        let update_ngram =
+            |ngram: &mut HashMap<(u32, u32), Vec<u32>>, history: &[u32], k_draft: usize| {
+                // For each pos i in history with i+1 <= history.len()-1, key = (history[i-1], history[i])
+                // value = up to k_draft tokens [history[i+1] .. history[i+1+k_draft]]
+                if history.len() < 3 {
+                    return;
+                }
+                for i in 1..history.len() - 1 {
+                    let key = (history[i - 1], history[i]);
+                    let end = (i + 1 + k_draft).min(history.len());
+                    let cont: Vec<u32> = history[i + 1..end].to_vec();
+                    if !cont.is_empty() {
+                        ngram.insert(key, cont);
+                    }
+                }
+            };
+        // Seed from prompt
+        update_ngram(&mut ngram, &prompt_ids, k_draft);
+        // Seed from prompt → first generated
+        if !generated.is_empty() && prompt_ids.len() >= 2 {
+            let mut seed_seq: Vec<u32> = Vec::with_capacity(prompt_ids.len() + generated.len());
+            seed_seq.extend_from_slice(&prompt_ids);
+            seed_seq.extend_from_slice(&generated);
+            update_ngram(&mut ngram, &seed_seq, k_draft);
         }
 
+        // For 2-gram lookup we need the last 2 tokens. Seed prev_token from prompt.
+        let mut prev_token: u32 = if prompt_ids.len() >= 2 {
+            prompt_ids[prompt_ids.len() - 2]
+        } else {
+            last
+        };
+
+        // T167 dynamic abort : track acceptance rate over rolling window.
+        // If < BREAK_EVEN over the last WINDOW rounds, fall back to forward_token
+        // for this round (never regress baseline). Resume spec on next round if
+        // a 2-gram cache hit is available.
+        const ABORT_WINDOW: usize = 8;
+        const BREAK_EVEN_PCT: f32 = 8.0; // ~ forward_batch(B=8) overhead vs sequential
+        let mut recent_accept: std::collections::VecDeque<u32> =
+            std::collections::VecDeque::with_capacity(ABORT_WINDOW);
+
         while generated.len() < n {
-            // Build candidates
+            // Decide spec vs fallback : need a cache hit AND acceptance window OK.
+            let lookup_key = (prev_token, last);
+            let cache_hit = ngram.get(&lookup_key).map_or(0, |v| v.len()) > 0;
+            let window_acc = if recent_accept.is_empty() {
+                100.0 // optimistic on cold start
+            } else {
+                let total: u32 = recent_accept.iter().sum();
+                100.0 * (total as f32) / (recent_accept.len() as f32 * (k_draft as f32))
+            };
+            let should_spec = cache_hit && window_acc >= BREAK_EVEN_PCT;
+
+            if !should_spec {
+                // Fallback : forward_token, no spec overhead
+                last = forward_token(backend, &model, last, cur_pos, &mut scratch);
+                generated.push(last);
+                cur_pos += 1;
+                spec_total_skipped += 1;
+                if generated.len() >= 2 {
+                    prev_token = generated[generated.len() - 2];
+                }
+                continue;
+            }
+
+            // Build candidates: [last] + lookup
             let mut candidates: Vec<u32> = Vec::with_capacity(b_total);
             candidates.push(last);
-            let mut draft_seed = last;
-            for _ in 1..b_total {
-                let next = *bigram.get(&draft_seed).unwrap_or(&draft_seed);
-                candidates.push(next);
-                draft_seed = next;
+            let lookup_key = (prev_token, last);
+            if let Some(cont) = ngram.get(&lookup_key) {
+                // Take up to k_draft from cache
+                for &t in cont.iter().take(k_draft) {
+                    candidates.push(t);
+                }
+            }
+            // Pad with last (worst case fallback) if cache hit was short
+            while candidates.len() < b_total {
+                candidates.push(last);
             }
 
             let outs = forward_batch(backend, &model, &candidates, cur_pos, &mut scratch);
             spec_rounds += 1;
-            spec_total_drafts += b_total - 1;
+            spec_total_drafts += k_draft;
 
-            // Walk: how many drafts match the model's predictions?
+            // Walk: longest prefix match
             let mut accepted_count = 0usize;
-            for i in 0..(b_total - 1) {
+            for i in 0..k_draft {
                 if outs[i] == candidates[i + 1] {
                     accepted_count += 1;
                 } else {
@@ -4586,30 +4723,47 @@ fn main() -> ExitCode {
             }
             spec_accepted += accepted_count;
 
-            // Tokens to commit:
-            //   accepted drafts at positions [pos+1..pos+accepted_count]
-            //   + bonus token at position [pos+accepted_count+1] = outs[accepted_count]
+            // T167 dynamic abort window update
+            if recent_accept.len() == ABORT_WINDOW {
+                recent_accept.pop_front();
+            }
+            recent_accept.push_back(accepted_count as u32);
+
+            // Commit accepted drafts + 1 bonus
             for i in 0..accepted_count {
                 generated.push(candidates[i + 1]);
                 if generated.len() >= n {
                     break;
                 }
             }
+            // Update prev_token : it should track second-to-last token for next 2-gram lookup
+            // After commit of N tokens, prev_token = generated[generated.len()-2], last = generated[generated.len()-1]
             if generated.len() < n {
                 let bonus = outs[accepted_count];
                 generated.push(bonus);
+                if generated.len() >= 2 {
+                    prev_token = generated[generated.len() - 2];
+                }
                 last = bonus;
             } else {
+                if generated.len() >= 2 {
+                    prev_token = generated[generated.len() - 2];
+                }
                 last = candidates[accepted_count];
             }
             cur_pos += accepted_count + 1;
 
-            // Update bigram cache with the actually-confirmed transitions
-            for w in candidates[..=accepted_count].windows(2) {
-                bigram.insert(w[0], w[1]);
+            // Update n-gram cache from the just-committed sequence
+            // We need at least last 2 + accepted+1 = lookback for the 2-gram update
+            let history_start = generated.len().saturating_sub(accepted_count + 3);
+            let mut hist_window: Vec<u32> = Vec::new();
+            // Include last 2 tokens before this commit window for proper 2-gram seeding
+            if history_start >= 2 {
+                hist_window.extend_from_slice(&generated[history_start - 2..]);
+            } else {
+                hist_window.extend_from_slice(&generated[..]);
             }
-            // Last accepted → bonus
-            bigram.insert(candidates[accepted_count], last);
+            update_ngram(&mut ngram, &hist_window, k_draft);
         }
     } else {
         for _ in 1..n {
@@ -4742,11 +4896,18 @@ fn main() -> ExitCode {
             0.0
         };
         let avg_per_round = (spec_accepted + spec_rounds) as f64 / spec_rounds.max(1) as f64;
-        println!("\n=== T122 speculative B={} stats ===", speculative_b);
-        println!("  rounds            : {}", spec_rounds);
+        println!("\n=== T167 lookahead B={} stats ===", speculative_b);
+        println!("  spec rounds       : {}", spec_rounds);
+        println!(
+            "  fallback rounds   : {} (auto-abort when accept < 8%)",
+            spec_total_skipped
+        );
         println!("  drafts proposed   : {}", spec_total_drafts);
         println!("  drafts accepted   : {}", spec_accepted);
-        println!("  accept rate       : {:.2}%", accept_rate);
+        println!(
+            "  accept rate       : {:.2}% (over spec rounds)",
+            accept_rate
+        );
         println!("  avg tokens/round  : {:.3}", avg_per_round);
     }
     println!("\ngenerated: {:?}", generated);
