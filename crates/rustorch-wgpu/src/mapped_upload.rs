@@ -13,10 +13,9 @@
 //! pool reuse) and requires the size to be known up-front.
 
 use crate::error::WgpuError;
-use crate::pooled::PooledBuffer;
 use crate::storage::WgpuStorage;
 use rustorch_core::tensor::dtype::Dtype;
-use std::sync::Arc;
+use rustorch_core::tensor::storage::WgpuStorage as CoreWgpuStorage;
 
 /// Allocate a `WgpuStorage` of `bytes` size and write `data` into it
 /// in one shot via `mapped_at_creation`. The buffer is created with
@@ -24,10 +23,10 @@ use std::sync::Arc;
 /// kernels and transfers immediately.
 ///
 /// Returns `Err(ShapeMismatch)` if `data.len() != numel * dtype.byte_size()`.
-/// The buffer is wrapped as a [`PooledBuffer::standalone`] — it will
-/// not return to any pool on drop (`mapped_at_creation` is incompatible
-/// with the size-bin pool because the destination size is exact, not
-/// bucketed).
+/// The buffer is wrapped as a [`CoreWgpuStorage::standalone`] — it
+/// will not return to any pool on drop (`mapped_at_creation` is
+/// incompatible with the size-bin pool because the destination size
+/// is exact, not bucketed).
 pub fn upload_mapped_at_creation(
     device: &wgpu::Device,
     numel: usize,
@@ -73,7 +72,7 @@ pub fn upload_mapped_at_creation(
     }
     buffer.unmap();
     Ok(WgpuStorage {
-        buffer: Arc::new(PooledBuffer::standalone(buffer)),
+        buffer: CoreWgpuStorage::standalone(buffer, expected_bytes),
         dtype,
         numel,
     })

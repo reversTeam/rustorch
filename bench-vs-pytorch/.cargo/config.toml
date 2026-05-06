@@ -1,0 +1,8 @@
+# Always build with native CPU features so LLVM can auto-vectorize.
+# This is the fairest Rust setup we can give RusTorch — same level of
+# auto-tuning that any user with `RUSTFLAGS=-C target-cpu=native` would get.
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+neon,+fp16"]

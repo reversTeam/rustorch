@@ -38,11 +38,16 @@ members = [
     "crates/rustorch-rpc-internal",
     "crates/rustorch-attention",
     "crates/rustorch-quant",
+    "crates/rustorch-tokenizer",
+    "crates/rustorch-llm",
     "crates/rustorch-fusion",
     "crates/rustorch-amp",
     "crates/rustorch-checkpoint",
     "crates/rustorch-fusion-macros",
     "crates/rustorch-cuda",
+    "crates/rustorch-metal",
+    "crates/rustorch-gguf",
+    "crates/rustorch-bench-candle",
 ]
 exclude = [
     "pytorch", # reference clone of upstream PyTorch (read-only)
@@ -78,11 +83,15 @@ rustorch-wgpu      = { version = "0.0.1", path = "crates/rustorch-wgpu" }
 rustorch-planner   = { version = "0.0.1", path = "crates/rustorch-planner" }
 rustorch-attention = { version = "0.0.1", path = "crates/rustorch-attention" }
 rustorch-quant     = { version = "0.0.1", path = "crates/rustorch-quant" }
+rustorch-tokenizer = { version = "0.0.1", path = "crates/rustorch-tokenizer" }
+rustorch-llm       = { version = "0.0.1", path = "crates/rustorch-llm" }
 rustorch-fusion    = { version = "0.0.1", path = "crates/rustorch-fusion" }
 rustorch-amp       = { version = "0.0.1", path = "crates/rustorch-amp" }
 rustorch-checkpoint = { version = "0.0.1", path = "crates/rustorch-checkpoint" }
 rustorch-fusion-macros = { version = "0.0.1", path = "crates/rustorch-fusion-macros" }
 rustorch-cuda      = { version = "0.0.1", path = "crates/rustorch-cuda" }
+rustorch-metal     = { version = "0.0.1", path = "crates/rustorch-metal" }
+rustorch-gguf      = { version = "0.0.1", path = "crates/rustorch-gguf" }
 
 # Numerics & types
 half        = "2.4"   # f16 / bf16
@@ -135,7 +144,13 @@ js-sys       = "0.3"
 # - wasm32          → webgpu (added implicitly by wgpu when target_family=wasm)
 # `default` already includes wgsl + metal + dx12 + webgpu. We add
 # `vulkan-portability` so Linux runners pick up the Vulkan backend too.
-wgpu         = { version = "22.1", features = ["vulkan-portability"] }
+# `fragile-send-sync-non-atomic-wasm` is required for wgpu 22 to build
+# on wasm32: by default `wgpu::Device` / `Queue` are `!Send + !Sync` on
+# the browser backend, but `WgpuBackend` wraps them in `Arc<…>` which
+# requires `Send + Sync`. The feature is a no-op on native (where the
+# types are `Send + Sync` already) and is the standard wgpu workaround
+# for "single-threaded JS, no real cross-thread sharing" wasm builds.
+wgpu         = { version = "22.1", features = ["vulkan-portability", "fragile-send-sync-non-atomic-wasm"] }
 pollster     = "0.3"
 
 # Dev-only — benchmarks, property tests, concurrent-correctness tests.

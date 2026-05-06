@@ -75,9 +75,48 @@ impl Variable {
         self.data.lock().unwrap().clone()
     }
 
-    /// Alias for [`Variable::tensor`] kept for legacy callers.
+    /// Snapshot the underlying tensor as a **host-readable** Tensor.
+    ///
+    /// Used by optimisers (Adam, AdamW, SGD, ...) that need to read
+    /// parameter bytes via `.as_slice::<f32>()`. With P3.Z Task A
+    /// strict semantics, that call returns `None` for tensors whose
+    /// storage lives on the GPU — so this method auto-materialises
+    /// via `tensor_to_cpu` when the wgpu feature is enabled.
+    ///
+    /// Transitional bridge: P3.Z Task O FusedAdamW will operate on
+    /// `Storage::Wgpu` natively (no host trip), removing this
+    /// download from the optimiser hot path. Same applies to the
+    /// future Metal FusedAdamW (Task J Phase 4).
     pub fn data_snapshot(&self) -> Tensor {
-        self.tensor()
+        let t = self.tensor();
+        if t.storage().is_cpu() {
+            return t;
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            if t.as_metal_storage().is_some() {
+                if let Ok(host) = rustorch_metal::transfer::tensor_to_cpu(&t) {
+                    return host.with_device(t.device());
+                }
+            }
+        }
+        #[cfg(feature = "wgpu")]
+        {
+            if t.as_wgpu_storage().is_some() {
+                if let Ok(host) = rustorch_wgpu::transfer::tensor_to_cpu(&t) {
+                    return host.with_device(t.device());
+                }
+            }
+        }
+        t
+    }
+
+    /// Device the underlying tensor lives on. Used by the autograd
+    /// dispatcher to pick the right backend (CPU vs Wgpu) at op time.
+    /// See P3.Y plan, Phase A.
+    #[inline]
+    pub fn device(&self) -> rustorch_core::tensor::device::Device {
+        self.data.lock().unwrap().device()
     }
 
     /// Replace the shared `data` with a new tensor. Used by optimisers
@@ -88,13 +127,60 @@ impl Variable {
 
     /// Read the accumulated gradient (returns `None` until
     /// `backward()` has run on a downstream output).
+    ///
+    /// **P3.Z Task A**: when the wgpu feature is on and the gradient
+    /// lives on the GPU, this auto-materialises to host so optimisers
+    /// (Adam / AdamW / SGD / ...) can read its bytes via
+    /// `.as_slice::<f32>()`. Optimisers that have a GPU-native path
+    /// (e.g. AdamW with the `wgpu` feature on `rustorch-optim`)
+    /// bypass this download via [`Variable::raw_grad`].
     pub fn grad(&self) -> Option<Tensor> {
+        let g = self.grad.lock().unwrap().clone()?;
+        if g.storage().is_cpu() {
+            return Some(g);
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            if g.as_metal_storage().is_some() {
+                if let Ok(host) = rustorch_metal::transfer::tensor_to_cpu(&g) {
+                    return Some(host.with_device(g.device()));
+                }
+            }
+        }
+        #[cfg(feature = "wgpu")]
+        {
+            if g.as_wgpu_storage().is_some() {
+                if let Ok(host) = rustorch_wgpu::transfer::tensor_to_cpu(&g) {
+                    return Some(host.with_device(g.device()));
+                }
+            }
+        }
+        Some(g)
+    }
+
+    /// Raw gradient without host auto-materialisation — preserves the
+    /// underlying `Storage::Wgpu` (or other GPU variant) so callers
+    /// that have a GPU-native fast path can extract the device buffer
+    /// via `Tensor::as_wgpu_storage()` and dispatch a kernel directly.
+    /// Returns `None` if the gradient hasn't been computed yet (same
+    /// as [`Variable::grad`]).
+    pub fn raw_grad(&self) -> Option<Tensor> {
         self.grad.lock().unwrap().clone()
     }
 
     /// Reset the accumulated gradient to `None`.
     pub fn zero_grad(&self) {
         *self.grad.lock().unwrap() = None;
+    }
+
+    /// Replace the accumulated gradient with `new_grad`. Used by
+    /// gradient post-processors (e.g. `clip_grad_norm_` in
+    /// `rustorch-optim`) that need to scale or clip the grad in
+    /// place after `backward()` has run but before `optimizer.step()`.
+    ///
+    /// Pass `None` to reset (equivalent to [`Self::zero_grad`]).
+    pub fn set_grad(&self, new_grad: Option<Tensor>) {
+        *self.grad.lock().unwrap() = new_grad;
     }
 
     /// Return a *detached* copy — same data snapshot, no grad_fn,

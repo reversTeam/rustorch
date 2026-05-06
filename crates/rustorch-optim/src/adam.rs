@@ -29,6 +29,24 @@ pub struct Adam {
     step_t: usize,
     m: Vec<Option<Vec<f32>>>,
     v: Vec<Option<Vec<f32>>>,
+    /// Per-parameter GPU `m` state (allocated lazily on the first GPU
+    /// step). When present, the WGSL FusedAdamW kernel is used in
+    /// place of the CPU loop for that parameter — single dispatch,
+    /// zero host trip. P3.Z Task A perf path.
+    #[cfg(feature = "wgpu")]
+    m_gpu: Vec<Option<rustorch_wgpu::storage::WgpuStorage>>,
+    /// Per-parameter GPU `v` state (lazily allocated, see [`Self::m_gpu`]).
+    #[cfg(feature = "wgpu")]
+    v_gpu: Vec<Option<rustorch_wgpu::storage::WgpuStorage>>,
+    /// Per-parameter Metal `m` state (lazily allocated). Populates the
+    /// FusedAdamW Metal kernel for params whose tensor lives on
+    /// `Storage::Metal` — same in-place mutate-across-steps pattern
+    /// as the WGSL version. P3.Z Task J Phase 3.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    m_metal: Vec<Option<rustorch_metal::Buffer>>,
+    /// Per-parameter Metal `v` state.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    v_metal: Vec<Option<rustorch_metal::Buffer>>,
 }
 
 impl Adam {
@@ -45,6 +63,14 @@ impl Adam {
             step_t: 0,
             m: vec![None; n],
             v: vec![None; n],
+            #[cfg(feature = "wgpu")]
+            m_gpu: (0..n).map(|_| None).collect(),
+            #[cfg(feature = "wgpu")]
+            v_gpu: (0..n).map(|_| None).collect(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            m_metal: (0..n).map(|_| None).collect(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            v_metal: (0..n).map(|_| None).collect(),
         }
     }
 
@@ -158,13 +184,301 @@ impl AdamW {
     }
 }
 
+#[cfg(feature = "wgpu")]
+impl Adam {
+    /// Try to run a fused AdamW step entirely on GPU memory.
+    ///
+    /// Returns `true` when the step was dispatched on GPU (caller
+    /// should `continue` to the next param), `false` when the param
+    /// or grad isn't on Wgpu storage and the caller must fall back
+    /// to the CPU path. Only handles the **decoupled-WD** variant
+    /// (i.e. `AdamW`) — classical Adam's coupled WD takes the CPU
+    /// path because the kernel doesn't yet branch for it.
+    ///
+    /// Lazily allocates the per-parameter `m_gpu` / `v_gpu` zero
+    /// buffers on the first GPU step. State persists across steps
+    /// inside the kernel-mutated buffers — no upload, no download.
+    fn try_step_wgpu(&mut self, i: usize, _bc1: f32, _bc2: f32) -> bool {
+        use rustorch_core::tensor::device::Device;
+        use rustorch_wgpu::backend_singleton::wgpu_backend;
+        use rustorch_wgpu::fused_adamw::{allocate_zeros, fused_adamw_step, AdamWStepParams};
+        use rustorch_wgpu::transfer::to_gpu;
+
+        let param = self.params[i].clone();
+        let param_tensor = param.tensor();
+
+        // Only run on Wgpu-targeted params. Tensors flagged
+        // Device::Cpu skip the GPU path entirely.
+        if param_tensor.device() != Device::Wgpu {
+            return false;
+        }
+        let backend = wgpu_backend();
+
+        // First-step bridge: a parameter tagged Wgpu may still hold
+        // its initial CPU storage (typical pattern is
+        // `Tensor::from_vec(...).with_device(Wgpu)` for weight init).
+        // Upload it once here so subsequent steps reuse the GPU
+        // buffer for free.
+        let param_storage = match param_tensor.as_wgpu_storage() {
+            Some(s) => s.clone(),
+            None => match to_gpu(backend, &param_tensor) {
+                Ok(uploaded) => {
+                    let core_handle = uploaded.buffer.clone();
+                    let promoted = rustorch_core::tensor::tensor_impl::Tensor::from_wgpu_storage(
+                        core_handle.clone(),
+                        param_tensor.shape().to_vec(),
+                        param_tensor.dtype(),
+                    );
+                    param.set_data(promoted);
+                    core_handle
+                },
+                Err(_) => return false,
+            },
+        };
+
+        // Fetch the raw gradient (no auto-materialise); skip if absent
+        // or if it lives on the host (the kernel needs both buffers
+        // on the same device).
+        let grad_tensor = match param.raw_grad() {
+            Some(g) => g,
+            None => return true, // No gradient ⇒ nothing to do, but counts as "handled".
+        };
+        let grad_storage = match grad_tensor.as_wgpu_storage() {
+            Some(s) => s.clone(),
+            None => match to_gpu(backend, &grad_tensor) {
+                Ok(uploaded) => uploaded.buffer.clone(),
+                Err(_) => return false,
+            },
+        };
+
+        let n = param_tensor.numel();
+        let backend = wgpu_backend();
+
+        // Lazy-init m / v on GPU. Once allocated, the same buffers
+        // are reused every step — the kernel mutates them in-place,
+        // so state survives across calls without any copy.
+        if self.m_gpu[i].is_none() {
+            let m = match allocate_zeros(backend, n) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            self.m_gpu[i] = Some(m);
+        }
+        if self.v_gpu[i].is_none() {
+            let v = match allocate_zeros(backend, n) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            self.v_gpu[i] = Some(v);
+        }
+
+        let m = self.m_gpu[i].as_ref().expect("m_gpu just allocated above");
+        let v = self.v_gpu[i].as_ref().expect("v_gpu just allocated above");
+
+        let core = rustorch_wgpu::storage::WgpuStorage {
+            buffer: param_storage,
+            dtype: param_tensor.dtype(),
+            numel: n,
+        };
+        let core_grad = rustorch_wgpu::storage::WgpuStorage {
+            buffer: grad_storage,
+            dtype: grad_tensor.dtype(),
+            numel: grad_tensor.numel(),
+        };
+
+        let step_params = AdamWStepParams {
+            lr: self.lr,
+            beta1: self.betas.0,
+            beta2: self.betas.1,
+            eps: self.eps,
+            weight_decay: self.weight_decay,
+            t: self.step_t as u32,
+        };
+        let new_param = match fused_adamw_step(backend, &core, &core_grad, m, v, step_params) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        // Wrap the freshly-allocated GPU buffer back into a Tensor
+        // with `Storage::Wgpu(...)` so the next forward pass's
+        // `to_gpu` takes the fast path (clone Arc, no upload).
+        let shape = param_tensor.shape().to_vec();
+        let dtype = param_tensor.dtype();
+        let new_tensor = rustorch_core::tensor::tensor_impl::Tensor::from_wgpu_storage(
+            new_param.buffer,
+            shape,
+            dtype,
+        );
+        param.set_data(new_tensor);
+        true
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl Adam {
+    /// Try to run a fused AdamW step on Apple Metal direct.
+    /// Mirror of [`Self::try_step_wgpu`] for the rustorch-metal path.
+    /// Returns `true` on dispatch (caller should `continue`), `false`
+    /// when the param/grad isn't on Metal storage.
+    fn try_step_metal(&mut self, i: usize) -> bool {
+        use rustorch_core::tensor::device::Device;
+        use rustorch_metal::backend_singleton::metal_backend;
+        use rustorch_metal::fused_adamw::{allocate_zeros, AdamWStepParams};
+
+        let param = self.params[i].clone();
+        let param_tensor = param.tensor();
+
+        if param_tensor.device() != Device::Metal {
+            return false;
+        }
+        let backend = metal_backend();
+
+        // First-step bridge: param tagged Metal but still in CPU
+        // storage. Upload via shared-mode buffer (essentially a memcpy
+        // on Apple Silicon thanks to unified memory).
+        let param_buf: rustorch_metal::Buffer = match param_tensor.as_metal_storage() {
+            Some(s) => (**s).clone(),
+            None => {
+                let n_bytes = param_tensor.numel() * 4;
+                let buf = match backend.alloc_shared(n_bytes) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                let data = match param_tensor.as_slice::<f32>() {
+                    Some(d) => d,
+                    None => return false,
+                };
+                // SAFETY: shared-storage buffer; pointer valid for n_bytes.
+                unsafe {
+                    let dst = buf.contents() as *mut f32;
+                    for (j, &v) in data.iter().enumerate() {
+                        *dst.add(j) = v;
+                    }
+                }
+                let core =
+                    rustorch_core::tensor::storage::MetalStorage::standalone(buf.clone(), n_bytes);
+                let promoted = rustorch_core::tensor::tensor_impl::Tensor::from_metal_storage(
+                    core,
+                    param_tensor.shape().to_vec(),
+                    param_tensor.dtype(),
+                );
+                param.set_data(promoted);
+                buf
+            },
+        };
+
+        // Get the gradient buffer (raw — no auto-materialise).
+        let grad_tensor = match param.raw_grad() {
+            Some(g) => g,
+            None => return true, // No gradient ⇒ nothing to do.
+        };
+        let grad_buf: rustorch_metal::Buffer = match grad_tensor.as_metal_storage() {
+            Some(s) => (**s).clone(),
+            None => {
+                // Gradient is on CPU storage (e.g. via auto-materialise
+                // from an upstream backward op). Upload before dispatch.
+                let n_bytes = grad_tensor.numel() * 4;
+                let buf = match backend.alloc_shared(n_bytes) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                let data = match grad_tensor.as_slice::<f32>() {
+                    Some(d) => d,
+                    None => return false,
+                };
+                // SAFETY: shared-storage buffer; pointer valid for n_bytes.
+                unsafe {
+                    let dst = buf.contents() as *mut f32;
+                    for (j, &v) in data.iter().enumerate() {
+                        *dst.add(j) = v;
+                    }
+                }
+                buf
+            },
+        };
+
+        let n = param_tensor.numel();
+
+        if self.m_metal[i].is_none() {
+            let m = match allocate_zeros(backend, n) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            self.m_metal[i] = Some(m);
+        }
+        if self.v_metal[i].is_none() {
+            let v = match allocate_zeros(backend, n) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            self.v_metal[i] = Some(v);
+        }
+        let m = self.m_metal[i].as_ref().expect("m_metal just allocated");
+        let v = self.v_metal[i].as_ref().expect("v_metal just allocated");
+
+        let step_params = AdamWStepParams {
+            lr: self.lr,
+            beta1: self.betas.0,
+            beta2: self.betas.1,
+            eps: self.eps,
+            weight_decay: self.weight_decay,
+            t: self.step_t as u32,
+        };
+        // In-place AdamW: write back into `param_buf` instead of
+        // allocating a fresh ~4 MB output. The Tensor wrapping
+        // `param_buf` is shared via `Arc<MetalStorageInner>`, so
+        // mutating the underlying MTLBuffer is observable to all
+        // current readers. No `param.set_data()` needed because the
+        // Tensor's storage Arc is unchanged.
+        use rustorch_metal::fused_adamw::fused_adamw_step_inplace;
+        if fused_adamw_step_inplace(backend, &param_buf, &grad_buf, m, v, n, step_params).is_err() {
+            return false;
+        }
+        // bf16 cache for `param_buf` is now stale (param values just
+        // changed). Evict so the next forward/backward re-casts.
+        if let Some(s) = param_tensor.as_metal_storage() {
+            backend.evict_bf16(s.cache_key());
+        }
+        // No `param.set_data()` needed — the Tensor still wraps the
+        // (now in-place updated) `param_buf` Arc. This also avoids the
+        // first-step "promote CPU storage to Metal" branch on step 2+
+        // since param.tensor() already reports `Storage::Metal`.
+        true
+    }
+}
+
 impl Optimizer for Adam {
     fn step(&mut self) {
         self.step_t += 1;
         let t = self.step_t as f32;
         let bc1 = 1.0 - self.betas.0.powf(t);
         let bc2 = 1.0 - self.betas.1.powf(t);
-        for (i, param) in self.params.iter().enumerate() {
+
+        // Snapshot the indices of params we're iterating before the
+        // borrow checker complains about `self.params.iter()` aliasing
+        // `&mut self.m_gpu` etc. The expensive work is per-param so
+        // the index-based loop has the same shape as the original.
+        let n_params = self.params.len();
+        for i in 0..n_params {
+            // P3.Z Task A GPU fast path: when wgpu feature is on AND
+            // both `param` and `grad` live on `Storage::Wgpu`, dispatch
+            // a single WGSL kernel that computes the entire AdamW step
+            // in-place on GPU memory — no host trip, no CPU compute.
+            #[cfg(feature = "wgpu")]
+            {
+                if self.decoupled_wd && self.try_step_wgpu(i, bc1, bc2) {
+                    continue;
+                }
+            }
+            // P3.Z Task J Phase 3 — same pattern for Apple Metal direct.
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                if self.decoupled_wd && self.try_step_metal(i) {
+                    continue;
+                }
+            }
+
+            let param = &self.params[i];
             let grad = match param.grad() {
                 Some(g) => g,
                 None => continue,
@@ -173,40 +487,30 @@ impl Optimizer for Adam {
             let p_data: &[f32] = snapshot.as_slice::<f32>().expect("Adam: F32 only");
             let g_data: &[f32] = grad.as_slice::<f32>().expect("Adam: F32 only");
 
-            // Effective gradient: classical Adam couples weight decay
-            // into the gradient; AdamW applies it directly to the param.
-            let g_eff: Vec<f32> = if !self.decoupled_wd && self.weight_decay > 0.0 {
-                p_data
-                    .iter()
-                    .zip(g_data.iter())
-                    .map(|(&p, &g)| g + self.weight_decay * p)
-                    .collect()
-            } else {
-                g_data.to_vec()
-            };
+            let n = p_data.len();
+            let mut m_buf = self.m[i].take().unwrap_or_else(|| vec![0.0_f32; n]);
+            let mut v_buf = self.v[i].take().unwrap_or_else(|| vec![0.0_f32; n]);
+            let mut new = vec![0.0_f32; n];
 
-            // m and v buffers
-            let mut m_buf = self.m[i]
-                .take()
-                .unwrap_or_else(|| vec![0.0_f32; p_data.len()]);
-            let mut v_buf = self.v[i]
-                .take()
-                .unwrap_or_else(|| vec![0.0_f32; p_data.len()]);
-            for k in 0..p_data.len() {
-                m_buf[k] = self.betas.0 * m_buf[k] + (1.0 - self.betas.0) * g_eff[k];
-                v_buf[k] = self.betas.1 * v_buf[k] + (1.0 - self.betas.1) * g_eff[k] * g_eff[k];
-            }
-
-            let mut new = Vec::with_capacity(p_data.len());
-            for k in 0..p_data.len() {
-                let m_hat = m_buf[k] / bc1;
-                let v_hat = v_buf[k] / bc2;
-                let mut p_new = p_data[k] - self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                if self.decoupled_wd && self.weight_decay > 0.0 {
-                    p_new -= self.lr * self.weight_decay * p_data[k];
-                }
-                new.push(p_new);
-            }
+            // Fused parallel AdamW step: one rayon-driven pass that
+            // computes effective grad, updates m / v in-place, and
+            // writes the new parameter. Replaces four sequential 1M-
+            // element scalar loops + two intermediate Vec allocs.
+            cpu_adamw_kernel(
+                p_data,
+                g_data,
+                &mut m_buf,
+                &mut v_buf,
+                &mut new,
+                self.lr,
+                self.betas.0,
+                self.betas.1,
+                self.eps,
+                self.weight_decay,
+                self.decoupled_wd,
+                bc1,
+                bc2,
+            );
             write_param_data(param, new);
             self.m[i] = Some(m_buf);
             self.v[i] = Some(v_buf);
@@ -242,4 +546,108 @@ impl Optimizer for AdamW {
     fn set_lr(&mut self, lr: f32) {
         self.0.set_lr(lr);
     }
+}
+
+/// Fused, parallel AdamW kernel for the CPU backend.
+///
+/// Replaces the previous 4-loop scalar implementation:
+/// 1. compute g_eff (with optional coupled weight decay)
+/// 2. update m
+/// 3. update v
+/// 4. write new param (with optional decoupled weight decay)
+///
+/// All four updates are independent across elements, so we fuse them
+/// into a single rayon-driven pass over chunks of the parameter
+/// arrays. On a parameter of N elements this brings the per-step
+/// CPU time from O(N) sequential to O(N / num_threads) parallel —
+/// for the canonical 1024² = 1 M-element Linear weight on M4 Max
+/// (12 perf cores) the AdamW step drops from ~7 ms to well under
+/// 1 ms.
+///
+/// Below `PARALLEL_THRESHOLD` we stay sequential — rayon's task
+/// dispatch overhead exceeds the compute for tiny tensors (e.g. the
+/// bias term with N=1024).
+#[allow(clippy::too_many_arguments)]
+fn cpu_adamw_kernel(
+    p_data: &[f32],
+    g_data: &[f32],
+    m_buf: &mut [f32],
+    v_buf: &mut [f32],
+    new: &mut [f32],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    decoupled_wd: bool,
+    bc1: f32,
+    bc2: f32,
+) {
+    use rayon::prelude::*;
+
+    let n = p_data.len();
+    debug_assert_eq!(g_data.len(), n);
+    debug_assert_eq!(m_buf.len(), n);
+    debug_assert_eq!(v_buf.len(), n);
+    debug_assert_eq!(new.len(), n);
+
+    /// Below this many elements we run the kernel single-threaded —
+    /// rayon overhead exceeds the work otherwise. Picked to be safely
+    /// above the typical bias-vector size (a few thousand) and well
+    /// below typical Linear weight sizes (10⁵+).
+    const PARALLEL_THRESHOLD: usize = 16_384;
+    /// Chunk size for rayon `par_chunks_mut`. Big enough to amortise
+    /// task-dispatch overhead, small enough to give the work-stealer
+    /// fine-grained slices.
+    const CHUNK: usize = 4_096;
+
+    let inv_bc1 = 1.0 / bc1;
+    let inv_bc2 = 1.0 / bc2;
+
+    let kernel = |p: f32, g: f32, m: &mut f32, v: &mut f32, n_out: &mut f32| {
+        let g_eff = if !decoupled_wd && weight_decay > 0.0 {
+            g + weight_decay * p
+        } else {
+            g
+        };
+        *m = beta1 * *m + (1.0 - beta1) * g_eff;
+        *v = beta2 * *v + (1.0 - beta2) * g_eff * g_eff;
+        let m_hat = *m * inv_bc1;
+        let v_hat = *v * inv_bc2;
+        let mut p_new = p - lr * m_hat / (v_hat.sqrt() + eps);
+        if decoupled_wd && weight_decay > 0.0 {
+            p_new -= lr * weight_decay * p;
+        }
+        *n_out = p_new;
+    };
+
+    if n < PARALLEL_THRESHOLD {
+        for i in 0..n {
+            kernel(
+                p_data[i],
+                g_data[i],
+                &mut m_buf[i],
+                &mut v_buf[i],
+                &mut new[i],
+            );
+        }
+        return;
+    }
+
+    new.par_chunks_mut(CHUNK)
+        .zip(p_data.par_chunks(CHUNK))
+        .zip(g_data.par_chunks(CHUNK))
+        .zip(m_buf.par_chunks_mut(CHUNK))
+        .zip(v_buf.par_chunks_mut(CHUNK))
+        .for_each(|((((new_chunk, p_chunk), g_chunk), m_chunk), v_chunk)| {
+            for i in 0..new_chunk.len() {
+                kernel(
+                    p_chunk[i],
+                    g_chunk[i],
+                    &mut m_chunk[i],
+                    &mut v_chunk[i],
+                    &mut new_chunk[i],
+                );
+            }
+        });
 }

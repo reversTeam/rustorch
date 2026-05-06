@@ -1,0 +1,102 @@
+{
+  "framework": "rustorch",
+  "results": [
+    {
+      "gflops": 2.1207903290071135,
+      "median_ns": 1977708,
+      "op": "matmul",
+      "p99_ns": 3466542,
+      "shape": "[128,128] x [128,128]"
+    },
+    {
+      "gflops": 3.231164534106913,
+      "median_ns": 10384625,
+      "op": "matmul",
+      "p99_ns": 10432083,
+      "shape": "[256,256] x [256,256]"
+    },
+    {
+      "gflops": 3.1428414106548317,
+      "median_ns": 85411709,
+      "op": "matmul",
+      "p99_ns": 85866042,
+      "shape": "[512,512] x [512,512]"
+    },
+    {
+      "gflops": 2.399663819680108,
+      "median_ns": 894910208,
+      "op": "matmul",
+      "p99_ns": 932916000,
+      "shape": "[1024,1024] x [1024,1024]"
+    },
+    {
+      "median_ns": 17251917,
+      "op": "softmax",
+      "p99_ns": 17874459,
+      "shape": "[128,32000]"
+    },
+    {
+      "median_ns": 122050167,
+      "op": "softmax",
+      "p99_ns": 126305750,
+      "shape": "[512,50257]"
+    },
+    {
+      "median_ns": 6092458,
+      "op": "flash_attention_forward",
+      "p99_ns": 6164708,
+      "shape": "B=1 H=1 N=512 D=64"
+    },
+    {
+      "median_ns": 13913375,
+      "op": "naive_attention_forward",
+      "p99_ns": 14281000,
+      "shape": "B=1 H=1 N=512 D=64"
+    },
+    {
+      "median_ns": 24406208,
+      "op": "flash_attention_forward",
+      "p99_ns": 26509000,
+      "shape": "B=1 H=4 N=1024 D=64"
+    },
+    {
+      "median_ns": 232620417,
+      "op": "naive_attention_forward",
+      "p99_ns": 234494334,
+      "shape": "B=1 H=4 N=1024 D=64"
+    },
+    {
+      "median_ns": 99043250,
+      "op": "flash_attention_forward",
+      "p99_ns": 99905333,
+      "shape": "B=2 H=4 N=2048 D=64"
+    },
+    {
+      "median_ns": 1895728708,
+      "op": "naive_attention_forward",
+      "p99_ns": 1949662375,
+      "shape": "B=2 H=4 N=2048 D=64"
+    },
+    {
+      "median_ns": 1458,
+      "op": "elementwise_add",
+      "p99_ns": 1500,
+      "shape": "[1000]"
+    },
+    {
+      "median_ns": 136875,
+      "op": "elementwise_add",
+      "p99_ns": 141542,
+      "shape": "[100000]"
+    },
+    {
+      "median_ns": 1497292,
+      "op": "elementwise_add",
+      "p99_ns": 1600792,
+      "shape": "[1000000]"
+    }
+  ],
+  "timed_iters": 20,
+  "version": "0.0.1",
+  "warmup_iters": 3
+}

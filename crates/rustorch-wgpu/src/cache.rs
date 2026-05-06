@@ -132,8 +132,10 @@ impl Default for PoolPolicy {
 }
 
 /// Inner state of a [`BufferPool`]. Held behind an `Arc` so that
-/// [`crate::pooled::PooledBuffer`] can hold a `Weak<PoolInner>` and
-/// detect pool teardown without keeping it alive.
+/// the on-drop callback in `core::WgpuStorage` (created by
+/// [`crate::storage::WgpuStorage::allocate_pooled`]) can hold a
+/// `Weak<PoolInner>` and detect pool teardown without keeping it
+/// alive.
 pub struct PoolInner {
     /// Size-bucketed bins of recycled buffers.
     pub(crate) bins: Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
@@ -154,8 +156,10 @@ impl PoolInner {
     }
 
     /// Push a buffer back into the pool, applying the eviction policy.
-    /// Called by [`crate::pooled::PooledBuffer::drop`].
-    pub(crate) fn try_release(&self, buf: wgpu::Buffer, bucket: u64) {
+    /// Called from the `on_drop` closure captured by
+    /// [`crate::storage::WgpuStorage::allocate_pooled`] when the last
+    /// clone of the underlying `core::WgpuStorage` drops.
+    pub fn try_release(&self, buf: wgpu::Buffer, bucket: u64) {
         let policy = *self.policy.lock().expect("policy lock");
         let cur_bytes = self.metrics.bytes_pooled.load(Ordering::Relaxed);
         let mut guard = self.bins.lock().expect("pool lock");
@@ -333,20 +337,13 @@ impl BufferPool {
         })
     }
 
-    /// Acquire a buffer wrapped in a [`crate::pooled::PooledBuffer`]
-    /// that will return itself to this pool when dropped.
-    ///
-    /// The bucket is sized as the next power of two of `size`,
-    /// clamped to at least 64 bytes (wgpu's minimum useful buffer).
-    pub fn acquire_pooled(
-        &self,
-        device: &wgpu::Device,
-        size: u64,
-        usage: wgpu::BufferUsages,
-    ) -> crate::pooled::PooledBuffer {
-        let bucket = size.next_power_of_two().max(64);
-        let buffer = self.acquire(device, bucket, usage);
-        crate::pooled::PooledBuffer::from_pool(buffer, bucket, Arc::downgrade(&self.inner))
+    /// Hand out a `Weak<PoolInner>` so callers can build their own
+    /// return-to-pool callbacks (e.g. the on_drop closure captured
+    /// by [`crate::storage::WgpuStorage::allocate_pooled`]). The
+    /// `Weak` lets the pool be torn down without keeping it alive
+    /// from outstanding buffers.
+    pub fn weak_inner(&self) -> std::sync::Weak<PoolInner> {
+        Arc::downgrade(&self.inner)
     }
 
     /// How many buffers are pooled in total.

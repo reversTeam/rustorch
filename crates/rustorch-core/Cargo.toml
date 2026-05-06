@@ -23,6 +23,17 @@ ndarray = ["dep:ndarray"]
 # storage/version concurrent-model tests to verify Arc/Atomic correctness
 # under all interleavings.
 loom    = ["dep:loom"]
+# Multi-device Storage variants (P3.Z Storage Option A — Task A).
+# Each feature pulls the underlying GPU crate and unlocks a corresponding
+# `Storage::*` variant (Wgpu / WgpuShared / Cuda / Metal). Backends
+# (rustorch-wgpu / rustorch-cuda / rustorch-metal) ENABLE the matching
+# feature on their `rustorch-core` dependency line.
+wgpu  = ["dep:wgpu", "dep:pollster"]
+cuda  = []   # rustorch-cuda will populate concrete CudaStorage when impl lands (Task M)
+# `metal` pulls the macOS-only `metal` crate (Apple Metal Framework
+# bindings). The dep is target-gated, so enabling this feature on a
+# non-macOS target produces a placeholder MetalStorage (no buffer).
+metal = ["dep:metal"]
 
 [dependencies]
 half       = { workspace = true }
@@ -32,6 +43,22 @@ thiserror  = { workspace = true }
 serde      = { workspace = true, optional = true }
 ndarray    = { workspace = true, optional = true }
 loom       = { workspace = true, optional = true }
+# Multi-device Storage GPU handles (feature-gated, Task A).
+wgpu       = { workspace = true, optional = true }
+pollster   = { workspace = true, optional = true }
+
+# `metal` is macOS-only. We declare it under a target-gated section
+# so non-macOS builds with feature=metal compile to a placeholder
+# (MetalStorage with no concrete buffer). The crate is "optional"
+# in the macOS table so the `metal` feature controls inclusion.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.29", optional = true }
+
+# rayon for the contiguous in-place op fast path (binary_inplace,
+# unary_inplace) when n ≥ 1 M elements. Below that the scheduler
+# overhead dominates. wasm32 has no rayon — guarded at call site.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -11,9 +11,13 @@ publish     = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rustorch-core  = { workspace = true }
-rustorch-wgpu  = { workspace = true }
-rustorch-serde = { workspace = true }
+rustorch-core     = { workspace = true }
+rustorch-wgpu     = { workspace = true }
+rustorch-serde    = { workspace = true }
+rustorch-autograd = { workspace = true }
+rustorch-cpu      = { workspace = true }
+rustorch-nn       = { workspace = true }
+rustorch-optim    = { workspace = true }
 
 [features]
 default = []

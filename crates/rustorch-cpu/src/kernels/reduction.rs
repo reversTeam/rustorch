@@ -20,6 +20,22 @@ use rustorch_core::tensor::tensor_impl::Tensor;
 /// as size 1; otherwise removed.
 pub fn sum_dim(src: &Tensor, dims: &[usize], keepdim: bool) -> Result<Tensor, BackendError> {
     validate_dims(src, dims, "sum_dim")?;
+    // Fast path: 2D contiguous f32 + single axis. The hot case in
+    // autograd backward (dbias = sum(grad, dim=0) for Linear, or
+    // sum(grad, dim=1) for batch-mean reductions). The generic
+    // `reduce_dim` recomputes coords and strides per element via
+    // `Vec` allocations, which is ~40× too slow for 64K-element
+    // tensors.
+    if src.dtype() == Dtype::F32
+        && src.ndim() == 2
+        && dims.len() == 1
+        && src.is_contiguous()
+        && src.storage_offset() == 0
+    {
+        if let Some(out) = sum_dim_2d_f32(src, dims[0], keepdim) {
+            return out;
+        }
+    }
     match src.dtype() {
         Dtype::F32 => reduce_dim::<f32>(src, dims, keepdim, 0.0_f32, |a, b| a + b),
         Dtype::F64 => reduce_dim::<f64>(src, dims, keepdim, 0.0_f64, |a, b| a + b),
@@ -30,6 +46,53 @@ pub fn sum_dim(src: &Tensor, dims: &[usize], keepdim: bool) -> Result<Tensor, Ba
             lhs: d,
             rhs: d,
         }),
+    }
+}
+
+/// Fast 2D contiguous f32 single-axis sum. Returns None if shape doesn't
+/// fit (caller falls back to the generic path).
+fn sum_dim_2d_f32(
+    src: &Tensor,
+    axis: usize,
+    keepdim: bool,
+) -> Option<Result<Tensor, BackendError>> {
+    let buf = src.as_slice::<f32>()?;
+    let shape = src.shape();
+    let (rows, cols) = (shape[0], shape[1]);
+    if axis == 0 {
+        // Output: [cols] (or [1, cols] if keepdim) — sum each column.
+        // Walk row-by-row, accumulating into the output for cache-
+        // friendly contiguous reads of `buf`.
+        let mut out = vec![0.0_f32; cols];
+        for r in 0..rows {
+            let row = &buf[r * cols..r * cols + cols];
+            for c in 0..cols {
+                out[c] += row[c];
+            }
+        }
+        let out_shape: Vec<usize> = if keepdim { vec![1, cols] } else { vec![cols] };
+        Some(
+            Tensor::from_vec_typed::<f32, _>(out_shape, out)
+                .map_err(|_| BackendError::OutOfMemory { bytes: cols * 4 }),
+        )
+    } else if axis == 1 {
+        // Output: [rows] (or [rows, 1]) — sum each row.
+        let mut out = vec![0.0_f32; rows];
+        for r in 0..rows {
+            let row = &buf[r * cols..r * cols + cols];
+            let mut acc = 0.0_f32;
+            for &v in row {
+                acc += v;
+            }
+            out[r] = acc;
+        }
+        let out_shape: Vec<usize> = if keepdim { vec![rows, 1] } else { vec![rows] };
+        Some(
+            Tensor::from_vec_typed::<f32, _>(out_shape, out)
+                .map_err(|_| BackendError::OutOfMemory { bytes: rows * 4 }),
+        )
+    } else {
+        None
     }
 }
 

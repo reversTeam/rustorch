@@ -41,6 +41,9 @@ thiserror     = { workspace = true }
 # rayon is unavailable on wasm32 — guarded at feature level
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = { workspace = true }
+# State-of-the-art pure-Rust GEMM (faer-rs ecosystem). NEON+AVX-512
+# explicit vectorization, ~70-80% Intel MKL out-of-the-box. P3.X T2-new.
+gemm         = { version = "0.18", default-features = false, features = ["rayon"] }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -18,12 +18,13 @@
 //! pattern.
 
 use crate::backward::BackwardError;
+use crate::dispatch::{pick_backend, require_same_device_2, require_same_device_3};
 use crate::node::{Edge, Node};
 use crate::tape::is_grad_enabled;
 use crate::variable::Variable;
+use rustorch_core::tensor::device::Device;
 use rustorch_core::tensor::tensor_impl::Tensor;
 use rustorch_cpu::backend::Reduction;
-use rustorch_cpu::cpu_backend::cpu_backend;
 
 /// Convenience to wrap a backend error into [`BackwardError`].
 fn backend_err(op: &'static str, e: rustorch_cpu::error::BackendError) -> BackwardError {
@@ -38,6 +39,11 @@ fn backend_err(op: &'static str, e: rustorch_cpu::error::BackendError) -> Backwa
 // --------------------------------------------------------------------------
 
 struct AddBackward {
+    /// Original input shapes — used to unbroadcast the upstream gradient
+    /// when forward broadcast was performed (e.g. `[B, T, 1] + [B, T, D]`).
+    lhs_shape: Vec<usize>,
+    rhs_shape: Vec<usize>,
+    device: Device,
     edges: [Edge; 2],
 }
 
@@ -46,8 +52,11 @@ impl Node for AddBackward {
         "AddBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        // Both inputs receive the same upstream gradient.
-        vec![Some(grad.clone()), Some(grad.clone())]
+        // Both inputs receive the same upstream gradient, but each must be
+        // reduced back to the input's original shape if forward broadcast.
+        let g_lhs = crate::broadcast::unbroadcast_to(self.device, grad, &self.lhs_shape);
+        let g_rhs = crate::broadcast::unbroadcast_to(self.device, grad, &self.rhs_shape);
+        vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {
         &self.edges
@@ -56,12 +65,16 @@ impl Node for AddBackward {
 
 /// `lhs + rhs` (autograd-aware).
 pub fn add(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("add", lhs, rhs)?;
+    let out = pick_backend(device)
         .add(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("add", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
         let node = std::sync::Arc::new(AddBackward {
+            lhs_shape: lhs.tensor().shape().to_vec(),
+            rhs_shape: rhs.tensor().shape().to_vec(),
+            device,
             edges: [lhs.edge(), rhs.edge()],
         });
         out.grad_fn = Some(node);
@@ -75,6 +88,9 @@ pub fn add(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
 // --------------------------------------------------------------------------
 
 struct SubBackward {
+    lhs_shape: Vec<usize>,
+    rhs_shape: Vec<usize>,
+    device: Device,
     edges: [Edge; 2],
 }
 
@@ -83,8 +99,12 @@ impl Node for SubBackward {
         "SubBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        let neg_grad = cpu_backend().neg(grad).expect("neg never fails on f32/f64");
-        vec![Some(grad.clone()), Some(neg_grad)]
+        let neg_grad = pick_backend(self.device)
+            .neg(grad)
+            .expect("neg never fails on f32/f64");
+        let g_lhs = crate::broadcast::unbroadcast_to(self.device, grad, &self.lhs_shape);
+        let g_rhs = crate::broadcast::unbroadcast_to(self.device, &neg_grad, &self.rhs_shape);
+        vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {
         &self.edges
@@ -93,12 +113,16 @@ impl Node for SubBackward {
 
 /// `lhs - rhs`.
 pub fn sub(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("sub", lhs, rhs)?;
+    let out = pick_backend(device)
         .sub(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("sub", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
         let node = std::sync::Arc::new(SubBackward {
+            lhs_shape: lhs.tensor().shape().to_vec(),
+            rhs_shape: rhs.tensor().shape().to_vec(),
+            device,
             edges: [lhs.edge(), rhs.edge()],
         });
         out.grad_fn = Some(node);
@@ -114,6 +138,7 @@ pub fn sub(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
 struct MulBackward {
     lhs_saved: Tensor,
     rhs_saved: Tensor,
+    device: Device,
     edges: [Edge; 2],
 }
 
@@ -122,12 +147,20 @@ impl Node for MulBackward {
         "MulBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        let g_lhs = cpu_backend()
+        // d(x*y)/dx = y, d(x*y)/dy = x. The mul operates with broadcast,
+        // so the raw products take the broadcast output shape — they must
+        // be reduced back to each input's original shape before being
+        // accumulated into the input slots.
+        let g_lhs_raw = pick_backend(self.device)
             .mul(grad, &self.rhs_saved)
             .expect("mul backward");
-        let g_rhs = cpu_backend()
+        let g_rhs_raw = pick_backend(self.device)
             .mul(grad, &self.lhs_saved)
             .expect("mul backward");
+        let g_lhs =
+            crate::broadcast::unbroadcast_to(self.device, &g_lhs_raw, self.lhs_saved.shape());
+        let g_rhs =
+            crate::broadcast::unbroadcast_to(self.device, &g_rhs_raw, self.rhs_saved.shape());
         vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {
@@ -137,7 +170,8 @@ impl Node for MulBackward {
 
 /// `lhs * rhs`.
 pub fn mul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("mul", lhs, rhs)?;
+    let out = pick_backend(device)
         .mul(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("mul", e))?;
     let mut out = Variable::new(out);
@@ -145,6 +179,7 @@ pub fn mul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
         let node = std::sync::Arc::new(MulBackward {
             lhs_saved: lhs.tensor().clone(),
             rhs_saved: rhs.tensor().clone(),
+            device,
             edges: [lhs.edge(), rhs.edge()],
         });
         out.grad_fn = Some(node);
@@ -158,6 +193,7 @@ pub fn mul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
 // --------------------------------------------------------------------------
 
 struct NegBackward {
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -166,7 +202,9 @@ impl Node for NegBackward {
         "NegBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        vec![Some(cpu_backend().neg(grad).expect("neg backward"))]
+        vec![Some(
+            pick_backend(self.device).neg(grad).expect("neg backward"),
+        )]
     }
     fn next_edges(&self) -> &[Edge] {
         &self.edges
@@ -175,12 +213,13 @@ impl Node for NegBackward {
 
 /// `-src`.
 pub fn neg(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .neg(&src.tensor())
         .map_err(|e| backend_err("neg", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(NegBackward {
+            device: src.device(),
             edges: [src.edge()],
         });
         out.grad_fn = Some(node);
@@ -196,6 +235,7 @@ pub fn neg(src: &Variable) -> Result<Variable, BackwardError> {
 struct MatMulBackward {
     lhs_saved: Tensor,
     rhs_saved: Tensor,
+    device: Device,
     edges: [Edge; 2],
 }
 
@@ -204,10 +244,20 @@ impl Node for MatMulBackward {
         "MatMulBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        let rhs_t = self.rhs_saved.transpose(0, 1).expect("transpose");
-        let lhs_t = self.lhs_saved.transpose(0, 1).expect("transpose");
-        let g_lhs = cpu_backend().matmul(grad, &rhs_t).expect("matmul lhs grad");
-        let g_rhs = cpu_backend().matmul(&lhs_t, grad).expect("matmul rhs grad");
+        // Route the transposed matmuls through `matmul_with_transposes`.
+        // Backends that override the default impl (e.g. MetalBackend) fuse
+        // the transpose into the matmul kernel via `simdgroup_load(...,
+        // transpose=true)`, skipping the explicit transpose dispatch +
+        // the intermediate `[N,K]` / `[K,M]` buffer per backward pass.
+        // CPU + WGPU keep the default `transpose + matmul` semantics.
+        // - dX = grad @ W^T  → matmul_with_transposes(grad, W, false, true)
+        // - dW = X^T @ grad  → matmul_with_transposes(X, grad, true, false)
+        let g_lhs = pick_backend(self.device)
+            .matmul_with_transposes(grad, &self.rhs_saved, false, true)
+            .expect("matmul lhs grad (dX = G @ W^T)");
+        let g_rhs = pick_backend(self.device)
+            .matmul_with_transposes(&self.lhs_saved, grad, true, false)
+            .expect("matmul rhs grad (dW = X^T @ G)");
         vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {
@@ -217,7 +267,8 @@ impl Node for MatMulBackward {
 
 /// `lhs @ rhs` (rank-2 matmul).
 pub fn matmul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("matmul", lhs, rhs)?;
+    let out = pick_backend(device)
         .matmul(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("matmul", e))?;
     let mut out = Variable::new(out);
@@ -227,6 +278,7 @@ pub fn matmul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError>
         let node = std::sync::Arc::new(MatMulBackward {
             lhs_saved: lhs.tensor().clone(),
             rhs_saved: rhs.tensor().clone(),
+            device,
             edges: [lhs.edge(), rhs.edge()],
         });
         out.grad_fn = Some(node);
@@ -241,6 +293,7 @@ pub fn matmul(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError>
 
 struct ReluBackward {
     saved: Tensor,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -251,11 +304,13 @@ impl Node for ReluBackward {
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
         // mask = (saved > 0); g = grad * mask (with mask cast to grad dtype)
         let zero = Tensor::scalar(0.0);
-        let mask = cpu_backend()
+        let mask = pick_backend(self.device)
             .gt(&self.saved, &zero)
             .expect("gt for relu mask");
         let mask_f = mask.to_dtype(grad.dtype());
-        let g = cpu_backend().mul(grad, &mask_f).expect("relu mask mul");
+        let g = pick_backend(self.device)
+            .mul(grad, &mask_f)
+            .expect("relu mask mul");
         vec![Some(g)]
     }
     fn next_edges(&self) -> &[Edge] {
@@ -265,13 +320,14 @@ impl Node for ReluBackward {
 
 /// `relu(src)`.
 pub fn relu(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .relu(&src.tensor())
         .map_err(|e| backend_err("relu", e))?;
     let mut out = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(ReluBackward {
             saved: src.tensor().clone(),
+            device: src.device(),
             edges: [src.edge()],
         });
         out.grad_fn = Some(node);
@@ -286,6 +342,7 @@ pub fn relu(src: &Variable) -> Result<Variable, BackwardError> {
 
 struct SigmoidBackward {
     saved_out: Tensor,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -296,11 +353,13 @@ impl Node for SigmoidBackward {
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
         // g = grad * out * (1 - out)
         let one = Tensor::scalar(1.0);
-        let one_minus = cpu_backend().sub(&one, &self.saved_out).expect("1-out");
-        let s_times_one_minus = cpu_backend()
+        let one_minus = pick_backend(self.device)
+            .sub(&one, &self.saved_out)
+            .expect("1-out");
+        let s_times_one_minus = pick_backend(self.device)
             .mul(&self.saved_out, &one_minus)
             .expect("s*(1-s)");
-        let g = cpu_backend()
+        let g = pick_backend(self.device)
             .mul(grad, &s_times_one_minus)
             .expect("sigmoid backward mul");
         vec![Some(g)]
@@ -312,13 +371,14 @@ impl Node for SigmoidBackward {
 
 /// `sigmoid(src)`.
 pub fn sigmoid(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .sigmoid(&src.tensor())
         .map_err(|e| backend_err("sigmoid", e))?;
     let mut out_var = Variable::new(out.clone());
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(SigmoidBackward {
             saved_out: out,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -333,6 +393,7 @@ pub fn sigmoid(src: &Variable) -> Result<Variable, BackwardError> {
 
 struct TanhBackward {
     saved_out: Tensor,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -342,11 +403,11 @@ impl Node for TanhBackward {
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
         let one = Tensor::scalar(1.0);
-        let sq = cpu_backend()
+        let sq = pick_backend(self.device)
             .mul(&self.saved_out, &self.saved_out)
             .expect("tanh^2");
-        let one_minus_sq = cpu_backend().sub(&one, &sq).expect("1-tanh^2");
-        let g = cpu_backend()
+        let one_minus_sq = pick_backend(self.device).sub(&one, &sq).expect("1-tanh^2");
+        let g = pick_backend(self.device)
             .mul(grad, &one_minus_sq)
             .expect("tanh backward mul");
         vec![Some(g)]
@@ -358,13 +419,14 @@ impl Node for TanhBackward {
 
 /// `tanh(src)`.
 pub fn tanh(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .tanh(&src.tensor())
         .map_err(|e| backend_err("tanh", e))?;
     let mut out_var = Variable::new(out.clone());
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(TanhBackward {
             saved_out: out,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -379,6 +441,8 @@ pub fn tanh(src: &Variable) -> Result<Variable, BackwardError> {
 
 struct SumBackward {
     in_shape: Vec<usize>,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -405,13 +469,14 @@ impl Node for SumBackward {
 
 /// Full-tensor sum.
 pub fn sum(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .sum(&src.tensor())
         .map_err(|e| backend_err("sum", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(SumBackward {
             in_shape: src.tensor().shape().to_vec(),
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -427,6 +492,8 @@ pub fn sum(src: &Variable) -> Result<Variable, BackwardError> {
 struct MeanBackward {
     in_shape: Vec<usize>,
     n: usize,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -447,7 +514,7 @@ impl Node for MeanBackward {
 
 /// Full-tensor mean.
 pub fn mean(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .mean(&src.tensor())
         .map_err(|e| backend_err("mean", e))?;
     let mut out_var = Variable::new(out);
@@ -455,6 +522,7 @@ pub fn mean(src: &Variable) -> Result<Variable, BackwardError> {
         let node = std::sync::Arc::new(MeanBackward {
             in_shape: src.tensor().shape().to_vec(),
             n: src.tensor().numel(),
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -474,6 +542,8 @@ struct CrossEntropyBackward {
     n_samples: usize,
     n_classes: usize,
     reduction: Reduction,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -518,14 +588,15 @@ pub fn cross_entropy(
     reduction: Reduction,
 ) -> Result<Variable, BackwardError> {
     // Forward: cross_entropy via the backend (= log_softmax + nll).
-    let loss = cpu_backend()
+    let device = require_same_device_2("cross_entropy", input, target)?;
+    let loss = pick_backend(device)
         .cross_entropy(&input.tensor(), &target.tensor(), reduction)
         .map_err(|e| backend_err("cross_entropy", e))?;
     let mut out_var = Variable::new(loss);
     if is_grad_enabled() && input.requires_grad {
         // For backward we save the softmax (not log_softmax) so that
         // grad = (softmax - one_hot(target)) / N.
-        let softmax = cpu_backend()
+        let softmax = pick_backend(device)
             .softmax(&input.tensor(), 1)
             .map_err(|e| backend_err("cross_entropy:softmax", e))?;
         let n_samples = input.tensor().shape()[0];
@@ -536,6 +607,7 @@ pub fn cross_entropy(
             n_samples,
             n_classes,
             reduction,
+            device,
             edges: [input.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -553,6 +625,7 @@ struct AddBiasBackward {
     /// Original bias shape (e.g. [out_features]) — used to sum the
     /// upstream grad back to that shape.
     bias_shape: Vec<usize>,
+    device: Device,
     edges: [Edge; 2],
 }
 
@@ -564,7 +637,7 @@ impl Node for AddBiasBackward {
         // d/dx: grad passes through unchanged.
         // d/dbias: sum over the batch axis (axis 0) to collapse [B, …]
         // back to bias_shape.
-        let g_bias = cpu_backend()
+        let g_bias = pick_backend(self.device)
             .sum_dim(grad, &[0], false)
             .expect("sum_dim across batch for bias grad");
         // sum_dim of [B, out] over dim 0 → [out] — exactly bias_shape.
@@ -578,6 +651,7 @@ impl Node for AddBiasBackward {
 
 /// `x + bias` where `bias.shape == x.shape[1..]` (broadcast across batch).
 pub fn add_bias(x: &Variable, bias: &Variable) -> Result<Variable, BackwardError> {
+    let device = require_same_device_2("add_bias", x, bias)?;
     let x_t = x.tensor();
     let bias_t = bias.tensor();
     if x_t.ndim() != 2 || bias_t.ndim() != 1 {
@@ -602,21 +676,106 @@ pub fn add_bias(x: &Variable, bias: &Variable) -> Result<Variable, BackwardError
             ),
         });
     }
-    // Forward: broadcast bias along axis 0.
-    let bias_buf: &[f32] = bias_t.as_slice::<f32>().expect("f32");
-    let mut wide = Vec::with_capacity(batch * n_out);
-    for _ in 0..batch {
-        wide.extend_from_slice(bias_buf);
-    }
-    let bias_wide = Tensor::from_vec([batch, n_out], wide).expect("bias broadcast shape");
-    let out = cpu_backend()
-        .add(&x_t, &bias_wide)
+    // Forward: dispatch to the backend's native add_bias which knows
+    // how to broadcast a [N] bias across [B, N] without leaving the
+    // device. P3.Z Task A: the previous CPU-side `as_slice + manual
+    // tile + backend.add` round-trip path is gone — that would have
+    // panicked the moment `bias_t` lived on Storage::Wgpu.
+    let _ = (batch, n_out);
+    let out = pick_backend(device)
+        .add_bias(&x_t, &bias_t)
         .map_err(|e| backend_err("add_bias", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && (x.requires_grad || bias.requires_grad) {
         let node = std::sync::Arc::new(AddBiasBackward {
             bias_shape: bias_t.shape().to_vec(),
+            device,
             edges: [x.edge(), bias.edge()],
+        });
+        out_var.grad_fn = Some(node);
+        out_var.requires_grad = true;
+    }
+    Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// linear — y = x @ w + bias.  Forward dispatches to the backend's
+// `matmul_with_bias` (Metal fuses into a single kernel; CPU/WGPU
+// compose). Backward is the chain rule of matmul + add_bias:
+//   dx    = grad @ w^T
+//   dw    = x^T @ grad
+//   dbias = sum(grad, dim=0)
+// --------------------------------------------------------------------------
+
+struct LinearBackward {
+    x_saved: Tensor,
+    w_saved: Tensor,
+    bias_shape: Vec<usize>,
+    device: Device,
+    edges: [Edge; 3],
+}
+
+impl Node for LinearBackward {
+    fn name(&self) -> &'static str {
+        "LinearBackward"
+    }
+    fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
+        let backend = pick_backend(self.device);
+        // dx = grad @ W^T  (transpose-aware matmul on Metal)
+        let dx = backend
+            .matmul_with_transposes(grad, &self.w_saved, false, true)
+            .expect("linear bw: dx = grad @ W^T");
+        // dW = X^T @ grad
+        let dw = backend
+            .matmul_with_transposes(&self.x_saved, grad, true, false)
+            .expect("linear bw: dW = X^T @ grad");
+        // dbias = sum(grad, dim=0) — collapse the batch axis.
+        let dbias = backend
+            .sum_dim(grad, &[0], false)
+            .expect("linear bw: dbias = sum(grad, dim=0)");
+        let _ = &self.bias_shape; // shape implicit in sum_dim output
+        vec![Some(dx), Some(dw), Some(dbias)]
+    }
+    fn next_edges(&self) -> &[Edge] {
+        &self.edges
+    }
+}
+
+/// Fused linear layer forward: `y = x @ w + bias`.
+///
+/// Single autograd op equivalent to `add_bias(matmul(x, w), bias)`,
+/// but the forward goes through the backend's `matmul_with_bias` which
+/// on Metal3-capable devices fuses into a single dispatch (no
+/// intermediate `[B, N]` write-back). Backward decomposes into the
+/// usual matmul + add_bias chain rule, with the matmul side using
+/// `matmul_with_transposes` to skip explicit transpose dispatches.
+pub fn linear(x: &Variable, w: &Variable, bias: &Variable) -> Result<Variable, BackwardError> {
+    let device = require_same_device_3("linear", x, w, bias)?;
+    let x_t = x.tensor();
+    let w_t = w.tensor();
+    let bias_t = bias.tensor();
+    if x_t.ndim() != 2 || w_t.ndim() != 2 || bias_t.ndim() != 1 {
+        return Err(BackwardError::Backend {
+            op: "linear",
+            message: format!(
+                "expected x: rank-2, w: rank-2, bias: rank-1; got {:?}, {:?}, {:?}",
+                x_t.shape(),
+                w_t.shape(),
+                bias_t.shape()
+            ),
+        });
+    }
+    let out = pick_backend(device)
+        .matmul_with_bias(&x_t, &w_t, &bias_t)
+        .map_err(|e| backend_err("linear", e))?;
+    let mut out_var = Variable::new(out);
+    if is_grad_enabled() && (x.requires_grad || w.requires_grad || bias.requires_grad) {
+        let node = std::sync::Arc::new(LinearBackward {
+            x_saved: x_t.clone(),
+            w_saved: w_t.clone(),
+            bias_shape: bias_t.shape().to_vec(),
+            device,
+            edges: [x.edge(), w.edge(), bias.edge()],
         });
         out_var.grad_fn = Some(node);
         out_var.requires_grad = true;
@@ -632,7 +791,13 @@ struct MseBackward {
     diff: Tensor, // x - y
     n: usize,
     reduction: Reduction,
+    device: Device,
     edges: [Edge; 2],
+    /// Skip the `neg` dispatch when the target tensor doesn't require
+    /// gradients (the common training case — labels are constants).
+    /// Saves one GPU dispatch per loss invocation.
+    input_requires_grad: bool,
+    target_requires_grad: bool,
 }
 
 impl Node for MseBackward {
@@ -646,11 +811,37 @@ impl Node for MseBackward {
             Reduction::None => 2.0,
         };
         let scale_t = Tensor::scalar(scale);
-        let g_x = cpu_backend()
-            .mul(&self.diff, &scale_t)
-            .expect("mse grad mul");
-        let g_y = cpu_backend().neg(&g_x).expect("mse grad neg");
-        vec![Some(g_x), Some(g_y)]
+        // g_x = diff * scale ; g_y = -g_x. Fold the sign into the scalar
+        // when only one side is needed so we avoid a redundant `mul +
+        // neg` chain. When both sides are needed, the standard `mul +
+        // neg` path stays.
+        match (self.input_requires_grad, self.target_requires_grad) {
+            (true, true) => {
+                let g_x = pick_backend(self.device)
+                    .mul(&self.diff, &scale_t)
+                    .expect("mse grad mul");
+                let g_y = pick_backend(self.device).neg(&g_x).expect("mse grad neg");
+                vec![Some(g_x), Some(g_y)]
+            },
+            (true, false) => {
+                // Common training case: target is a constant (labels).
+                // Skip the `neg` dispatch entirely.
+                let g_x = pick_backend(self.device)
+                    .mul(&self.diff, &scale_t)
+                    .expect("mse grad mul");
+                vec![Some(g_x), None]
+            },
+            (false, true) => {
+                // Symmetric: only target needs a grad. Fold the negation
+                // into the scalar — single mul dispatch, no neg.
+                let neg_scale = Tensor::scalar(-scale);
+                let g_y = pick_backend(self.device)
+                    .mul(&self.diff, &neg_scale)
+                    .expect("mse grad mul (-)");
+                vec![None, Some(g_y)]
+            },
+            (false, false) => vec![None, None],
+        }
     }
     fn next_edges(&self) -> &[Edge] {
         &self.edges
@@ -663,19 +854,23 @@ pub fn mse_loss(
     target: &Variable,
     reduction: Reduction,
 ) -> Result<Variable, BackwardError> {
-    let loss = cpu_backend()
+    let device = require_same_device_2("mse_loss", input, target)?;
+    let loss = pick_backend(device)
         .mse_loss(&input.tensor(), &target.tensor(), reduction)
         .map_err(|e| backend_err("mse_loss", e))?;
     let mut out_var = Variable::new(loss);
     if is_grad_enabled() && (input.requires_grad || target.requires_grad) {
-        let diff = cpu_backend()
+        let diff = pick_backend(device)
             .sub(&input.tensor(), &target.tensor())
             .map_err(|e| backend_err("mse_loss:sub", e))?;
         let node = std::sync::Arc::new(MseBackward {
             diff,
             n: input.tensor().numel(),
             reduction,
+            device,
             edges: [input.edge(), target.edge()],
+            input_requires_grad: input.requires_grad,
+            target_requires_grad: target.requires_grad,
         });
         out_var.grad_fn = Some(node);
         out_var.requires_grad = true;
@@ -689,6 +884,7 @@ pub fn mse_loss(
 
 struct SiluBackward {
     saved_input: Tensor,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -698,19 +894,23 @@ impl Node for SiluBackward {
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
         // s = sigmoid(x); local = s * (1 + x * (1 - s))
-        let s = cpu_backend()
+        let s = pick_backend(self.device)
             .sigmoid(&self.saved_input)
             .expect("silu bw: sigmoid");
         let one = Tensor::scalar(1.0);
-        let one_minus_s = cpu_backend().sub(&one, &s).expect("silu bw: 1-s");
-        let x_one_minus_s = cpu_backend()
+        let one_minus_s = pick_backend(self.device)
+            .sub(&one, &s)
+            .expect("silu bw: 1-s");
+        let x_one_minus_s = pick_backend(self.device)
             .mul(&self.saved_input, &one_minus_s)
             .expect("silu bw: x*(1-s)");
-        let inner = cpu_backend()
+        let inner = pick_backend(self.device)
             .add(&one, &x_one_minus_s)
             .expect("silu bw: 1 + x*(1-s)");
-        let local = cpu_backend().mul(&s, &inner).expect("silu bw: local");
-        let g = cpu_backend()
+        let local = pick_backend(self.device)
+            .mul(&s, &inner)
+            .expect("silu bw: local");
+        let g = pick_backend(self.device)
             .mul(grad, &local)
             .expect("silu bw: grad*local");
         vec![Some(g)]
@@ -722,13 +922,14 @@ impl Node for SiluBackward {
 
 /// `silu(src)` = `src * sigmoid(src)` (a.k.a. swish, autograd-aware).
 pub fn silu(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .silu(&src.tensor())
         .map_err(|e| backend_err("silu", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(SiluBackward {
             saved_input: src.tensor().clone(),
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -744,6 +945,8 @@ pub fn silu(src: &Variable) -> Result<Variable, BackwardError> {
 struct LeakyReluBackward {
     saved_input: Tensor,
     slope: f64,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -773,7 +976,7 @@ impl Node for LeakyReluBackward {
 
 /// `leaky_relu(src, slope)` (autograd-aware).
 pub fn leaky_relu(src: &Variable, slope: f64) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .leaky_relu(&src.tensor(), slope)
         .map_err(|e| backend_err("leaky_relu", e))?;
     let mut out_var = Variable::new(out);
@@ -781,6 +984,7 @@ pub fn leaky_relu(src: &Variable, slope: f64) -> Result<Variable, BackwardError>
         let node = std::sync::Arc::new(LeakyReluBackward {
             saved_input: src.tensor().clone(),
             slope,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -796,6 +1000,7 @@ pub fn leaky_relu(src: &Variable, slope: f64) -> Result<Variable, BackwardError>
 struct SoftmaxBackward {
     saved_out: Tensor,
     dim: usize,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -805,15 +1010,17 @@ impl Node for SoftmaxBackward {
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
         // dot = sum_along_dim(grad * y, dim, keepdim=true)
-        let gy = cpu_backend()
+        let gy = pick_backend(self.device)
             .mul(grad, &self.saved_out)
             .expect("softmax bw: g*y");
-        let dot = cpu_backend()
+        let dot = pick_backend(self.device)
             .sum_dim(&gy, &[self.dim], true)
             .expect("softmax bw: sum_dim");
         // diff = grad - dot (broadcast)
-        let diff = cpu_backend().sub(grad, &dot).expect("softmax bw: g - dot");
-        let g = cpu_backend()
+        let diff = pick_backend(self.device)
+            .sub(grad, &dot)
+            .expect("softmax bw: g - dot");
+        let g = pick_backend(self.device)
             .mul(&self.saved_out, &diff)
             .expect("softmax bw: y*diff");
         vec![Some(g)]
@@ -825,7 +1032,7 @@ impl Node for SoftmaxBackward {
 
 /// `softmax(src, dim)` (numerically stable, autograd-aware).
 pub fn softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .softmax(&src.tensor(), dim)
         .map_err(|e| backend_err("softmax", e))?;
     let mut out_var = Variable::new(out.clone());
@@ -833,6 +1040,7 @@ pub fn softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
         let node = std::sync::Arc::new(SoftmaxBackward {
             saved_out: out,
             dim,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -848,6 +1056,7 @@ pub fn softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
 struct LogSoftmaxBackward {
     saved_out: Tensor, // log_softmax output
     dim: usize,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -857,16 +1066,16 @@ impl Node for LogSoftmaxBackward {
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
         // softmax = exp(log_softmax); grad_x = grad - softmax * sum_along(grad, dim, keepdim)
-        let s = cpu_backend()
+        let s = pick_backend(self.device)
             .exp(&self.saved_out)
             .expect("log_softmax bw: exp");
-        let sum_g = cpu_backend()
+        let sum_g = pick_backend(self.device)
             .sum_dim(grad, &[self.dim], true)
             .expect("log_softmax bw: sum_dim");
-        let s_sum = cpu_backend()
+        let s_sum = pick_backend(self.device)
             .mul(&s, &sum_g)
             .expect("log_softmax bw: s*sum_g");
-        let g = cpu_backend()
+        let g = pick_backend(self.device)
             .sub(grad, &s_sum)
             .expect("log_softmax bw: grad - s*sum_g");
         vec![Some(g)]
@@ -878,7 +1087,7 @@ impl Node for LogSoftmaxBackward {
 
 /// `log_softmax(src, dim)` (autograd-aware).
 pub fn log_softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .log_softmax(&src.tensor(), dim)
         .map_err(|e| backend_err("log_softmax", e))?;
     let mut out_var = Variable::new(out.clone());
@@ -886,6 +1095,7 @@ pub fn log_softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError
         let node = std::sync::Arc::new(LogSoftmaxBackward {
             saved_out: out,
             dim,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -901,6 +1111,7 @@ pub fn log_softmax(src: &Variable, dim: usize) -> Result<Variable, BackwardError
 struct DivBackward {
     lhs_saved: Tensor,
     rhs_saved: Tensor,
+    device: Device,
     edges: [Edge; 2],
 }
 
@@ -909,20 +1120,28 @@ impl Node for DivBackward {
         "DivBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        let g_lhs = cpu_backend()
+        // d(x/y)/dx = 1/y ; d(x/y)/dy = -x/y²
+        // Both raw products take the broadcast output shape — reduce back
+        // to each input's original shape before accumulating.
+        let g_lhs_raw = pick_backend(self.device)
             .div(grad, &self.rhs_saved)
             .expect("div bw: g/rhs");
-        // dy = -x/y² * grad = -lhs * grad / (rhs*rhs)
-        let rhs_sq = cpu_backend()
+        let rhs_sq = pick_backend(self.device)
             .mul(&self.rhs_saved, &self.rhs_saved)
             .expect("div bw: rhs²");
-        let lhs_grad = cpu_backend()
+        let lhs_grad = pick_backend(self.device)
             .mul(&self.lhs_saved, grad)
             .expect("div bw: x*g");
-        let div_term = cpu_backend()
+        let div_term = pick_backend(self.device)
             .div(&lhs_grad, &rhs_sq)
             .expect("div bw: x*g/rhs²");
-        let g_rhs = cpu_backend().neg(&div_term).expect("div bw: neg");
+        let g_rhs_raw = pick_backend(self.device)
+            .neg(&div_term)
+            .expect("div bw: neg");
+        let g_lhs =
+            crate::broadcast::unbroadcast_to(self.device, &g_lhs_raw, self.lhs_saved.shape());
+        let g_rhs =
+            crate::broadcast::unbroadcast_to(self.device, &g_rhs_raw, self.rhs_saved.shape());
         vec![Some(g_lhs), Some(g_rhs)]
     }
     fn next_edges(&self) -> &[Edge] {
@@ -932,7 +1151,8 @@ impl Node for DivBackward {
 
 /// `lhs / rhs` (autograd-aware).
 pub fn div(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let device = require_same_device_2("div", lhs, rhs)?;
+    let out = pick_backend(device)
         .div(&lhs.tensor(), &rhs.tensor())
         .map_err(|e| backend_err("div", e))?;
     let mut out_var = Variable::new(out);
@@ -940,6 +1160,7 @@ pub fn div(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
         let node = std::sync::Arc::new(DivBackward {
             lhs_saved: lhs.tensor().clone(),
             rhs_saved: rhs.tensor().clone(),
+            device,
             edges: [lhs.edge(), rhs.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -954,6 +1175,7 @@ pub fn div(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
 
 struct ExpBackward {
     saved_out: Tensor,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -962,7 +1184,7 @@ impl Node for ExpBackward {
         "ExpBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        let g = cpu_backend()
+        let g = pick_backend(self.device)
             .mul(grad, &self.saved_out)
             .expect("exp bw: grad*out");
         vec![Some(g)]
@@ -974,13 +1196,14 @@ impl Node for ExpBackward {
 
 /// `exp(src)` (autograd-aware).
 pub fn exp(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .exp(&src.tensor())
         .map_err(|e| backend_err("exp", e))?;
     let mut out_var = Variable::new(out.clone());
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(ExpBackward {
             saved_out: out,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -995,6 +1218,7 @@ pub fn exp(src: &Variable) -> Result<Variable, BackwardError> {
 
 struct LogBackward {
     saved_input: Tensor,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -1003,7 +1227,7 @@ impl Node for LogBackward {
         "LogBackward"
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
-        let g = cpu_backend()
+        let g = pick_backend(self.device)
             .div(grad, &self.saved_input)
             .expect("log bw: grad/x");
         vec![Some(g)]
@@ -1015,13 +1239,14 @@ impl Node for LogBackward {
 
 /// `log(src)` (natural log, autograd-aware).
 pub fn log(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .log(&src.tensor())
         .map_err(|e| backend_err("log", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(LogBackward {
             saved_input: src.tensor().clone(),
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1036,6 +1261,7 @@ pub fn log(src: &Variable) -> Result<Variable, BackwardError> {
 
 struct SqrtBackward {
     saved_out: Tensor,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -1047,11 +1273,11 @@ impl Node for SqrtBackward {
         // grad / (2 * out)
         let two_out = {
             let two = Tensor::scalar(2.0);
-            cpu_backend()
+            pick_backend(self.device)
                 .mul(&two, &self.saved_out)
                 .expect("sqrt bw: 2*out")
         };
-        let g = cpu_backend()
+        let g = pick_backend(self.device)
             .div(grad, &two_out)
             .expect("sqrt bw: grad/(2*out)");
         vec![Some(g)]
@@ -1063,13 +1289,14 @@ impl Node for SqrtBackward {
 
 /// `sqrt(src)` (autograd-aware).
 pub fn sqrt(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .sqrt(&src.tensor())
         .map_err(|e| backend_err("sqrt", e))?;
     let mut out_var = Variable::new(out.clone());
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(SqrtBackward {
             saved_out: out,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1084,6 +1311,8 @@ pub fn sqrt(src: &Variable) -> Result<Variable, BackwardError> {
 
 struct AbsBackward {
     saved_input: Tensor,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -1115,13 +1344,14 @@ impl Node for AbsBackward {
 
 /// `abs(src)` (autograd-aware).
 pub fn abs(src: &Variable) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .abs(&src.tensor())
         .map_err(|e| backend_err("abs", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(AbsBackward {
             saved_input: src.tensor().clone(),
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1137,6 +1367,7 @@ pub fn abs(src: &Variable) -> Result<Variable, BackwardError> {
 struct PowScalarBackward {
     saved_input: Tensor,
     exponent: f64,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -1146,12 +1377,14 @@ impl Node for PowScalarBackward {
     }
     fn apply(&self, grad: &Tensor) -> Vec<Option<Tensor>> {
         // n * x^(n-1) * grad
-        let xn1 = cpu_backend()
+        let xn1 = pick_backend(self.device)
             .pow_scalar(&self.saved_input, self.exponent - 1.0)
             .expect("pow bw: x^(n-1)");
         let n = Tensor::scalar(self.exponent as f32);
-        let scaled = cpu_backend().mul(&n, &xn1).expect("pow bw: n*x^(n-1)");
-        let g = cpu_backend()
+        let scaled = pick_backend(self.device)
+            .mul(&n, &xn1)
+            .expect("pow bw: n*x^(n-1)");
+        let g = pick_backend(self.device)
             .mul(grad, &scaled)
             .expect("pow bw: grad*scaled");
         vec![Some(g)]
@@ -1163,7 +1396,7 @@ impl Node for PowScalarBackward {
 
 /// `src.pow(exponent)` (scalar exponent, autograd-aware).
 pub fn pow_scalar(src: &Variable, exponent: f64) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .pow_scalar(&src.tensor(), exponent)
         .map_err(|e| backend_err("pow_scalar", e))?;
     let mut out_var = Variable::new(out);
@@ -1171,6 +1404,7 @@ pub fn pow_scalar(src: &Variable, exponent: f64) -> Result<Variable, BackwardErr
         let node = std::sync::Arc::new(PowScalarBackward {
             saved_input: src.tensor().clone(),
             exponent,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1187,6 +1421,8 @@ pub fn pow_scalar(src: &Variable, exponent: f64) -> Result<Variable, BackwardErr
 struct IndexSelectBackward {
     in_shape: Vec<usize>, // src shape (V, D, ...)
     indices: Tensor,      // 1-D I64 of length K
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -1225,7 +1461,7 @@ impl Node for IndexSelectBackward {
 /// `index_select(src, 0, indices)` — gather rows of `src` by 1-D I64
 /// indices (autograd-aware; backward via scatter-add).
 pub fn index_select(src: &Variable, indices: &Tensor) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .index_select(&src.tensor(), 0, indices)
         .map_err(|e| backend_err("index_select", e))?;
     let mut out_var = Variable::new(out);
@@ -1233,6 +1469,7 @@ pub fn index_select(src: &Variable, indices: &Tensor) -> Result<Variable, Backwa
         let node = std::sync::Arc::new(IndexSelectBackward {
             in_shape: src.tensor().shape().to_vec(),
             indices: indices.clone(),
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1243,63 +1480,17 @@ pub fn index_select(src: &Variable, indices: &Tensor) -> Result<Variable, Backwa
 
 // --------------------------------------------------------------------------
 // bmm — batched matmul: [B, M, K] @ [B, K, N] = [B, M, N]
+// Forward now goes through the `Backend::bmm` trait method (added in P3.Y
+// Phase A3); this module keeps `bmm_grad_inputs` for the backward path
+// until Phase C1 wires backward through the trait too.
 // Backward: dA[bi] = grad[bi] @ B[bi].T;  dB[bi] = A[bi].T @ grad[bi]
 // --------------------------------------------------------------------------
-
-fn bmm_forward(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, BackwardError> {
-    let l_shape = lhs.shape();
-    let r_shape = rhs.shape();
-    if l_shape.len() != 3 || r_shape.len() != 3 {
-        return Err(BackwardError::Backend {
-            op: "bmm",
-            message: format!("bmm needs rank-3 inputs, got {l_shape:?} @ {r_shape:?}"),
-        });
-    }
-    let (b, m, k1) = (l_shape[0], l_shape[1], l_shape[2]);
-    let (b2, k2, n) = (r_shape[0], r_shape[1], r_shape[2]);
-    if b != b2 || k1 != k2 {
-        return Err(BackwardError::Backend {
-            op: "bmm",
-            message: format!("shape mismatch: {l_shape:?} @ {r_shape:?}"),
-        });
-    }
-    let l_data = lhs
-        .as_slice::<f32>()
-        .ok_or_else(|| BackwardError::Backend {
-            op: "bmm",
-            message: "lhs must be contiguous F32".to_string(),
-        })?;
-    let r_data = rhs
-        .as_slice::<f32>()
-        .ok_or_else(|| BackwardError::Backend {
-            op: "bmm",
-            message: "rhs must be contiguous F32".to_string(),
-        })?;
-    let k = k1;
-    let mut out = vec![0.0_f32; b * m * n];
-    for bi in 0..b {
-        let l_off = bi * m * k;
-        let r_off = bi * k * n;
-        let o_off = bi * m * n;
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0_f32;
-                for kk in 0..k {
-                    acc += l_data[l_off + i * k + kk] * r_data[r_off + kk * n + j];
-                }
-                out[o_off + i * n + j] = acc;
-            }
-        }
-    }
-    Tensor::from_vec([b, m, n], out).map_err(|e| BackwardError::Backend {
-        op: "bmm",
-        message: format!("output build: {e}"),
-    })
-}
 
 struct BmmBackward {
     lhs_saved: Tensor,
     rhs_saved: Tensor,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 2],
 }
 
@@ -1370,6 +1561,8 @@ impl Node for BmmBackward {
 struct TransposeBackward {
     d0: usize,
     d1: usize,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -1394,6 +1587,7 @@ impl Node for TransposeBackward {
 
 /// `src.transpose(d0, d1)` (autograd-aware, contiguous output).
 pub fn transpose(src: &Variable, d0: usize, d1: usize) -> Result<Variable, BackwardError> {
+    let dev = src.device();
     let out_view = src
         .tensor()
         .transpose(d0, d1)
@@ -1401,12 +1595,15 @@ pub fn transpose(src: &Variable, d0: usize, d1: usize) -> Result<Variable, Backw
             op: "transpose",
             message: format!("{e}"),
         })?;
-    let out = out_view.contiguous();
+    // `.contiguous()` may strip the device tag (it materialises through the
+    // CPU layout). Preserve it explicitly so autograd dispatch stays consistent.
+    let out = out_view.contiguous().with_device(dev);
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(TransposeBackward {
             d0,
             d1,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1423,6 +1620,8 @@ pub fn transpose(src: &Variable, d0: usize, d1: usize) -> Result<Variable, Backw
 
 struct ReshapeBackward {
     in_shape: Vec<usize>,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -1453,6 +1652,8 @@ struct Conv2dBackward {
     pad_h: usize,
     pad_w: usize,
     has_bias: bool,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: Vec<Edge>,
 }
 
@@ -1516,6 +1717,8 @@ struct BatchNorm2dBackward {
     saved_mean: Tensor,
     saved_var: Tensor,
     eps: f32,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 3],
 }
 
@@ -1564,6 +1767,7 @@ pub fn batch_norm2d(
             saved_mean: mean,
             saved_var: var,
             eps,
+            device: input.device(),
             edges: [input.edge(), gamma.edge(), beta.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1579,6 +1783,8 @@ pub fn batch_norm2d(
 struct MaxPool2dBackward {
     in_shape: Vec<usize>,
     argmax_idx: Tensor,
+    #[allow(dead_code)] // captured for Phase C2-C9 backward dispatch refactor
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -1612,6 +1818,7 @@ pub fn max_pool2d(
         let node = std::sync::Arc::new(MaxPool2dBackward {
             in_shape: input.tensor().shape().to_vec(),
             argmax_idx: idx,
+            device: input.device(),
             edges: [input.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1653,6 +1860,7 @@ pub fn conv2d(
             pad_h,
             pad_w,
             has_bias: bias.is_some(),
+            device: input.device(),
             edges,
         });
         out_var.grad_fn = Some(node);
@@ -1676,7 +1884,14 @@ pub fn reshape(src: &Variable, shape: Vec<usize>) -> Result<Variable, BackwardEr
             ),
         });
     }
-    let data = src_t
+    let device = src.device();
+    // Pull the data via a CPU view, build the reshaped tensor, then re-tag
+    // it with the source device so autograd dispatch keeps routing to the
+    // right backend.
+    let src_cpu = src_t
+        .clone()
+        .with_device(rustorch_core::tensor::device::Device::Cpu);
+    let data = src_cpu
         .as_slice::<f32>()
         .ok_or_else(|| BackwardError::Backend {
             op: "reshape",
@@ -1686,10 +1901,12 @@ pub fn reshape(src: &Variable, shape: Vec<usize>) -> Result<Variable, BackwardEr
         op: "reshape",
         message: format!("{e}"),
     })?;
+    let out = out.with_device(device);
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && src.requires_grad {
         let node = std::sync::Arc::new(ReshapeBackward {
             in_shape: src_t.shape().to_vec(),
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1700,12 +1917,16 @@ pub fn reshape(src: &Variable, shape: Vec<usize>) -> Result<Variable, BackwardEr
 
 /// Batched matmul `[B, M, K] @ [B, K, N] = [B, M, N]` (autograd-aware).
 pub fn bmm(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
-    let out = bmm_forward(&lhs.tensor(), &rhs.tensor())?;
+    let device = require_same_device_2("bmm", lhs, rhs)?;
+    let out = pick_backend(device)
+        .bmm(&lhs.tensor(), &rhs.tensor())
+        .map_err(|e| backend_err("bmm", e))?;
     let mut out_var = Variable::new(out);
     if is_grad_enabled() && (lhs.requires_grad || rhs.requires_grad) {
         let node = std::sync::Arc::new(BmmBackward {
             lhs_saved: lhs.tensor().clone(),
             rhs_saved: rhs.tensor().clone(),
+            device,
             edges: [lhs.edge(), rhs.edge()],
         });
         out_var.grad_fn = Some(node);
@@ -1721,6 +1942,7 @@ pub fn bmm(lhs: &Variable, rhs: &Variable) -> Result<Variable, BackwardError> {
 struct MeanDimBackward {
     in_shape: Vec<usize>,
     n_reduced: usize,
+    device: Device,
     edges: [Edge; 1],
 }
 
@@ -1737,7 +1959,7 @@ impl Node for MeanDimBackward {
         let numel: usize = self.in_shape.iter().product();
         let scaled_ones =
             Tensor::from_vec(self.in_shape.clone(), vec![inv_n; numel]).expect("scaled ones");
-        let g = cpu_backend()
+        let g = pick_backend(self.device)
             .mul(grad, &scaled_ones)
             .expect("mean_dim bw: grad * ones/N");
         vec![Some(g)]
@@ -1749,7 +1971,7 @@ impl Node for MeanDimBackward {
 
 /// `mean(src, dims, keepdim=true)` (autograd-aware; v1 requires keepdim=true).
 pub fn mean_dim(src: &Variable, dims: &[usize]) -> Result<Variable, BackwardError> {
-    let out = cpu_backend()
+    let out = pick_backend(src.device())
         .mean_dim(&src.tensor(), dims, true)
         .map_err(|e| backend_err("mean_dim", e))?;
     let mut out_var = Variable::new(out);
@@ -1760,10 +1982,72 @@ pub fn mean_dim(src: &Variable, dims: &[usize]) -> Result<Variable, BackwardErro
         let node = std::sync::Arc::new(MeanDimBackward {
             in_shape,
             n_reduced,
+            device: src.device(),
             edges: [src.edge()],
         });
         out_var.grad_fn = Some(node);
         out_var.requires_grad = true;
     }
     Ok(out_var)
+}
+
+// --------------------------------------------------------------------------
+// l2_normalize — `x / max(eps, sqrt(sum(x², dim)))` along a single axis.
+//
+// Composed entirely from existing autograd-aware ops:
+//   square     = x * x          (via mul)
+//   mean_sq    = mean_dim(square, dim)        // shape: [..., 1, ...]
+//   sum_sq     = mean_sq * N                  // restore sum from mean
+//   norm_sq    = sum_sq + eps                 // numerical stability
+//   norm       = sqrt(norm_sq)
+//   out        = x / norm                     // broadcast div
+//
+// This avoids extending the autograd surface with `sum_dim`. The
+// gradient flows through every step via the existing backward formulas.
+// --------------------------------------------------------------------------
+
+/// L2-normalise `src` along `dim`. Equivalent to PyTorch's
+/// `F.normalize(x, dim=dim, p=2)`.
+///
+/// Returns `x / sqrt(sum(x², dim, keepdim=true) + eps)` where `eps`
+/// defaults to `1e-12`. Use [`l2_normalize_with_eps`] to override.
+///
+/// Numerical safety: for an all-zero input vector along `dim`, the
+/// result is `x / sqrt(eps) ≈ 0/sqrt(1e-12)` which is finite. The
+/// epsilon prevents division-by-zero NaN.
+pub fn l2_normalize(src: &Variable, dim: usize) -> Result<Variable, BackwardError> {
+    l2_normalize_with_eps(src, dim, 1e-12)
+}
+
+/// L2-normalise along `dim` with a caller-provided epsilon. See
+/// [`l2_normalize`] for the formula.
+pub fn l2_normalize_with_eps(
+    src: &Variable,
+    dim: usize,
+    eps: f32,
+) -> Result<Variable, BackwardError> {
+    let in_shape = src.tensor().shape().to_vec();
+    if dim >= in_shape.len() {
+        return Err(BackwardError::Backend {
+            op: "l2_normalize",
+            message: format!("dim {} out of range for shape {:?}", dim, in_shape),
+        });
+    }
+    let n_reduced = in_shape[dim];
+    // square = x * x
+    let dev = src.tensor().device();
+    let square = mul(src, src)?;
+    // mean over the reduced dim (keepdim=true)
+    let mean_sq = mean_dim(&square, &[dim])?;
+    // sum_sq = mean_sq * N  (restore sum from mean; N is a constant scalar
+    // placed on the same device so autograd dispatch matches).
+    let n_scalar = Variable::new(Tensor::scalar(n_reduced as f32).with_device(dev));
+    let sum_sq = mul(&mean_sq, &n_scalar)?;
+    // norm_sq = sum_sq + eps  (eps on the same device too)
+    let eps_scalar = Variable::new(Tensor::scalar(eps).with_device(dev));
+    let norm_sq = add(&sum_sq, &eps_scalar)?;
+    // norm = sqrt(norm_sq)
+    let norm = sqrt(&norm_sq)?;
+    // out = x / norm  (broadcast over the kept-1 dim)
+    div(src, &norm)
 }

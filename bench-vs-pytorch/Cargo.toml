@@ -1,0 +1,42 @@
+[package]
+name = "bench-vs-pytorch"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "rustorch_bench"
+path = "src/main.rs"
+
+[[bench]]
+name = "compare"
+harness = false
+
+[dependencies]
+rustorch-core = { path = "../crates/rustorch-core" }
+rustorch-cpu = { path = "../crates/rustorch-cpu" }
+rustorch-attention = { path = "../crates/rustorch-attention" }
+rustorch-fusion = { path = "../crates/rustorch-fusion" }
+rustorch-amp = { path = "../crates/rustorch-amp" }
+rustorch-nn = { path = "../crates/rustorch-nn" }
+rustorch-autograd = { path = "../crates/rustorch-autograd" }
+serde_json = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+half = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+
+[profile.bench]
+inherits = "release"
+debug = false
+
+# Enable native CPU features (NEON/SVE on Apple Silicon).
+# To override at the command line: RUSTFLAGS='-C target-cpu=native' cargo bench
+[profile.release.package."*"]
+opt-level = 3

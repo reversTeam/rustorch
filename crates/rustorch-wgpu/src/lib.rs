@@ -21,6 +21,8 @@
 pub mod argmax;
 pub mod attention;
 pub mod backend;
+pub mod backend_impl;
+pub mod backend_singleton;
 pub mod broadcast;
 pub mod cache;
 pub mod capabilities;
@@ -29,10 +31,14 @@ pub mod elementwise;
 pub mod error;
 pub mod flash_attn;
 pub mod fused;
+pub mod fused_adamw;
 pub mod layernorm;
 pub mod mapped_upload;
 pub mod matmul;
-pub mod pooled;
+// `pooled::PooledBuffer` was removed in P3.Z Task A — its
+// return-to-pool semantics are now expressed via the `on_drop`
+// callback in `rustorch_core::tensor::storage::WgpuStorage`,
+// captured by `crate::storage::WgpuStorage::allocate_pooled`.
 pub mod preprocessor;
 pub mod reduce;
 pub mod registry;
@@ -50,6 +56,7 @@ pub use attention::{
     apply_causal_mask, attention_naive, attention_naive_causal, mul_scalar, multi_head_attention,
 };
 pub use backend::WgpuBackend;
+pub use backend_singleton::{try_wgpu_backend, wgpu_backend};
 pub use broadcast::{broadcast_shape, dispatch_binary_broadcast};
 pub use capabilities::Capabilities;
 pub use conv::{conv2d_forward, transpose_weight, Conv2dCfg};

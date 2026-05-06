@@ -1,0 +1,52 @@
+[package]
+name = "rustorch-metal"
+description = "Apple Metal direct backend for rustorch — simdgroup_matrix bf16, unified memory, beat PyTorch MPS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# macOS-only crate. Cargo respects target-specific deps via the
+# `[target.'cfg(target_os = "macos")'.dependencies]` table; the crate
+# itself compiles to a no-op stub on non-macOS targets so that
+# downstream code with a feature flag doesn't need to special-case
+# the platform.
+
+[features]
+default = []
+# Run tests that actually require a Metal device. Off by default so
+# `cargo test` works on CI without a Mac.
+gpu-tests = []
+
+[dependencies]
+rustorch-core = { workspace = true, features = ["metal"] }
+rustorch-cpu  = { workspace = true }
+bytemuck      = { workspace = true }
+thiserror     = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `metal` is the canonical Rust binding to Apple's Metal Framework,
+# used by wgpu-hal as its Metal backend, by candle, by burn-metal,
+# and by tinygrad's Rust experiments. Mature, type-safe, no objc
+# manual reference counting at the call site.
+metal     = "0.29"
+objc      = "0.2"
+core-graphics-types = "0.1"
+foreign-types = "0.5"
+
+[dev-dependencies]
+# Pulled in only by `bench_llm_shapes` example to compare Metal
+# matmul against the Apple Accelerate AMX path used by `rustorch-llm`.
+rustorch-fusion = { workspace = true }
+# Used by `bench_q4k_metal` example for Q4_K weights + correctness ref
+# against the scalar `sgemv_q4_k` CPU implementation.
+rustorch-gguf   = { workspace = true }
+half            = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

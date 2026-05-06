@@ -29,15 +29,47 @@ rocm        = []
 mkl         = []
 accelerate  = []
 mlir        = []
+# P3.Y plan, Phase E/F — wgpu (Metal/Vulkan/DX12/WebGPU) training dispatch.
+# Pulls rustorch-autograd's `wgpu` feature which transitively brings the
+# rustorch-wgpu backend in. Default OFF to keep CPU-only builds light.
+wgpu        = ["rustorch-autograd/wgpu", "rustorch-optim/wgpu"]
+# P3.Z Task J — Apple Metal direct backend. macOS-only at runtime;
+# the dep chain is target-gated so non-macOS builds with feature
+# `metal` are no-ops.
+metal       = ["rustorch-autograd/metal", "rustorch-optim/metal", "dep:rustorch-metal"]
+
+[[example]]
+name = "mnist_wgpu"
+required-features = ["wgpu"]
+
+[[example]]
+name = "cpu_vs_wgpu_train"
+required-features = ["wgpu"]
+
+[[example]]
+name = "cpu_vs_metal_train"
+required-features = ["metal"]
 
 [dependencies]
 rustorch-core     = { workspace = true }
 rustorch-cpu      = { workspace = true }
 rustorch-autograd = { workspace = true }
+# Optional rustorch-metal direct backend (P3.Z Task J). macOS-only at
+# runtime; the dep is target-gated below.
+rustorch-metal    = { workspace = true, optional = true }
 rustorch-nn       = { workspace = true }
 rustorch-optim    = { workspace = true }
 rustorch-data     = { workspace = true }
 rustorch-serde    = { workspace = true }
+
+[dev-dependencies]
+# Used by examples/gpt2_inference_demo.rs to expose the
+# `Activation` enum for the fused Linear forward path.
+rustorch-fusion   = { workspace = true }
+# Direct access to cblas_sgemm (T51) — saves ~5 µs/call vs the
+# fused wrapper on M=1 sgemv shapes by skipping the shape +
+# activation epilogue checks.
+rustorch-cpu      = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

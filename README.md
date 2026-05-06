@@ -38,9 +38,9 @@ This project is **pre-1.0** but has shipped through Phase 3.
 
 - **`rustorch-core`** — `Tensor`, `Storage`, `Layout`, 8 dtypes (f32/f64/bf16/f16/i32/i64/bool/u8), zero-copy views, refcount sharing.
 - **`rustorch-cpu`** — CPU backend with rayon parallelism + LLVM auto-vectorisation; ~50 ops (arithmetic, linalg, conv, activations, reductions, normalisations, indexing, shape).
-- **`rustorch-autograd`** — Tape-based reverse-mode AD with `Variable`, ~35 backward formulas, `CustomFunction` trait, `checkpoint` / `checkpoint_n`, `autocast` scope guard, anomaly mode.
-- **`rustorch-nn`** — `Module` trait, `Linear`, `Conv1d/2d/3d`, `LayerNorm`, `RMSNorm`, `BatchNorm2d`, `MultiheadAttention`, `Embedding`, `Dropout`, `Sequential`, `ModuleList`, hooks.
-- **`rustorch-optim`** — `Optimizer` trait, `SGD`, `Adam`, `AdamW`, `Lion`, `RMSprop`, `Adagrad`, `Adamax`, `NAdam`, `RAdam`, `LBFGS`, `Adadelta` + LR schedulers (`StepLR`, `CosineAnnealing`, `OneCycle`, `ReduceLROnPlateau`).
+- **`rustorch-autograd`** — Tape-based reverse-mode AD with `Variable` (incl. `set_grad` for grad post-processing), ~35 backward formulas, composed ops like `l2_normalize`, `CustomFunction` trait, `checkpoint` / `checkpoint_n`, `autocast` scope guard, anomaly mode.
+- **`rustorch-nn`** — `Module` trait, `Linear` (rank-N input, PyTorch parity), `Conv1d/2d/3d`, `LayerNorm`, `RMSNorm`, `BatchNorm2d`, `Embedding`, `Dropout`, `Sequential`, `ModuleList`, hooks. Transformer building blocks: `MultiHeadAttention` (self + cross), `SingleHeadAttention`, `SinusoidalPositionalEncoding` / `LearnedPositionalEncoding`, `causal_mask` / `sliding_window_mask`, `CrossAttentionPool` (Perceiver / Q-Former style).
+- **`rustorch-optim`** — `Optimizer` trait, `SGD`, `Adam`, `AdamW`, `Lion`, `RMSprop`, `Adagrad`, `Adamax`, `NAdam`, `RAdam`, `LBFGS`, `Adadelta` + LR schedulers (`StepLR`, `CosineAnnealing`, `OneCycle`, `ReduceLROnPlateau`) + `clip_grad_norm_` / `clip_grad_norm_per_param_` gradient clipping helpers.
 - **`rustorch-data`** — `Dataset` / `IterableDataset` traits, `DataLoader` with rayon workers, `Sampler` (Sequential / Random / WeightedRandom / BucketBy / Distributed), bundled MNIST / CIFAR / ImageNet / WikiText / LibriSpeech.
 - **`rustorch-serde`** — Native `safetensors` reader/writer + `state_dict` round-trip.
 - **`rustorch-wgpu`** — wgpu backend (Vulkan/Metal/DX12/WebGPU); ~80 WGSL kernels; pipeline cache; cross-platform native + browser; built-in Flash Attention v1.
@@ -109,6 +109,45 @@ fn main() -> rustorch::Result<()> {
     Ok(())
 }
 ```
+
+### Transformer building blocks (Phase 1 surface)
+
+The high-level `nn` modules compose into a standard transformer encoder
+without leaving safe Rust:
+
+```rust
+use rustorch_autograd::Variable;
+use rustorch_core::tensor::tensor_impl::Tensor;
+use rustorch_nn::{
+    causal_mask, CrossAttentionPool, LayerNorm, Linear, Module,
+    MultiHeadAttention, RMSNorm, SinusoidalPositionalEncoding,
+};
+
+let dim = 1024;
+let num_heads = 16;
+let max_len = 512;
+
+// Token embedding -> add positional encoding -> attention block.
+let pe = SinusoidalPositionalEncoding::new(dim, max_len);
+let mha = MultiHeadAttention::new(dim, num_heads);
+let norm = RMSNorm::new(dim);
+let ffn = Linear::new(dim, dim);  // accepts [B, T, D] directly
+
+// Forward on a [B=2, T=64, D=1024] input.
+let x = Variable::new(Tensor::zeros([2usize, 64, 1024]));
+let pos = pe.forward_for_len(64)?;       // [64, 1024]
+let h   = norm.forward(&x)?;
+let h   = mha.self_attention(&h, Some(&causal_mask(64)))?;
+let h   = ffn.forward(&h)?;              // rank-N Linear, no manual reshape
+
+// Pool variable-length [B, T, D] to a fixed-size [B, Q, D] (Perceiver / Q-Former).
+let pool = CrossAttentionPool::new(dim, /*num_queries=*/ 32, num_heads);
+let queries = pool.forward(&x)?;          // [2, 32, 1024]
+```
+
+For training, pair with `rustorch_optim::clip_grad_norm_` between
+`backward()` and `optimizer.step()` to guard against gradient
+explosion in deep stacks.
 
 ### Flash Attention forward (Phase 3)
 
@@ -350,13 +389,107 @@ project knowledge graph. Highlights from Phase 3:
 - **Scalar int8 GEMM as golden reference** (quant): SIMD specialisations
   (AVX-VNNI / NEON sdot) land in arch-specific commits; cpu_features helpers
   let call sites branch today.
+- **Flatten-then-reshape rank-N Linear** (nn): PyTorch parity without
+  changing `add_bias`. Leading batch dims fold into a single rank-2
+  matmul, then unfold — fast path preserved for rank-2, gradient flows
+  via the autograd-aware `reshape`.
+- **Fold-batch path for MultiHeadAttention** (nn): autograd's `bmm` is
+  strictly rank-3, so the rank-4 head split `[B, H, T, head_dim]` is
+  collapsed to `[B*H, T, head_dim]` for the dot products and unfolded
+  back. All shape changes go through the autograd-aware `reshape` and
+  `transpose` ops.
+- **`-1e4` instead of `-inf` in masks** (nn): keeps softmax NaN-safe
+  when an entire row is masked. `softmax([-1e4, -1e4]) = [0.5, 0.5]`
+  numerically; `softmax([-inf, -inf])` would NaN.
+- **Compose `mean_dim × N` instead of adding `sum_dim`** (autograd): the
+  l2_normalize formula avoids extending the autograd surface by
+  scaling the existing autograd-aware `mean_dim` back up to a sum.
 
 See [`docs/rfcs/`](docs/rfcs/) for the full RFCs and the project's Decision
 graph (queryable via the Project Orchestrator MCP tools).
 
+## Training on GPU
+
+P3.Y plan delivers training-on-GPU through the `wgpu` backend
+(Metal on macOS, Vulkan on Linux/Android, DX12 on Windows, WebGPU on wasm32).
+Enable with the `wgpu` Cargo feature:
+
+```toml
+[dependencies]
+rustorch = { version = "...", features = ["wgpu"] }
+```
+
+```rust
+use rustorch::nn::{Linear, module::Module};
+use rustorch_autograd::{backward, ops, Variable};
+use rustorch_core::tensor::device::Device;
+use rustorch_optim::{AdamW, Optimizer};
+
+let mut model = Linear::new(784, 10);
+model.to_device(Device::Wgpu);   // walks parameters() and re-tags
+let mut opt = AdamW::new(model.parameters(), 0.001);
+
+for _step in 0..n_steps {
+    opt.zero_grad();
+    let pred = model.forward(&xs).unwrap();
+    let loss = ops::mse_loss(&pred, &ys, Reduction::Mean).unwrap();
+    backward(&loss, None).unwrap();
+    opt.step();
+}
+```
+
+Backend support matrix:
+
+| Platform | Backend | Status |
+|---|---|---|
+| macOS | Metal | ✅ Production |
+| Linux/Android | Vulkan | ✅ Production |
+| Windows | DX12 | ✅ Production |
+| Browser | WebGPU | ✅ via wasm32 target |
+| NVIDIA GPU | CUDA | 📋 Phase 4 (drop-in `impl Backend for CudaBackend`) |
+
+End-to-end examples:
+
+- [`crates/rustorch/examples/mnist_wgpu.rs`](crates/rustorch/examples/mnist_wgpu.rs) — MLP training on synthetic MNIST
+- [`crates/rustorch/examples/cpu_vs_wgpu_train.rs`](crates/rustorch/examples/cpu_vs_wgpu_train.rs) — CPU vs Wgpu training-step bench
+
+```sh
+cargo run -p rustorch --release --example mnist_wgpu --features wgpu
+cargo run -p rustorch --release --example cpu_vs_wgpu_train --features wgpu
+```
+
+**Architecture note** (Storage Option B, transitional): every wgpu op
+currently pays a host↔device round-trip because the Tensor stores its
+data in a CPU shadow with a `Device` tag. Correctness is solid (parity
+tests cosine ≥ 0.999 vs CPU on Metal, including forward+backward+optimiser
+chains) but raw throughput is lower than a fully-resident GPU storage.
+Storage Option A (Tensor enum `Cpu(Vec<f32>) | Wgpu(WgpuStorage)`) is the
+perf follow-up; it removes the round-trip and unlocks the speedup ceiling.
+
+### Same-machine perf reference (Apple M4 Max, Linear 1024×1024, MSE+AdamW)
+
+| Stack | ms/step | vs PyTorch CPU |
+|---|---:|---:|
+| PyTorch MPS | **0.89** | 0.5× (best) |
+| PyTorch CPU | **1.75** | 1× (baseline) |
+| rustorch CPU | 12.81 | 7.3× slower |
+| rustorch Wgpu | 22.30 | 12.7× slower |
+
+The rustorch Wgpu number reflects the Storage Option B round-trip cost
++ CPU-fallback backward kernels. Closing the gap to PyTorch MPS is
+tracked as Phase 3.5 (native WGSL backward kernels) and Phase 3.6
+(Storage Option A migration) in [`ROADMAP.md`](ROADMAP.md). Reproduce
+the PyTorch numbers on your machine via:
+
+```sh
+cd /tmp  # avoid shadowing the installed torch by the local pytorch/ source
+python3 /path/to/rustorch/crates/rustorch/examples/pytorch_compare.py
+```
+
 ## Project documentation
 
 - [`docs/rfcs/`](docs/rfcs/) — architectural RFCs (Phase 0 deliverable)
+- [`ROADMAP.md`](ROADMAP.md) — phase-by-phase milestones
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution guide, commit style
 - [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor Covenant 2.1
 

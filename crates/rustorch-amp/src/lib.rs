@@ -27,6 +27,8 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+#[cfg(target_os = "macos")]
+pub mod accelerate;
 pub mod autocast;
 pub mod bf16_kernels;
 pub mod dtypes;

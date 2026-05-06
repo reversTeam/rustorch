@@ -27,6 +27,7 @@
 //! assert!(t.is_contiguous());
 //! ```
 
+use super::device::Device;
 use super::dtype::{Dtype, Element};
 use super::layout::Layout;
 use super::shape::Shape;
@@ -47,6 +48,12 @@ pub struct Tensor {
     layout: Layout,
     version: VersionCounter,
     requires_grad: bool,
+    /// Device tag for autograd dispatch (P3.Y plan, Phase A).
+    /// Defaults to `Device::Cpu`; set to `Device::Wgpu` after a
+    /// `to_gpu` upload.  The actual GPU buffer is held externally
+    /// in `WgpuStorage`; this field is the *marker* used by the
+    /// `Backend` dispatcher to pick the right kernel path.
+    device: Device,
 }
 
 // --------------------------------------------------------------------------
@@ -87,7 +94,19 @@ impl Tensor {
         }
         let elem_size = core::mem::size_of::<T>();
         let byte_len = expected * elem_size;
-        let mut storage = Storage::cpu_zeroed(byte_len)?;
+        // T39 — uninit-allocate the storage and overwrite every byte
+        // via copy_nonoverlapping. The previous `cpu_zeroed` zeroed
+        // the buffer first then copied — pure waste of DRAM
+        // bandwidth (on a 1.5 MB LayerNorm output the zero pass
+        // alone costs ~19 µs on M-series). The unconditional copy
+        // below initialises every byte before any reader sees the
+        // storage, so an uninit buffer is sound.
+        // SAFETY: cpu_uninit returns a buffer with unspecified
+        // contents; we overwrite ALL byte_len bytes via the
+        // copy_nonoverlapping below before any other code can
+        // observe the storage. For byte_len == 0 cpu_uninit returns
+        // a sentinel and the copy is skipped.
+        let mut storage = unsafe { Storage::cpu_uninit(byte_len)? };
         if byte_len > 0 {
             // SAFETY: storage was just allocated; we are unique owner.
             let dst = storage
@@ -110,6 +129,7 @@ impl Tensor {
             layout,
             version: VersionCounter::new(),
             requires_grad: false,
+            device: Device::Cpu,
         })
     }
 
@@ -130,6 +150,7 @@ impl Tensor {
             layout,
             version: VersionCounter::new(),
             requires_grad: false,
+            device: Device::Cpu,
         }
     }
 
@@ -161,6 +182,89 @@ impl Tensor {
             layout,
             version,
             requires_grad,
+            device: Device::Cpu,
+        }
+    }
+
+    /// Tag this tensor with `device` (in-place builder). Used by the
+    /// wgpu backend after `to_gpu` to mark the tensor as living on the
+    /// GPU side. The CPU storage stays as a shadow until dropped.
+    #[inline]
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.device = device;
+        self
+    }
+
+    /// Build a Tensor whose storage is a wgpu GPU buffer (no CPU
+    /// shadow). P3.Z Task A round-trip elimination: backend kernels
+    /// that produce a fresh `core::WgpuStorage` (e.g. matmul / fused
+    /// ops output) wrap it directly into a Tensor without ever
+    /// shipping the bytes back to the host.
+    ///
+    /// The Tensor is marked `Device::Wgpu` so autograd dispatch
+    /// routes follow-on ops to `wgpu_backend()`. Layout is
+    /// contiguous + offset 0.
+    #[cfg(feature = "wgpu")]
+    pub fn from_wgpu_storage<S: Into<Shape>>(
+        wgpu_storage: super::storage::WgpuStorage,
+        shape: S,
+        dtype: Dtype,
+    ) -> Tensor {
+        let shape = shape.into();
+        let layout = Layout::contiguous(shape, dtype);
+        Tensor {
+            storage: Storage::Wgpu(wgpu_storage),
+            layout,
+            version: VersionCounter::new(),
+            requires_grad: false,
+            device: Device::Wgpu,
+        }
+    }
+
+    /// Borrow the inner `core::WgpuStorage` if this Tensor lives on
+    /// the wgpu device. Returns `None` for CPU / Cuda / Metal /
+    /// WgpuShared tensors — callers needing a wgpu handle from a
+    /// non-wgpu tensor must first migrate the storage.
+    #[cfg(feature = "wgpu")]
+    pub fn as_wgpu_storage(&self) -> Option<&super::storage::WgpuStorage> {
+        match &self.storage {
+            Storage::Wgpu(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Build a Tensor whose storage is a Metal GPU buffer (no CPU
+    /// shadow). Mirrors `Tensor::from_wgpu_storage` for the Apple
+    /// Metal direct backend (P3.Z Task J).
+    ///
+    /// The Tensor is marked `Device::Metal` so autograd dispatch
+    /// routes follow-on ops to `metal_backend()`. Layout is
+    /// contiguous + offset 0.
+    #[cfg(feature = "metal")]
+    pub fn from_metal_storage<S: Into<Shape>>(
+        metal_storage: super::storage::MetalStorage,
+        shape: S,
+        dtype: Dtype,
+    ) -> Tensor {
+        let shape = shape.into();
+        let layout = Layout::contiguous(shape, dtype);
+        Tensor {
+            storage: Storage::Metal(metal_storage),
+            layout,
+            version: VersionCounter::new(),
+            requires_grad: false,
+            device: Device::Metal,
+        }
+    }
+
+    /// Borrow the inner `core::MetalStorage` if this Tensor lives on
+    /// the Metal device. Returns `None` for CPU / Wgpu / Cuda /
+    /// WgpuShared tensors.
+    #[cfg(feature = "metal")]
+    pub fn as_metal_storage(&self) -> Option<&super::storage::MetalStorage> {
+        match &self.storage {
+            Storage::Metal(s) => Some(s),
+            _ => None,
         }
     }
 }
@@ -198,6 +302,14 @@ impl Tensor {
     #[inline]
     pub fn dtype(&self) -> Dtype {
         self.layout.dtype()
+    }
+
+    /// Device tag — `Device::Cpu` by default, `Device::Wgpu` after a
+    /// `to_gpu` upload. Used by the autograd dispatcher to pick the
+    /// right backend at op time. See P3.Y plan, Phase A.
+    #[inline]
+    pub fn device(&self) -> Device {
+        self.device
     }
 
     /// Number of dimensions (rank).
@@ -274,28 +386,49 @@ impl Tensor {
     /// Borrow the buffer as `&[f32]` for the common P0.3-prototype path.
     ///
     /// **Panics** if the tensor is not contiguous F32 with
-    /// `storage_offset == 0`. Use [`Tensor::as_slice`] for the typed,
-    /// fallible form.
+    /// `storage_offset == 0`, or if the storage lives on a non-CPU
+    /// device (Wgpu / Cuda / Metal). Use [`Tensor::as_slice`] for the
+    /// typed, fallible form, or call [`Tensor::to_cpu`] (when
+    /// available) to materialise host bytes first.
     #[inline]
     pub fn data(&self) -> &[f32] {
         match self.as_slice::<f32>() {
             Some(s) => s,
             None => panic!(
-                "Tensor::data() requires contiguous F32 storage with offset 0; \
-                 got dtype={:?}, contiguous={}, offset={}",
+                "Tensor::data() requires contiguous F32 storage on CPU with offset 0; \
+                 got dtype={:?}, contiguous={}, offset={}, device={:?}, on_cpu={}",
                 self.dtype(),
                 self.is_contiguous(),
                 self.storage_offset(),
+                self.device(),
+                self.storage.is_cpu(),
             ),
         }
     }
 
-    /// Borrow the buffer as `&[T]` if the tensor is contiguous, has
-    /// dtype matching `T`, and `storage_offset == 0`. Returns `None`
-    /// otherwise — caller must `.contiguous()` first (P1.1 task
-    /// `Conversions`).
+    /// Borrow the buffer as `&[T]` if the tensor is contiguous F32 on
+    /// CPU storage with `storage_offset == 0` and dtype matching `T`.
+    ///
+    /// **STRICT semantics (P3.Z Task A)**: returns `None` when the
+    /// underlying [`Storage`] lives on a GPU device (`Wgpu`,
+    /// `WgpuShared` not yet mapped, `Cuda`, `Metal`). Callers needing
+    /// host bytes from a GPU tensor must call `.to_cpu()` (sync) or
+    /// `.to_cpu_async()` first to materialise. This catches
+    /// cross-device bugs at the type-system level — no surprise
+    /// per-op host↔device round-trips.
     pub fn as_slice<T: Element>(&self) -> Option<&[T]> {
         if self.dtype() != T::DTYPE || !self.is_contiguous() || self.storage_offset() != 0 {
+            return None;
+        }
+        // P3.Z Task A: strict CPU-only check. WgpuShared with an
+        // already-mapped region also exposes host bytes via
+        // `Storage::as_bytes()` so we accept any storage variant
+        // whose `as_bytes()` returns a non-empty slice (Cpu always,
+        // WgpuShared after `ensure_mapped`).
+        let bytes = self.storage.as_bytes();
+        if bytes.is_empty() && self.numel() > 0 {
+            // Non-CPU storage with no mapped region: caller must
+            // materialise to CPU first.
             return None;
         }
         // SAFETY: dtype matches T; the storage holds `numel * size_of::<T>()`
@@ -369,21 +502,113 @@ impl Tensor {
     /// Panics if the underlying storage is shared with a clone (an
     /// alias) — the caller must `.contiguous()` or own the buffer.
     pub fn add_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        // T9 — monomorphic dense f32 fast path. The generic
+        // `binary_inplace` carries an `op: impl Fn(f32, f32) -> f32`
+        // closure which LLVM cannot reliably hoist out of the inner
+        // loop on aarch64; the resulting code path tops out at
+        // ~10 GB/s on M-series Macs (12-15× behind PyTorch ATen which
+        // calls NEON intrinsics directly). Hardcoding `+` collapses
+        // the closure barrier and lets the auto-vectoriser emit a
+        // tight `fadd.4s` loop with prefetch. Matches PyTorch's
+        // `at::vec::Vectorized<float>::operator+` strategy.
+        if self.dtype() == Dtype::F32
+            && other.dtype() == Dtype::F32
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.storage_offset() == 0
+            && other.storage_offset() == 0
+            && self.shape() == other.shape()
+        {
+            // macOS: `vDSP_vadd` saturates ~85 GB/s single-thread on
+            // M4 Max above the FFI break-even point (~64 K elements).
+            // Below that, the inline monomorphic loop wins.
+            #[cfg(target_os = "macos")]
+            {
+                // T22 — calibrated 2026-05-04 on M4 Max P-cores.
+                // vDSP_vadd carries ~250 ns FFI overhead (indirect
+                // call + Accelerate runtime dispatch). The inline
+                // monomorphic loop at ~30 GB/s wins below 4 K
+                // elements; vDSP saturates ~85 GB/s above.
+                //   1 K elements: inline 245 ns, vDSP 495 ns
+                //   4 K elements: inline ~ vDSP (crossover)
+                //  10 K elements: inline 3.5 µs, vDSP 1.5 µs
+                const VDSP_MIN: usize = 4 * 1024;
+                if self.numel() >= VDSP_MIN {
+                    return add_f32_vdsp_inplace(self, other);
+                }
+            }
+            return add_f32_dense_inplace(self, other);
+        }
         binary_inplace(self, other, "add_", |a, b| a + b, |a, b| a + b)
     }
 
     /// In-place subtraction: `self -= other`.
     pub fn sub_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        // T9 — monomorphic dense f32 fast path (see `add_` rationale).
+        if self.dtype() == Dtype::F32
+            && other.dtype() == Dtype::F32
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.storage_offset() == 0
+            && other.storage_offset() == 0
+            && self.shape() == other.shape()
+        {
+            #[cfg(target_os = "macos")]
+            {
+                // T22 — same 4K crossover as add_; see add_ comment.
+                const VDSP_MIN: usize = 4 * 1024;
+                if self.numel() >= VDSP_MIN {
+                    return sub_f32_vdsp_inplace(self, other);
+                }
+            }
+            return sub_f32_dense_inplace(self, other);
+        }
         binary_inplace(self, other, "sub_", |a, b| a - b, |a, b| a - b)
     }
 
     /// In-place multiplication: `self *= other`.
     pub fn mul_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        // T9 — monomorphic dense f32 fast path. Mul is the hottest
+        // op in optimizer.step (param * learning_rate, momentum
+        // updates) so the closure-collapse pays off heavily.
+        if self.dtype() == Dtype::F32
+            && other.dtype() == Dtype::F32
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.storage_offset() == 0
+            && other.storage_offset() == 0
+            && self.shape() == other.shape()
+        {
+            #[cfg(target_os = "macos")]
+            {
+                // T22 — same 4K crossover as add_; see add_ comment.
+                const VDSP_MIN: usize = 4 * 1024;
+                if self.numel() >= VDSP_MIN {
+                    return mul_f32_vdsp_inplace(self, other);
+                }
+            }
+            return mul_f32_dense_inplace(self, other);
+        }
         binary_inplace(self, other, "mul_", |a, b| a * b, |a, b| a * b)
     }
 
     /// In-place division: `self /= other`.
     pub fn div_(&mut self, other: &Tensor) -> Result<&mut Tensor, TensorError> {
+        // T9 — monomorphic dense f32 fast path. Div is rarer than
+        // add/mul but still appears in normalisation and softmax
+        // backward, so closure-collapse helps. No vDSP path:
+        // `vDSP_vdiv` exists but offers minimal advantage on f32
+        // because divide isn't bandwidth-bound on M-series.
+        if self.dtype() == Dtype::F32
+            && other.dtype() == Dtype::F32
+            && self.is_contiguous()
+            && other.is_contiguous()
+            && self.storage_offset() == 0
+            && other.storage_offset() == 0
+            && self.shape() == other.shape()
+        {
+            return div_f32_dense_inplace(self, other);
+        }
         binary_inplace(self, other, "div_", |a, b| a / b, |a, b| a / b)
     }
 
@@ -458,8 +683,8 @@ fn binary_inplace<'a>(
     lhs: &'a mut Tensor,
     rhs: &Tensor,
     op_name: &'static str,
-    op_f32: impl Fn(f32, f32) -> f32,
-    op_f64: impl Fn(f64, f64) -> f64,
+    op_f32: impl Fn(f32, f32) -> f32 + Send + Sync,
+    op_f64: impl Fn(f64, f64) -> f64 + Send + Sync,
 ) -> Result<&'a mut Tensor, TensorError> {
     if lhs.dtype() != rhs.dtype() {
         return Err(TensorError::DtypeMismatch {
@@ -493,11 +718,11 @@ fn binary_inplace<'a>(
 fn binary_inplace_typed<'a, T>(
     lhs: &'a mut Tensor,
     rhs: &Tensor,
-    op: impl Fn(T, T) -> T,
+    op: impl Fn(T, T) -> T + Send + Sync,
     op_name: &'static str,
 ) -> Result<&'a mut Tensor, TensorError>
 where
-    T: Element + core::ops::Add<Output = T> + core::ops::Sub<Output = T>,
+    T: Element + Send + Sync + core::ops::Add<Output = T> + core::ops::Sub<Output = T>,
 {
     let n = lhs.numel();
     let lhs_shape = lhs.shape().to_vec();
@@ -529,6 +754,65 @@ where
     // SAFETY: unique borrow via Storage::as_bytes_mut, dtype matches.
     let lhs_raw: &mut [T] =
         unsafe { core::slice::from_raw_parts_mut(lhs_bytes_ptr as *mut T, lhs_typed_len) };
+
+    // Fast path: both sides are dense contiguous + same shape + zero
+    // offset → tight `i = 0..n` slice loop, no `strided_index` calls,
+    // LLVM auto-vectorises with NEON / AVX. This is the dominant path
+    // for `add_`, `sub_`, `mul_`, `div_` on freshly-allocated tensors
+    // (Linear forward, AdamW step, residual adds in transformer FFNs).
+    //
+    // Measured M4 Max post-T2.5 (P3.X): elementwise_add 10M takes
+    // 14.5 ms via the strided path vs ~1 ms via the contiguous fast
+    // path (auto-vectorised NEON FMA-equivalent). Without this branch
+    // we are 15× slower than PyTorch on bandwidth-bound ops; with it
+    // we approach memory-bandwidth ceiling on M4 Max (~120 GB/s).
+    if lhs_offset == 0
+        && rhs_offset == 0
+        && lhs_shape == *rhs.shape()
+        && lhs.is_contiguous()
+        && rhs.is_contiguous()
+        && lhs_raw.len() >= n
+        && rhs_raw.len() >= n
+    {
+        let lhs_dense = &mut lhs_raw[..n];
+        let rhs_dense = &rhs_raw[..n];
+
+        // Rayon-parallel for memory-bandwidth-bound shapes large
+        // enough to amortise the scheduler cost. Crossover measured
+        // empirically on M4 Max:
+        //   - 1 M elements:  rayon 754 µs vs serial 527 µs (rayon LOSES)
+        //   - 10 M elements: rayon 2.77 ms vs serial 3.66 ms (rayon WINS)
+        // So the threshold sits around 4 M elements (≈ 16 MB f32, the
+        // M4 Max shared L2). Below this we let the auto-vectorised
+        // single-thread loop saturate L1d/L2 bandwidth without paying
+        // for the rayon scheduler. Above it, sharding across P-cores
+        // unlocks the full ~120 GB/s DRAM bandwidth.
+        const PARALLEL_MIN: usize = 4_000_000;
+        #[cfg(not(target_arch = "wasm32"))]
+        if n >= PARALLEL_MIN {
+            use rayon::prelude::*;
+            // Chunk ≥ 256 K elements (1 MB f32) keeps each task
+            // doing enough work that scheduler overhead is < 1% of
+            // wall-clock; a smaller chunk wastes time on dispatch.
+            let chunk = (n / rayon::current_num_threads().max(1)).max(256 * 1024);
+            lhs_dense
+                .par_chunks_mut(chunk)
+                .zip(rhs_dense.par_chunks(chunk))
+                .for_each(|(l_chunk, r_chunk)| {
+                    for (l, r) in l_chunk.iter_mut().zip(r_chunk.iter()) {
+                        *l = op(*l, *r);
+                    }
+                });
+            lhs.version().bump();
+            return Ok(lhs);
+        }
+
+        for (l, r) in lhs_dense.iter_mut().zip(rhs_dense.iter()) {
+            *l = op(*l, *r);
+        }
+        lhs.version().bump();
+        return Ok(lhs);
+    }
 
     for i in 0..n {
         let li = strided_index(i, &lhs_shape, &lhs_strides, lhs_offset);
@@ -566,6 +850,7 @@ fn unary_inplace_typed<'a, T: Element>(
     let shape = src.shape().to_vec();
     let strides = src.strides().to_vec();
     let offset = src.storage_offset();
+    let is_dense = offset == 0 && src.is_contiguous();
     let storage = src
         .storage_mut_for_inplace()
         .ok_or(TensorError::Aliased { op: op_name })?;
@@ -573,6 +858,18 @@ fn unary_inplace_typed<'a, T: Element>(
     // SAFETY: unique mutable borrow + dtype match.
     let raw: &mut [T] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut T, typed_len) };
+    // Fast path: dense contiguous in-place unary (relu, sigmoid_,
+    // tanh_, neg_, ...) — tight loop, auto-vectorised epilogue. Same
+    // motivation as `binary_inplace_typed`: avoids per-element
+    // `strided_index` modular divisions on the dominant path.
+    if is_dense && raw.len() >= n {
+        let dense = &mut raw[..n];
+        for cell in dense.iter_mut() {
+            *cell = op(*cell);
+        }
+        src.version().bump();
+        return Ok(src);
+    }
     for i in 0..n {
         let idx = strided_index(i, &shape, &strides, offset);
         raw[idx] = op(raw[idx]);
@@ -660,6 +957,270 @@ fn copy_inplace_typed<'a, T: Element>(
 }
 
 /// Compute the storage element index for the i-th shape-order element.
+/// In-place f32 contiguous add through Apple Accelerate's `vDSP_vadd`.
+///
+/// `vDSP_vadd(A, 1, B, 1, C, 1, N)` computes `C[i] = A[i] + B[i]`.
+/// The aliased call `vDSP_vadd(self, 1, self, 1, other, 1, n)` is
+/// fully supported (vDSP guarantees correctness when source and
+/// destination overlap as long as the strides are equal).
+#[cfg(target_os = "macos")]
+fn add_f32_vdsp_inplace<'a>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = lhs.numel();
+    if n == 0 {
+        return Ok(lhs);
+    }
+    // Borrow rhs slice first (immutable borrow ends before we
+    // acquire the unique mutable borrow on lhs).
+    let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+    let rhs_len = rhs.storage().byte_len() / core::mem::size_of::<f32>();
+    debug_assert!(rhs_len >= n);
+
+    let storage = lhs
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "add_" })?;
+    let lhs_typed_len = storage.len() / core::mem::size_of::<f32>();
+    debug_assert!(lhs_typed_len >= n);
+    let lhs_ptr = storage.as_mut_ptr() as *mut f32;
+
+    extern "C" {
+        /// `vDSP_vadd(A, IA, B, IB, C, IC, N)` — C[i] = A[i] + B[i].
+        /// Apple Accelerate framework, stable since macOS 10.4.
+        fn vDSP_vadd(
+            a: *const f32,
+            ia: isize,
+            b: *const f32,
+            ib: isize,
+            c: *mut f32,
+            ic: isize,
+            n: usize,
+        );
+    }
+    // SAFETY: pointer/length invariants checked above; vDSP_vadd is
+    // documented as supporting source/destination aliasing when
+    // strides are equal.
+    unsafe {
+        vDSP_vadd(lhs_ptr, 1, rhs_ptr, 1, lhs_ptr, 1, n);
+    }
+    lhs.version().bump();
+    Ok(lhs)
+}
+
+#[link(name = "Accelerate", kind = "framework")]
+#[cfg(target_os = "macos")]
+extern "C" {}
+
+/// In-place f32 contiguous subtract through `vDSP_vsub` (T9).
+///
+/// `vDSP_vsub(B, 1, A, 1, C, 1, N)` computes `C[i] = A[i] - B[i]`
+/// — note the **reversed argument order** in vDSP (B is subtracted
+/// from A). The aliased call `vDSP_vsub(rhs, 1, lhs, 1, lhs, 1, n)`
+/// computes `lhs[i] = lhs[i] - rhs[i]`.
+#[cfg(target_os = "macos")]
+fn sub_f32_vdsp_inplace<'a>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = lhs.numel();
+    if n == 0 {
+        return Ok(lhs);
+    }
+    let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+    let storage = lhs
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "sub_" })?;
+    let lhs_ptr = storage.as_mut_ptr() as *mut f32;
+
+    extern "C" {
+        fn vDSP_vsub(
+            b: *const f32,
+            ib: isize,
+            a: *const f32,
+            ia: isize,
+            c: *mut f32,
+            ic: isize,
+            n: usize,
+        );
+    }
+    // SAFETY: bounds checked by caller; vDSP supports aliased C=A.
+    unsafe {
+        vDSP_vsub(rhs_ptr, 1, lhs_ptr, 1, lhs_ptr, 1, n);
+    }
+    lhs.version().bump();
+    Ok(lhs)
+}
+
+/// In-place f32 contiguous multiply through `vDSP_vmul` (T9).
+///
+/// `vDSP_vmul(A, 1, B, 1, C, 1, N)` computes `C[i] = A[i] * B[i]`.
+/// Heavily used in optim.step (param * lr, momentum updates).
+#[cfg(target_os = "macos")]
+fn mul_f32_vdsp_inplace<'a>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = lhs.numel();
+    if n == 0 {
+        return Ok(lhs);
+    }
+    let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+    let storage = lhs
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "mul_" })?;
+    let lhs_ptr = storage.as_mut_ptr() as *mut f32;
+
+    extern "C" {
+        fn vDSP_vmul(
+            a: *const f32,
+            ia: isize,
+            b: *const f32,
+            ib: isize,
+            c: *mut f32,
+            ic: isize,
+            n: usize,
+        );
+    }
+    // SAFETY: bounds checked by caller; vDSP supports aliased C=A.
+    unsafe {
+        vDSP_vmul(lhs_ptr, 1, rhs_ptr, 1, lhs_ptr, 1, n);
+    }
+    lhs.version().bump();
+    Ok(lhs)
+}
+
+/// Macro: emit a monomorphic dense f32 in-place binary op. The
+/// `op` token is the actual operator (`+=`, `-=`, `*=`, `/=`),
+/// which collapses to a single hardware instruction inside the
+/// vectorised inner loop. Matches PyTorch's `at::vec::Vectorized`
+/// strategy (NEON `fadd.4s` / AVX2 `vfmadd231ps` etc.).
+///
+/// Caller invariants (already checked by the `Tensor::*_` callers):
+/// - both tensors are F32, contiguous, zero offset, equal shape.
+macro_rules! emit_dense_f32_binary {
+    ($name:ident, $op_name:literal, $op:tt) => {
+        fn $name<'a>(
+            lhs: &'a mut Tensor,
+            rhs: &Tensor,
+        ) -> Result<&'a mut Tensor, TensorError> {
+            let n = lhs.numel();
+            if n == 0 {
+                return Ok(lhs);
+            }
+            let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+            let rhs_len = rhs.storage().byte_len() / core::mem::size_of::<f32>();
+            debug_assert!(rhs_len >= n);
+            // SAFETY: dtype + length checked by caller; rhs immutable.
+            let rhs_slice: &[f32] = unsafe { core::slice::from_raw_parts(rhs_ptr, n) };
+
+            let storage = lhs
+                .storage_mut_for_inplace()
+                .ok_or(TensorError::Aliased { op: $op_name })?;
+            let lhs_typed_len = storage.len() / core::mem::size_of::<f32>();
+            debug_assert!(lhs_typed_len >= n);
+            // SAFETY: unique borrow + dtype match.
+            let lhs_slice: &mut [f32] =
+                unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut f32, n) };
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                const PARALLEL_MIN: usize = 4_000_000;
+                if n >= PARALLEL_MIN {
+                    use rayon::prelude::*;
+                    let chunk = (n / rayon::current_num_threads().max(1)).max(256 * 1024);
+                    lhs_slice
+                        .par_chunks_mut(chunk)
+                        .zip(rhs_slice.par_chunks(chunk))
+                        .for_each(|(l_chunk, r_chunk)| {
+                            for (l, r) in l_chunk.iter_mut().zip(r_chunk.iter()) {
+                                *l $op *r;
+                            }
+                        });
+                    lhs.version().bump();
+                    return Ok(lhs);
+                }
+            }
+            for (l, r) in lhs_slice.iter_mut().zip(rhs_slice.iter()) {
+                *l $op *r;
+            }
+            lhs.version().bump();
+            Ok(lhs)
+        }
+    };
+}
+
+emit_dense_f32_binary!(sub_f32_dense_inplace, "sub_", -=);
+emit_dense_f32_binary!(mul_f32_dense_inplace, "mul_", *=);
+emit_dense_f32_binary!(div_f32_dense_inplace, "div_", /=);
+
+/// Monomorphic dense f32 in-place add (T9). Bypasses the generic
+/// `binary_inplace` closure barrier so LLVM can emit straight-line
+/// `fadd.4s` NEON / AVX2 instructions with the right prefetch
+/// pattern. Matches PyTorch's `at::vec::Vectorized<float> + ` strategy.
+///
+/// Caller invariants (already checked by `Tensor::add_`):
+/// - both tensors are F32, contiguous, zero offset, equal shape.
+fn add_f32_dense_inplace<'a>(
+    lhs: &'a mut Tensor,
+    rhs: &Tensor,
+) -> Result<&'a mut Tensor, TensorError> {
+    let n = lhs.numel();
+    if n == 0 {
+        return Ok(lhs);
+    }
+    // Read rhs first — immutable borrow drops before we acquire the
+    // unique mutable borrow on lhs.
+    let rhs_ptr = rhs.storage().as_bytes().as_ptr() as *const f32;
+    let rhs_len = rhs.storage().byte_len() / core::mem::size_of::<f32>();
+    debug_assert!(rhs_len >= n);
+    // SAFETY: dtype matches, length checked, lifetime tied to rhs.
+    let rhs_slice: &[f32] = unsafe { core::slice::from_raw_parts(rhs_ptr, n) };
+
+    let storage = lhs
+        .storage_mut_for_inplace()
+        .ok_or(TensorError::Aliased { op: "add_" })?;
+    let lhs_typed_len = storage.len() / core::mem::size_of::<f32>();
+    debug_assert!(lhs_typed_len >= n);
+    // SAFETY: unique mutable borrow + dtype match.
+    let lhs_slice: &mut [f32] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut f32, n) };
+
+    // Rayon shard for memory-bandwidth-bound regimes — same threshold
+    // as `binary_inplace_typed` to keep the calibration consistent.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        const PARALLEL_MIN: usize = 4_000_000;
+        if n >= PARALLEL_MIN {
+            use rayon::prelude::*;
+            let chunk = (n / rayon::current_num_threads().max(1)).max(256 * 1024);
+            lhs_slice
+                .par_chunks_mut(chunk)
+                .zip(rhs_slice.par_chunks(chunk))
+                .for_each(|(l_chunk, r_chunk)| {
+                    // Hot inner loop: monomorphic fadd. LLVM unrolls
+                    // and emits NEON `fadd.4s` (4 lanes × f32 per
+                    // cycle on M-series Macs).
+                    for (l, r) in l_chunk.iter_mut().zip(r_chunk.iter()) {
+                        *l += *r;
+                    }
+                });
+            lhs.version().bump();
+            return Ok(lhs);
+        }
+    }
+
+    // Single-thread tight loop. The `+=` operator on f32 collapses
+    // to a single `fadd` instruction; LLVM auto-vectorises across
+    // 4-element lanes (NEON) or 8-element (AVX2 fma) without the
+    // closure barrier of the generic path.
+    for (l, r) in lhs_slice.iter_mut().zip(rhs_slice.iter()) {
+        *l += *r;
+    }
+    lhs.version().bump();
+    Ok(lhs)
+}
+
 fn strided_index(linear: usize, shape: &[usize], strides: &[isize], offset: usize) -> usize {
     let mut idx = linear;
     let mut storage = offset as isize;

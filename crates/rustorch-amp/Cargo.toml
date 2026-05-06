@@ -13,6 +13,12 @@ categories.workspace = true
 [dependencies]
 half = { workspace = true }
 
+# bf16/fp16 GEMM dispatches to a single-precision GEMM after up-cast
+# (no native bf16 cblas on macOS). gemm crate handles non-macOS;
+# Accelerate FFI handles macOS. P3.X T7 (bf16 perf path).
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "macos")))'.dependencies]
+gemm = { version = "0.18", default-features = false, features = ["rayon"] }
+
 [dev-dependencies]
 proptest = { workspace = true }
 

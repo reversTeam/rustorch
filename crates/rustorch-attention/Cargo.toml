@@ -13,6 +13,12 @@ categories.workspace = true
 [dependencies]
 rayon = { workspace = true }
 
+# State-of-the-art pure-Rust GEMM (faer-rs ecosystem). Used as the
+# non-macOS f32 path for Flash Attention's tile-level Q@K^T and P@V
+# matmuls. P3.X T6 (flash BLAS path).
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "macos")))'.dependencies]
+gemm = { version = "0.18", default-features = false, features = ["rayon"] }
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest  = { workspace = true }

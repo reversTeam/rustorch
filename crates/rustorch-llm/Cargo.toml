@@ -1,0 +1,55 @@
+[package]
+name = "rustorch-llm"
+description = "LLM-runner core for RusTorch — Llama / Qwen architecture, safetensors checkpoint loader, and the autoregressive decode loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rustorch-core      = { workspace = true }
+rustorch-serde     = { workspace = true }
+rustorch-nn        = { workspace = true }
+rustorch-tokenizer = { workspace = true }
+rustorch-fusion    = { workspace = true }
+rustorch-gguf      = { workspace = true }
+serde              = { workspace = true, features = ["derive"] }
+serde_json         = { version = "1" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Used by `qwen_inference_metal` example to wire our T71/T72 Metal
+# Q4_K / Q6_K kernels into the rustorch-llm decode loop and measure
+# end-to-end tok/s on Apple Silicon.
+rustorch-metal = { workspace = true }
+metal          = "0.29"
+
+[[example]]
+name = "qwen_inference"
+path = "examples/qwen_inference.rs"
+
+[[example]]
+name = "inspect_qnorm"
+path = "examples/inspect_qnorm.rs"
+
+[[example]]
+name = "qwen_inference_metal"
+path = "examples/qwen_inference_metal.rs"
+required-features = []
+
+[[example]]
+name = "qwen35_inspect"
+path = "examples/qwen35_inspect.rs"
+
+[[example]]
+name = "qwen35_metal_kernel_parity"
+path = "examples/qwen35_metal_kernel_parity.rs"
+required-features = []
+
+[[example]]
+name = "qwen35_inference_metal"
+path = "examples/qwen35_inference_metal.rs"
+required-features = []

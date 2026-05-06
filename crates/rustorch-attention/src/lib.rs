@@ -16,6 +16,8 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+#[cfg(target_os = "macos")]
+pub mod accelerate;
 pub mod cpu_backward;
 pub mod cpu_forward;
 pub mod gpu_wgsl;

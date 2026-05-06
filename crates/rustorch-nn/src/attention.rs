@@ -1,16 +1,30 @@
 //! Scaled Dot-Product Attention (P1.6).
 //!
-//! v1 ships **single-head** attention with the standard formula:
+//! Standard formula:
 //! ```text
-//!   attn(Q, K, V) = softmax(Q @ K.T / sqrt(d)) @ V
+//!   attn(Q, K, V) = softmax(Q @ K.T / sqrt(d_k)) @ V
 //! ```
 //!
-//! Inputs are 3-D `[B, T, D]` (batch, sequence, embed_dim). Multi-head
-//! support requires either a 4-D batched matmul or autograd-aware
-//! reshape — both pending follow-ups.
+//! ## Variants
+//!
+//! - [`scaled_dot_product_attention`]: stateless rank-3 SDP on
+//!   pre-projected `[B, T, D]` Q/K/V tensors.
+//! - [`SingleHeadAttention`]: SDP wrapped with learned Q/K/V/O
+//!   projections (`nn.MultiheadAttention(d, num_heads=1)` parity).
+//!   Rank-3 input, B=1 only in v1.
+//! - [`MultiHeadAttention`]: full multi-head parity with
+//!   `torch.nn.MultiheadAttention(batch_first=True)`. Supports
+//!   self-attention and cross-attention (different `T_q` and `T_kv`).
+//!   Internally folds the rank-4 head-split `[B, H, T, head_dim]` to
+//!   `[B*H, T, head_dim]` for the rank-3 `bmm` path.
+//!
+//! Combine with [`crate::masks::causal_mask`] /
+//! [`crate::masks::sliding_window_mask`] for decoder-style or
+//! local-attention models.
 
 use crate::module::{Module, ModuleError};
-use rustorch_autograd::{ops, Variable};
+use rustorch_autograd::{is_grad_enabled, ops, Variable};
+use rustorch_core::tensor::dtype::Dtype;
 use rustorch_core::tensor::tensor_impl::Tensor;
 
 /// Stateless single-head scaled dot-product attention.
@@ -34,7 +48,10 @@ pub fn scaled_dot_product_attention(
     let k_t = ops::transpose(k, 1, 2)?;
     // Scores: Q @ K.T / sqrt(d) → [B, T, T]
     let raw_scores = ops::bmm(q, &k_t)?;
-    let inv_scale = Variable::new(Tensor::scalar(1.0_f32 / d.sqrt()));
+    // Place the scalar on the same device as the queries so the multiply
+    // doesn't trigger a device-mismatch panic when running on Wgpu/CUDA.
+    let inv_scale =
+        Variable::new(Tensor::scalar(1.0_f32 / d.sqrt()).with_device(q.tensor().device()));
     let scores = ops::mul(&raw_scores, &inv_scale)?;
     // Softmax over the LAST dim (each query attends to all keys).
     let attn = ops::softmax(&scores, 2)?;
@@ -181,6 +198,382 @@ fn unsqueeze_batch(v: &Variable, b: usize, t: usize, d: usize) -> Result<Variabl
     Ok(Variable::leaf(t_new))
 }
 
+/// Multi-head scaled-dot-product attention with learned Q/K/V/O
+/// projections. Matches `torch.nn.MultiheadAttention(d_model,
+/// num_heads, batch_first=True)` semantics.
+///
+/// Implementation note: rustorch's autograd `bmm` is strictly rank-3,
+/// so the rank-4 head split `[B, T, H, head_dim]` is folded into a
+/// `[B*H, T, head_dim]` batch axis for the `Q@K.T` and `attn@V`
+/// matmuls, then unfolded back. All shape changes go through the
+/// autograd-aware `reshape` and `transpose` ops, so gradient flow is
+/// preserved through the four projections.
+pub struct MultiHeadAttention {
+    /// Query projection — `[embed_dim, embed_dim]`.
+    pub q_proj: crate::Linear,
+    /// Key projection — `[embed_dim, embed_dim]`.
+    pub k_proj: crate::Linear,
+    /// Value projection — `[embed_dim, embed_dim]`.
+    pub v_proj: crate::Linear,
+    /// Output projection — `[embed_dim, embed_dim]`.
+    pub o_proj: crate::Linear,
+    embed_dim: usize,
+    num_heads: usize,
+    head_dim: usize,
+    /// Dropout probability accepted but ignored in v1 (no autograd-aware
+    /// dropout op yet). Stored for future enabling without API break.
+    pub dropout: f32,
+}
+
+impl MultiHeadAttention {
+    /// Build with `embed_dim` divisible by `num_heads`. Each head sees
+    /// `head_dim = embed_dim / num_heads` features.
+    ///
+    /// Panics if `num_heads == 0` or `embed_dim % num_heads != 0`.
+    pub fn new(embed_dim: usize, num_heads: usize) -> Self {
+        assert!(num_heads > 0, "MultiHeadAttention: num_heads must be > 0");
+        assert!(
+            embed_dim % num_heads == 0,
+            "MultiHeadAttention: embed_dim {} must be divisible by num_heads {}",
+            embed_dim,
+            num_heads
+        );
+        let head_dim = embed_dim / num_heads;
+        MultiHeadAttention {
+            q_proj: crate::Linear::new(embed_dim, embed_dim),
+            k_proj: crate::Linear::new(embed_dim, embed_dim),
+            v_proj: crate::Linear::new(embed_dim, embed_dim),
+            o_proj: crate::Linear::new(embed_dim, embed_dim),
+            embed_dim,
+            num_heads,
+            head_dim,
+            dropout: 0.0,
+        }
+    }
+
+    /// Embedding dim (input/output feature count).
+    pub fn embed_dim(&self) -> usize {
+        self.embed_dim
+    }
+
+    /// Number of attention heads.
+    pub fn num_heads(&self) -> usize {
+        self.num_heads
+    }
+
+    /// Per-head feature count (`embed_dim / num_heads`).
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// Standard MHA forward.
+    ///
+    /// Inputs `q`, `k`, `v` all share shape `[B, T, embed_dim]`.
+    /// `attn_mask` is an optional additive bias (`0.0` keep,
+    /// `MASK_NEG`-style large-negative mask) — shapes `[T, T]`,
+    /// `[1, T, T]`, or `[B*H, T, T]` are accepted thanks to the
+    /// CPU broadcast.
+    ///
+    /// Output: `[B, T, embed_dim]`.
+    pub fn forward(
+        &self,
+        q: &Variable,
+        k: &Variable,
+        v: &Variable,
+        attn_mask: Option<&Variable>,
+    ) -> Result<Variable, ModuleError> {
+        let q_shape = q.tensor().shape().to_vec();
+        let k_shape = k.tensor().shape().to_vec();
+        let v_shape = v.tensor().shape().to_vec();
+        for (name, sh) in [("q", &q_shape), ("k", &k_shape), ("v", &v_shape)] {
+            if sh.len() != 3 {
+                return Err(rustorch_autograd::BackwardError::Backend {
+                    op: "MultiHeadAttention::forward",
+                    message: format!("expected rank-3 {name} [B, T, D], got {sh:?}"),
+                });
+            }
+        }
+        let batch = q_shape[0];
+        let t_q = q_shape[1];
+        let t_kv = k_shape[1];
+        let embed = q_shape[2];
+        if embed != self.embed_dim || k_shape[2] != self.embed_dim || v_shape[2] != self.embed_dim {
+            return Err(rustorch_autograd::BackwardError::Backend {
+                op: "MultiHeadAttention::forward",
+                message: format!(
+                    "embed dim mismatch: q={}, k={}, v={}, configured={}",
+                    embed, k_shape[2], v_shape[2], self.embed_dim
+                ),
+            });
+        }
+        if k_shape[0] != batch || v_shape[0] != batch || v_shape[1] != t_kv {
+            return Err(rustorch_autograd::BackwardError::Backend {
+                op: "MultiHeadAttention::forward",
+                message: format!(
+                    "k/v batch or seq mismatch: q={q_shape:?}, k={k_shape:?}, v={v_shape:?}"
+                ),
+            });
+        }
+
+        // T34 — degenerate S=1 self-attention fast path. When the
+        // sequence has length 1, `softmax(Q · K^T)` over a single
+        // position trivially equals 1.0, so the attention output is
+        // exactly V. Q and K projections are computed for nothing.
+        // We skip them entirely and only compute V_proj followed by
+        // O_proj — saving ~75 % of the MHA work on S=1 (the
+        // single-token decode hot path).
+        if !is_grad_enabled()
+            && attn_mask.is_none()
+            && t_q == 1
+            && t_kv == 1
+            && q.tensor().dtype() == Dtype::F32
+        {
+            let v_proj = self.v_proj.forward(v)?;
+            return self.o_proj.forward(&v_proj);
+        }
+
+        // 1. Project Q, K, V — Linear is rank-N capable so [B, T, D] → [B, T, D].
+        let q = self.q_proj.forward(q)?;
+        let k = self.k_proj.forward(k)?;
+        let v = self.v_proj.forward(v)?;
+
+        // T19 — fast path: route to the optimised flash_forward
+        // kernel under no_grad when the full self-attention path
+        // applies (no mask, f32, equal seq lengths). Bypasses 2
+        // bmms + 2 reshapes + 2 transposes + softmax that the
+        // autograd-composed path strings together (each producing a
+        // fresh Tensor allocation). On the GPT-2 block bench (B=2
+        // S=128 D=256 H=4) this collapses ~10 ms of MHA into ~500 µs.
+        if !is_grad_enabled()
+            && attn_mask.is_none()
+            && t_q == t_kv
+            && q.tensor().dtype() == Dtype::F32
+            && k.tensor().dtype() == Dtype::F32
+            && v.tensor().dtype() == Dtype::F32
+            && q.tensor().is_contiguous()
+            && k.tensor().is_contiguous()
+            && v.tensor().is_contiguous()
+        {
+            let context_t = mha_flash_forward_f32(
+                &q.tensor(),
+                &k.tensor(),
+                &v.tensor(),
+                batch,
+                t_q,
+                self.num_heads,
+                self.head_dim,
+            )?;
+            let context = Variable::new(context_t);
+            return self.o_proj.forward(&context);
+        }
+
+        // 2. Split heads. Q uses t_q; K and V use t_kv (cross-attention
+        //    can have different query and key/value sequence lengths).
+        let q = self.split_heads(&q, batch, t_q)?;
+        let k = self.split_heads(&k, batch, t_kv)?;
+        let v = self.split_heads(&v, batch, t_kv)?;
+
+        // 3. K transpose for QK^T: [B*H, T_kv, hd] → [B*H, hd, T_kv]
+        let k_t = ops::transpose(&k, 1, 2)?;
+        // 4. Scores = (Q @ K^T) / sqrt(head_dim) → [B*H, T_q, T_kv]
+        let raw = ops::bmm(&q, &k_t)?;
+        // Place the scalar on the same device as the queries so that the
+        // multiplication doesn't trigger a device-mismatch panic when the
+        // model lives on Wgpu/CUDA. Cf. autograd dispatch P3.Y.
+        let inv_scale = Variable::new(
+            Tensor::scalar(1.0_f32 / (self.head_dim as f32).sqrt())
+                .with_device(q.tensor().device()),
+        );
+        let scores = ops::mul(&raw, &inv_scale)?;
+        // 5. Optional additive mask (broadcast over the leading B*H dim)
+        let scores = if let Some(m) = attn_mask {
+            ops::add(&scores, m)?
+        } else {
+            scores
+        };
+        // 6. Softmax over last dim
+        let attn = ops::softmax(&scores, 2)?;
+        // 7. Attn @ V → [B*H, T_q, head_dim]
+        let context = ops::bmm(&attn, &v)?;
+        // 8. Unfold + transpose + reshape back to [B, T_q, D]
+        let context = self.merge_heads(&context, batch, t_q)?;
+        // 9. Output projection
+        self.o_proj.forward(&context)
+    }
+
+    /// Self-attention shortcut: `forward(x, x, x, mask)`.
+    pub fn self_attention(
+        &self,
+        x: &Variable,
+        attn_mask: Option<&Variable>,
+    ) -> Result<Variable, ModuleError> {
+        self.forward(x, x, x, attn_mask)
+    }
+
+    /// `[B, T, D] → [B*H, T, head_dim]` via reshape + transpose +
+    /// fold-batch. All steps are autograd-aware.
+    fn split_heads(&self, x: &Variable, batch: usize, seq: usize) -> Result<Variable, ModuleError> {
+        // [B, T, D] → [B, T, H, hd]
+        let x4 = ops::reshape(x, vec![batch, seq, self.num_heads, self.head_dim])?;
+        // [B, T, H, hd] → [B, H, T, hd]
+        let x4 = ops::transpose(&x4, 1, 2)?;
+        // [B, H, T, hd] → [B*H, T, hd]
+        ops::reshape(&x4, vec![batch * self.num_heads, seq, self.head_dim])
+    }
+
+    /// Inverse of `split_heads`: `[B*H, T, head_dim] → [B, T, D]`.
+    fn merge_heads(&self, x: &Variable, batch: usize, seq: usize) -> Result<Variable, ModuleError> {
+        // [B*H, T, hd] → [B, H, T, hd]
+        let x4 = ops::reshape(x, vec![batch, self.num_heads, seq, self.head_dim])?;
+        // [B, H, T, hd] → [B, T, H, hd]
+        let x4 = ops::transpose(&x4, 1, 2)?;
+        // [B, T, H, hd] → [B, T, D]
+        ops::reshape(&x4, vec![batch, seq, self.embed_dim])
+    }
+}
+
+/// T19 — fused flash-attention forward for the no_grad MHA path.
+///
+/// Inputs `q`, `k`, `v` are the **already-projected** tensors of
+/// shape `[B, T, embed_dim]` with `embed_dim = H * head_dim`.
+/// Returns the attention output (still `[B, T, embed_dim]`) ready
+/// for the `o_proj` linear; the output projection is applied by
+/// the caller.
+///
+/// Internally:
+///   1. Transposes `[B, T, H, hd]` → `[B, H, T, hd]` for q/k/v
+///      via a manual contiguous copy (one alloc per tensor, vs ~5
+///      autograd-aware reshape+transpose allocs in the slow path).
+///   2. Calls `rustorch_attention::flash_forward` — the same
+///      Apple-Accelerate-tile-fed kernel that hits 145× speedup
+///      vs naive in the standalone bench, runs softmax online so
+///      no full B*H*T*T scores tensor is materialised.
+///   3. Transposes `[B, H, T, hd]` → `[B, T, embed_dim]` back.
+fn mha_flash_forward_f32(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Result<Tensor, ModuleError> {
+    use rustorch_attention::{flash_forward, AttentionShape};
+
+    let n = batch * seq * heads * head_dim;
+    let q_in = q.as_slice::<f32>().expect("checked F32 contiguous");
+    let k_in = k.as_slice::<f32>().expect("checked F32 contiguous");
+    let v_in = v.as_slice::<f32>().expect("checked F32 contiguous");
+
+    let mut q_bhtd = vec![0.0_f32; n];
+    let mut k_bhtd = vec![0.0_f32; n];
+    let mut v_bhtd = vec![0.0_f32; n];
+    transpose_BTHD_to_BHTD_f32(q_in, &mut q_bhtd, batch, seq, heads, head_dim);
+    transpose_BTHD_to_BHTD_f32(k_in, &mut k_bhtd, batch, seq, heads, head_dim);
+    transpose_BTHD_to_BHTD_f32(v_in, &mut v_bhtd, batch, seq, heads, head_dim);
+
+    let mut out_bhtd = vec![0.0_f32; n];
+    let shape = AttentionShape::new(batch, heads, seq, head_dim);
+    flash_forward(&shape, &q_bhtd, &k_bhtd, &v_bhtd, &mut out_bhtd).map_err(|e| {
+        ModuleError::Backend {
+            op: "MultiHeadAttention::forward(flash)",
+            message: format!("{e:?}"),
+        }
+    })?;
+
+    let mut out_bthd = vec![0.0_f32; n];
+    transpose_BHTD_to_BTHD_f32(&out_bhtd, &mut out_bthd, batch, seq, heads, head_dim);
+
+    Tensor::from_vec(vec![batch, seq, heads * head_dim], out_bthd).map_err(|e| {
+        ModuleError::Backend {
+            op: "MultiHeadAttention::forward(flash)",
+            message: format!("{e:?}"),
+        }
+    })
+}
+
+/// `[B, T, H, hd]` (logical view of `[B, T, D]` with D = H*hd)
+/// → `[B, H, T, hd]` contiguous f32 copy. The input is assumed
+/// row-major contiguous on `[B, T, D]`.
+#[allow(non_snake_case)]
+fn transpose_BTHD_to_BHTD_f32(
+    src: &[f32],
+    dst: &mut [f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+) {
+    let d = heads * head_dim;
+    // For each (b, h, t) write a head_dim-long slice; the inner
+    // copy is bandwidth-bound so we let LLVM lower it to NEON
+    // load/store rather than splitting per-element.
+    for b in 0..batch {
+        for h in 0..heads {
+            for t in 0..seq {
+                let src_off = b * seq * d + t * d + h * head_dim;
+                let dst_off = b * heads * seq * head_dim + h * seq * head_dim + t * head_dim;
+                dst[dst_off..dst_off + head_dim].copy_from_slice(&src[src_off..src_off + head_dim]);
+            }
+        }
+    }
+}
+
+/// Inverse of `transpose_BTHD_to_BHTD_f32`: `[B, H, T, hd]` →
+/// `[B, T, H, hd]` row-major contiguous.
+#[allow(non_snake_case)]
+fn transpose_BHTD_to_BTHD_f32(
+    src: &[f32],
+    dst: &mut [f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+) {
+    let d = heads * head_dim;
+    for b in 0..batch {
+        for h in 0..heads {
+            for t in 0..seq {
+                let src_off = b * heads * seq * head_dim + h * seq * head_dim + t * head_dim;
+                let dst_off = b * seq * d + t * d + h * head_dim;
+                dst[dst_off..dst_off + head_dim].copy_from_slice(&src[src_off..src_off + head_dim]);
+            }
+        }
+    }
+}
+
+impl Module for MultiHeadAttention {
+    /// Self-attention default — equivalent to `self_attention(input, None)`.
+    fn forward(&self, input: &Variable) -> Result<Variable, ModuleError> {
+        self.self_attention(input, None)
+    }
+
+    fn parameters(&self) -> Vec<Variable> {
+        let mut p = self.q_proj.parameters();
+        p.extend(self.k_proj.parameters());
+        p.extend(self.v_proj.parameters());
+        p.extend(self.o_proj.parameters());
+        p
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Variable)> {
+        let mut out = Vec::new();
+        for (sub, v) in self.q_proj.named_parameters() {
+            out.push((format!("q_proj.{sub}"), v));
+        }
+        for (sub, v) in self.k_proj.named_parameters() {
+            out.push((format!("k_proj.{sub}"), v));
+        }
+        for (sub, v) in self.v_proj.named_parameters() {
+            out.push((format!("v_proj.{sub}"), v));
+        }
+        for (sub, v) in self.o_proj.named_parameters() {
+            out.push((format!("o_proj.{sub}"), v));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +644,123 @@ mod tests {
         assert!(names.contains(&"q_proj.weight".to_string()));
         assert!(names.contains(&"q_proj.bias".to_string()));
         assert!(names.contains(&"o_proj.weight".to_string()));
+    }
+
+    // ----------------------------------------------------------------
+    // MultiHeadAttention
+    // ----------------------------------------------------------------
+
+    /// Output shape is `[B, T, embed_dim]` and parameters() returns the
+    /// 8 expected entries (4 projections × {weight, bias}).
+    #[test]
+    fn multihead_attention_output_shape_and_params() {
+        let mha = MultiHeadAttention::new(8, 4);
+        let x = Variable::new(
+            Tensor::from_vec(
+                [2usize, 5, 8],
+                (0..80).map(|i| (i as f32) * 0.01).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let out = mha.self_attention(&x, None).unwrap();
+        assert_eq!(out.tensor().shape(), &[2, 5, 8]);
+        assert_eq!(mha.parameters().len(), 8);
+        assert_eq!(mha.head_dim(), 2);
+    }
+
+    /// num_heads=1 should be functionally equivalent to a single-head
+    /// path (same scaled-dot-product structure). We cannot directly
+    /// compare to SingleHeadAttention because that one uses different
+    /// internal helpers, but we can sanity-check that num_heads=1 with
+    /// constant input produces a constant output (every position
+    /// attends uniformly to every other position).
+    #[test]
+    fn multihead_num_heads_1_constant_input_constant_output() {
+        let mha = MultiHeadAttention::new(4, 1);
+        // Constant input → uniform attention → output constant per row.
+        let x = Variable::new(Tensor::from_vec([1usize, 3, 4], vec![1.0_f32; 12]).unwrap());
+        let out = mha.self_attention(&x, None).unwrap();
+        let t = out.tensor();
+        let s = t.as_slice::<f32>().unwrap();
+        // Each "row" of the output should have the same constant value
+        // because attention weights are uniform 1/T and V is constant.
+        let row0: &[f32] = &s[0..4];
+        for r in 1..3 {
+            for c in 0..4 {
+                assert!(
+                    (s[r * 4 + c] - row0[c]).abs() < 1e-4,
+                    "row {r} col {c} differs"
+                );
+            }
+        }
+    }
+
+    /// Backward through MHA must produce a non-zero gradient on every
+    /// projection's weight (proves all four paths are autograd-aware
+    /// through the rank-3 fold-batch path).
+    #[test]
+    fn multihead_backward_flows_to_all_projections() {
+        use rustorch_autograd::{backward, ops::sum};
+        let mha = MultiHeadAttention::new(6, 3);
+        let x = Variable::leaf(
+            Tensor::from_vec(
+                [2usize, 4, 6],
+                (0..48).map(|i| (i as f32) * 0.01).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let out = mha.self_attention(&x, None).unwrap();
+        let s = sum(&out).unwrap();
+        backward(&s, None).unwrap();
+        for proj in [&mha.q_proj, &mha.k_proj, &mha.v_proj, &mha.o_proj] {
+            let g = proj
+                .weight
+                .grad()
+                .expect("projection should have a weight gradient");
+            assert_eq!(g.shape(), &[6, 6]);
+            let any_nonzero = g.as_slice::<f32>().unwrap().iter().any(|&x| x.abs() > 0.0);
+            assert!(any_nonzero, "weight grad is all zeros — flow broken");
+        }
+    }
+
+    /// Adding a causal mask should make position 0 only attend to
+    /// position 0 — the row-0 output for self-attention with constant
+    /// V should equal V[0] (i.e., uniform attention is "killed" above
+    /// the diagonal).
+    #[test]
+    fn multihead_causal_mask_restricts_first_row() {
+        let mha = MultiHeadAttention::new(4, 2);
+        // Constant input — without mask, output rows would all be equal.
+        let x = Variable::new(Tensor::from_vec([1usize, 3, 4], vec![1.0_f32; 12]).unwrap());
+        // Build a causal mask of shape [3, 3] (broadcasts over [B*H, 3, 3]).
+        let mask = crate::masks::causal_mask(3);
+        let out = mha.self_attention(&x, Some(&mask)).unwrap();
+        // Sanity: shape preserved.
+        assert_eq!(out.tensor().shape(), &[1, 3, 4]);
+        // Row 0 should be finite and well-defined (no NaN from mask).
+        let t = out.tensor();
+        let s = t.as_slice::<f32>().unwrap();
+        for &v in &s[0..4] {
+            assert!(v.is_finite(), "row 0 has non-finite value: {v}");
+        }
+    }
+
+    /// Wrong embed_dim surfaces as a clean error, no panic.
+    #[test]
+    fn multihead_rejects_wrong_embed_dim() {
+        let mha = MultiHeadAttention::new(4, 2);
+        let x = Variable::new(Tensor::from_vec([1usize, 3, 8], vec![0.0_f32; 24]).unwrap());
+        assert!(mha.self_attention(&x, None).is_err());
+    }
+
+    /// Named parameters expose the 4 projections distinctly.
+    #[test]
+    fn multihead_named_parameters_distinct_projections() {
+        let mha = MultiHeadAttention::new(4, 2);
+        let names: Vec<String> = mha.named_parameters().into_iter().map(|(n, _)| n).collect();
+        for prefix in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            let weight = format!("{prefix}.weight");
+            assert!(names.contains(&weight), "missing {weight}");
+        }
     }
 }

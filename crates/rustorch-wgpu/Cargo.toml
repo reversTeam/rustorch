@@ -17,7 +17,11 @@ default = []
 gpu-tests = []
 
 [dependencies]
-rustorch-core = { workspace = true }
+# Enable the `wgpu` feature on rustorch-core so we can use Storage::Wgpu
+# / WgpuShared directly. Required by Task A (P3.Z) for the round-trip
+# elimination — Tensors hold their GPU buffer natively in Storage,
+# not as a separate cache outside the type.
+rustorch-core = { workspace = true, features = ["wgpu"] }
 rustorch-cpu  = { workspace = true }
 wgpu          = { workspace = true }
 pollster      = { workspace = true }

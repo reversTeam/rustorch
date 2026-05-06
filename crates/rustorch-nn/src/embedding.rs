@@ -10,7 +10,8 @@
 
 use crate::init::{init_with_seed, Init};
 use crate::module::{Module, ModuleError};
-use rustorch_autograd::{ops, Variable};
+use rustorch_autograd::{is_grad_enabled, ops, Variable};
+use rustorch_core::tensor::dtype::Dtype;
 use rustorch_core::tensor::tensor_impl::Tensor;
 
 /// `nn.Embedding(vocab_size, embed_dim)`.
@@ -57,8 +58,60 @@ impl Embedding {
 
     /// Forward with a 1-D I64 index tensor — returns `[len(indices), embed_dim]`.
     pub fn forward_indices(&self, indices: &Tensor) -> Result<Variable, ModuleError> {
+        // T26 — fast path: under no_grad, do a direct row-copy lookup
+        // bypassing the autograd `index_select` which materialises a
+        // full strided copy of the weight matrix on every call. For
+        // a vocab=50257 dim=768 weight (38 M f32 = 150 MB), that's
+        // a ~50 ms catastrophe per forward pass. Direct copy of N
+        // rows × 768 = ~5 µs on M-series Macs.
+        let w_t = self.weight.tensor();
+        if !is_grad_enabled()
+            && w_t.dtype() == Dtype::F32
+            && w_t.is_contiguous()
+            && indices.dtype() == Dtype::I64
+            && indices.is_contiguous()
+            && indices.ndim() == 1
+        {
+            let out = embedding_lookup_f32_dense(&w_t, self.embed_dim, indices)?;
+            return Ok(Variable::new(out));
+        }
         ops::index_select(&self.weight, indices)
     }
+}
+
+/// T26 — direct row-copy embedding lookup (no_grad fast path).
+///
+/// Bypasses the autograd `index_select` which on every call clones
+/// the full weight matrix via a strided iter — pathological for
+/// vocab×dim ≥ 1 M.
+fn embedding_lookup_f32_dense(
+    weight: &Tensor,
+    embed_dim: usize,
+    indices: &Tensor,
+) -> Result<Tensor, ModuleError> {
+    let n = indices.numel();
+    let vocab = weight.shape()[0];
+    let w_slice = weight.as_slice::<f32>().expect("checked F32 contiguous");
+    let idx_slice = indices.as_slice::<i64>().expect("checked I64 contiguous");
+
+    let mut out = vec![0.0_f32; n * embed_dim];
+    for (i, &raw_idx) in idx_slice.iter().enumerate() {
+        if raw_idx < 0 || (raw_idx as usize) >= vocab {
+            return Err(ModuleError::Backend {
+                op: "Embedding::forward_indices(fast)",
+                message: format!("index {raw_idx} out of vocab [0, {vocab})"),
+            });
+        }
+        let row = raw_idx as usize;
+        let src_off = row * embed_dim;
+        let dst_off = i * embed_dim;
+        out[dst_off..dst_off + embed_dim].copy_from_slice(&w_slice[src_off..src_off + embed_dim]);
+    }
+
+    Tensor::from_vec(vec![n, embed_dim], out).map_err(|e| ModuleError::Backend {
+        op: "Embedding::forward_indices(fast)",
+        message: format!("{e:?}"),
+    })
 }
 
 impl Module for Embedding {

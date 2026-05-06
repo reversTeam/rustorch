@@ -39,14 +39,51 @@ pub const CPU_ALIGN: usize = 64;
 
 /// Refcounted, type-erased buffer that backs a tensor.
 ///
-/// `#[non_exhaustive]` so adding `Cuda(...)` / `Wgpu(...)` later is
-/// non-breaking for downstream code that uses pattern matching with a
-/// catch-all arm.
+/// `#[non_exhaustive]` so adding new variants is non-breaking for
+/// downstream code that uses pattern matching with a catch-all arm.
+///
+/// **P3.Z Storage Option A** (Task A):
+/// - `Cpu` always present.
+/// - `Wgpu`        — feature `wgpu`, used by the `rustorch-wgpu` backend
+///   (cross-platform AMD / Intel / WebGPU canonical perf path).
+/// - `WgpuShared`  — feature `wgpu`, **macOS only**: unified-memory
+///   buffer mapped via `MAPPABLE_PRIMARY_BUFFERS` (zero-copy CPU↔GPU).
+/// - `Cuda`        — feature `cuda`, used by the `rustorch-cuda` backend
+///   (NVIDIA H100 + RTX canonical perf path).
+/// - `Metal`       — feature `metal`, used by the `rustorch-metal`
+///   backend (Apple Silicon canonical perf path).
+///
+/// `as_slice::<T>()` (and the public surface that returns `&[T]`) is
+/// **strict**: it returns `None` for any non-`Cpu` variant. Callers
+/// that need host bytes must call `.to_cpu()` (sync) or
+/// `.to_cpu_async()` first. This catches cross-device bugs at the
+/// type-system level — no surprise materialisation, no hidden
+/// round-trips. Matches PyTorch's `.cpu().numpy()` discipline,
+/// candle's `Storage::Cpu(...)` checks, and JAX/MLX device-strict APIs.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Storage {
     /// Aligned heap buffer on the host (CPU).
     Cpu(CpuStorage),
+    /// `wgpu::Buffer` handle for the cross-platform GPU path
+    /// (`rustorch-wgpu` backend). Concrete payload is feature-gated
+    /// to avoid pulling `wgpu` into builds that don't need it.
+    #[cfg(feature = "wgpu")]
+    Wgpu(WgpuStorage),
+    /// Unified-memory `wgpu::Buffer` (macOS only) — same semantics as
+    /// `Wgpu` but allocated with `MAPPABLE_PRIMARY_BUFFERS` so the
+    /// GPU buffer can be mapped to host memory without a staging copy.
+    /// Massive win on Apple Silicon thanks to the unified architecture.
+    #[cfg(all(feature = "wgpu", target_os = "macos", not(target_arch = "wasm32")))]
+    WgpuShared(WgpuSharedStorage),
+    /// CUDA device pointer (`rustorch-cuda` backend). Populated by
+    /// `rustorch-cuda` Task M.
+    #[cfg(feature = "cuda")]
+    Cuda(CudaStorage),
+    /// Metal `MTLBuffer` handle (`rustorch-metal` backend). Populated
+    /// by `rustorch-metal` Task J.
+    #[cfg(feature = "metal")]
+    Metal(MetalStorage),
 }
 
 impl Storage {
@@ -85,6 +122,14 @@ impl Storage {
     pub fn byte_len(&self) -> usize {
         match self {
             Storage::Cpu(s) => s.byte_len,
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(s) => s.byte_len(),
+            #[cfg(all(feature = "wgpu", target_os = "macos", not(target_arch = "wasm32")))]
+            Storage::WgpuShared(s) => s.byte_len(),
+            #[cfg(feature = "cuda")]
+            Storage::Cuda(s) => s.byte_len(),
+            #[cfg(feature = "metal")]
+            Storage::Metal(s) => s.byte_len(),
         }
     }
 
@@ -100,23 +145,69 @@ impl Storage {
     pub fn strong_count(&self) -> usize {
         match self {
             Storage::Cpu(s) => Arc::strong_count(&s.inner),
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(s) => Arc::strong_count(&s.inner),
+            #[cfg(all(feature = "wgpu", target_os = "macos", not(target_arch = "wasm32")))]
+            Storage::WgpuShared(s) => Arc::strong_count(&s.inner),
+            #[cfg(feature = "cuda")]
+            Storage::Cuda(s) => Arc::strong_count(&s.inner),
+            #[cfg(feature = "metal")]
+            Storage::Metal(s) => Arc::strong_count(&s.inner),
         }
     }
 
-    /// Read-only access to the raw bytes. Returns `&[]` when
-    /// `byte_len() == 0`.
+    /// `true` iff this `Storage` lives on the host (CPU). All other
+    /// variants (Wgpu / WgpuShared / Cuda / Metal) return `false`.
+    /// **STRICT semantics** — callers that need host bytes MUST check
+    /// this first or call `Tensor::to_cpu()` to materialise.
+    #[inline]
+    pub fn is_cpu(&self) -> bool {
+        matches!(self, Storage::Cpu(_))
+    }
+
+    /// `true` iff this `Storage` lives on a GPU device (any of the
+    /// non-Cpu variants).
+    #[inline]
+    pub fn is_gpu(&self) -> bool {
+        !self.is_cpu()
+    }
+
+    /// Read-only access to the raw bytes — **CPU only**.
+    /// Returns `&[]` for non-Cpu variants (rather than panicking) so
+    /// existing low-level callers degrade gracefully; high-level
+    /// `Tensor::as_slice::<T>()` and `Tensor::data()` enforce strict
+    /// semantics by returning `None` / panicking with a clear
+    /// "tensor not on CPU" message when the storage is on a device.
+    /// Returns `&[]` when `byte_len() == 0` regardless of variant.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Storage::Cpu(s) => s.as_bytes(),
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(_) => &[],
+            #[cfg(all(feature = "wgpu", target_os = "macos", not(target_arch = "wasm32")))]
+            Storage::WgpuShared(s) => s.as_bytes_if_mapped().unwrap_or(&[]),
+            #[cfg(feature = "cuda")]
+            Storage::Cuda(_) => &[],
+            #[cfg(feature = "metal")]
+            Storage::Metal(_) => &[],
         }
     }
 
-    /// Get a mutable slice if and only if `is_unique()` returns `true`.
-    /// Returns `None` if any clone exists (caller must `to_owned` /
-    /// COW).
+    /// Get a mutable slice if and only if `is_unique()` returns `true`
+    /// AND the storage is on CPU (or a host-mappable GPU variant such
+    /// as `WgpuShared`). Returns `None` for shared-Arc storages and
+    /// for non-host GPU variants (`Wgpu`, `Cuda`, `Metal`).
     pub fn as_bytes_mut(&mut self) -> Option<&mut [u8]> {
         match self {
             Storage::Cpu(s) => s.as_bytes_mut(),
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(_) => None,
+            #[cfg(all(feature = "wgpu", target_os = "macos", not(target_arch = "wasm32")))]
+            Storage::WgpuShared(s) => s.as_bytes_mut_if_mapped(),
+            #[cfg(feature = "cuda")]
+            Storage::Cuda(_) => None,
+            #[cfg(feature = "metal")]
+            Storage::Metal(_) => None,
         }
     }
 
@@ -125,7 +216,9 @@ impl Storage {
     /// # Safety
     ///
     /// `T` must match the dtype the buffer was allocated for, and the
-    /// byte length must be divisible by `size_of::<T>()`.
+    /// byte length must be divisible by `size_of::<T>()`. Returns an
+    /// empty slice for any non-Cpu variant (callers requiring host
+    /// data MUST go through `Tensor::to_cpu()` first).
     pub unsafe fn as_slice<T: Copy + 'static>(&self) -> &[T] {
         let bytes = self.as_bytes();
         if bytes.is_empty() {
@@ -158,9 +251,22 @@ impl CpuStorage {
             return Ok(empty_cpu());
         }
         let layout = alloc_layout(byte_len)?;
-        // SAFETY: layout is non-zero because byte_len > 0.
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).ok_or(StorageError::OutOfMemory { byte_len })?;
+        // T40 — try the thread-local pool first. On a hit we
+        // still need to zero the buffer (zeroed contract); but we
+        // skip the system alloc + page-fault. On a miss we fall
+        // back to alloc_zeroed which combines both.
+        let ptr = if let Some(reused) = cpu_storage_pool::try_acquire(layout) {
+            // SAFETY: reused ptr was allocated with the same layout;
+            // memset it to zero to honour the `zeroed` contract.
+            unsafe {
+                core::ptr::write_bytes(reused.as_ptr(), 0, byte_len);
+            }
+            reused
+        } else {
+            // SAFETY: layout is non-zero because byte_len > 0.
+            let raw = unsafe { alloc::alloc_zeroed(layout) };
+            NonNull::new(raw).ok_or(StorageError::OutOfMemory { byte_len })?
+        };
         Ok(CpuStorage::wrap(ptr, layout, byte_len))
     }
 
@@ -169,9 +275,15 @@ impl CpuStorage {
             return Ok(empty_cpu());
         }
         let layout = alloc_layout(byte_len)?;
-        // SAFETY: layout is non-zero because byte_len > 0.
-        let ptr = unsafe { alloc::alloc(layout) };
-        let ptr = NonNull::new(ptr).ok_or(StorageError::OutOfMemory { byte_len })?;
+        // T40 — try the thread-local pool first; pool buffers carry
+        // unspecified contents so they satisfy `uninit` directly.
+        let ptr = if let Some(reused) = cpu_storage_pool::try_acquire(layout) {
+            reused
+        } else {
+            // SAFETY: layout is non-zero because byte_len > 0.
+            let raw = unsafe { alloc::alloc(layout) };
+            NonNull::new(raw).ok_or(StorageError::OutOfMemory { byte_len })?
+        };
         Ok(CpuStorage::wrap(ptr, layout, byte_len))
     }
 
@@ -253,10 +365,120 @@ impl fmt::Debug for CpuStorageInner {
 impl Drop for CpuStorageInner {
     fn drop(&mut self) {
         if self.byte_len > 0 {
-            // SAFETY: ptr/layout are the ones returned from `alloc_*`
-            // with the same `AllocLayout`.
-            unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+            // T40 — thread-local caching allocator. Instead of
+            // `alloc::dealloc` we try to push the buffer back to
+            // the pool keyed on its allocation layout. The next
+            // allocation request for the same layout will reuse
+            // this buffer instead of going to the system allocator,
+            // saving the page-fault + kernel context-switch cost
+            // on hot transformer paths where Tensor materialise +
+            // drop cycles compound across 60+ ops per forward.
+            //
+            // If the pool refuses (cap reached, or zero-sized), we
+            // fall back to the underlying `alloc::dealloc`.
+            if !cpu_storage_pool::try_release(self.ptr, self.layout) {
+                // SAFETY: ptr/layout are the ones returned from
+                // `alloc_*` with the same `AllocLayout`.
+                unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+            }
         }
+    }
+}
+
+// --------------------------------------------------------------------------
+// T40 — thread-local CpuStorage caching allocator
+// --------------------------------------------------------------------------
+
+/// Thread-local pool of recently-released CpuStorage buffers, keyed
+/// on `(size, align)`. PyTorch's `c10::Allocator` does the same on
+/// CPU; without it, every transformer forward heap-thrashes the
+/// system allocator (60+ allocs at typical layer counts).
+mod cpu_storage_pool {
+    use super::AllocLayout;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::ptr::NonNull;
+
+    /// Maximum buffers retained per (size, align) bucket. Each
+    /// bucket holds buffers for a specific allocation layout; this
+    /// cap keeps total memory bounded even if a workload churns
+    /// through many distinct layouts.
+    const PER_BUCKET_CAP: usize = 16;
+
+    /// Maximum total bytes retained in the pool. Protects against
+    /// pathological workloads that allocate hundreds of MB of
+    /// short-lived tensors in a hot loop.
+    const POOL_BYTE_BUDGET: usize = 256 * 1024 * 1024;
+
+    struct Pool {
+        /// (size, align) -> stack of free buffers.
+        buckets: HashMap<(usize, usize), Vec<NonNull<u8>>>,
+        retained_bytes: usize,
+    }
+
+    impl Pool {
+        fn new() -> Self {
+            Pool {
+                buckets: HashMap::new(),
+                retained_bytes: 0,
+            }
+        }
+    }
+
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            // Release every retained buffer when the thread exits.
+            for ((size, align), stack) in self.buckets.drain() {
+                if let Ok(layout) = AllocLayout::from_size_align(size, align) {
+                    for ptr in stack {
+                        // SAFETY: ptr was originally allocated with
+                        // this exact layout (we only push matching
+                        // (size, align) entries below).
+                        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+                    }
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static POOL: RefCell<Pool> = RefCell::new(Pool::new());
+    }
+
+    /// Try to obtain a buffer matching `layout` from the pool.
+    /// Returns `Some(ptr)` on a hit; the caller becomes the owner
+    /// and is responsible for the (eventual) `dealloc` or
+    /// `try_release`. Returns `None` on a miss.
+    pub fn try_acquire(layout: AllocLayout) -> Option<NonNull<u8>> {
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            let key = (layout.size(), layout.align());
+            let stack = pool.buckets.get_mut(&key)?;
+            let ptr = stack.pop()?;
+            pool.retained_bytes = pool.retained_bytes.saturating_sub(layout.size());
+            Some(ptr)
+        })
+    }
+
+    /// Try to return a buffer to the pool. Returns `true` on a
+    /// successful retain; `false` if the bucket is full or the
+    /// global byte budget is exceeded — in which case the caller
+    /// must `dealloc` the buffer themselves.
+    pub fn try_release(ptr: NonNull<u8>, layout: AllocLayout) -> bool {
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.retained_bytes.saturating_add(layout.size()) > POOL_BYTE_BUDGET {
+                return false;
+            }
+            let key = (layout.size(), layout.align());
+            let stack = pool.buckets.entry(key).or_default();
+            if stack.len() >= PER_BUCKET_CAP {
+                return false;
+            }
+            stack.push(ptr);
+            pool.retained_bytes += layout.size();
+            true
+        })
     }
 }
 
@@ -286,6 +508,473 @@ fn empty_cpu() -> CpuStorage {
         byte_len: 0,
     }
 }
+
+// --------------------------------------------------------------------------
+// GPU Storage variants — Task A (P3.Z Storage Option A)
+//
+// Each backend provides concrete payloads for its variant via these
+// types. Drop hooks (return-to-pool callbacks) are stored as
+// `Box<dyn FnOnce>` and invoked **once at the buffer's drop time** —
+// this is NOT per-op virtual dispatch, just a one-shot teardown
+// callback that lets pool semantics live in the backend crate
+// without polluting `rustorch-core` with pool internals.
+// --------------------------------------------------------------------------
+
+#[cfg(feature = "wgpu")]
+mod wgpu_storage {
+    use super::*;
+    use core::mem::ManuallyDrop;
+
+    /// Drop callback type. Captured at allocation time by
+    /// [`WgpuStorage::with_pool_return`] and invoked exactly once when
+    /// the underlying `wgpu::Buffer` would otherwise be freed. Lets
+    /// the `rustorch-wgpu` `BufferPool` recycle buffers without
+    /// rustorch-core knowing about pool internals.
+    type DropCallback = Box<dyn FnOnce(wgpu::Buffer) + Send + Sync + 'static>;
+
+    /// `wgpu::Buffer` handle held by `Storage::Wgpu`. Cheap clone via
+    /// `Arc<WgpuStorageInner>`.
+    #[derive(Clone)]
+    pub struct WgpuStorage {
+        pub(super) inner: Arc<WgpuStorageInner>,
+    }
+
+    /// Single owner of a `wgpu::Buffer` plus the optional
+    /// return-to-pool callback. `ManuallyDrop` lets the `Drop` impl
+    /// move the buffer out and feed it to the callback exactly once.
+    pub struct WgpuStorageInner {
+        buffer: ManuallyDrop<wgpu::Buffer>,
+        /// Logical byte length (may be ≤ `buffer.size()` because wgpu
+        /// rounds up to the device's minimum buffer alignment).
+        byte_len: usize,
+        /// One-shot teardown hook. `None` for buffers that should
+        /// drop normally; `Some(f)` for pool-managed buffers where
+        /// `f(buffer)` returns the buffer to the pool's free list.
+        on_drop: Option<DropCallback>,
+    }
+
+    impl WgpuStorage {
+        /// Wrap a fresh `wgpu::Buffer` with no pool integration. The
+        /// buffer drops normally (freed back to the GPU allocator)
+        /// when the last clone is dropped.
+        pub fn standalone(buffer: wgpu::Buffer, byte_len: usize) -> Self {
+            WgpuStorage {
+                inner: Arc::new(WgpuStorageInner {
+                    buffer: ManuallyDrop::new(buffer),
+                    byte_len,
+                    on_drop: None,
+                }),
+            }
+        }
+
+        /// Wrap a fresh `wgpu::Buffer` with a return-to-pool callback.
+        /// `on_drop(buffer)` is invoked exactly once when the last
+        /// clone is dropped — the callback typically pushes `buffer`
+        /// into a `BufferPool` bucket. If the pool has been torn down
+        /// by the time `on_drop` fires, the callback should let the
+        /// buffer drop normally.
+        pub fn with_pool_return(
+            buffer: wgpu::Buffer,
+            byte_len: usize,
+            on_drop: impl FnOnce(wgpu::Buffer) + Send + Sync + 'static,
+        ) -> Self {
+            WgpuStorage {
+                inner: Arc::new(WgpuStorageInner {
+                    buffer: ManuallyDrop::new(buffer),
+                    byte_len,
+                    on_drop: Some(Box::new(on_drop)),
+                }),
+            }
+        }
+
+        /// Borrow the underlying `wgpu::Buffer`. Used by backend
+        /// kernels for `as_entire_binding()` and `copy_buffer_*` ops.
+        #[inline]
+        pub fn buffer(&self) -> &wgpu::Buffer {
+            &self.inner.buffer
+        }
+
+        /// Strong reference count for the underlying inner allocation.
+        /// Used by backend code that wants to detect "this is the only
+        /// owner — safe to drop without leaking pool semantics".
+        #[inline]
+        pub fn strong_count(&self) -> usize {
+            Arc::strong_count(&self.inner)
+        }
+
+        /// Logical byte length (may be ≤ `buffer.size()` because of
+        /// wgpu alignment padding).
+        #[inline]
+        pub fn byte_len(&self) -> usize {
+            self.inner.byte_len
+        }
+    }
+
+    /// `Deref` lets existing call sites that expect a `&wgpu::Buffer`
+    /// keep working unchanged: e.g. `storage.buffer.as_entire_binding()`
+    /// when `WgpuStorage` is held in a struct with a `pub buffer`
+    /// field of this type.
+    impl core::ops::Deref for WgpuStorage {
+        type Target = wgpu::Buffer;
+        #[inline]
+        fn deref(&self) -> &wgpu::Buffer {
+            &self.inner.buffer
+        }
+    }
+
+    impl fmt::Debug for WgpuStorage {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("WgpuStorage")
+                .field("byte_len", &self.inner.byte_len)
+                .field("buffer_size", &self.inner.buffer.size())
+                .field("pool_managed", &self.inner.on_drop.is_some())
+                .finish()
+        }
+    }
+
+    impl Drop for WgpuStorageInner {
+        fn drop(&mut self) {
+            // SAFETY: ManuallyDrop::take is called exactly once at drop time.
+            let buf = unsafe { ManuallyDrop::take(&mut self.buffer) };
+            if let Some(f) = self.on_drop.take() {
+                f(buf);
+            }
+            // else: `buf` falls out of scope and frees the GPU memory normally.
+        }
+    }
+
+    // -- WgpuShared (macOS unified memory zero-copy) -----------------------
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+    pub use shared::WgpuSharedStorage;
+
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+    mod shared {
+        use super::*;
+        use std::sync::Mutex;
+
+        /// macOS-only: a `wgpu::Buffer` allocated with
+        /// `MAPPABLE_PRIMARY_BUFFERS` so its memory is shared between
+        /// CPU and GPU on Apple Silicon. After a one-shot
+        /// `map_async`, the host can read/write the bytes directly
+        /// with no staging copy. Mirrors MLX's unified-memory pattern.
+        #[derive(Clone)]
+        pub struct WgpuSharedStorage {
+            pub(in super::super) inner: Arc<WgpuSharedStorageInner>,
+        }
+
+        pub struct WgpuSharedStorageInner {
+            buffer: ManuallyDrop<wgpu::Buffer>,
+            byte_len: usize,
+            /// Cached host-mapped pointer + length, populated by
+            /// `map_async` lazily. `None` until first `map_*` call;
+            /// `Some(_)` once mapped.
+            mapped: Mutex<Option<MappedRange>>,
+            on_drop: Option<DropCallback>,
+        }
+
+        /// Raw pointer + length of the host-mapped region. Lifetime
+        /// is tied to the parent `WgpuSharedStorageInner` (held alive
+        /// by `Arc`), so the `&[u8]` we hand out via
+        /// `as_bytes_if_mapped` is safe as long as the storage lives.
+        struct MappedRange {
+            ptr: *mut u8,
+            len: usize,
+        }
+
+        // SAFETY: the mapped region is just bytes; access is
+        // serialised by the `Mutex` in `WgpuSharedStorageInner`.
+        unsafe impl Send for MappedRange {}
+        unsafe impl Sync for MappedRange {}
+
+        impl WgpuSharedStorage {
+            /// Wrap a fresh mappable `wgpu::Buffer`. Callers MUST have
+            /// allocated with `wgpu::Features::MAPPABLE_PRIMARY_BUFFERS`
+            /// and `BufferUsages::STORAGE | MAP_READ | MAP_WRITE`.
+            pub fn standalone(buffer: wgpu::Buffer, byte_len: usize) -> Self {
+                WgpuSharedStorage {
+                    inner: Arc::new(WgpuSharedStorageInner {
+                        buffer: ManuallyDrop::new(buffer),
+                        byte_len,
+                        mapped: Mutex::new(None),
+                        on_drop: None,
+                    }),
+                }
+            }
+
+            /// Borrow the underlying `wgpu::Buffer`.
+            #[inline]
+            pub fn buffer(&self) -> &wgpu::Buffer {
+                &self.inner.buffer
+            }
+
+            /// Logical byte length.
+            #[inline]
+            pub fn byte_len(&self) -> usize {
+                self.inner.byte_len
+            }
+
+            /// Borrow the host-mapped bytes if `map_async` has
+            /// already been driven to completion. Returns `None`
+            /// otherwise — caller should call
+            /// [`Self::ensure_mapped_blocking`] first.
+            pub fn as_bytes_if_mapped(&self) -> Option<&[u8]> {
+                let guard = self.inner.mapped.lock().ok()?;
+                let m = guard.as_ref()?;
+                // SAFETY: `m.ptr`/`m.len` are valid as long as `self`
+                // (which holds the buffer) lives.
+                Some(unsafe { core::slice::from_raw_parts(m.ptr, m.len) })
+            }
+
+            /// Like [`Self::as_bytes_if_mapped`] but the underlying
+            /// `Storage::as_bytes_mut` path needs a `&mut [u8]`. We
+            /// hand it out under the same Mutex so concurrent maps
+            /// can't overlap. Caller is responsible for buffer-state
+            /// invariants (no in-flight GPU writes during the borrow).
+            pub fn as_bytes_mut_if_mapped(&mut self) -> Option<&mut [u8]> {
+                // We need `&mut [u8]` — only safe if we have the only
+                // strong reference to `inner`.
+                if Arc::strong_count(&self.inner) != 1 {
+                    return None;
+                }
+                let guard = self.inner.mapped.lock().ok()?;
+                let m = guard.as_ref()?;
+                // SAFETY: unique Arc owner above; mapped region is
+                // valid for the buffer's lifetime.
+                Some(unsafe { core::slice::from_raw_parts_mut(m.ptr, m.len) })
+            }
+        }
+
+        impl fmt::Debug for WgpuSharedStorage {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("WgpuSharedStorage")
+                    .field("byte_len", &self.inner.byte_len)
+                    .field("mapped", &self.inner.mapped.lock().is_ok())
+                    .finish()
+            }
+        }
+
+        impl Drop for WgpuSharedStorageInner {
+            fn drop(&mut self) {
+                // SAFETY: ManuallyDrop::take called exactly once.
+                let buf = unsafe { ManuallyDrop::take(&mut self.buffer) };
+                if let Some(f) = self.on_drop.take() {
+                    f(buf);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+pub use wgpu_storage::WgpuStorage;
+
+#[cfg(all(feature = "wgpu", target_os = "macos", not(target_arch = "wasm32")))]
+pub use wgpu_storage::WgpuSharedStorage;
+
+// -- CUDA placeholder -----------------------------------------------------
+// rustorch-cuda Task M will swap this for the real cudarc-backed type.
+#[cfg(feature = "cuda")]
+mod cuda_storage {
+    use super::*;
+
+    /// Placeholder CUDA storage. `rustorch-cuda` Task M will populate
+    /// the inner with a real `cudarc::driver::CudaSlice<u8>` (or
+    /// equivalent device pointer + dropper).
+    #[derive(Clone)]
+    pub struct CudaStorage {
+        pub(super) inner: Arc<CudaStorageInner>,
+    }
+
+    /// Inner — currently records only a logical byte length. Will be
+    /// extended with the cudarc handle at Task M.
+    pub struct CudaStorageInner {
+        byte_len: usize,
+    }
+
+    impl CudaStorage {
+        /// Build a placeholder with a logical byte length. Real
+        /// allocator API lands with `rustorch-cuda` Task M.
+        pub fn placeholder(byte_len: usize) -> Self {
+            CudaStorage {
+                inner: Arc::new(CudaStorageInner { byte_len }),
+            }
+        }
+
+        /// Logical byte length of the (placeholder) device buffer.
+        #[inline]
+        pub fn byte_len(&self) -> usize {
+            self.inner.byte_len
+        }
+    }
+
+    impl fmt::Debug for CudaStorage {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("CudaStorage")
+                .field("byte_len", &self.inner.byte_len)
+                .finish()
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub use cuda_storage::CudaStorage;
+
+// -- Metal storage --------------------------------------------------------
+// On macOS with `feature = "metal"`, this is a real `metal::Buffer`
+// handle with the same Drop-callback pool pattern used by WgpuStorage.
+// On other targets, it stays a placeholder so feature=metal still
+// compiles for cross-platform CI.
+#[cfg(feature = "metal")]
+mod metal_storage {
+    use super::*;
+    #[cfg(target_os = "macos")]
+    use core::mem::ManuallyDrop;
+
+    /// Drop callback type. Captured at allocation time by the
+    /// `rustorch-metal` heap allocator and invoked exactly once when
+    /// the underlying `metal::Buffer` would otherwise be freed. Lets
+    /// the Metal heap recycle buffers without rustorch-core knowing
+    /// about heap internals.
+    #[cfg(target_os = "macos")]
+    type DropCallback = Box<dyn FnOnce(metal::Buffer) + Send + Sync + 'static>;
+
+    /// Apple `metal::Buffer` handle held by `Storage::Metal`. Cheap
+    /// clone via `Arc<MetalStorageInner>`. Same Drop-hook pool
+    /// pattern as `WgpuStorage`.
+    #[derive(Clone)]
+    pub struct MetalStorage {
+        pub(super) inner: Arc<MetalStorageInner>,
+    }
+
+    /// Single owner of a `metal::Buffer` plus the optional return-to-
+    /// heap callback. `ManuallyDrop` lets the `Drop` impl move the
+    /// buffer out and feed it to the callback exactly once.
+    #[cfg(target_os = "macos")]
+    pub struct MetalStorageInner {
+        buffer: ManuallyDrop<metal::Buffer>,
+        byte_len: usize,
+        on_drop: Option<DropCallback>,
+    }
+
+    /// Non-macOS placeholder — same struct shape (so callers compile)
+    /// but holds nothing; constructors error out at runtime.
+    #[cfg(not(target_os = "macos"))]
+    pub struct MetalStorageInner {
+        byte_len: usize,
+    }
+
+    impl MetalStorage {
+        /// **macOS only**. Wrap a fresh `metal::Buffer` with no heap
+        /// integration. The buffer drops normally when the last
+        /// clone is dropped.
+        #[cfg(target_os = "macos")]
+        pub fn standalone(buffer: metal::Buffer, byte_len: usize) -> Self {
+            MetalStorage {
+                inner: Arc::new(MetalStorageInner {
+                    buffer: ManuallyDrop::new(buffer),
+                    byte_len,
+                    on_drop: None,
+                }),
+            }
+        }
+
+        /// **macOS only**. Wrap a `metal::Buffer` with a return-to-
+        /// heap callback. The callback fires exactly once when the
+        /// last clone is dropped.
+        #[cfg(target_os = "macos")]
+        pub fn with_pool_return(
+            buffer: metal::Buffer,
+            byte_len: usize,
+            on_drop: impl FnOnce(metal::Buffer) + Send + Sync + 'static,
+        ) -> Self {
+            MetalStorage {
+                inner: Arc::new(MetalStorageInner {
+                    buffer: ManuallyDrop::new(buffer),
+                    byte_len,
+                    on_drop: Some(Box::new(on_drop)),
+                }),
+            }
+        }
+
+        /// Build a placeholder with a logical byte length only. Used
+        /// on non-macOS targets and for tests that don't need a real
+        /// buffer. On macOS prefer [`Self::standalone`] /
+        /// [`Self::with_pool_return`].
+        #[cfg(not(target_os = "macos"))]
+        pub fn placeholder(byte_len: usize) -> Self {
+            MetalStorage {
+                inner: Arc::new(MetalStorageInner { byte_len }),
+            }
+        }
+
+        /// Borrow the underlying `metal::Buffer`. Used by Metal kernel
+        /// dispatch (set_buffer, etc.). macOS only.
+        #[cfg(target_os = "macos")]
+        #[inline]
+        pub fn buffer(&self) -> &metal::Buffer {
+            &self.inner.buffer
+        }
+
+        /// Logical byte length (may be ≤ `buffer.length()` if the
+        /// allocator pads to a heap bucket size).
+        #[inline]
+        pub fn byte_len(&self) -> usize {
+            self.inner.byte_len
+        }
+
+        /// Strong reference count for the underlying inner allocation.
+        #[inline]
+        pub fn strong_count(&self) -> usize {
+            Arc::strong_count(&self.inner)
+        }
+
+        /// Stable identifier (Arc pointer cast to usize) for use as a
+        /// cache key. Two clones of the same `MetalStorage` share the
+        /// same id; distinct allocations have distinct ids. Used by
+        /// the Metal backend's bf16-cast cache to amortise f32 → bf16
+        /// conversions across multiple matmul calls on the same buffer.
+        #[inline]
+        pub fn cache_key(&self) -> usize {
+            Arc::as_ptr(&self.inner) as usize
+        }
+    }
+
+    impl fmt::Debug for MetalStorage {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("MetalStorage")
+                .field("byte_len", &self.inner.byte_len)
+                .finish()
+        }
+    }
+
+    /// `Deref<Target = metal::Buffer>` lets call sites that hold a
+    /// `MetalStorage` access the underlying `metal::Buffer` methods
+    /// (`length()`, `contents()`, …) without an explicit `.buffer()`
+    /// indirection. Mirrors the wgpu side.
+    #[cfg(target_os = "macos")]
+    impl core::ops::Deref for MetalStorage {
+        type Target = metal::Buffer;
+        #[inline]
+        fn deref(&self) -> &metal::Buffer {
+            &self.inner.buffer
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for MetalStorageInner {
+        fn drop(&mut self) {
+            // SAFETY: ManuallyDrop::take is called exactly once at drop time.
+            let buf = unsafe { ManuallyDrop::take(&mut self.buffer) };
+            if let Some(f) = self.on_drop.take() {
+                f(buf);
+            }
+            // else: `buf` falls out of scope and frees the Metal memory normally.
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+pub use metal_storage::MetalStorage;
 
 // --------------------------------------------------------------------------
 // Errors

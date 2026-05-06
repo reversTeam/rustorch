@@ -91,13 +91,37 @@ impl WgpuBackend {
             backends,
             ..Default::default()
         });
-        // Enumerate, score, and pick the best (or the requested index).
-        let adapters: Vec<wgpu::Adapter> = instance.enumerate_adapters(backends);
-        let chosen = if let Some(i) = index {
-            adapters.into_iter().nth(i).ok_or(WgpuError::NoAdapter)?
-        } else if adapters.is_empty() {
-            // Fall back to request_adapter — some platforms (browser)
-            // don't expose enumerate_adapters meaningfully.
+        // On native targets, enumerate adapters and pick the best (or the
+        // requested index) by scoring the device type. On wasm32 the
+        // browser-backed wgpu instance doesn't expose enumerate_adapters,
+        // so we fall back to the standard `request_adapter` path which
+        // returns whatever adapter the WebGPU runtime hands us.
+        #[cfg(not(target_arch = "wasm32"))]
+        let chosen = {
+            let adapters: Vec<wgpu::Adapter> = instance.enumerate_adapters(backends);
+            if let Some(i) = index {
+                adapters.into_iter().nth(i).ok_or(WgpuError::NoAdapter)?
+            } else if adapters.is_empty() {
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        force_fallback_adapter: false,
+                        compatible_surface: None,
+                    })
+                    .await
+                    .ok_or(WgpuError::NoAdapter)?
+            } else {
+                adapters
+                    .into_iter()
+                    .max_by_key(|a| score_adapter_type(a.get_info().device_type))
+                    .ok_or(WgpuError::NoAdapter)?
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let chosen = {
+            // `index` is meaningless on the browser path — WebGPU only
+            // surfaces a single navigator-selected adapter.
+            let _ = index;
             instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
@@ -106,14 +130,19 @@ impl WgpuBackend {
                 })
                 .await
                 .ok_or(WgpuError::NoAdapter)?
-        } else {
-            adapters
-                .into_iter()
-                .max_by_key(|a| score_adapter_type(a.get_info().device_type))
-                .ok_or(WgpuError::NoAdapter)?
         };
 
         let features_req = wgpu::Features::empty();
+        // Native targets: take whatever the adapter gives us.
+        // WebGPU (browser): take the adapter's limits to keep all the
+        // headroom we need for compute (workgroup size, storage buffer
+        // size, ...). The wgpu-22-specific field
+        // `maxInterStageShaderComponents` that newer Chrome rejects is
+        // stripped by a JS shim in `web/index.html` before the
+        // descriptor reaches `GPUAdapter.requestDevice`. Using the
+        // downlevel_webgl2 set instead would zero
+        // `max_compute_invocations_per_workgroup`, breaking every
+        // compute shader the demo runs.
         let limits = chosen.limits();
         let (device, queue) = chosen
             .request_device(
@@ -129,8 +158,10 @@ impl WgpuBackend {
             .map_err(|e| WgpuError::DeviceRequest(e.to_string()))?;
         // Capture the uncaptured-error stream so wgpu validation
         // failures surface as `WgpuError::Validation` rather than
-        // panicking through wgpu's default handler.
-        device.on_uncaptured_error(Box::new(|e| {
+        // panicking through wgpu's default handler. The closure type
+        // is annotated explicitly because rustc can't infer it on the
+        // wasm32 target where `Error` is a JS-bound type alias.
+        device.on_uncaptured_error(Box::new(|e: wgpu::Error| {
             // Uncaptured errors are reported via the tracing/log
             // ecosystem so users can hook them however they like.
             // We use eprintln! as the lowest-friction sink.

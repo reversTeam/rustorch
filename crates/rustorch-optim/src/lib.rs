@@ -1,15 +1,25 @@
 //! # rustorch-optim — Optimizers + LR schedulers (P1.7).
 //!
-//! v1 ships:
+//! ## Public surface
+//!
+//! ### Optimizers
 //! - [`Optimizer`] trait — `step`, `zero_grad`, `set_lr`, `lr`.
 //! - [`Sgd`] — vanilla + momentum + Nesterov + weight_decay.
 //! - [`Adam`] / [`AdamW`] — adaptive optimisers with bias correction.
+//! - [`Adagrad`], [`Adamax`], [`Adafactor`], [`Lion`], [`NAdam`],
+//!   [`RAdam`], [`RMSprop`].
+//!
+//! ### LR schedulers
 //! - [`LrScheduler`] trait + [`StepLR`] / [`ExponentialLR`] /
 //!   [`CosineAnnealingLR`] / [`LinearWarmup`] schedulers.
 //!
-//! More optimisers (Lion, Adafactor, RMSprop, NAdam, RAdam, LBFGS,
-//! Adadelta) and schedulers (OneCycle, Plateau, MultiStep, LambdaLR)
-//! plug into the same traits — they remain pending per the project plan.
+//! ### Gradient post-processing
+//! - [`clip_grad_norm_`] — global L2 grad clip
+//!   (`torch.nn.utils.clip_grad_norm_` parity).
+//! - [`clip_grad_norm_per_param_`] — per-parameter L2 clip variant.
+//!
+//! Pending the same traits: LBFGS, Adadelta; OneCycle / Plateau /
+//! MultiStep / LambdaLR schedulers.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
@@ -19,6 +29,7 @@ pub mod adafactor;
 pub mod adagrad;
 pub mod adam;
 pub mod adamax;
+pub mod clip;
 pub mod lion;
 pub mod nadam;
 pub mod radam;
@@ -31,6 +42,7 @@ pub use adafactor::Adafactor;
 pub use adagrad::Adagrad;
 pub use adam::{Adam, AdamW};
 pub use adamax::Adamax;
+pub use clip::{clip_grad_norm_, clip_grad_norm_per_param_};
 pub use lion::Lion;
 pub use nadam::NAdam;
 pub use radam::RAdam;
@@ -61,8 +73,19 @@ pub trait Optimizer {
 
 /// Helper: write a fresh `Vec<f32>` into the parameter's shared
 /// `data` slot. Used by SGD and the final update step of Adam/AdamW.
+///
+/// **P3.Z Task A**: keeps the parameter as CPU storage tagged with
+/// its original device. The next forward pass's `to_gpu` upload is
+/// fast (just `write_buffer`), so eagerly uploading here would cost
+/// MORE (forces `data_snapshot` to download on the next step).
+/// `Storage::Wgpu`-resident parameters arrive only when an upstream
+/// op produces them — Task O FusedAdamW will operate on those
+/// directly without involving this CPU helper.
 pub(crate) fn write_param_data(param: &Variable, new_data: Vec<f32>) {
+    let device = param.device();
     let shape = param.tensor().shape().to_vec();
-    let new_t = Tensor::from_vec(shape, new_data).expect("optimiser write");
+    let new_t = Tensor::from_vec(shape, new_data)
+        .expect("optimiser write")
+        .with_device(device);
     param.set_data(new_t);
 }
