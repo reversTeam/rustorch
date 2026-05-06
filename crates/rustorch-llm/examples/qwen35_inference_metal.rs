@@ -3181,6 +3181,7 @@ fn forward_batch(
                 LayerState::Attn(cache),
             ) => {
                 // Full batched : Attn + FFN dense.
+                let _t0_ab = std::time::Instant::now();
                 attn_block_forward_batch(
                     backend,
                     attn,
@@ -3195,6 +3196,8 @@ fn forward_batch(
                     max_seq,
                 )
                 .map_err(|e| format!("L{li} attn batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.attn_block_batched", _t0_ab);
+                let _t0_fb = std::time::Instant::now();
                 ffn_dense_forward_batch(
                     backend,
                     &attn.attn_post_norm,
@@ -3207,6 +3210,7 @@ fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("L{li} ffn batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.ffn_dense_batched", _t0_fb);
             },
             (
                 LayerMetal::Attn {
@@ -3276,6 +3280,7 @@ fn forward_batch(
             ) => {
                 // T162 phase 9e — SSM block batched (projections + apply_gate
                 // batched, scan séquentiel, output proj batched).
+                let _t0_sb = std::time::Instant::now();
                 ssm_block_forward_batch(
                     backend,
                     ssm,
@@ -3287,7 +3292,9 @@ fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("L{li} ssm batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.ssm_block_batched", _t0_sb);
                 // FFN dense batched (post-attn norm + gate/up/swiglu/down + residual).
+                let _t0_fb = std::time::Instant::now();
                 ffn_dense_forward_batch(
                     backend,
                     &ssm.attn_post_norm,
@@ -3300,6 +3307,7 @@ fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("L{li} ssm-ffn batched: {e:?}"))?;
+                profile_drain_record(backend, "  fb.ffn_dense_batched", _t0_fb);
             },
             (
                 LayerMetal::Ssm {
