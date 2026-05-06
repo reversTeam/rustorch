@@ -156,6 +156,9 @@ impl HybridMetalWeight {
                 }
             },
             GgmlType::Q4_K => {
+                // T177 (rejeté) — wiring qmv_fast ici a donné 0% gain mesurable
+                // sur 35B-A3B decode (matmul_into Q4_K = routing matmul ~50µs/call,
+                // pas le hot path). Cf. note T168 dans kernels.rs:7901.
                 sgemv_q4_k_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
             },
             GgmlType::Q5_K => {
@@ -2849,6 +2852,11 @@ fn ffn_dense_forward(
                                    x_stride: usize|
              -> Result<(), MetalError> {
                 match stacked.dtype {
+                    // T177 (rejeté, re-confirmation de T168) — wired
+                    // sgemv_q4_k_gather_qmv_fast_into ici → 0% gain mesuré
+                    // (42.0 vs 42.4 t/s sur 5 prompts naturels). MLX qmv_fast
+                    // pattern n'apporte rien sur Q4_K dequant ALU-saturé.
+                    // Cf. T168 dead-code doc dans kernels.rs:7901.
                     GgmlType::Q4_K => sgemv_q4_k_gather_f32_lcpp_nsg2_into(
                         backend,
                         x,
