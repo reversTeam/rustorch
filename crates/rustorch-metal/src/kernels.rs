@@ -13031,6 +13031,114 @@ pub fn routing_topk_softmax_norm_f32(
     Ok(())
 }
 
+// T174 — Sort tokens by expert (port of llama.cpp `kernel_mul_mm_id_map0`).
+//
+// Stage 1 of the M-major MoE BlockMMA pipeline. Takes the routing indices
+// (per-token expert IDs from topk_softmax) and produces:
+//   - tpe[E]   : token-per-expert count
+//   - ids[E,*] : per-expert sorted list of (token_idx * n_used + slot) values
+//
+// One TG with `n_experts` threads. Each thread owns one expert id and scans
+// all (token, slot) pairs to find ones routed to it. O(B × n_used) per
+// thread, all experts in parallel.
+//
+// Used by `mul_mm_id` (Stage 2) which dispatches a SGEMM per expert with
+// M = tpe[expert] tokens. Without this sort, batched MoE matmul cannot be
+// expressed as per-expert SGEMM — must use gather sgemv with per-row
+// expert lookup, which doesn't get BlockMMA throughput.
+//
+// Pre-conditions: n_experts <= 1024 (TG size limit on Metal3 Apple7+).
+const MUL_MM_ID_MAP0_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void mul_mm_id_map0(
+    device const uint*  indices,    // [B, n_used] expert ids per (token, slot)
+    device       uint*  tpe,        // [E] : token-per-expert count
+    device       uint*  ids,        // [E, max_per_expert] : sorted (b*n_used+slot) values
+    constant uint4&     dims,       // (B, n_used, n_experts, max_per_expert)
+    ushort              tpitg [[thread_position_in_threadgroup]]
+) {
+    uint expert = (uint)tpitg;
+    uint B = dims.x;
+    uint n_used = dims.y;
+    uint n_experts = dims.z;
+    uint max_per_expert = dims.w;
+    if (expert >= n_experts) return;
+
+    uint count = 0;
+    device uint* my_ids = ids + (uint64_t)expert * (uint64_t)max_per_expert;
+    uint b_n_used = B * n_used;
+
+    // Linear scan : O(B × n_used) per expert thread.
+    // For Qwen3.6 35B-A3B B=128 n_used=8 = 1024 reads/thread × 256 threads
+    // = 256K reads parallel. Trivially fast (~5 µs).
+    for (uint i = 0; i < b_n_used; ++i) {
+        uint id = indices[i];
+        if (id == expert && count < max_per_expert) {
+            my_ids[count] = i;  // i = b * n_used + slot, encodes both token & slot
+            count++;
+        }
+    }
+    tpe[expert] = count;
+}
+"#;
+
+/// T174 — Sort tokens by expert (Stage 1 of M-major MoE pipeline).
+///
+/// Port of llama.cpp's `kernel_mul_mm_id_map0`. Takes routing indices and
+/// produces (tpe[E], ids[E, max_per_expert]) suitable for per-expert SGEMM.
+///
+/// Pre-conditions :
+/// - `indices_buf` shape [B, n_used] u32
+/// - `tpe_buf` shape [E] u32 (output)
+/// - `ids_buf` shape [E, max_per_expert] u32 (output)
+/// - `n_experts <= 1024` (Metal TG size limit)
+/// - `max_per_expert >= B * n_used` (worst case: all routes to same expert)
+///   In practice, callers can pass `B * n_used` for a safe upper bound.
+pub fn mul_mm_id_map0_into(
+    backend: &MetalBackend,
+    indices_buf: &Buffer,
+    tpe_buf: &Buffer,
+    ids_buf: &Buffer,
+    b: usize,
+    n_used: usize,
+    n_experts: usize,
+    max_per_expert: usize,
+) -> Result<(), MetalError> {
+    if n_experts == 0 || n_experts > 1024 || b == 0 || n_used == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "mul_mm_id_map0: 0 < n_experts <= 1024, B > 0, n_used > 0 (got E={n_experts}, B={b}, n_used={n_used})"
+        )));
+    }
+    if max_per_expert < b * n_used {
+        return Err(MetalError::ShapeMismatch(format!(
+            "mul_mm_id_map0: max_per_expert ({max_per_expert}) must be >= B*n_used ({})",
+            b * n_used
+        )));
+    }
+    let pipeline = backend.pipeline("mul_mm_id_map0", MUL_MM_ID_MAP0_SHADER, "mul_mm_id_map0")?;
+    let dims = [
+        b as u32,
+        n_used as u32,
+        n_experts as u32,
+        max_per_expert as u32,
+    ];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(indices_buf), 0);
+        encoder.set_buffer(1, Some(tpe_buf), 0);
+        encoder.set_buffer(2, Some(ids_buf), 0);
+        encoder.set_bytes(3, 16, dims.as_ptr() as *const std::ffi::c_void);
+        // 1 TG with n_experts threads (round up to nearest 32 for SIMD efficiency).
+        let tg_threads = n_experts.div_ceil(32) * 32;
+        let tg_size = MTLSize::new(tg_threads as u64, 1, 1);
+        let groups = MTLSize::new(1, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T152.1b — top-K softmax + normalize 100% GPU sur 1 threadgroup.
 /// Pré-condition : `n_experts <= 256` et `k <= 16`. Pour le 35B-A3B :
 /// n_experts=256, k=8 → OK.
@@ -15009,6 +15117,115 @@ mod tests {
                 rel
             );
         }
+    }
+
+    /// T174 Day 1 — `mul_mm_id_map0` parity vs CPU reference.
+    ///
+    /// Builds a routing table for Qwen3.6-35B-A3B-style shapes (B=128
+    /// tokens, n_used=8, n_experts=256), runs the GPU kernel, compares
+    /// (tpe, ids) to a naive CPU sort.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn mul_mm_id_map0_matches_naive() {
+        let backend = metal_backend();
+
+        // Realistic shapes : 35B-A3B prefill batch.
+        let b = 128_usize;
+        let n_used = 8_usize;
+        let n_experts = 256_usize;
+        let b_n_used = b * n_used;
+        let max_per_expert = b_n_used; // safe upper bound
+
+        // Generate deterministic routing indices.
+        let indices: Vec<u32> = (0..b_n_used)
+            .map(|i| {
+                let h = (i as u64).wrapping_mul(2654435761) as u32;
+                h % (n_experts as u32)
+            })
+            .collect();
+
+        // CPU reference : same scan logic.
+        let mut tpe_ref = vec![0u32; n_experts];
+        let mut ids_ref = vec![0u32; n_experts * max_per_expert];
+        for (i, &id) in indices.iter().enumerate() {
+            let e = id as usize;
+            let pos = tpe_ref[e] as usize;
+            ids_ref[e * max_per_expert + pos] = i as u32;
+            tpe_ref[e] += 1;
+        }
+
+        // GPU run.
+        let indices_buf = backend.alloc_shared(b_n_used * 4).unwrap();
+        let tpe_buf = backend.alloc_shared(n_experts * 4).unwrap();
+        let ids_buf = backend
+            .alloc_shared(n_experts * max_per_expert * 4)
+            .unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                indices.as_ptr(),
+                indices_buf.contents() as *mut u32,
+                b_n_used,
+            );
+            // Zero outputs to detect missing writes.
+            std::ptr::write_bytes(tpe_buf.contents() as *mut u8, 0, n_experts * 4);
+            std::ptr::write_bytes(
+                ids_buf.contents() as *mut u8,
+                0,
+                n_experts * max_per_expert * 4,
+            );
+        }
+
+        mul_mm_id_map0_into(
+            backend,
+            &indices_buf,
+            &tpe_buf,
+            &ids_buf,
+            b,
+            n_used,
+            n_experts,
+            max_per_expert,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut tpe_got = vec![0u32; n_experts];
+        let mut ids_got = vec![0u32; n_experts * max_per_expert];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                tpe_buf.contents() as *const u32,
+                tpe_got.as_mut_ptr(),
+                n_experts,
+            );
+            std::ptr::copy_nonoverlapping(
+                ids_buf.contents() as *const u32,
+                ids_got.as_mut_ptr(),
+                n_experts * max_per_expert,
+            );
+        }
+
+        // Verify token-per-expert counts.
+        for e in 0..n_experts {
+            assert_eq!(
+                tpe_got[e], tpe_ref[e],
+                "tpe mismatch at expert {e}: got {} expected {}",
+                tpe_got[e], tpe_ref[e]
+            );
+        }
+        // Verify ids[expert, 0..tpe[expert]] match (only valid range).
+        for e in 0..n_experts {
+            let n = tpe_ref[e] as usize;
+            for i in 0..n {
+                assert_eq!(
+                    ids_got[e * max_per_expert + i],
+                    ids_ref[e * max_per_expert + i],
+                    "ids mismatch at expert {e}, slot {i}"
+                );
+            }
+        }
+
+        // Sanity: total tokens routed = B × n_used.
+        let total_routed: u32 = tpe_got.iter().sum();
+        assert_eq!(total_routed, b_n_used as u32);
     }
 
     /// T168 — Q4_K gather sgemv with qmv_fast pattern vs T152 lcpp_nsg2 reference.
