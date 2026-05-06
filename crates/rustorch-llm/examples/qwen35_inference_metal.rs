@@ -2283,6 +2283,308 @@ fn forward_token(
     Ok(argmax_cpu(&state.scratch.logits, cfg.vocab))
 }
 
+/// T162 phase 9d — Bundle of B_MAX-sized batched scratch buffers for
+/// `forward_batch`. Combines xd residual stream + attn block scratch + FFN
+/// dense scratch. SSM/MoE layers fall back to per-token sequential dispatch
+/// using the regular `Scratch` (passed alongside).
+struct BatchScratch {
+    xd: Buffer, // [B_MAX, d] residual stream
+    attn: BatchScratchAttn,
+    ffn: BatchScratchFfn,
+}
+
+impl BatchScratch {
+    fn new(backend: &MetalBackend, cfg: &Qwen35Config) -> Self {
+        let d = cfg.d;
+        Self {
+            xd: backend.alloc_shared(B_MAX_BATCH * d * 4).unwrap(),
+            attn: BatchScratchAttn::new(backend, cfg),
+            ffn: BatchScratchFfn::new(backend, cfg),
+        }
+    }
+}
+
+/// T162 phase 9d — Batched forward for B-token prefill on Qwen3.5/3.6 hybrid.
+///
+/// Per-layer dispatch :
+///   - Attn + Dense FFN  : full batched (attn_block_forward_batch + ffn_dense_forward_batch)
+///   - Attn + MoE FFN    : per-token loop (sequential forward_token-style block)
+///   - SSM  + Dense FFN  : SSM scan per-token (state recurrent), FFN dense batched
+///   - SSM  + MoE FFN    : per-token loop full layer
+///
+/// Pour 27B Dense (16 attn + 48 ssm) : ~50% des matmuls batchés (16×4 attn +
+/// 64×3 FFN dense) — Attn projections + tous les FFN. SSM scan reste séquentiel.
+///
+/// Pour 35B-A3B MoE : pas de speedup en phase 9d (tous les FFN sont MoE,
+/// donc per-token loop). 9f portera le MoE gather batched.
+///
+/// Final norm + lm_head : on calcule UNIQUEMENT pour le dernier token (B-1)
+/// car en prefill on veut juste le next-token id à partir du prompt complet.
+/// (Speculative decoding voudrait tous les B logits — phase ultérieure.)
+///
+/// Pré-conditions :
+///   - 1 ≤ B ≤ B_MAX_BATCH
+///   - `tokens.len() == B`
+///   - `pos_base + B ≤ max_seq`
+#[allow(clippy::too_many_arguments)]
+fn forward_batch(
+    backend: &MetalBackend,
+    file: &GgufFile,
+    model: &Qwen35MetalModel,
+    state: &mut DecodeState,
+    batch_scratch: &BatchScratch,
+    tokens: &[u32],
+    pos_base: usize,
+) -> Result<u32, String> {
+    let b = tokens.len();
+    if b == 0 || b > B_MAX_BATCH {
+        return Err(format!(
+            "forward_batch: B must be in 1..={B_MAX_BATCH} (got {b})"
+        ));
+    }
+    let cfg = &model.cfg;
+    let d = cfg.d;
+    let max_seq = state.max_seq;
+
+    // 1. Embed B tokens into xd_batched [B, d]. Reuse embed_token by
+    //    creating a per-token view (allocates a small temp f32 row).
+    for (bi, &tok) in tokens.iter().enumerate() {
+        let row_buf = backend.alloc_shared(d * 4).unwrap();
+        embed_token(file, tok, &row_buf, cfg)?;
+        unsafe {
+            let src = row_buf.contents() as *const f32;
+            let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
+            std::ptr::copy_nonoverlapping(src, dst, d);
+        }
+    }
+
+    // 2. Per-layer dispatch.
+    for li in 0..cfg.n_layers {
+        let layer = &model.layers[li];
+        match (layer, &state.layers[li]) {
+            (
+                LayerMetal::Attn {
+                    attn,
+                    ffn:
+                        FfnLayerMetal::Dense {
+                            w_gate,
+                            w_up,
+                            w_down,
+                        },
+                },
+                LayerState::Attn(cache),
+            ) => {
+                // Full batched : Attn + FFN dense.
+                attn_block_forward_batch(
+                    backend,
+                    attn,
+                    cache,
+                    &batch_scratch.xd,
+                    &state.rope_cos,
+                    &state.rope_sin,
+                    &batch_scratch.attn,
+                    cfg,
+                    pos_base,
+                    b,
+                    max_seq,
+                )
+                .map_err(|e| format!("L{li} attn batched: {e:?}"))?;
+                ffn_dense_forward_batch(
+                    backend,
+                    &attn.attn_post_norm,
+                    w_gate,
+                    w_up,
+                    w_down,
+                    &batch_scratch.xd,
+                    &batch_scratch.ffn,
+                    cfg,
+                    b,
+                )
+                .map_err(|e| format!("L{li} ffn batched: {e:?}"))?;
+            },
+            (LayerMetal::Attn { .. }, LayerState::Attn(_)) => {
+                // Attn + MoE : per-token loop. (Phase 9f portera le batched MoE.)
+                forward_batch_per_token_layer(
+                    backend,
+                    model,
+                    state,
+                    batch_scratch,
+                    li,
+                    b,
+                    pos_base,
+                )?;
+            },
+            (
+                LayerMetal::Ssm {
+                    ssm,
+                    ffn:
+                        FfnLayerMetal::Dense {
+                            w_gate,
+                            w_up,
+                            w_down,
+                        },
+                },
+                LayerState::Ssm(s),
+            ) => {
+                // SSM scan per-token (state recurrent ⇒ pas batchable trivialement),
+                // puis FFN dense batched.
+                // CRITICAL : drain pour que les GPU writes de la layer précédente
+                // (e.g. attn_block_forward_batch + ffn_dense_forward_batch) soient
+                // visibles avant la CPU-memcpy lecture de xd_batched.
+                backend.drain();
+                for bi in 0..b {
+                    // Copy xd_batched[bi] → scratch.xd.
+                    unsafe {
+                        let src = (batch_scratch.xd.contents() as *const f32).add(bi * d);
+                        let dst = state.scratch.xd.contents() as *mut f32;
+                        std::ptr::copy_nonoverlapping(src, dst, d);
+                    }
+                    let prefix = format!("p{:03}/L{li:02}", pos_base + bi);
+                    ssm_block_forward(backend, ssm, s, &state.scratch, cfg, &prefix)
+                        .map_err(|e| format!("L{li} ssm[{bi}]: {e:?}"))?;
+                    backend.drain();
+                    unsafe {
+                        let src = state.scratch.xd.contents() as *const f32;
+                        let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
+                        std::ptr::copy_nonoverlapping(src, dst, d);
+                    }
+                }
+                // FFN dense batched (post-attn norm + gate/up/swiglu/down + residual).
+                ffn_dense_forward_batch(
+                    backend,
+                    &ssm.attn_post_norm,
+                    w_gate,
+                    w_up,
+                    w_down,
+                    &batch_scratch.xd,
+                    &batch_scratch.ffn,
+                    cfg,
+                    b,
+                )
+                .map_err(|e| format!("L{li} ssm-ffn batched: {e:?}"))?;
+            },
+            (LayerMetal::Ssm { .. }, LayerState::Ssm(_)) => {
+                // SSM + MoE : per-token loop full layer.
+                forward_batch_per_token_layer(
+                    backend,
+                    model,
+                    state,
+                    batch_scratch,
+                    li,
+                    b,
+                    pos_base,
+                )?;
+            },
+            _ => return Err(format!("L{li}: kind/state mismatch")),
+        }
+    }
+
+    // 3. Final norm + lm_head sur le DERNIER token uniquement (next-token pred).
+    //    Copie xd_batched[B-1] → scratch.xd, puis run le path forward_token final.
+    //    CRITICAL : drain pour que les GPU writes de la dernière layer soient
+    //    visibles avant la CPU-memcpy lecture.
+    backend.drain();
+    unsafe {
+        let src = (batch_scratch.xd.contents() as *const f32).add((b - 1) * d);
+        let dst = state.scratch.xd.contents() as *mut f32;
+        std::ptr::copy_nonoverlapping(src, dst, d);
+    }
+    rms_norm_f32(
+        backend,
+        &state.scratch.xd,
+        &model.output_norm,
+        &state.scratch.h,
+        d,
+        cfg.rms_eps,
+    )
+    .map_err(|e| format!("final norm: {e:?}"))?;
+    model
+        .output
+        .matmul_into(backend, &state.scratch.h, &state.scratch.logits)
+        .map_err(|e| format!("lm_head: {e:?}"))?;
+    backend.drain();
+    Ok(argmax_cpu(&state.scratch.logits, cfg.vocab))
+}
+
+/// T162 phase 9d helper — single-layer per-token fallback for Attn+MoE / SSM+MoE.
+/// Iterates B times, copying xd_batched[bi] ↔ scratch.xd around a regular
+/// per-token block dispatch (attn_block_forward / ssm_block_forward + post-norm
+/// + ffn_dense_forward which handles the MoE branch).
+#[allow(clippy::too_many_arguments)]
+fn forward_batch_per_token_layer(
+    backend: &MetalBackend,
+    model: &Qwen35MetalModel,
+    state: &mut DecodeState,
+    batch_scratch: &BatchScratch,
+    li: usize,
+    b: usize,
+    pos_base: usize,
+) -> Result<(), String> {
+    let cfg = &model.cfg;
+    let d = cfg.d;
+    // CRITICAL : drain pour que les GPU writes des layers précédentes soient
+    // visibles avant les CPU-memcpy lectures de xd_batched.
+    backend.drain();
+    for bi in 0..b {
+        unsafe {
+            let src = (batch_scratch.xd.contents() as *const f32).add(bi * d);
+            let dst = state.scratch.xd.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(src, dst, d);
+        }
+        match (&model.layers[li], &state.layers[li]) {
+            (LayerMetal::Attn { attn, ffn }, LayerState::Attn(cache)) => {
+                attn_block_forward(
+                    backend,
+                    attn,
+                    cache,
+                    &state.scratch,
+                    &state.rope_cos,
+                    &state.rope_sin,
+                    cfg,
+                    pos_base + bi,
+                    state.max_seq,
+                )
+                .map_err(|e| format!("L{li}/{bi} attn: {e:?}"))?;
+                rms_norm_f32(
+                    backend,
+                    &state.scratch.xd,
+                    &attn.attn_post_norm,
+                    &state.scratch.h,
+                    d,
+                    cfg.rms_eps,
+                )
+                .map_err(|e| format!("L{li}/{bi} post norm: {e:?}"))?;
+                ffn_dense_forward(backend, ffn, &state.scratch, cfg)
+                    .map_err(|e| format!("L{li}/{bi} ffn: {e:?}"))?;
+            },
+            (LayerMetal::Ssm { ssm, ffn }, LayerState::Ssm(s)) => {
+                let prefix = format!("p{:03}/L{li:02}", pos_base + bi);
+                ssm_block_forward(backend, ssm, s, &state.scratch, cfg, &prefix)
+                    .map_err(|e| format!("L{li}/{bi} ssm: {e:?}"))?;
+                rms_norm_f32(
+                    backend,
+                    &state.scratch.xd,
+                    &ssm.attn_post_norm,
+                    &state.scratch.h,
+                    d,
+                    cfg.rms_eps,
+                )
+                .map_err(|e| format!("L{li}/{bi} post norm: {e:?}"))?;
+                ffn_dense_forward(backend, ffn, &state.scratch, cfg)
+                    .map_err(|e| format!("L{li}/{bi} ffn: {e:?}"))?;
+            },
+            _ => return Err(format!("L{li}/{bi}: kind/state mismatch")),
+        }
+        backend.drain();
+        unsafe {
+            let src = state.scratch.xd.contents() as *const f32;
+            let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
+            std::ptr::copy_nonoverlapping(src, dst, d);
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Byte-level BPE tokenizer using vocab + merges from the GGUF metadata.
 // Same algorithm GPT-2 / Qwen2 / Qwen3 / Qwen3.5 / Qwen3.6 use: each input
@@ -2610,9 +2912,12 @@ fn parity_attn_batch_on_loaded_weights(
     let n_kv = cfg.n_kv_heads;
     let kv_dim = head_dim * n_kv;
     let max_seq = 64_usize;
-    let b = 8_usize; // M >= 8 → SGEMM path. Le fallback M<8 (CPU-copy) est
-                     // corrigé via drain() mais pas dans le critical path
-                     // production — phase 9d utilisera B ≥ 32 systématiquement.
+    // T162 phase 9d : also test B=1 (forward_batch path called per chunk
+    // when prompt has only 1 token).
+    let b: usize = std::env::var("RUSTORCH_PARITY_B")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
     let pos_base = 0_usize;
 
     let phase_label = if ffn_dense.is_some() {
@@ -3190,6 +3495,15 @@ fn main() -> ExitCode {
         })
         .unwrap_or_default();
     let stream = env::args().any(|a| a == "--stream");
+    // T162 phase 9d — `--prefill-batch B` : chunk size for batched prefill
+    // (forward_batch). 0 / unset = legacy per-token forward_token.
+    // Recommandé : 32 ou 64 pour bénéficier des SGEMM tile 64×64.
+    let prefill_batch: usize = env::args()
+        .skip_while(|a| a != "--prefill-batch")
+        .nth(1)
+        .and_then(|a| a.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(B_MAX_BATCH);
 
     // High-level chat: --prompt "text" auto-tokenises through the GGUF's
     // embedded vocab+merges and wraps the prompt in the Qwen ChatML
@@ -3241,15 +3555,44 @@ fn main() -> ExitCode {
         let mut last = 0u32;
         let mut cur_pos = 0_usize;
         let t0 = Instant::now();
-        for &t in &prompt_ids {
-            match forward_token(backend, &file, &model, &mut state, t, cur_pos) {
-                Ok(out) => last = out,
-                Err(e) => {
-                    eprintln!("forward error at prefill: {e}");
-                    return ExitCode::FAILURE;
-                },
+        // T162 phase 9d : si --prefill-batch B est set et B > 1, utilise
+        // forward_batch en chunks. Sinon, legacy per-token forward_token.
+        if prefill_batch > 1 {
+            println!("  T162 phase 9d : prefill batched (B={prefill_batch}, B_MAX={B_MAX_BATCH})");
+            let batch_scratch = BatchScratch::new(backend, &cfg);
+            let mut idx = 0;
+            while idx < prompt_ids.len() {
+                let chunk_size = prefill_batch.min(prompt_ids.len() - idx);
+                let chunk = &prompt_ids[idx..idx + chunk_size];
+                match forward_batch(
+                    backend,
+                    &file,
+                    &model,
+                    &mut state,
+                    &batch_scratch,
+                    chunk,
+                    cur_pos,
+                ) {
+                    Ok(out) => last = out,
+                    Err(e) => {
+                        eprintln!("forward_batch error at prefill: {e}");
+                        return ExitCode::FAILURE;
+                    },
+                }
+                cur_pos += chunk_size;
+                idx += chunk_size;
             }
-            cur_pos += 1;
+        } else {
+            for &t in &prompt_ids {
+                match forward_token(backend, &file, &model, &mut state, t, cur_pos) {
+                    Ok(out) => last = out,
+                    Err(e) => {
+                        eprintln!("forward error at prefill: {e}");
+                        return ExitCode::FAILURE;
+                    },
+                }
+                cur_pos += 1;
+            }
         }
         let prefill_d = t0.elapsed();
         println!(
