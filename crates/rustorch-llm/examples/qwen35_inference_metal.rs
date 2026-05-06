@@ -2606,11 +2606,17 @@ fn ffn_dense_forward(
             let use_amx_async = std::env::var("RUSTORCH_AMX_ROUTING_ASYNC").is_ok()
                 && matches!(gate_inp.dtype, GgmlType::F32);
             if use_amx_async {
-                // T172 Day 5 — async hybrid GPU+CPU routing.
-                // GPU just produced h (post-norm). Encode signal_event,
-                // CPU AMX worker runs routing in parallel with GPU's
-                // continuation, GPU waits for AMX before reading logits.
-                // No drain — fully in-band sync via MTLSharedEvent.
+                // T172 Day 5 + T173 amortization — async hybrid GPU+CPU routing.
+                // GPU produced h. Encode signal_event, submit AMX, do GPU work
+                // INDEPENDENT of routing (shared expert path + zero(moe_acc) +
+                // dot_scalar) in the gap, then encode_wait_for_event.
+                // The GPU work between submit and wait amortizes the encoder-break
+                // overhead, hiding the AMX 9 µs entirely behind ~80-150 µs of
+                // shared-expert GPU compute.
+                //
+                // Day 5 was: submit + immediate wait → -10/-14% (overhead > savings).
+                // T173 reorders to put shared expert + dot_scalar + zero(moe_acc)
+                // BETWEEN submit and wait, expecting net positive gain.
                 let exec = amx_executor(backend);
                 let (wait_v, signal_v) = exec.next_event_pair();
                 backend.encode_signal_event(exec.event(), wait_v);
@@ -2625,7 +2631,37 @@ fn ffn_dense_forward(
                     wait_v,
                     signal_v,
                 );
+
+                // === GPU work in PARALLEL with CPU AMX (no read of moe_logits here) ===
+                // 1. Zero accumulator early (otherwise done later at line ~2678)
+                zero_f32(backend, &scratch.moe_acc, d)?;
+                // 2. Shared expert path (independent of routing)
+                gate_shexp.matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
+                up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
+                swiglu_f32(
+                    backend,
+                    &scratch.moe_gate,
+                    &scratch.moe_up,
+                    &scratch.moe_fd,
+                    ef,
+                )?;
+                down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
+                // 3. Dot scalar for shared gate
+                sgemv_f32_lcpp_simd_into(
+                    backend,
+                    &scratch.h,
+                    gate_inp_shexp,
+                    &scratch.moe_dot_scalar,
+                    d,
+                    1,
+                )?;
+                // === All this GPU work overlapped with CPU AMX routing ===
+
                 backend.encode_wait_for_event(exec.event(), signal_v);
+                // Sigmoid_add_moe needs both moe_acc (filled by gather chain
+                // below) and moe_expert_out (already done above) — but it must
+                // run AFTER the gather chain. Skip the redundant later
+                // shared+dot calls by setting a flag.
             } else if use_amx_sync {
                 // Drain GPU so h is fully written before CPU AMX reads it.
                 backend.drain();
@@ -2675,7 +2711,10 @@ fn ffn_dense_forward(
             profile_drain_record(backend, "  moe.routing", _moe_t0_routing);
 
             // 3. T147a — zero the accumulator on GPU (no drain).
-            zero_f32(backend, &scratch.moe_acc, d)?;
+            // T173 : skip if async path already zeroed it during AMX overlap.
+            if !use_amx_async {
+                zero_f32(backend, &scratch.moe_acc, d)?;
+            }
 
             // 4. T152 — gather sgemv path (1 dispatch / projection au lieu de
             //    n_used dispatchs). Inspired by MLX `affine_gather_qmm_rhs`.
@@ -2805,17 +2844,20 @@ fn ffn_dense_forward(
             //    `shared_gate = build_lora_mm(ffn_gate_inp_shexp, cur)` with
             //    ffn_gate_inp_shexp of shape [d] would imply a 1×d matrix → output
             //    is a scalar per token. So a dot product.
+            // T173 : skip if async path already ran shared expert during AMX overlap.
             let _moe_t0_shared = std::time::Instant::now();
-            gate_shexp.matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
-            up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
-            swiglu_f32(
-                backend,
-                &scratch.moe_gate,
-                &scratch.moe_up,
-                &scratch.moe_fd,
-                ef,
-            )?;
-            down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
+            if !use_amx_async {
+                gate_shexp.matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
+                up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
+                swiglu_f32(
+                    backend,
+                    &scratch.moe_gate,
+                    &scratch.moe_up,
+                    &scratch.moe_fd,
+                    ef,
+                )?;
+                down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
+            }
             profile_drain_record(backend, "  moe.shared", _moe_t0_shared);
 
             // T152.1 — Shared expert gating + final add ENTIÈREMENT GPU.
@@ -2825,15 +2867,18 @@ fn ffn_dense_forward(
             //   `xd[i] += moe_acc[i] + sigmoid(scalar) * moe_expert_out[i]`
             // 1 dispatch GPU au lieu de 1 drain + 2 CPU loops sur d éléments.
             // Économie : 1 drain × 16 MoE layers = 16 drains/token sur 35B-A3B.
+            // T173 : skip dot_scalar if async path already computed it.
             let _moe_t0_final = std::time::Instant::now();
-            sgemv_f32_lcpp_simd_into(
-                backend,
-                &scratch.h,
-                gate_inp_shexp,
-                &scratch.moe_dot_scalar,
-                d,
-                1,
-            )?;
+            if !use_amx_async {
+                sgemv_f32_lcpp_simd_into(
+                    backend,
+                    &scratch.h,
+                    gate_inp_shexp,
+                    &scratch.moe_dot_scalar,
+                    d,
+                    1,
+                )?;
+            }
             sigmoid_add_moe_f32(
                 backend,
                 &scratch.moe_acc,
