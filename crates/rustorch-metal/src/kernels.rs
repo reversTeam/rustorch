@@ -2768,18 +2768,23 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
 
         // Phase 3 : 4 K-fragments × 4×4 MMAs per simdgroup.
         // T162 phase 3-bis : full unroll des boucles fragment pour permettre
-        // au compilateur Apple Metal de pipeliner les MMAs (sans unroll, le
-        // compilateur peut sérialiser → 64× moins de throughput théorique).
+        // au compilateur Apple Metal de pipeliner les MMAs.
+        // T162 phase 9g : simdgroup_barrier hints entre phases (pattern llama.cpp)
+        // — aide le compilateur à serialize les loads avant les MMAs et eviter
+        // les dépendances false sur les registres simdgroup.
         #pragma clang loop unroll(full)
         for (uint k_frag = 0; k_frag < BK / 8u; ++k_frag) {
             simdgroup_matrix<float, 8, 8> A_frags[4];
             simdgroup_matrix<float, 8, 8> B_frags[4];
 
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (uint i = 0; i < FM; ++i) {
                 uint a_row = sgi * TM + i * 8u;
                 simdgroup_load(A_frags[i], Xs + a_row * BK + k_frag * 8u, BK);
             }
+
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (uint j = 0; j < FN; ++j) {
                 uint w_row = sgj * TN + j * 8u;
@@ -2791,6 +2796,7 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
                     /* transpose */ true);
             }
 
+            simdgroup_barrier(mem_flags::mem_none);
             // Outer product : C[i][j] += A[i] @ B[j], full unroll.
             #pragma clang loop unroll(full)
             for (uint i = 0; i < FM; ++i) {
@@ -3196,16 +3202,20 @@ kernel void sgemm_q3_k_f32_simdgroup_matrix_64(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Phase 3 : 4 K-fragments × 4×4 MMAs per simdgroup. UNROLL CRITIQUE.
+        // T162 phase 9g : simdgroup_barrier hints (pattern llama.cpp).
         #pragma clang loop unroll(full)
         for (uint k_frag = 0; k_frag < BK_Q3K_64 / 8u; ++k_frag) {
             simdgroup_matrix<float, 8, 8> A_frags[4];
             simdgroup_matrix<float, 8, 8> B_frags[4];
 
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (uint i = 0; i < FM_Q3K_64; ++i) {
                 uint a_row = sgi * TM_Q3K_64 + i * 8u;
                 simdgroup_load(A_frags[i], Xs + a_row * BK_Q3K_64 + k_frag * 8u, BK_Q3K_64);
             }
+
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (uint j = 0; j < FN_Q3K_64; ++j) {
                 uint w_row = sgj * TN_Q3K_64 + j * 8u;
@@ -3217,6 +3227,7 @@ kernel void sgemm_q3_k_f32_simdgroup_matrix_64(
                     /* transpose */ true);
             }
 
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (uint i = 0; i < FM_Q3K_64; ++i) {
                 #pragma clang loop unroll(full)
@@ -3616,16 +3627,20 @@ kernel void sgemm_q6_k_f32_simdgroup_matrix_64(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Phase 3 : 4 K-fragments × 4×4 MMAs per simdgroup. UNROLL CRITIQUE.
+        // T162 phase 9g : simdgroup_barrier hints (pattern llama.cpp).
         #pragma clang loop unroll(full)
         for (uint k_frag = 0; k_frag < BK_Q6K_64 / 8u; ++k_frag) {
             simdgroup_matrix<float, 8, 8> A_frags[4];
             simdgroup_matrix<float, 8, 8> B_frags[4];
 
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (uint i = 0; i < FM_Q6K_64; ++i) {
                 uint a_row = sgi * TM_Q6K_64 + i * 8u;
                 simdgroup_load(A_frags[i], Xs + a_row * BK_Q6K_64 + k_frag * 8u, BK_Q6K_64);
             }
+
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (uint j = 0; j < FN_Q6K_64; ++j) {
                 uint w_row = sgj * TN_Q6K_64 + j * 8u;
@@ -3637,6 +3652,7 @@ kernel void sgemm_q6_k_f32_simdgroup_matrix_64(
                     /* transpose */ true);
             }
 
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (uint i = 0; i < FM_Q6K_64; ++i) {
                 #pragma clang loop unroll(full)
