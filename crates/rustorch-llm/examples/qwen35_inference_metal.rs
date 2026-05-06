@@ -47,12 +47,13 @@ use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
-    add_inplace_batched_f32, add_inplace_f32, build_em_perm_f32_into, delta_net_step_f32,
-    delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets, gather_pack_rows_f32,
-    gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32, kv_append_f32,
-    l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
-    rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets,
-    rope_half_split_f32, rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
+    add_inplace_batched_f32, add_inplace_f32, argmax_batched_f32, build_em_perm_f32_into,
+    delta_net_step_f32, delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets,
+    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32,
+    kv_append_f32, l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32,
+    rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
+    rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
+    rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
     sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
     sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
@@ -3359,6 +3360,7 @@ struct BatchScratch {
     // T176 — Speculative decoding scratch : batched final norm + lm_head outputs.
     h_final_batched: Buffer, // [B_MAX, d] post-final-norm
     logits_batched: Buffer,  // [B_MAX, vocab]
+    argmax_indices: Buffer,  // [B_MAX] u32 — GPU argmax output
 }
 
 impl BatchScratch {
@@ -3373,6 +3375,7 @@ impl BatchScratch {
             moe: BatchScratchMoe::new(backend, cfg),
             h_final_batched: backend.alloc_shared(B_MAX_BATCH * d * 4).unwrap(),
             logits_batched: backend.alloc_shared(B_MAX_BATCH * vocab * 4).unwrap(),
+            argmax_indices: backend.alloc_shared(B_MAX_BATCH * 4).unwrap(),
         }
     }
 }
@@ -3736,23 +3739,24 @@ fn forward_batch_argmax(
                 &batch_scratch.logits_batched,
             )
             .map_err(|e| format!("lm_head batched: {e:?}"))?;
+        // T176 — GPU argmax (1 dispatch B threadgroups vs CPU loop B × vocab=151936
+        // reads ≈ 5 ms per spec round). Reads only B u32 indices CPU-side post-drain.
+        argmax_batched_f32(
+            backend,
+            &batch_scratch.logits_batched,
+            &batch_scratch.argmax_indices,
+            b,
+            cfg.vocab,
+        )
+        .map_err(|e| format!("argmax batched: {e:?}"))?;
         backend.drain();
-        // CPU argmax per row.
-        let mut outs = Vec::with_capacity(b);
-        let logits_ptr = batch_scratch.logits_batched.contents() as *const f32;
-        let vocab = cfg.vocab;
-        for bi in 0..b {
-            let row_offset = bi * vocab;
-            let mut best_idx = 0_u32;
-            let mut best_val = f32::NEG_INFINITY;
-            for k in 0..vocab {
-                let v = unsafe { *logits_ptr.add(row_offset + k) };
-                if v > best_val {
-                    best_val = v;
-                    best_idx = k as u32;
-                }
-            }
-            outs.push(best_idx);
+        let mut outs = vec![0u32; b];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                batch_scratch.argmax_indices.contents() as *const u32,
+                outs.as_mut_ptr(),
+                b,
+            );
         }
         Ok(outs)
     }
