@@ -48,23 +48,24 @@ use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, delta_net_step_f32, delta_net_step_with_l2_f32,
-    gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32, kv_append_f32,
-    l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
-    rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
-    rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
+    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32,
+    kv_append_f32, l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32,
+    rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
+    rope_half_split_f32, rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
-    sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
-    sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
-    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into,
-    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
-    sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32,
-    sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
-    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_batched_f32,
-    swiglu_f32, topk_softmax_norm_batched_f32, topk_softmax_norm_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, zero_f32,
+    sgemm_q4_k_f32_expert_major_8x8_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
+    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
+    sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
+    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+    sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into,
+    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32,
+    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
+    ssm_conv1d_step_f32, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
+    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_batched_f32,
+    weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -1413,6 +1414,17 @@ struct BatchScratchMoe {
     shexp_fd: Buffer,     // [B_MAX, ef] post-SwiGLU
     shexp_out: Buffer,    // [B_MAX, d] shared expert down proj
     shexp_scalar: Buffer, // [B_MAX] gate_inp_shexp · h scalar gate
+
+    // T163 phase 9f-quater — expert-major MoE pipeline buffers.
+    // M_padded worst case = B_MAX*n_used + 7*n_experts (each expert pads ≤ 7 rows).
+    em_src_indices: Buffer, // [M_padded] u32 = src token (b*n_used+k_slot) or sentinel
+    em_gather_src: Buffer,  // [M_padded] u32 = b for gather (or sentinel)
+    em_tile_expert_ids: Buffer, // [M_padded/8] u32 = expert per M-tile
+    em_x_packed: Buffer,    // [M_padded, d] gathered+padded x for expert_major
+    em_out_ef_gate: Buffer, // [M_padded, ef] expert_major output (gate)
+    em_out_ef_up: Buffer,   // [M_padded, ef] expert_major output (up)
+    em_fd: Buffer,          // [M_padded, ef] post-swiglu
+    em_out_d: Buffer,       // [M_padded, d] expert_major down output
 }
 
 impl BatchScratchMoe {
@@ -1439,8 +1451,59 @@ impl BatchScratchMoe {
             shexp_fd: alloc(b * ef * 4),
             shexp_out: alloc(b * d * 4),
             shexp_scalar: alloc(b * 4),
+
+            // M_padded worst case for expert_major pipeline.
+            em_src_indices: alloc((b * n_used + 7 * n_experts) * 4),
+            em_gather_src: alloc((b * n_used + 7 * n_experts) * 4),
+            em_tile_expert_ids: alloc(((b * n_used + 7 * n_experts) / 8 + 1) * 4),
+            em_x_packed: alloc((b * n_used + 7 * n_experts) * d * 4),
+            em_out_ef_gate: alloc((b * n_used + 7 * n_experts) * ef * 4),
+            em_out_ef_up: alloc((b * n_used + 7 * n_experts) * ef * 4),
+            em_fd: alloc((b * n_used + 7 * n_experts) * ef * 4),
+            em_out_d: alloc((b * n_used + 7 * n_experts) * d * 4),
         }
     }
+}
+
+/// T163 phase 9f-quater — sort tokens par expert + pad mult-8.
+fn build_expert_major_perm(
+    indices_cpu: &[u32],
+    n_used: usize,
+    n_experts: usize,
+    src_indices_out: &mut Vec<u32>,
+    gather_src_out: &mut Vec<u32>,
+    tile_expert_ids_out: &mut Vec<u32>,
+) -> usize {
+    src_indices_out.clear();
+    gather_src_out.clear();
+    tile_expert_ids_out.clear();
+    const SENTINEL: u32 = 0xFFFFFFFFu32;
+
+    let mut buckets: Vec<Vec<u32>> = (0..n_experts).map(|_| Vec::new()).collect();
+    for (i, &expert) in indices_cpu.iter().enumerate() {
+        let e = expert as usize;
+        if e < n_experts {
+            buckets[e].push(i as u32);
+        }
+    }
+    for (e, bucket) in buckets.iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        for &idx in bucket {
+            src_indices_out.push(idx);
+            gather_src_out.push(idx / n_used as u32);
+        }
+        let padded = bucket.len().div_ceil(8) * 8;
+        for _ in bucket.len()..padded {
+            src_indices_out.push(SENTINEL);
+            gather_src_out.push(SENTINEL);
+        }
+        for _ in 0..(padded / 8) {
+            tile_expert_ids_out.push(e as u32);
+        }
+    }
+    src_indices_out.len()
 }
 
 /// T162 phase 9f — gather dispatch helper (Q4_K/Q5_K/Q6_K stacked experts).
@@ -1574,69 +1637,166 @@ fn ffn_moe_forward_batch(
         b,
     )?;
 
-    // 4-7. T162 phase 9f-bis : gather PER-TOKEN dans le kernel (b_token = b/n_used).
-    //      Tous les B*n_used = b_eff expert-evals en 1 dispatch / projection.
-    //      Pas de memcpy h_repl (économie 128MB/layer) ni de boucle CPU per-token.
-    zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
+    // 4-7. T163 phase 9f-quater : EXPERT-MAJOR si tous les MoE weights sont Q4_K
+    //      (sort + pad mult-8 + SGEMM expert_major + scatter atomic). Sinon
+    //      fallback gather_per_token (T162 phase 9f-bis).
+    let all_q4k_moe = matches!(gate_exps_stacked.dtype, GgmlType::Q4_K)
+        && matches!(up_exps_stacked.dtype, GgmlType::Q4_K)
+        && matches!(down_exps_stacked.dtype, GgmlType::Q4_K);
 
-    // Gate gather : Q4_K, lit h_post[b_token, :] via b_token=b/n_used in-kernel.
-    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
-        backend,
-        &batch_scratch.h_post,
-        &gate_exps_stacked.buffer,
-        &batch_scratch.indices,
-        b_eff,
-        n_used,
-        &batch_scratch.gate_gather,
-        d,
-        ef,
-        gate_exps_stacked.bytes_per_expert,
-    )?;
-    // Up gather : Q4_K, idem.
-    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
-        backend,
-        &batch_scratch.h_post,
-        &up_exps_stacked.buffer,
-        &batch_scratch.indices,
-        b_eff,
-        n_used,
-        &batch_scratch.up_gather,
-        d,
-        ef,
-        up_exps_stacked.bytes_per_expert,
-    )?;
-    // SwiGLU : element-wise sur b_eff*ef floats.
-    swiglu_f32(
-        backend,
-        &batch_scratch.gate_gather,
-        &batch_scratch.up_gather,
-        &batch_scratch.fd_gather,
-        b_eff * ef,
-    )?;
-    // Down gather : input = fd_gather [b_eff, ef] (per-row, déjà packed),
-    // donc x_stride=ef et le standard gather kernel suffit (pas per-token).
-    dispatch_gather_sgemv(
-        backend,
-        down_exps_stacked,
-        &batch_scratch.fd_gather,
-        &batch_scratch.down_gather,
-        &batch_scratch.indices,
-        b_eff,
-        ef,
-        d,
-        ef,
-    )?;
+    if all_q4k_moe {
+        // CPU sort indices.
+        backend.drain();
+        let mut src_indices_vec: Vec<u32> = Vec::with_capacity(b_eff + 7 * n_experts);
+        let mut gather_src_vec: Vec<u32> = Vec::with_capacity(b_eff + 7 * n_experts);
+        let mut tile_expert_ids_vec: Vec<u32> = Vec::with_capacity(b_eff / 8 + n_experts);
+        let indices_cpu = unsafe {
+            std::slice::from_raw_parts(batch_scratch.indices.contents() as *const u32, b * n_used)
+        };
+        let m_padded = build_expert_major_perm(
+            indices_cpu,
+            n_used,
+            n_experts,
+            &mut src_indices_vec,
+            &mut gather_src_vec,
+            &mut tile_expert_ids_vec,
+        );
 
-    // 8. Batched weighted reduce : moe_acc[t, d] += sum_k topw[t, k] * down_gather[t, k, d].
-    weighted_reduce_add_batched_f32(
-        backend,
-        &batch_scratch.down_gather,
-        &batch_scratch.topw,
-        &batch_scratch.moe_acc,
-        n_used,
-        d,
-        b,
-    )?;
+        // Upload to GPU.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_indices_vec.as_ptr(),
+                batch_scratch.em_src_indices.contents() as *mut u32,
+                m_padded,
+            );
+            std::ptr::copy_nonoverlapping(
+                gather_src_vec.as_ptr(),
+                batch_scratch.em_gather_src.contents() as *mut u32,
+                m_padded,
+            );
+            std::ptr::copy_nonoverlapping(
+                tile_expert_ids_vec.as_ptr(),
+                batch_scratch.em_tile_expert_ids.contents() as *mut u32,
+                tile_expert_ids_vec.len(),
+            );
+        }
+
+        // GPU pipeline expert-major.
+        zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
+        gather_pack_rows_f32(
+            backend,
+            &batch_scratch.h_post,
+            &batch_scratch.em_gather_src,
+            &batch_scratch.em_x_packed,
+            d,
+            m_padded,
+        )?;
+        sgemm_q4_k_f32_expert_major_8x8_into(
+            backend,
+            &batch_scratch.em_x_packed,
+            &gate_exps_stacked.buffer,
+            &batch_scratch.em_tile_expert_ids,
+            &batch_scratch.em_out_ef_gate,
+            m_padded,
+            ef,
+            d,
+            gate_exps_stacked.bytes_per_expert,
+        )?;
+        sgemm_q4_k_f32_expert_major_8x8_into(
+            backend,
+            &batch_scratch.em_x_packed,
+            &up_exps_stacked.buffer,
+            &batch_scratch.em_tile_expert_ids,
+            &batch_scratch.em_out_ef_up,
+            m_padded,
+            ef,
+            d,
+            up_exps_stacked.bytes_per_expert,
+        )?;
+        swiglu_f32(
+            backend,
+            &batch_scratch.em_out_ef_gate,
+            &batch_scratch.em_out_ef_up,
+            &batch_scratch.em_fd,
+            m_padded * ef,
+        )?;
+        sgemm_q4_k_f32_expert_major_8x8_into(
+            backend,
+            &batch_scratch.em_fd,
+            &down_exps_stacked.buffer,
+            &batch_scratch.em_tile_expert_ids,
+            &batch_scratch.em_out_d,
+            m_padded,
+            d,
+            ef,
+            down_exps_stacked.bytes_per_expert,
+        )?;
+        weighted_scatter_add_f32(
+            backend,
+            &batch_scratch.em_out_d,
+            &batch_scratch.em_src_indices,
+            &batch_scratch.topw,
+            &batch_scratch.moe_acc,
+            d,
+            m_padded,
+            n_used,
+        )?;
+    } else {
+        // Fallback : gather_per_token (T162 phase 9f-bis) pour les modèles
+        // mixed-dtype (e.g., 35B-A3B Q4_K gate/up + Q5_K down).
+        zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
+        sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
+            backend,
+            &batch_scratch.h_post,
+            &gate_exps_stacked.buffer,
+            &batch_scratch.indices,
+            b_eff,
+            n_used,
+            &batch_scratch.gate_gather,
+            d,
+            ef,
+            gate_exps_stacked.bytes_per_expert,
+        )?;
+        sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
+            backend,
+            &batch_scratch.h_post,
+            &up_exps_stacked.buffer,
+            &batch_scratch.indices,
+            b_eff,
+            n_used,
+            &batch_scratch.up_gather,
+            d,
+            ef,
+            up_exps_stacked.bytes_per_expert,
+        )?;
+        swiglu_f32(
+            backend,
+            &batch_scratch.gate_gather,
+            &batch_scratch.up_gather,
+            &batch_scratch.fd_gather,
+            b_eff * ef,
+        )?;
+        dispatch_gather_sgemv(
+            backend,
+            down_exps_stacked,
+            &batch_scratch.fd_gather,
+            &batch_scratch.down_gather,
+            &batch_scratch.indices,
+            b_eff,
+            ef,
+            d,
+            ef,
+        )?;
+        weighted_reduce_add_batched_f32(
+            backend,
+            &batch_scratch.down_gather,
+            &batch_scratch.topw,
+            &batch_scratch.moe_acc,
+            n_used,
+            d,
+            b,
+        )?;
+    }
 
     // 9. Shared expert pipeline (BATCHED dense FFN).
     dispatch_batched_attn_matmul(

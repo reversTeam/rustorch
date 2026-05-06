@@ -2821,6 +2821,174 @@ pub fn sgemm_q4_k_f32_expert_major_8x8_into(
 }
 
 // =============================================================================
+// T163 phase 9f-quater — gather rows from x according to permutation.
+//
+// Pour expert-major MoE pipeline : pack les rows de x dans un layout permuté
+// où les rows d'un même expert sont contiguës.
+//
+// Input  : x [B, K] activations (per-token), src_indices [M_padded] (= permutation
+//           mais stocké directement comme src token row indices, sentinel 0xFFFFFFFF
+//           pour padding zero-rows).
+// Output : x_packed [M_padded, K]
+//
+// src_indices[i] doit être :
+//   - VALID : token_row_idx = b ∈ [0, B), copies x[b, :] vers x_packed[i, :]
+//   - PADDING : 0xFFFFFFFF, écrit zeros à x_packed[i, :]
+const GATHER_PACK_ROWS_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint SENTINEL_PAD = 0xFFFFFFFFu;
+
+kernel void gather_pack_rows_f32(
+    device const float* x           [[buffer(0)]],   // [B, K]
+    device const uint*  src_indices [[buffer(1)]],   // [M_padded]
+    device float*       x_packed    [[buffer(2)]],   // [M_padded, K]
+    constant uint2&     dims        [[buffer(3)]],   // (K, M_padded)
+    uint2               gid         [[thread_position_in_grid]]
+) {
+    uint K = dims.x;
+    uint M_padded = dims.y;
+    uint k = gid.x;
+    uint i = gid.y;
+    if (k >= K || i >= M_padded) return;
+
+    uint src = src_indices[i];
+    if (src == SENTINEL_PAD) {
+        x_packed[i * K + k] = 0.0f;
+    } else {
+        x_packed[i * K + k] = x[src * K + k];
+    }
+}
+"#;
+
+/// T163 phase 9f-quater — gather x rows par permutation pour expert-major MoE.
+///
+/// `src_indices[i]` :
+/// - valid : token row idx (∈ [0, B))  → x_packed[i, :] = x[src, :]
+/// - 0xFFFFFFFF : padding zero-row     → x_packed[i, :] = 0
+///
+/// Économie vs CPU memcpy : 1 dispatch, GPU-side, pas de drain CPU.
+pub fn gather_pack_rows_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    src_indices_buf: &Buffer,
+    x_packed_buf: &Buffer,
+    k: usize,
+    m_padded: usize,
+) -> Result<(), MetalError> {
+    if k == 0 || m_padded == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "gather_pack_rows_f32: K={k}, M_padded={m_padded}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "gather_pack_rows_f32",
+        GATHER_PACK_ROWS_F32_SHADER,
+        "gather_pack_rows_f32",
+    )?;
+    let dims = [k as u32, m_padded as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(src_indices_buf), 0);
+        encoder.set_buffer(2, Some(x_packed_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(k as u64, m_padded as u64, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
+// T163 phase 9f-quater — weighted scatter add pour expert-major MoE.
+//
+// Inverse de gather_pack_rows. Pour chaque row i ∈ [0, M_padded) qui est valide
+// (src_indices[i] != SENTINEL), accumule out_packed[i] pondéré par topw[src]
+// dans moe_acc[token_idx, :] où token_idx = src / n_used.
+//
+// Input  : out_packed [M_padded, D], src_indices [M_padded], topw [B, n_used]
+// Output : moe_acc [B, D] in/out (caller doit zero ou pré-charger)
+const WEIGHTED_SCATTER_ADD_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint SCATTER_SENTINEL_PAD = 0xFFFFFFFFu;
+
+kernel void weighted_scatter_add_f32(
+    device const float* out_packed  [[buffer(0)]],   // [M_padded, D]
+    device const uint*  src_indices [[buffer(1)]],   // [M_padded]
+    device const float* topw        [[buffer(2)]],   // [B, n_used] (flat)
+    device       atomic_float* moe_acc [[buffer(3)]], // [B, D]
+    constant uint3&     dims        [[buffer(4)]],   // (D, M_padded, n_used)
+    uint2               gid         [[thread_position_in_grid]]
+) {
+    uint D = dims.x;
+    uint M_padded = dims.y;
+    uint n_used = dims.z;
+    uint d = gid.x;
+    uint i = gid.y;
+    if (d >= D || i >= M_padded) return;
+
+    uint src = src_indices[i];
+    if (src == SCATTER_SENTINEL_PAD) return;
+
+    uint b = src / n_used;
+    float w = topw[src];
+    float v = w * out_packed[i * D + d];
+
+    // Atomic add to moe_acc[b, d] : multiple i can map to same b (n_used different
+    // experts per token) → need atomic.
+    atomic_fetch_add_explicit(&moe_acc[b * D + d], v, memory_order_relaxed);
+}
+"#;
+
+/// T163 phase 9f-quater — weighted scatter add pour expert-major MoE.
+///
+/// Pour chaque row valide i (src != sentinel) :
+///   moe_acc[src/n_used, :] += topw[src] * out_packed[i, :]
+///
+/// Atomic add nécessaire : n_used différents `i` (= different experts per token)
+/// peuvent mapper vers le même `b = src/n_used`.
+///
+/// Pré-condition : `moe_acc` doit être pré-zéroé par caller (zero_f32 ou eq.)
+pub fn weighted_scatter_add_f32(
+    backend: &MetalBackend,
+    out_packed_buf: &Buffer,
+    src_indices_buf: &Buffer,
+    topw_buf: &Buffer,
+    moe_acc_buf: &Buffer,
+    d: usize,
+    m_padded: usize,
+    n_used: usize,
+) -> Result<(), MetalError> {
+    if d == 0 || m_padded == 0 || n_used == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "weighted_scatter_add_f32: D={d}, M_padded={m_padded}, n_used={n_used}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "weighted_scatter_add_f32",
+        WEIGHTED_SCATTER_ADD_F32_SHADER,
+        "weighted_scatter_add_f32",
+    )?;
+    let dims = [d as u32, m_padded as u32, n_used as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(out_packed_buf), 0);
+        encoder.set_buffer(1, Some(src_indices_buf), 0);
+        encoder.set_buffer(2, Some(topw_buf), 0);
+        encoder.set_buffer(3, Some(moe_acc_buf), 0);
+        encoder.set_bytes(4, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(d as u64, m_padded as u64, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T162 phase 3 — Q4_K SGEMM avec tiles 64×64 multi-warp.
 //
 // Évolution de phase 2 (tile 8×8 single-simdgroup) : passage à BM=BN=64 avec
