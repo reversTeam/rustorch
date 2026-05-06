@@ -2563,6 +2563,177 @@ pub fn sgemm_q8_0_f32_simdgroup_matrix_into(
 }
 
 // =============================================================================
+// T175 — Q8_0 SGEMM 8×64 multi-warp half MMA (bigger tile vs 8×8 single-warp).
+//
+// Same routing convention as the 8×8 variant (no expert routing — just dense
+// SGEMM) but with 4 simdgroups per TG and half SHM/half MMA into float
+// accumulator. Used for attn projections (Q/K/V/O) and shared expert weights
+// on Qwen3.6 35B-A3B (Q8_0 = 9% of model).
+//
+// Pre-conditions : M%8, N%64, K%32 (Q8_0 block size).
+const SGEMM_Q8_0_F32_8X64_HALF_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q8K_BYTES_8X64 = 34u;
+constant uint Q8K_WEIGHTS_8X64 = 32u;
+constant uint Q8K_NR_M = 8u;
+constant uint Q8K_NR_N = 64u;
+constant uint Q8K_NK = 32u;
+
+kernel void sgemm_q8_0_f32_8x64_half(
+    device const float*  A      [[buffer(0)]],   // [M, K] f32
+    device const uchar*  W_q8   [[buffer(1)]],   // [N, K] Q8_0
+    device float*        C      [[buffer(2)]],   // [M, N] f32
+    constant uint3&      dims   [[buffer(3)]],   // (M, N, K)
+    uint3                tgpig  [[threadgroup_position_in_grid]],
+    ushort               tiitg  [[thread_index_in_threadgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    uint m_tile = tgpig.y;
+    uint n_tile = tgpig.x;
+    if (m_tile * Q8K_NR_M >= M || n_tile * Q8K_NR_N >= N) return;
+
+    threadgroup half sa[Q8K_NR_M * Q8K_NK];
+    threadgroup half sb[Q8K_NR_N * Q8K_NK];
+
+    uint blocks_per_row = K / Q8K_WEIGHTS_8X64;
+    uint row_stride_bytes = blocks_per_row * Q8K_BYTES_8X64;
+
+    simdgroup_matrix<float, 8, 8> mc[2];
+    mc[0] = simdgroup_matrix<float, 8, 8>(0.0);
+    mc[1] = simdgroup_matrix<float, 8, 8>(0.0);
+
+    for (uint k_offset = 0; k_offset < K; k_offset += Q8K_NK) {
+        // Load A → sa.
+        {
+            uint sa_row = tiitg / 16u;
+            uint sa_chunk = tiitg % 16u;
+            uint k_in_tile = sa_chunk * 2u;
+            if (sa_row < Q8K_NR_M) {
+                uint a_row_global = m_tile * Q8K_NR_M + sa_row;
+                if (a_row_global < M) {
+                    device const float* A_ptr = A + (uint64_t)a_row_global * (uint64_t)K
+                                                  + (uint64_t)(k_offset + k_in_tile);
+                    sa[sa_row * Q8K_NK + k_in_tile + 0u] = (half)A_ptr[0];
+                    sa[sa_row * Q8K_NK + k_in_tile + 1u] = (half)A_ptr[1];
+                } else {
+                    sa[sa_row * Q8K_NK + k_in_tile + 0u] = (half)0.0;
+                    sa[sa_row * Q8K_NK + k_in_tile + 1u] = (half)0.0;
+                }
+            }
+        }
+
+        // Load+dequant W → sb (Q8_0 : 1 block per K-tile per N-row, 32 weights).
+        // 128 threads / 64 N-rows = 2 threads per N-row, each loading 16 weights.
+        {
+            uint sb_row = tiitg / 2u;
+            uint sb_chunk = tiitg % 2u;
+            uint w_row_global = n_tile * Q8K_NR_N + sb_row;
+            uint super_block_idx = k_offset / Q8K_WEIGHTS_8X64;
+
+            device const uchar* row_block = W_q8
+                + (uint64_t)w_row_global * row_stride_bytes
+                + (uint64_t)super_block_idx * Q8K_BYTES_8X64;
+            device const half* d_ptr = (device const half*)(row_block);
+            float d = float(*d_ptr);
+
+            device const char* qs_ptr = (device const char*)(row_block + 2);
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < 16u; ++c) {
+                uint k_in_tile = sb_chunk * 16u + c;
+                int q = (int)qs_ptr[k_in_tile];
+                sb[sb_row * Q8K_NK + k_in_tile] = (half)(d * (float)q);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* sa_ptr = sa;
+        threadgroup const half* sb_ptr = sb + (uint)sgitg * 16u * Q8K_NK;
+
+        #pragma clang loop unroll(full)
+        for (uint k_frag = 0; k_frag < 4u; ++k_frag) {
+            simdgroup_matrix<half, 8, 8> ma;
+            simdgroup_matrix<half, 8, 8> mb[2];
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma, sa_ptr + k_frag * 8u, Q8K_NK);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb_ptr + k_frag * 8u,            Q8K_NK, ulong2(0, 0), true);
+            simdgroup_load(mb[1], sb_ptr + k_frag * 8u + 8u * Q8K_NK, Q8K_NK, ulong2(0, 0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0], ma, mb[0], mc[0]);
+            simdgroup_multiply_accumulate(mc[1], ma, mb[1], mc[1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint c_row = m_tile * Q8K_NR_M;
+    uint c_col_base = n_tile * Q8K_NR_N + (uint)sgitg * 16u;
+    if (c_row + Q8K_NR_M - 1u < M) {
+        device float* C_ptr0 = C + (uint64_t)c_row * (uint64_t)N + (uint64_t)c_col_base;
+        device float* C_ptr1 = C_ptr0 + 8u;
+        if (c_col_base + 7u < N) {
+            simdgroup_store(mc[0], C_ptr0, N);
+        }
+        if (c_col_base + 15u < N) {
+            simdgroup_store(mc[1], C_ptr1, N);
+        }
+    }
+}
+"#;
+
+/// T175 — Q8_0 SGEMM 8×64 multi-warp half MMA (drop-in for 8×8).
+pub fn sgemm_q8_0_f32_8x64_half_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_q8_buf: &Buffer,
+    c_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q8_0_f32_8x64_half needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 8 != 0 || n % 64 != 0 || k % 32 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q8_0_f32_8x64_half: M%8==0, N%64==0, K%32==0 (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q8_0_f32_8x64_half",
+        SGEMM_Q8_0_F32_8X64_HALF_SHADER,
+        "sgemm_q8_0_f32_8x64_half",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_q8_buf), 0);
+        encoder.set_buffer(2, Some(c_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1);
+        let n_tg_x = (n / 64) as u64;
+        let n_tg_y = (m / 8) as u64;
+        let groups = MTLSize::new(n_tg_x, n_tg_y, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T162 phase 2 — Q4_K SGEMM avec simdgroup_matrix + dequant inline.
 //
 // Premier kernel rustorch combinant Apple Matrix Engine + Q4_K. C'est le
@@ -17259,6 +17430,78 @@ mod tests {
                 rel
             );
         }
+    }
+
+    /// T175 — Q8_0 SGEMM 8×64 half MMA parity vs Q8_0 SGEMM 8×8 reference.
+    /// Cosine similarity check (half MMA drift expected).
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemm_q8_0_f32_8x64_half_matches_8x8() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            return;
+        }
+        let m = 32_usize;
+        let n = 64_usize;
+        let k = 256_usize;
+        let blocks_per_row = k / 32;
+        let mut w_bytes = vec![0u8; n * blocks_per_row * 34];
+        for nrow in 0..n {
+            for ib in 0..blocks_per_row {
+                let off = (nrow * blocks_per_row + ib) * 34;
+                let d_val = ((nrow as f32 + 1.0) * 0.005) + (ib as f32) * 0.001;
+                let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                w_bytes[off] = d_h[0];
+                w_bytes[off + 1] = d_h[1];
+                for c in 0..32 {
+                    let q = ((nrow as i32 ^ ib as i32 ^ c as i32) - 16) as i8;
+                    w_bytes[off + 2 + c] = q as u8;
+                }
+            }
+        }
+        let a = det_vec(m * k, 1.5);
+        let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        let c_8x8 = backend.alloc_shared(m * n * 4).unwrap();
+        let c_8x64 = backend.alloc_shared(m * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+        }
+        sgemm_q8_0_f32_simdgroup_matrix_into(backend, &a_buf, &w_buf, &c_8x8, m, n, k).unwrap();
+        sgemm_q8_0_f32_8x64_half_into(backend, &a_buf, &w_buf, &c_8x64, m, n, k).unwrap();
+        backend.drain();
+        let mut v_8x8 = vec![0.0_f32; m * n];
+        let mut v_8x64 = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_8x8.contents() as *const f32,
+                v_8x8.as_mut_ptr(),
+                m * n,
+            );
+            std::ptr::copy_nonoverlapping(
+                c_8x64.contents() as *const f32,
+                v_8x64.as_mut_ptr(),
+                m * n,
+            );
+        }
+        let dot: f64 = v_8x8
+            .iter()
+            .zip(v_8x64.iter())
+            .map(|(a, b)| (a * b) as f64)
+            .sum();
+        let na: f64 = v_8x8.iter().map(|a| (a * a) as f64).sum::<f64>().sqrt();
+        let nb: f64 = v_8x64.iter().map(|a| (a * a) as f64).sum::<f64>().sqrt();
+        let cos = dot / (na * nb);
+        assert!(
+            cos > 0.999,
+            "Q8_0 8x64 cosine too low: {cos:.6} (expected > 0.999)"
+        );
+        eprintln!("[sgemm_q8_0_8x64] m={m} n={n} k={k}: cos={cos:.6}");
     }
 
     /// T175 P0' — `build_em_perm_f32_into` parity vs CPU `build_expert_major_perm`.

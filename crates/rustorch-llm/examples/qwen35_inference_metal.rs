@@ -58,8 +58,8 @@ use rustorch_metal::kernels::{
     sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
     sgemm_q5_k_f32_expert_major_8x64_half_into, sgemm_q5_k_f32_expert_major_8x8_into,
     sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
-    sgemm_q8_0_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
-    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+    sgemm_q8_0_f32_8x64_half_into, sgemm_q8_0_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into,
+    sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
     sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into,
     sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
     sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
@@ -362,9 +362,18 @@ impl HybridMetalWeight {
             GgmlType::Q8_0 => {
                 // T175 — Q8_0 SGEMM batched. Critical for shared expert weights
                 // and attn projections on Qwen3.6 35B-A3B (Q8_0 = 9% of model).
-                // Without this, fallback drain×M fired ~14 ms per matmul call
-                // = 42 ms per ffn_moe layer (3 shared SGEMMs × 14 ms).
-                if m >= 8 && m % 8 == 0 && self.n % 8 == 0 && self.k % 32 == 0 {
+                // 8×64 multi-warp half MMA when N%64 (1.25× vs 8×8), fallback 8×8.
+                if m >= 8 && m % 8 == 0 && self.n % 64 == 0 && self.k % 32 == 0 {
+                    sgemm_q8_0_f32_8x64_half_into(
+                        backend,
+                        x_batched,
+                        &self.buffer,
+                        out_batched,
+                        m,
+                        self.n,
+                        self.k,
+                    )
+                } else if m >= 8 && m % 8 == 0 && self.n % 8 == 0 && self.k % 32 == 0 {
                     sgemm_q8_0_f32_simdgroup_matrix_into(
                         backend,
                         x_batched,
