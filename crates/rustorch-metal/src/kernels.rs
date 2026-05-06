@@ -11292,6 +11292,82 @@ pub fn ssm_apply_gate_f32(
     Ok(())
 }
 
+// T162 phase 9e — batched ssm_apply_gate for B-token prefill.
+// Same as ssm_apply_gate_f32 but operates on `[B, n_v]` buffers for alpha/beta
+// + outputs gate_h/beta_sig in `[B, n_v]`. dt_bias and ssm_a are shared across
+// the batch (per-layer constants).
+const SSM_APPLY_GATE_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void ssm_apply_gate_batched_f32(
+    device const float* alpha    [[buffer(0)]],   // [B, n_v]
+    device const float* beta     [[buffer(1)]],   // [B, n_v]
+    device const float* dt_bias  [[buffer(2)]],   // [n_v] (shared)
+    device const float* ssm_a    [[buffer(3)]],   // [n_v] (shared)
+    device float*       gate_h   [[buffer(4)]],   // [B, n_v] out
+    device float*       beta_sig [[buffer(5)]],   // [B, n_v] out
+    constant uint2&     dims     [[buffer(6)]],   // (n_v, B)
+    uint2               gid      [[thread_position_in_grid]]
+) {
+    uint n = dims.x;
+    uint B = dims.y;
+    uint i = gid.x;
+    uint b = gid.y;
+    if (i >= n || b >= B) return;
+    uint off = b * n + i;
+    float a = alpha[off] + dt_bias[i];
+    float sp;
+    if (a > 20.0)       sp = a;
+    else if (a < -20.0) sp = exp(a);
+    else                sp = log(1.0 + exp(a));
+    gate_h[off] = sp * ssm_a[i];
+    beta_sig[off] = 1.0 / (1.0 + exp(-beta[off]));
+}
+"#;
+
+/// T162 phase 9e — Batched fused SSM-block gate ops for B tokens.
+/// Equivalent to B sequential `ssm_apply_gate_f32` calls.
+/// dt_bias and ssm_a are layer-constants (shared across all B tokens).
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_apply_gate_batched_f32(
+    backend: &MetalBackend,
+    alpha_buf: &Buffer,
+    beta_buf: &Buffer,
+    dt_bias_buf: &Buffer,
+    ssm_a_buf: &Buffer,
+    gate_h_buf: &Buffer,
+    beta_sig_buf: &Buffer,
+    n_v: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if n_v == 0 || b == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ssm_apply_gate_batched_f32: n_v={n_v}, B={b}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "ssm_apply_gate_batched_f32",
+        SSM_APPLY_GATE_BATCHED_F32_SHADER,
+        "ssm_apply_gate_batched_f32",
+    )?;
+    let dims = [n_v as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(alpha_buf), 0);
+        encoder.set_buffer(1, Some(beta_buf), 0);
+        encoder.set_buffer(2, Some(dt_bias_buf), 0);
+        encoder.set_buffer(3, Some(ssm_a_buf), 0);
+        encoder.set_buffer(4, Some(gate_h_buf), 0);
+        encoder.set_buffer(5, Some(beta_sig_buf), 0);
+        encoder.set_bytes(6, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(n_v as u64, b as u64, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
 // T146b — Per-head split of the combined QG buffer (Q + gate, 2x output
 // width) into separate Q and gate buffers. Used by Qwen3Next attention
 // where wq outputs `2 * head_dim * n_q` and the first half-per-head is Q,
@@ -14305,6 +14381,118 @@ mod tests {
                     "batch={batch} i={i} mismatch: seq={a} batch={bv} (rel {r:.3e})"
                 );
             }
+        }
+    }
+
+    /// T162 phase 9e — batched ssm_apply_gate must match B sequential calls.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn ssm_apply_gate_batched_f32_matches_singles() {
+        let backend = metal_backend();
+        let n_v = 32usize;
+        let b = 4usize;
+
+        // Build B different (alpha, beta) rows + shared (dt_bias, ssm_a).
+        let mut alpha_all = vec![0.0f32; b * n_v];
+        let mut beta_all = vec![0.0f32; b * n_v];
+        for batch in 0..b {
+            for i in 0..n_v {
+                alpha_all[batch * n_v + i] =
+                    ((i as f32 + 1.0 + batch as f32 * 3.0) * 0.011).sin() * 2.0;
+                beta_all[batch * n_v + i] =
+                    ((i as f32 + 1.0 + batch as f32 * 5.0) * 0.017).cos() * 0.5;
+            }
+        }
+        let dt_bias: Vec<f32> = (0..n_v).map(|i| 0.05 + (i as f32) * 0.001).collect();
+        let ssm_a: Vec<f32> = (0..n_v).map(|i| 1.0 + (i as f32) * 0.003).collect();
+
+        let dt_buf = backend.alloc_shared(n_v * 4).unwrap();
+        let a_buf = backend.alloc_shared(n_v * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(dt_bias.as_ptr(), dt_buf.contents() as *mut f32, n_v);
+            std::ptr::copy_nonoverlapping(ssm_a.as_ptr(), a_buf.contents() as *mut f32, n_v);
+        }
+
+        // Reference: B sequential calls.
+        let mut gate_h_seq = vec![0.0f32; b * n_v];
+        let mut beta_sig_seq = vec![0.0f32; b * n_v];
+        for batch in 0..b {
+            let alpha_b = backend.alloc_shared(n_v * 4).unwrap();
+            let beta_b = backend.alloc_shared(n_v * 4).unwrap();
+            let g_b = backend.alloc_shared(n_v * 4).unwrap();
+            let bs_b = backend.alloc_shared(n_v * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    alpha_all[batch * n_v..(batch + 1) * n_v].as_ptr(),
+                    alpha_b.contents() as *mut f32,
+                    n_v,
+                );
+                std::ptr::copy_nonoverlapping(
+                    beta_all[batch * n_v..(batch + 1) * n_v].as_ptr(),
+                    beta_b.contents() as *mut f32,
+                    n_v,
+                );
+            }
+            ssm_apply_gate_f32(
+                backend, &alpha_b, &beta_b, &dt_buf, &a_buf, &g_b, &bs_b, n_v,
+            )
+            .unwrap();
+            backend.drain();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    g_b.contents() as *const f32,
+                    gate_h_seq[batch * n_v..(batch + 1) * n_v].as_mut_ptr(),
+                    n_v,
+                );
+                std::ptr::copy_nonoverlapping(
+                    bs_b.contents() as *const f32,
+                    beta_sig_seq[batch * n_v..(batch + 1) * n_v].as_mut_ptr(),
+                    n_v,
+                );
+            }
+        }
+
+        // Batched call.
+        let alpha_buf = backend.alloc_shared(b * n_v * 4).unwrap();
+        let beta_buf = backend.alloc_shared(b * n_v * 4).unwrap();
+        let g_buf = backend.alloc_shared(b * n_v * 4).unwrap();
+        let bs_buf = backend.alloc_shared(b * n_v * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                alpha_all.as_ptr(),
+                alpha_buf.contents() as *mut f32,
+                b * n_v,
+            );
+            std::ptr::copy_nonoverlapping(
+                beta_all.as_ptr(),
+                beta_buf.contents() as *mut f32,
+                b * n_v,
+            );
+        }
+        ssm_apply_gate_batched_f32(
+            backend, &alpha_buf, &beta_buf, &dt_buf, &a_buf, &g_buf, &bs_buf, n_v, b,
+        )
+        .unwrap();
+        backend.drain();
+
+        let g_bat =
+            unsafe { std::slice::from_raw_parts(g_buf.contents() as *const f32, b * n_v).to_vec() };
+        let bs_bat = unsafe {
+            std::slice::from_raw_parts(bs_buf.contents() as *const f32, b * n_v).to_vec()
+        };
+        for i in 0..b * n_v {
+            assert!(
+                (gate_h_seq[i] - g_bat[i]).abs() < 1e-5,
+                "gate_h[{i}] mismatch: seq={} bat={}",
+                gate_h_seq[i],
+                g_bat[i]
+            );
+            assert!(
+                (beta_sig_seq[i] - bs_bat[i]).abs() < 1e-5,
+                "beta_sig[{i}] mismatch: seq={} bat={}",
+                beta_sig_seq[i],
+                bs_bat[i]
+            );
         }
     }
 

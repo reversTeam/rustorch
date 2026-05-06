@@ -51,18 +51,18 @@ use rustorch_metal::kernels::{
     gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32, kv_append_f32,
     l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
     rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
-    rope_half_split_partial_batched_f32, sgemm_q3_k_f32_simdgroup_matrix_64_into,
-    sgemm_q3_k_f32_simdgroup_matrix_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
-    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
-    sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
-    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
-    sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
-    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
-    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
-    swiglu_batched_f32, swiglu_f32, topk_softmax_norm_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_f32, zero_f32,
+    rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
+    sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
+    sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
+    sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
+    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into,
+    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32,
+    sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
+    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_batched_f32,
+    swiglu_f32, topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -280,6 +280,27 @@ impl HybridMetalWeight {
                 } else {
                     Err(MetalError::Unsupported(format!(
                         "HybridMetalWeight::matmul_batched_into: Q6_K SGEMM requires M >= 8, M%8 == 0, N%8 == 0, K%256 == 0 (got M={m}, N={}, K={})",
+                        self.n, self.k
+                    )))
+                }
+            },
+            GgmlType::F32 => {
+                // T162 phase 9e — F32 SGEMM pour les petites projections SSM
+                // (ssm_alpha, ssm_beta : K=d, N=n_v ~ 32-48).
+                // Pré-conditions : M%8, N%8, K%8 (cf sgemm_f32_simdgroup_matrix).
+                if m >= 8 && m % 8 == 0 && self.n % 8 == 0 && self.k % 8 == 0 {
+                    sgemm_f32_simdgroup_matrix_into(
+                        backend,
+                        x_batched,
+                        &self.buffer,
+                        out_batched,
+                        m,
+                        self.n,
+                        self.k,
+                    )
+                } else {
+                    Err(MetalError::Unsupported(format!(
+                        "HybridMetalWeight::matmul_batched_into: F32 SGEMM requires M%8, N%8, K%8 (got M={m}, N={}, K={})",
                         self.n, self.k
                     )))
                 }
@@ -1138,6 +1159,236 @@ fn ffn_dense_forward_batch(
     // 4. Batched down + residual.
     dispatch_batched_attn_matmul(backend, w_down, b, &scratch.fd, &scratch.fc2)?;
     add_inplace_batched_f32(backend, xd_batched, &scratch.fc2, d, b)?;
+    Ok(())
+}
+
+/// T162 phase 9e — Per-SSM-block batched scratch buffers (B_MAX-sized).
+/// Sized to match the per-token Scratch fields but with B dimension prefixed.
+/// `qkv_mixed`, `z`, `alpha`, `beta`, `gate_h`, `beta_sig` are populated by
+/// the batched input-projection + apply_gate phase. The SSM scan (conv +
+/// delta_net) reads these per-token (CPU memcpy slice into `state.scratch.*`).
+/// `ssm_out_buf` collects the per-token scan outputs, then the batched ssm_out
+/// projection writes `o`. Final residual add into `xd_batched` (caller).
+struct BatchScratchSsm {
+    h: Buffer,           // [B_MAX, d] post-ssm-norm
+    qkv_mixed: Buffer,   // [B_MAX, conv_dim]
+    z: Buffer,           // [B_MAX, value_dim]
+    alpha: Buffer,       // [B_MAX, n_v]
+    beta: Buffer,        // [B_MAX, n_v]
+    gate_h: Buffer,      // [B_MAX, n_v]
+    beta_sig: Buffer,    // [B_MAX, n_v]
+    ssm_out_buf: Buffer, // [B_MAX, value_dim]
+    o: Buffer,           // [B_MAX, d] post-ssm_out projection
+}
+
+impl BatchScratchSsm {
+    fn new(backend: &MetalBackend, cfg: &Qwen35Config) -> Self {
+        let d = cfg.d;
+        let head_v_dim = cfg.ssm_state;
+        let n_k = cfg.ssm_groups;
+        let n_v = cfg.ssm_dt_rank;
+        let key_dim = head_v_dim * n_k;
+        let value_dim = head_v_dim * n_v;
+        let conv_dim = 2 * key_dim + value_dim;
+        let b = B_MAX_BATCH;
+        let alloc = |bytes: usize| backend.alloc_shared(bytes.max(4)).unwrap();
+        Self {
+            h: alloc(b * d * 4),
+            qkv_mixed: alloc(b * conv_dim * 4),
+            z: alloc(b * value_dim * 4),
+            alpha: alloc(b * n_v * 4),
+            beta: alloc(b * n_v * 4),
+            gate_h: alloc(b * n_v * 4),
+            beta_sig: alloc(b * n_v * 4),
+            ssm_out_buf: alloc(b * value_dim * 4),
+            o: alloc(b * d * 4),
+        }
+    }
+}
+
+/// T162 phase 9e — Batched SSM block forward.
+///
+/// Equivalent to B sequential `ssm_block_forward` calls but with batched
+/// projections (input qkv/z/alpha/beta + apply_gate + output ssm_out). The
+/// recurrent scan (conv1d_step + delta_net_step + per-head-norm) stays
+/// sequential per-token because conv_state and ssm state are recurrent.
+///
+/// Pré-conditions :
+///   - `xd_batched` : `[B, d]` row-major (in/out — résidu cumulé sur place)
+///   - `state.scratch` : per-token Scratch utilisé pour la phase scan
+///   - 1 ≤ b ≤ B_MAX_BATCH
+#[allow(clippy::too_many_arguments)]
+fn ssm_block_forward_batch(
+    backend: &MetalBackend,
+    ssm: &SsmLayerMetal,
+    s: &SsmLayerState,
+    xd_batched: &Buffer,
+    batch_scratch: &BatchScratchSsm,
+    scratch: &Scratch,
+    cfg: &Qwen35Config,
+    b: usize,
+) -> Result<(), MetalError> {
+    if b == 0 || b > B_MAX_BATCH {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ssm_block_forward_batch: B must be in 1..={B_MAX_BATCH} (got {b})"
+        )));
+    }
+    let d = cfg.d;
+    let eps = cfg.rms_eps;
+    let head_v_dim = cfg.ssm_state;
+    let n_k = cfg.ssm_groups;
+    let n_v = cfg.ssm_dt_rank;
+    let key_dim = head_v_dim * n_k;
+    let value_dim = head_v_dim * n_v;
+    let conv_dim = 2 * key_dim + value_dim;
+
+    // 1. Batched pre-mixer norm.
+    rms_norm_batched_f32(
+        backend,
+        xd_batched,
+        &ssm.attn_norm,
+        &batch_scratch.h,
+        d,
+        b,
+        eps,
+    )?;
+
+    // 2. Batched 4 input projections (Q+K+V mixed, gate-z, alpha, beta).
+    dispatch_batched_attn_matmul(
+        backend,
+        &ssm.w_qkv,
+        b,
+        &batch_scratch.h,
+        &batch_scratch.qkv_mixed,
+    )?;
+    dispatch_batched_attn_matmul(backend, &ssm.w_gate, b, &batch_scratch.h, &batch_scratch.z)?;
+    dispatch_batched_attn_matmul(
+        backend,
+        &ssm.ssm_alpha,
+        b,
+        &batch_scratch.h,
+        &batch_scratch.alpha,
+    )?;
+    dispatch_batched_attn_matmul(
+        backend,
+        &ssm.ssm_beta,
+        b,
+        &batch_scratch.h,
+        &batch_scratch.beta,
+    )?;
+
+    // 3. Batched ssm_apply_gate.
+    ssm_apply_gate_batched_f32(
+        backend,
+        &batch_scratch.alpha,
+        &batch_scratch.beta,
+        &ssm.dt_bias,
+        &ssm.ssm_a,
+        &batch_scratch.gate_h,
+        &batch_scratch.beta_sig,
+        n_v,
+        b,
+    )?;
+
+    // 4. Per-token scan (recurrent). Drain pour que les batched dispatches
+    //    soient visibles avant CPU memcpy slice.
+    backend.drain();
+    for bi in 0..b {
+        // Slice les inputs depuis batch_scratch → scratch (per-token buffers).
+        unsafe {
+            // qkv_mixed [conv_dim]
+            std::ptr::copy_nonoverlapping(
+                (batch_scratch.qkv_mixed.contents() as *const f32).add(bi * conv_dim),
+                scratch.qkv_mixed.contents() as *mut f32,
+                conv_dim,
+            );
+            // z [value_dim]
+            std::ptr::copy_nonoverlapping(
+                (batch_scratch.z.contents() as *const f32).add(bi * value_dim),
+                scratch.z.contents() as *mut f32,
+                value_dim,
+            );
+            // gate_h [n_v]
+            std::ptr::copy_nonoverlapping(
+                (batch_scratch.gate_h.contents() as *const f32).add(bi * n_v),
+                scratch.gate_h.contents() as *mut f32,
+                n_v,
+            );
+            // beta_sig [n_v]
+            std::ptr::copy_nonoverlapping(
+                (batch_scratch.beta_sig.contents() as *const f32).add(bi * n_v),
+                scratch.beta_sig.contents() as *mut f32,
+                n_v,
+            );
+        }
+
+        // Conv1d step + ring buffer update (mutates s.conv_state).
+        ssm_conv1d_step_f32(
+            backend,
+            &scratch.qkv_mixed,
+            &ssm.conv1d,
+            &s.conv_state,
+            &scratch.conv_out,
+            cfg.ssm_conv_kernel,
+            conv_dim,
+        )?;
+        // GPU split q/k/v (réutilise le path T154-fast — fused L2 + delta_net).
+        split_qkv_f32(
+            backend,
+            &scratch.conv_out,
+            &scratch.q_ssm,
+            &scratch.k_ssm,
+            &scratch.v_ssm,
+            key_dim,
+            key_dim,
+            value_dim,
+        )?;
+        // T154-fast — fused L2 + delta_net (mutates s.state).
+        delta_net_step_with_l2_f32(
+            backend,
+            &scratch.q_ssm,
+            &scratch.k_ssm,
+            &scratch.v_ssm,
+            &scratch.gate_h,
+            &scratch.beta_sig,
+            &s.state,
+            &scratch.ssm_out_buf,
+            n_v,
+            head_v_dim,
+            n_k,
+            eps,
+        )?;
+        // Per-head RMSNorm gated by silu(z).
+        rms_norm_per_head_gated_f32(
+            backend,
+            &scratch.ssm_out_buf,
+            &ssm.ssm_norm,
+            &scratch.z,
+            n_v,
+            head_v_dim,
+            eps,
+        )?;
+        backend.drain();
+        // Copy scratch.ssm_out_buf → batch_scratch.ssm_out_buf[bi].
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scratch.ssm_out_buf.contents() as *const f32,
+                (batch_scratch.ssm_out_buf.contents() as *mut f32).add(bi * value_dim),
+                value_dim,
+            );
+        }
+    }
+
+    // 5. Batched output projection ssm_out_buf → o.
+    dispatch_batched_attn_matmul(
+        backend,
+        &ssm.ssm_out,
+        b,
+        &batch_scratch.ssm_out_buf,
+        &batch_scratch.o,
+    )?;
+    // 6. Batched residual add.
+    add_inplace_batched_f32(backend, xd_batched, &batch_scratch.o, d, b)?;
     Ok(())
 }
 
@@ -2291,6 +2542,7 @@ struct BatchScratch {
     xd: Buffer, // [B_MAX, d] residual stream
     attn: BatchScratchAttn,
     ffn: BatchScratchFfn,
+    ssm: BatchScratchSsm,
 }
 
 impl BatchScratch {
@@ -2300,6 +2552,7 @@ impl BatchScratch {
             xd: backend.alloc_shared(B_MAX_BATCH * d * 4).unwrap(),
             attn: BatchScratchAttn::new(backend, cfg),
             ffn: BatchScratchFfn::new(backend, cfg),
+            ssm: BatchScratchSsm::new(backend, cfg),
         }
     }
 }
@@ -2426,29 +2679,19 @@ fn forward_batch(
                 },
                 LayerState::Ssm(s),
             ) => {
-                // SSM scan per-token (state recurrent ⇒ pas batchable trivialement),
-                // puis FFN dense batched.
-                // CRITICAL : drain pour que les GPU writes de la layer précédente
-                // (e.g. attn_block_forward_batch + ffn_dense_forward_batch) soient
-                // visibles avant la CPU-memcpy lecture de xd_batched.
-                backend.drain();
-                for bi in 0..b {
-                    // Copy xd_batched[bi] → scratch.xd.
-                    unsafe {
-                        let src = (batch_scratch.xd.contents() as *const f32).add(bi * d);
-                        let dst = state.scratch.xd.contents() as *mut f32;
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                    let prefix = format!("p{:03}/L{li:02}", pos_base + bi);
-                    ssm_block_forward(backend, ssm, s, &state.scratch, cfg, &prefix)
-                        .map_err(|e| format!("L{li} ssm[{bi}]: {e:?}"))?;
-                    backend.drain();
-                    unsafe {
-                        let src = state.scratch.xd.contents() as *const f32;
-                        let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                }
+                // T162 phase 9e — SSM block batched (projections + apply_gate
+                // batched, scan séquentiel, output proj batched).
+                ssm_block_forward_batch(
+                    backend,
+                    ssm,
+                    s,
+                    &batch_scratch.xd,
+                    &batch_scratch.ssm,
+                    &state.scratch,
+                    cfg,
+                    b,
+                )
+                .map_err(|e| format!("L{li} ssm batched: {e:?}"))?;
                 // FFN dense batched (post-attn norm + gate/up/swiglu/down + residual).
                 ffn_dense_forward_batch(
                     backend,
