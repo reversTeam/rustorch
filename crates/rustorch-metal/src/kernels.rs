@@ -2626,6 +2626,241 @@ pub fn sgemm_q4_k_f32_simdgroup_matrix_into(
 }
 
 // =============================================================================
+// T162 phase 3 — Q4_K SGEMM avec tiles 64×64 multi-warp.
+//
+// Évolution de phase 2 (tile 8×8 single-simdgroup) : passage à BM=BN=64 avec
+// 4 simdgroups par TG (WM=WN=2). Chaque simdgroup gère un quadrant 32×32 =
+// 16 fragments 8×8. Réduit le nombre de TGs de 64× (64×64 tile vs 8×8) →
+// kill le dispatch overhead qui plafonnait la phase 2 à 2× sur grandes shapes.
+//
+// Architecture (alignée sur MLX `qmm_t_impl` BlockMMA<WM=2, WN=2>) :
+// - TG : 128 threads = 4 simdgroups × 32. Output tile BM×BN = 64×64.
+// - Threadgroup mem (16 KB) :
+//     Xs[BM=64, BK=32] f32 = 8 KB
+//     Ws[BN=64, BK=32] f32 = 8 KB (dequant Q4_K)
+// - Cooperative load : 128 threads × 16 elements = 2048 = BM × BK. Chaque
+//   thread charge/dequant 16 elements par K-iteration.
+// - Par K-iteration (BK=32 = 1 sub-block Q4_K) :
+//     load Xs (cooperative)
+//     dequant Ws (cooperative, formula scale × nibble - min)
+//     threadgroup_barrier
+//     chaque simdgroup : 4 K-fragments × 4×4 MMAs = 64 simdgroup MMAs
+// - Output stage : 4 simdgroups écrivent leurs 16 C fragments chacun.
+//
+// Pré-conditions : M, N multiples de 64 ; K multiple de 256.
+const SGEMM_Q4_K_F32_SIMDGROUP_MATRIX_64_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q4K_BYTES = 144u;
+constant uint Q4K_WEIGHTS = 256u;
+constant uint BM = 64u;
+constant uint BN = 64u;
+constant uint BK = 32u;
+constant uint WM = 2u;
+constant uint WN = 2u;
+constant uint TM = 32u;        // BM / WM
+constant uint TN = 32u;        // BN / WN
+constant uint FM = 4u;         // TM / 8 : 4 fragments per simdgroup row
+constant uint FN = 4u;         // TN / 8 : 4 fragments per simdgroup col
+
+kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
+    device const float*  A      [[buffer(0)]],
+    device const uchar*  W_q4k  [[buffer(1)]],
+    device float*        C      [[buffer(2)]],
+    constant uint3&      dims   [[buffer(3)]],
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    uint n_tiles_n = N / BN;
+    uint m_tile = tg_id / n_tiles_n;
+    uint n_tile = tg_id % n_tiles_n;
+    if (m_tile * BM >= M || n_tile * BN >= N) return;
+
+    uint sgi = (uint)sgitg / WN;       // 0..WM-1 = 0..1
+    uint sgj = (uint)sgitg % WN;       // 0..WN-1 = 0..1
+
+    threadgroup float Xs[64 * 32];     // BM × BK
+    threadgroup float Ws[64 * 32];     // BN × BK
+
+    // 16 C fragments per simdgroup, accumulators.
+    simdgroup_matrix<float, 8, 8> C_frag[4][4];
+    for (uint i = 0; i < FM; ++i) {
+        for (uint j = 0; j < FN; ++j) {
+            C_frag[i][j] = simdgroup_matrix<float, 8, 8>(0.0);
+        }
+    }
+
+    uint blocks_per_row = K / Q4K_WEIGHTS;
+    uint row_stride_bytes = blocks_per_row * Q4K_BYTES;
+
+    // Cooperative load layout : 128 threads, each handles 16 elements.
+    uint tid = (uint)sgitg * 32u + (uint)tiisg;   // 0..127
+    uint load_row = tid / 2u;                      // 0..63
+    uint load_chunk = tid % 2u;                    // 0..1 (cols 0..16 or 16..32)
+
+    for (uint k_offset = 0; k_offset < K; k_offset += BK) {
+        // Phase 1 : load Xs[BM=64, BK=32] = 2048 floats coopérativement.
+        uint a_row_global = m_tile * BM + load_row;
+        threadgroup float* xs_dst = Xs + load_row * BK + load_chunk * 16u;
+        if (a_row_global < M) {
+            uint a_base = a_row_global * K + k_offset + load_chunk * 16u;
+            for (uint c = 0; c < 16u; ++c) {
+                xs_dst[c] = A[a_base + c];
+            }
+        } else {
+            for (uint c = 0; c < 16u; ++c) {
+                xs_dst[c] = 0.0;
+            }
+        }
+
+        // Phase 2 : dequant Ws[BN=64, BK=32] coopérativement.
+        uint super_block_idx = k_offset / Q4K_WEIGHTS;
+        uint sb_in_super = (k_offset % Q4K_WEIGHTS) / 32u;
+        uint pair_idx = sb_in_super / 2u;
+        bool is_high = (sb_in_super & 1u) != 0u;
+
+        uint w_row_global = n_tile * BN + load_row;
+        threadgroup float* ws_dst = Ws + load_row * BK + load_chunk * 16u;
+        if (w_row_global < N) {
+            device const uchar* row_block = W_q4k
+                + (uint64_t)w_row_global * row_stride_bytes
+                + (uint64_t)super_block_idx * Q4K_BYTES;
+            device const half* d_ptr = (device const half*)(row_block);
+            float d    = float(d_ptr[0]);
+            float dmin = float(d_ptr[1]);
+
+            device const uchar* sc_raw = row_block + 4;
+            uchar sc6, m6;
+            if (sb_in_super < 4u) {
+                sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+                m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+            } else {
+                uint i = sb_in_super - 4u;
+                sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+                m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+            }
+            float scale   = d    * float(sc6);
+            float min_val = dmin * float(m6);
+
+            device const uchar* qs_ptr = row_block + 16u + pair_idx * 32u;
+            for (uint c = 0; c < 16u; ++c) {
+                uint byte_pos  = load_chunk * 16u + c;
+                uchar byte_val = qs_ptr[byte_pos];
+                uchar nibble   = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+                ws_dst[c] = scale * float(nibble) - min_val;
+            }
+        } else {
+            for (uint c = 0; c < 16u; ++c) {
+                ws_dst[c] = 0.0;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 3 : 4 K-fragments × 4×4 MMAs per simdgroup.
+        for (uint k_frag = 0; k_frag < BK / 8u; ++k_frag) {
+            simdgroup_matrix<float, 8, 8> A_frags[4];
+            simdgroup_matrix<float, 8, 8> B_frags[4];
+
+            // Load 4 A fragments (rows [sgi*TM + i*8] of Xs, cols [k_frag*8])
+            for (uint i = 0; i < FM; ++i) {
+                uint a_row = sgi * TM + i * 8u;
+                simdgroup_load(A_frags[i], Xs + a_row * BK + k_frag * 8u, BK);
+            }
+            // Load 4 B fragments TRANSPOSED (Ws stored [BN, BK] row-major,
+            // we want B[K, N] = Ws^T) — cols are rows in B.
+            for (uint j = 0; j < FN; ++j) {
+                uint w_row = sgj * TN + j * 8u;
+                simdgroup_load(
+                    B_frags[j],
+                    Ws + w_row * BK + k_frag * 8u,
+                    BK,
+                    ulong2(0, 0),
+                    /* transpose */ true);
+            }
+
+            // Outer product : C[i][j] += A[i] @ B[j].
+            for (uint i = 0; i < FM; ++i) {
+                for (uint j = 0; j < FN; ++j) {
+                    simdgroup_multiply_accumulate(
+                        C_frag[i][j], A_frags[i], B_frags[j], C_frag[i][j]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store C tile : 16 fragments × 4 simdgroups = 64 fragments écrits.
+    for (uint i = 0; i < FM; ++i) {
+        for (uint j = 0; j < FN; ++j) {
+            uint c_row = m_tile * BM + sgi * TM + i * 8u;
+            uint c_col = n_tile * BN + sgj * TN + j * 8u;
+            if (c_row + 7u < M && c_col + 7u < N) {
+                device float* C_ptr = C + (uint64_t)c_row * N + (uint64_t)c_col;
+                simdgroup_store(C_frag[i][j], C_ptr, N);
+            }
+        }
+    }
+}
+"#;
+
+/// T162 phase 3 — Q4_K SGEMM tiles 64×64 multi-warp (4 simdgroups par TG).
+///
+/// Pré-conditions :
+/// - Metal3 (Apple7+)
+/// - M, N multiples de 64 ; K multiple de 256
+///
+/// Performance attendue : sur shapes ≥ 64×N×K, 5-7× plus rapide que la
+/// phase 2 (tile 8×8). Réduit le TG count de 64× → dispatch overhead
+/// éliminé sur grandes matmuls FFN du Qwen3-14B (5120×5120, 14336×5120).
+pub fn sgemm_q4_k_f32_simdgroup_matrix_64_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    c_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q4_k_f32_simdgroup_matrix_64 needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 64 != 0 || n % 64 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q4_k_f32_simdgroup_matrix_64: M, N must be multiples of 64 and K multiple of 256 (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q4_k_f32_simdgroup_matrix_64",
+        SGEMM_Q4_K_F32_SIMDGROUP_MATRIX_64_SHADER,
+        "sgemm_q4_k_f32_simdgroup_matrix_64",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(c_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1); // 4 simdgroups × 32
+        let n_tg = ((m / 64) * (n / 64)) as u64;
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // sgemv_q4_k_f32 — direct sgemv on Q4_K-quantised weights, no f32 expansion.
 //
 // Reads 144-byte Q4_K super-blocks straight from the GPU buffer, dequantises
@@ -10551,6 +10786,109 @@ mod tests {
         }
     }
 
+    /// T162 phase 3 — Q4_K SGEMM tiles 64×64 multi-warp vs CPU dequant + naive matmul.
+    ///
+    /// Validation correctness du kernel multi-warp avec 4 simdgroups par TG.
+    /// PASS gate de la phase 3 (intégration prefill).
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemm_q4_k_f32_simdgroup_matrix_64_matches_cpu() {
+        use rustorch_gguf::dequant::dequant_q4_k;
+
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[sgemm_q4_k_simdmat_64] skipping: no Metal3");
+            return;
+        }
+
+        // Shape minimale : M=N=64, K=512 (2 super-blocks). Exerce le multi-warp,
+        // les 16 C fragments par simdgroup, et le K-loop multi-superblock.
+        let m = 64_usize;
+        let n = 64_usize;
+        let k = 512_usize;
+        let blocks_per_row = k / 256;
+
+        // Build deterministic Q4_K bytes (varied scales/qs).
+        let mut w_bytes = vec![0u8; n * blocks_per_row * 144];
+        for nrow in 0..n {
+            for ib in 0..blocks_per_row {
+                let off = (nrow * blocks_per_row + ib) * 144;
+                let d_val = ((nrow as f32 + 1.0) * 0.005) + (ib as f32) * 0.001;
+                let dmin_val = ((nrow as f32) * 0.002) + (ib as f32) * 0.0005;
+                let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                let dmin_h = half::f16::from_f32(dmin_val).to_le_bytes();
+                w_bytes[off] = d_h[0];
+                w_bytes[off + 1] = d_h[1];
+                w_bytes[off + 2] = dmin_h[0];
+                w_bytes[off + 3] = dmin_h[1];
+                for i in 0..12 {
+                    w_bytes[off + 4 + i] =
+                        (0x12_u8.wrapping_add((nrow as u8) ^ (i as u8) ^ (ib as u8))) | 0x05;
+                }
+                for i in 0..128 {
+                    w_bytes[off + 16 + i] =
+                        ((nrow as u8) ^ (i as u8) ^ (ib as u8)).wrapping_add(0x29);
+                }
+            }
+        }
+
+        let a = det_vec(m * k, 1.5);
+        let mut w_f32 = vec![0.0_f32; n * k];
+        for nrow in 0..n {
+            let row_off = nrow * blocks_per_row * 144;
+            let row_bytes = &w_bytes[row_off..row_off + blocks_per_row * 144];
+            let row_dst = &mut w_f32[nrow * k..(nrow + 1) * k];
+            dequant_q4_k(row_bytes, row_dst).unwrap();
+        }
+
+        let mut c_ref = vec![0.0_f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0_f32;
+                for l in 0..k {
+                    s += a[i * k + l] * w_f32[j * k + l];
+                }
+                c_ref[i * n + j] = s;
+            }
+        }
+
+        let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        let c_buf = backend.alloc_shared(m * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+        }
+        sgemm_q4_k_f32_simdgroup_matrix_64_into(backend, &a_buf, &w_buf, &c_buf, m, n, k).unwrap();
+        backend.drain();
+
+        let mut c_metal = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_buf.contents() as *const f32,
+                c_metal.as_mut_ptr(),
+                m * n,
+            );
+        }
+
+        for i in 0..(m * n) {
+            let abs_err = (c_ref[i] - c_metal[i]).abs();
+            let denom = c_ref[i].abs().max(1e-3);
+            let rel = abs_err / denom;
+            assert!(
+                rel < 1e-2,
+                "Q4_K SGEMM 64×64 mismatch at {i}: ref={} metal={} (rel {:.3e})",
+                c_ref[i],
+                c_metal[i],
+                rel
+            );
+        }
+    }
+
     /// T162 phase 2 — Bench Q4_K SGEMM simdgroup_matrix vs sgemv_q4_k loop.
     ///
     /// Le path actuel rustorch pour prefill : `sgemv_q4_k_f32_lcpp_nsg2` appelé
@@ -10663,8 +11001,36 @@ mod tests {
             let sgemv_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
             let speedup = sgemv_ms / sgemm_ms;
+
+            // Path C : SGEMM tile 64×64 multi-warp (phase 3) si shape compatible.
+            let sgemm64_ms = if m % 64 == 0 && n_dim % 64 == 0 {
+                for _ in 0..3 {
+                    sgemm_q4_k_f32_simdgroup_matrix_64_into(
+                        backend, &a_buf, &w_buf, &c_buf, m, n_dim, k,
+                    )
+                    .unwrap();
+                }
+                backend.drain();
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    sgemm_q4_k_f32_simdgroup_matrix_64_into(
+                        backend, &a_buf, &w_buf, &c_buf, m, n_dim, k,
+                    )
+                    .unwrap();
+                }
+                backend.drain();
+                t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+            } else {
+                f64::NAN
+            };
+            let speedup64 = if sgemm64_ms.is_finite() {
+                sgemv_ms / sgemm64_ms
+            } else {
+                f64::NAN
+            };
+
             eprintln!(
-                "M={m:4}, N={n_dim:5}, K={k:5}: Q4_K sgemm_simdmat={sgemm_ms:7.3}ms, sgemv_loop={sgemv_ms:7.3}ms, speedup={speedup:5.2}×"
+                "M={m:4}, N={n_dim:5}, K={k:5}: Q4_K phase2(8x8)={sgemm_ms:7.3}ms (×{speedup:5.2}), phase3(64x64)={sgemm64_ms:7.3}ms (×{speedup64:5.2}), sgemv_loop={sgemv_ms:7.3}ms"
             );
         }
     }
