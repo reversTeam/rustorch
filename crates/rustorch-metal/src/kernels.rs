@@ -3082,6 +3082,214 @@ pub fn sgemm_q4_k_f32_expert_major_8x64_half_into(
 }
 
 // =============================================================================
+// T174 Day 5-bis — Q4_K SGEMM EXPERT-MAJOR avec tile 8×128 multi-simdgroup half MMA.
+//
+// Variant of `sgemm_q4_k_f32_expert_major_8x64_half` with N-tile widened to
+// 128 (vs 64). Each simdgroup owns mc[4] frags = 8M × 32N output (vs mc[2]
+// = 16N in 8x64). Cuts the dispatched TG count by another 2× for the same
+// total work — better amortizes kernel-launch overhead.
+//
+// Tradeoff: more register pressure per simdgroup (mc[4] frags = 4 8×8 float
+// matrices = 16 fp32 regs per lane). Should still fit but may stall.
+//
+// Pre-conditions :
+// - Metal3 (Apple7+), N % 128 == 0 (vs N % 64 for 8x64)
+const SGEMM_Q4_K_F32_EXPERT_MAJOR_8X128_HALF_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q4K_BYTES_8X128 = 144u;
+constant uint Q4K_WEIGHTS_8X128 = 256u;
+constant uint NR_M_8X128 = 8u;
+constant uint NR_N_8X128 = 128u;
+constant uint NK_8X128 = 32u;
+
+kernel void sgemm_q4_k_f32_expert_major_8x128_half(
+    device const float*  A         [[buffer(0)]],
+    device const uchar*  W_stacked [[buffer(1)]],
+    device const uint*   tile_expert_ids [[buffer(2)]],
+    device float*        C         [[buffer(3)]],
+    constant uint3&      dims      [[buffer(4)]],
+    constant uint&       expert_stride [[buffer(5)]],
+    uint3                tgpig     [[threadgroup_position_in_grid]],
+    ushort               tiitg     [[thread_index_in_threadgroup]],
+    ushort               sgitg     [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    uint m_tile = tgpig.y;
+    uint n_tile = tgpig.x;
+    if (m_tile * NR_M_8X128 >= M || n_tile * NR_N_8X128 >= N) return;
+
+    uint expert_id = tile_expert_ids[m_tile];
+    device const uchar* W_q4k = W_stacked + (uint64_t)expert_id * (uint64_t)expert_stride;
+
+    threadgroup half sa[NR_M_8X128 * NK_8X128];          // 8 × 32 = 256 halves = 512 B
+    threadgroup half sb[NR_N_8X128 * NK_8X128];          // 128 × 32 = 4096 halves = 8 KB
+
+    uint blocks_per_row = K / Q4K_WEIGHTS_8X128;
+    uint row_stride_bytes = blocks_per_row * Q4K_BYTES_8X128;
+
+    // Per simdgroup : mc[4] frags = 8M × 32N output area.
+    // sgitg ∈ [0, 4), each owns N-cols [sgitg*32 .. sgitg*32+31].
+    simdgroup_matrix<float, 8, 8> mc[4];
+    mc[0] = simdgroup_matrix<float, 8, 8>(0.0);
+    mc[1] = simdgroup_matrix<float, 8, 8>(0.0);
+    mc[2] = simdgroup_matrix<float, 8, 8>(0.0);
+    mc[3] = simdgroup_matrix<float, 8, 8>(0.0);
+
+    for (uint k_offset = 0; k_offset < K; k_offset += NK_8X128) {
+        // Load A → sa : 128 threads × 2 elements = 256 halves.
+        {
+            uint sa_row = tiitg / 16u;
+            uint sa_chunk = tiitg % 16u;
+            uint k_in_tile = sa_chunk * 2u;
+            if (sa_row < NR_M_8X128) {
+                uint a_row_global = m_tile * NR_M_8X128 + sa_row;
+                if (a_row_global < M) {
+                    device const float* A_ptr = A + (uint64_t)a_row_global * (uint64_t)K
+                                                  + (uint64_t)(k_offset + k_in_tile);
+                    sa[sa_row * NK_8X128 + k_in_tile + 0u] = (half)A_ptr[0];
+                    sa[sa_row * NK_8X128 + k_in_tile + 1u] = (half)A_ptr[1];
+                } else {
+                    sa[sa_row * NK_8X128 + k_in_tile + 0u] = (half)0.0;
+                    sa[sa_row * NK_8X128 + k_in_tile + 1u] = (half)0.0;
+                }
+            }
+        }
+
+        // Load+dequant W → sb : 128 threads × 32 elements = 4096 halves.
+        // Each thread handles 32 K-positions of one N-row (= one full K-tile row).
+        {
+            uint sb_row = tiitg;                 // 0..127 maps directly to sb-rows
+            uint w_row_global = n_tile * NR_N_8X128 + sb_row;
+
+            uint super_block_idx = k_offset / Q4K_WEIGHTS_8X128;
+            uint sb_in_super = (k_offset % Q4K_WEIGHTS_8X128) / 32u;
+            uint pair_idx = sb_in_super / 2u;
+            bool is_high = (sb_in_super & 1u) != 0u;
+
+            device const uchar* row_block = W_q4k
+                + (uint64_t)w_row_global * row_stride_bytes
+                + (uint64_t)super_block_idx * Q4K_BYTES_8X128;
+            device const half* d_ptr = (device const half*)(row_block);
+            float d    = float(d_ptr[0]);
+            float dmin = float(d_ptr[1]);
+
+            device const uchar* sc_raw = row_block + 4;
+            uchar sc6, m6;
+            if (sb_in_super < 4u) {
+                sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+                m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+            } else {
+                uint i = sb_in_super - 4u;
+                sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+                m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+            }
+            float scale   = d    * float(sc6);
+            float min_val = dmin * float(m6);
+
+            device const uchar* qs_ptr = row_block + 16u + pair_idx * 32u;
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < 32u; ++c) {
+                uchar byte_val = qs_ptr[c];
+                uchar nibble = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+                sb[sb_row * NK_8X128 + c] = (half)(scale * float(nibble) - min_val);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* sa_ptr = sa;
+        threadgroup const half* sb_ptr = sb + (uint)sgitg * 32u * NK_8X128;
+
+        #pragma clang loop unroll(full)
+        for (uint k_frag = 0; k_frag < 4u; ++k_frag) {
+            simdgroup_matrix<half, 8, 8> ma;
+            simdgroup_matrix<half, 8, 8> mb[4];
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma, sa_ptr + k_frag * 8u, NK_8X128);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb_ptr + k_frag * 8u +  0u * NK_8X128, NK_8X128, ulong2(0, 0), true);
+            simdgroup_load(mb[1], sb_ptr + k_frag * 8u +  8u * NK_8X128, NK_8X128, ulong2(0, 0), true);
+            simdgroup_load(mb[2], sb_ptr + k_frag * 8u + 16u * NK_8X128, NK_8X128, ulong2(0, 0), true);
+            simdgroup_load(mb[3], sb_ptr + k_frag * 8u + 24u * NK_8X128, NK_8X128, ulong2(0, 0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0], ma, mb[0], mc[0]);
+            simdgroup_multiply_accumulate(mc[1], ma, mb[1], mc[1]);
+            simdgroup_multiply_accumulate(mc[2], ma, mb[2], mc[2]);
+            simdgroup_multiply_accumulate(mc[3], ma, mb[3], mc[3]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint c_row = m_tile * NR_M_8X128;
+    uint c_col_base = n_tile * NR_N_8X128 + (uint)sgitg * 32u;
+    if (c_row + NR_M_8X128 - 1u < M) {
+        device float* C_ptr0 = C + (uint64_t)c_row * (uint64_t)N + (uint64_t)c_col_base;
+        if (c_col_base +  7u < N) simdgroup_store(mc[0], C_ptr0,        N);
+        if (c_col_base + 15u < N) simdgroup_store(mc[1], C_ptr0 +  8u,  N);
+        if (c_col_base + 23u < N) simdgroup_store(mc[2], C_ptr0 + 16u,  N);
+        if (c_col_base + 31u < N) simdgroup_store(mc[3], C_ptr0 + 24u,  N);
+    }
+}
+"#;
+
+/// T174 Day 5-bis — Q4_K SGEMM EXPERT-MAJOR with 8×128 tile, 4 simdgroups, half MMA.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_q4_k_f32_expert_major_8x128_half_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_stacked_buf: &Buffer,
+    tile_expert_ids_buf: &Buffer,
+    c_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+    expert_stride_bytes: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q4_k_f32_expert_major_8x128_half needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 8 != 0 || n % 128 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q4_k_f32_expert_major_8x128_half: M%8==0, N%128==0, K%256==0 (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q4_k_f32_expert_major_8x128_half",
+        SGEMM_Q4_K_F32_EXPERT_MAJOR_8X128_HALF_SHADER,
+        "sgemm_q4_k_f32_expert_major_8x128_half",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    let stride_u32 = expert_stride_bytes as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_stacked_buf), 0);
+        encoder.set_buffer(2, Some(tile_expert_ids_buf), 0);
+        encoder.set_buffer(3, Some(c_buf), 0);
+        encoder.set_bytes(4, 12, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1);
+        let n_tg_x = (n / 128) as u64;
+        let n_tg_y = (m / 8) as u64;
+        let groups = MTLSize::new(n_tg_x, n_tg_y, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T163 phase 9f-cinq — Q5_K SGEMM EXPERT-MAJOR (port pour 35B-A3B down weights).
 //
 // Q5_K format (176 bytes/super-block) :
@@ -19511,19 +19719,18 @@ mod tests {
 
         eprintln!();
         eprintln!(
-            "{:>4} | {:>9} | {:>9} | {:>9} | {:>9} | {:>9} | {:>9} | {:>8} | {:>8} | {:>9}",
+            "{:>4} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>9}",
             "B",
             "EM 8x8",
             "EM 8x64",
+            "EM 8x128",
             "mm_id",
             "sgemv",
-            "FFN C",
-            "FFN D",
-            "8x8/8x64",
-            "D/sgemv",
-            "FFN C/D"
+            "FFN×3 8x8",
+            "FFN×3 128",
+            "8x8/128"
         );
-        eprintln!("{}", "-".repeat(120));
+        eprintln!("{}", "-".repeat(110));
 
         for &b in &[1_usize, 4, 16, 32, 64, 128] {
             let b_n_used = b * n_used;
@@ -19746,6 +19953,41 @@ mod tests {
             backend.drain();
             let em8x64_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters_em as f64;
 
+            // Path E: EM 8×128 half MMA — even wider N-tile (4 sg × mc[4]).
+            // Requires N % 128. For our shape N=512 fine. Halves dispatched
+            // TG count (vs 8×64) → better launch-overhead amortization.
+            let c_em8x128_buf = backend.alloc_shared(m_padded_em * n * 4).unwrap();
+            for _ in 0..3 {
+                let _ = sgemm_q4_k_f32_expert_major_8x128_half_into(
+                    backend,
+                    &a_em_buf,
+                    &w_buf,
+                    &tile_ids_buf,
+                    &c_em8x128_buf,
+                    m_padded_em,
+                    n,
+                    k,
+                    bytes_per_expert,
+                );
+            }
+            backend.drain();
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters_em {
+                let _ = sgemm_q4_k_f32_expert_major_8x128_half_into(
+                    backend,
+                    &a_em_buf,
+                    &w_buf,
+                    &tile_ids_buf,
+                    &c_em8x128_buf,
+                    m_padded_em,
+                    n,
+                    k,
+                    bytes_per_expert,
+                );
+            }
+            backend.drain();
+            let em8x128_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters_em as f64;
+
             // Path A scatter timing — Stage 3 of the M-major pipeline.
             // Uses down_out[E, M_max, K_hidden] f32 as input (realistic
             // shape post down_proj) and moe_acc[B, K_hidden] as output.
@@ -19808,32 +20050,27 @@ mod tests {
             let scatter_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters_s as f64;
 
             // End-to-end time per FFN block:
-            //   FFN A = mm_id × 3 + scatter         (T174 path)
-            //   FFN B = sgemv × 3                   (decode/small-batch path)
-            //   FFN C = em8x8 × 3                   (current production B>=32)
-            //   FFN D = em8x64 × 3 + scatter        (T174 Day 5 candidate)
-            // Compare D against C (the real production target).
-            let e2e_a = mm_id_ms * 3.0 + scatter_ms;
-            let e2e_b = sgemv_ms * 3.0;
+            //   FFN×3 8x8  = current production at B>=32
+            //   FFN×3 128  = T174 Day 5 candidate (8×128 half MMA)
             let e2e_c = em_ms * 3.0;
-            let e2e_d = em8x64_ms * 3.0;
+            let e2e_e = em8x128_ms * 3.0;
 
             eprintln!(
-                "{:>4} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>7.2}× | {:>7.2}× | {:>8.2}×",
+                "{:>4} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.2}×",
                 b,
                 em_ms,
                 em8x64_ms,
+                em8x128_ms,
                 mm_id_ms,
                 sgemv_ms,
                 e2e_c,
-                e2e_d,
-                em_ms / em8x64_ms,
-                e2e_b / e2e_d,
-                e2e_c / e2e_d
+                e2e_e,
+                em_ms / em8x128_ms
             );
 
-            // Silence unused (kept for future scatter-only line).
-            let _ = e2e_a;
+            // Silence unused
+            let _ = scatter_ms;
+            let _ = mm_id_ms;
         }
     }
 }
