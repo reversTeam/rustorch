@@ -3502,6 +3502,302 @@ pub fn sgemm_q4_k_f32_simdgroup_matrix_64_into(
 }
 
 // =============================================================================
+// T164 — Fused gate+up SGEMM Q4_K : un seul kernel calcule simultanément
+// gate_out = X @ W_gate^T  ET  up_out = X @ W_up^T en partageant l'input X.
+//
+// Motivation (mesuré sur Qwen3 14B Q4_K, prefill M=256, K=5120, N=17408) :
+// - matmul_gate seul   : ~110 ms (12% prefill)
+// - matmul_up seul     : ~110 ms (12% prefill)
+// - Combiné fused      : ~130 ms cible (-40%) en partageant la lecture VRAM de X
+//
+// Architecture (extension du kernel `sgemm_q4_k_f32_simdgroup_matrix_64`) :
+// - TG : 128 threads = 4 simdgroups × 32. Output tile 64×64 (BM×BN).
+// - Threadgroup mem (24 KB sur 32 KB max) :
+//     Xs[64,32] half      = 4 KB (chargé UNE FOIS pour les 2 outputs)
+//     Ws_gate[64,32] half = 4 KB (dequant Q4_K depuis W_gate)
+//     Ws_up[64,32] half   = 4 KB (dequant Q4_K depuis W_up)
+//   Note : si on était en float (16KB/8KB/8KB = 32 KB), on saturait la TG mem.
+//   Le passage half (T162 phase 9h-bis) débloque ce fused kernel.
+// - C fragments : 4×4 fragments × 2 outputs = 32 simdgroup_matrix par simdgroup.
+// - Par K-iter (BK=32) :
+//     1. cooperative load Xs (128 threads × 16 elts = 2048)
+//     2. cooperative dequant Ws_gate (128 threads × 16 elts)
+//     3. cooperative dequant Ws_up   (128 threads × 16 elts)
+//     4. threadgroup_barrier
+//     5. 4 K-fragments × (4 A_frags + 4 B_gate + 4 B_up) loads
+//        + 16 MMAs vers C_gate + 16 MMAs vers C_up = 32 MMAs/iter/sg
+// - Output stage : 4 sgs × 16 fragments × 2 outputs = 128 fragments écrits.
+//
+// Pré-conditions : Metal3 ; M, N multiples de 64 ; K multiple de 256 ;
+// W_gate et W_up partagent la même shape [N, K] et le même dtype Q4_K.
+const SGEMM_Q4_K_F32_GATE_UP_64_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q4K_BYTES = 144u;
+constant uint Q4K_WEIGHTS = 256u;
+constant uint BM = 64u;
+constant uint BN = 64u;
+constant uint BK = 32u;
+constant uint WM = 2u;
+constant uint WN = 2u;
+constant uint TM = 32u;
+constant uint TN = 32u;
+constant uint FM = 4u;
+constant uint FN = 4u;
+
+kernel void sgemm_q4_k_f32_gate_up_64(
+    device const float*  A         [[buffer(0)]],
+    device const uchar*  W_gate    [[buffer(1)]],
+    device const uchar*  W_up      [[buffer(2)]],
+    device float*        C_gate    [[buffer(3)]],
+    device float*        C_up      [[buffer(4)]],
+    constant uint3&      dims      [[buffer(5)]],
+    uint                 tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiisg     [[thread_index_in_simdgroup]],
+    ushort               sgitg     [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    uint n_tiles_n = N / BN;
+    uint m_tile = tg_id / n_tiles_n;
+    uint n_tile = tg_id % n_tiles_n;
+    if (m_tile * BM >= M || n_tile * BN >= N) return;
+
+    uint sgi = (uint)sgitg / WN;
+    uint sgj = (uint)sgitg % WN;
+
+    threadgroup half Xs[64 * 32];
+    threadgroup half Ws_gate[64 * 32];
+    threadgroup half Ws_up[64 * 32];
+
+    simdgroup_matrix<float, 8, 8> Cg[4][4];
+    simdgroup_matrix<float, 8, 8> Cu[4][4];
+    for (uint i = 0; i < FM; ++i) {
+        for (uint j = 0; j < FN; ++j) {
+            Cg[i][j] = simdgroup_matrix<float, 8, 8>(0.0);
+            Cu[i][j] = simdgroup_matrix<float, 8, 8>(0.0);
+        }
+    }
+
+    uint blocks_per_row = K / Q4K_WEIGHTS;
+    uint row_stride_bytes = blocks_per_row * Q4K_BYTES;
+
+    uint tid = (uint)sgitg * 32u + (uint)tiisg;
+    uint load_row = tid / 2u;
+    uint load_chunk = tid % 2u;
+
+    for (uint k_offset = 0; k_offset < K; k_offset += BK) {
+        // Phase 1 : cooperative load Xs (PARTAGÉ entre gate et up — la grosse économie).
+        uint a_row_global = m_tile * BM + load_row;
+        threadgroup half* xs_dst = Xs + load_row * BK + load_chunk * 16u;
+        if (a_row_global < M) {
+            uint a_base = a_row_global * K + k_offset + load_chunk * 16u;
+            for (uint c = 0; c < 16u; ++c) {
+                xs_dst[c] = (half)A[a_base + c];
+            }
+        } else {
+            for (uint c = 0; c < 16u; ++c) { xs_dst[c] = (half)0.0; }
+        }
+
+        // Phase 2 : dequant Ws_gate ET Ws_up coopératifs (mêmes coords nibble dans les 2 buffers).
+        uint super_block_idx = k_offset / Q4K_WEIGHTS;
+        uint sb_in_super = (k_offset % Q4K_WEIGHTS) / 32u;
+        uint pair_idx = sb_in_super / 2u;
+        bool is_high = (sb_in_super & 1u) != 0u;
+
+        uint w_row_global = n_tile * BN + load_row;
+        threadgroup half* wg_dst = Ws_gate + load_row * BK + load_chunk * 16u;
+        threadgroup half* wu_dst = Ws_up   + load_row * BK + load_chunk * 16u;
+
+        if (w_row_global < N) {
+            // --- W_gate dequant ---
+            {
+                device const uchar* row_block = W_gate
+                    + (uint64_t)w_row_global * row_stride_bytes
+                    + (uint64_t)super_block_idx * Q4K_BYTES;
+                device const half* d_ptr = (device const half*)(row_block);
+                float d    = float(d_ptr[0]);
+                float dmin = float(d_ptr[1]);
+                device const uchar* sc_raw = row_block + 4;
+                uchar sc6, m6;
+                if (sb_in_super < 4u) {
+                    sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+                    m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+                } else {
+                    uint i = sb_in_super - 4u;
+                    sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+                    m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+                }
+                float scale   = d    * float(sc6);
+                float min_val = dmin * float(m6);
+                device const uchar* qs_ptr = row_block + 16u + pair_idx * 32u;
+                for (uint c = 0; c < 16u; ++c) {
+                    uint byte_pos  = load_chunk * 16u + c;
+                    uchar byte_val = qs_ptr[byte_pos];
+                    uchar nibble   = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+                    wg_dst[c] = (half)(scale * float(nibble) - min_val);
+                }
+            }
+            // --- W_up dequant ---
+            {
+                device const uchar* row_block = W_up
+                    + (uint64_t)w_row_global * row_stride_bytes
+                    + (uint64_t)super_block_idx * Q4K_BYTES;
+                device const half* d_ptr = (device const half*)(row_block);
+                float d    = float(d_ptr[0]);
+                float dmin = float(d_ptr[1]);
+                device const uchar* sc_raw = row_block + 4;
+                uchar sc6, m6;
+                if (sb_in_super < 4u) {
+                    sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+                    m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+                } else {
+                    uint i = sb_in_super - 4u;
+                    sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+                    m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+                }
+                float scale   = d    * float(sc6);
+                float min_val = dmin * float(m6);
+                device const uchar* qs_ptr = row_block + 16u + pair_idx * 32u;
+                for (uint c = 0; c < 16u; ++c) {
+                    uint byte_pos  = load_chunk * 16u + c;
+                    uchar byte_val = qs_ptr[byte_pos];
+                    uchar nibble   = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+                    wu_dst[c] = (half)(scale * float(nibble) - min_val);
+                }
+            }
+        } else {
+            for (uint c = 0; c < 16u; ++c) {
+                wg_dst[c] = (half)0.0;
+                wu_dst[c] = (half)0.0;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 3 : 4 K-fragments × (4 A + 4 B_gate + 4 B_up) loads + 16+16 MMAs.
+        // Xs est partagé : A_frags chargé UNE FOIS, réutilisé pour Cg ET Cu.
+        #pragma clang loop unroll(full)
+        for (uint k_frag = 0; k_frag < BK / 8u; ++k_frag) {
+            simdgroup_matrix<half, 8, 8> A_frags[4];
+            simdgroup_matrix<half, 8, 8> Bg_frags[4];
+            simdgroup_matrix<half, 8, 8> Bu_frags[4];
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < FM; ++i) {
+                uint a_row = sgi * TM + i * 8u;
+                simdgroup_load(A_frags[i], Xs + a_row * BK + k_frag * 8u, BK);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < FN; ++j) {
+                uint w_row = sgj * TN + j * 8u;
+                simdgroup_load(
+                    Bg_frags[j],
+                    Ws_gate + w_row * BK + k_frag * 8u,
+                    BK, ulong2(0, 0), /* transpose */ true);
+                simdgroup_load(
+                    Bu_frags[j],
+                    Ws_up + w_row * BK + k_frag * 8u,
+                    BK, ulong2(0, 0), /* transpose */ true);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            // 32 MMAs par K-fragment : 16 vers Cg, 16 vers Cu, A partagé.
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < FM; ++i) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < FN; ++j) {
+                    simdgroup_multiply_accumulate(Cg[i][j], A_frags[i], Bg_frags[j], Cg[i][j]);
+                    simdgroup_multiply_accumulate(Cu[i][j], A_frags[i], Bu_frags[j], Cu[i][j]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store : 4 sgs × 16 fragments × 2 outputs.
+    for (uint i = 0; i < FM; ++i) {
+        for (uint j = 0; j < FN; ++j) {
+            uint c_row = m_tile * BM + sgi * TM + i * 8u;
+            uint c_col = n_tile * BN + sgj * TN + j * 8u;
+            if (c_row + 7u < M && c_col + 7u < N) {
+                device float* Cg_ptr = C_gate + (uint64_t)c_row * N + (uint64_t)c_col;
+                device float* Cu_ptr = C_up   + (uint64_t)c_row * N + (uint64_t)c_col;
+                simdgroup_store(Cg[i][j], Cg_ptr, N);
+                simdgroup_store(Cu[i][j], Cu_ptr, N);
+            }
+        }
+    }
+}
+"#;
+
+/// T164 — Fused gate+up SGEMM Q4_K (extension du kernel `_simdgroup_matrix_64`).
+///
+/// Calcule simultanément :
+///   gate_out[M, N] = X[M, K] @ W_gate[N, K]^T
+///   up_out[M, N]   = X[M, K] @ W_up[N, K]^T
+/// en partageant la lecture VRAM de X entre les deux matmuls.
+///
+/// Pré-conditions :
+/// - Metal3 (Apple7+)
+/// - M, N multiples de 64 ; K multiple de 256
+/// - W_gate et W_up : même shape [N, K] et même dtype Q4_K
+///
+/// Performance attendue (Qwen3 14B prefill M=256, K=5120, N=17408) :
+/// gate+up combinés : 220 ms → ≤ 130 ms (-40%), prefill 268 → ~310 t/s (+15%).
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_q4_k_f32_gate_up_64_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_gate_buf: &Buffer,
+    w_up_buf: &Buffer,
+    c_gate_buf: &Buffer,
+    c_up_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q4_k_f32_gate_up_64 needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 64 != 0 || n % 64 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q4_k_f32_gate_up_64: M, N must be multiples of 64 and K multiple of 256 (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q4_k_f32_gate_up_64",
+        SGEMM_Q4_K_F32_GATE_UP_64_SHADER,
+        "sgemm_q4_k_f32_gate_up_64",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_gate_buf), 0);
+        encoder.set_buffer(2, Some(w_up_buf), 0);
+        encoder.set_buffer(3, Some(c_gate_buf), 0);
+        encoder.set_buffer(4, Some(c_up_buf), 0);
+        encoder.set_bytes(5, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1);
+        let n_tg = ((m / 64) * (n / 64)) as u64;
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T162 phase 9h — port complet du kernel llama.cpp::kernel_mul_mm fallback Q4_K.
 //
 // Port direct de ggml-metal.metal::kernel_mul_mm template fallback (pre-M5 path).
@@ -13702,6 +13998,157 @@ mod tests {
                 c_ref[i],
                 c_metal[i],
                 rel
+            );
+        }
+    }
+
+    /// T164 — Fused gate+up SGEMM Q4_K vs deux SGEMM séparés.
+    ///
+    /// Compare le fused kernel à l'exécution séquentielle de deux dispatchs
+    /// `sgemm_q4_k_f32_simdgroup_matrix_64_into` (gate puis up). Les deux paths
+    /// utilisent les mêmes MMAs (half × half + float accum) → parité bit-exact
+    /// attendue (tolerance 1e-4 marge sur l'ordre des MMAs intra-K-loop).
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemm_q4_k_f32_gate_up_64_matches_separate() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[sgemm_q4_k_gate_up_64] skipping: no Metal3");
+            return;
+        }
+
+        // Shape couvrant le cas réel (M=128 = 2 m_tiles, N=128 = 2 n_tiles, K=512).
+        let m = 128_usize;
+        let n = 128_usize;
+        let k = 512_usize;
+        let blocks_per_row = k / 256;
+        let bytes_per_w = n * blocks_per_row * 144;
+
+        // W_gate et W_up : poids DIFFÉRENTS pour vérifier qu'ils ne sont pas mélangés.
+        let mut w_gate = vec![0u8; bytes_per_w];
+        let mut w_up = vec![0u8; bytes_per_w];
+        for nrow in 0..n {
+            for ib in 0..blocks_per_row {
+                let off = (nrow * blocks_per_row + ib) * 144;
+                // gate : pattern A
+                let d_g = half::f16::from_f32(((nrow as f32) + 1.0) * 0.004 + (ib as f32) * 0.001)
+                    .to_le_bytes();
+                let dmin_g =
+                    half::f16::from_f32((nrow as f32) * 0.002 + (ib as f32) * 0.0005).to_le_bytes();
+                w_gate[off] = d_g[0];
+                w_gate[off + 1] = d_g[1];
+                w_gate[off + 2] = dmin_g[0];
+                w_gate[off + 3] = dmin_g[1];
+                for i in 0..12 {
+                    w_gate[off + 4 + i] =
+                        (0x12_u8.wrapping_add((nrow as u8) ^ (i as u8) ^ (ib as u8))) | 0x05;
+                }
+                for i in 0..128 {
+                    w_gate[off + 16 + i] =
+                        ((nrow as u8) ^ (i as u8) ^ (ib as u8)).wrapping_add(0x29);
+                }
+                // up : pattern B (différent — autre seed dans le scale et autre offset qs)
+                let d_u = half::f16::from_f32(((nrow as f32) + 2.0) * 0.003 + (ib as f32) * 0.0007)
+                    .to_le_bytes();
+                let dmin_u = half::f16::from_f32((nrow as f32) * 0.0015 + (ib as f32) * 0.0009)
+                    .to_le_bytes();
+                w_up[off] = d_u[0];
+                w_up[off + 1] = d_u[1];
+                w_up[off + 2] = dmin_u[0];
+                w_up[off + 3] = dmin_u[1];
+                for i in 0..12 {
+                    w_up[off + 4 + i] = (0x21_u8
+                        .wrapping_add((nrow as u8).wrapping_mul(3) ^ (i as u8) ^ (ib as u8)))
+                        | 0x05;
+                }
+                for i in 0..128 {
+                    w_up[off + 16 + i] =
+                        ((nrow as u8).wrapping_mul(7) ^ (i as u8).wrapping_mul(11) ^ (ib as u8))
+                            .wrapping_add(0x47);
+                }
+            }
+        }
+
+        let a = det_vec(m * k, 1.5);
+
+        // Buffers shared.
+        let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+        let wg_buf = backend.alloc_shared(bytes_per_w).unwrap();
+        let wu_buf = backend.alloc_shared(bytes_per_w).unwrap();
+        let cg_ref = backend.alloc_shared(m * n * 4).unwrap();
+        let cu_ref = backend.alloc_shared(m * n * 4).unwrap();
+        let cg_fused = backend.alloc_shared(m * n * 4).unwrap();
+        let cu_fused = backend.alloc_shared(m * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+            std::ptr::copy_nonoverlapping(
+                w_gate.as_ptr(),
+                wg_buf.contents() as *mut u8,
+                bytes_per_w,
+            );
+            std::ptr::copy_nonoverlapping(w_up.as_ptr(), wu_buf.contents() as *mut u8, bytes_per_w);
+        }
+
+        // Reference : 2 dispatchs séparés.
+        sgemm_q4_k_f32_simdgroup_matrix_64_into(backend, &a_buf, &wg_buf, &cg_ref, m, n, k)
+            .unwrap();
+        sgemm_q4_k_f32_simdgroup_matrix_64_into(backend, &a_buf, &wu_buf, &cu_ref, m, n, k)
+            .unwrap();
+        backend.drain();
+
+        // Fused dispatch.
+        sgemm_q4_k_f32_gate_up_64_into(
+            backend, &a_buf, &wg_buf, &wu_buf, &cg_fused, &cu_fused, m, n, k,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut cg_ref_h = vec![0.0_f32; m * n];
+        let mut cu_ref_h = vec![0.0_f32; m * n];
+        let mut cg_fused_h = vec![0.0_f32; m * n];
+        let mut cu_fused_h = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cg_ref.contents() as *const f32,
+                cg_ref_h.as_mut_ptr(),
+                m * n,
+            );
+            std::ptr::copy_nonoverlapping(
+                cu_ref.contents() as *const f32,
+                cu_ref_h.as_mut_ptr(),
+                m * n,
+            );
+            std::ptr::copy_nonoverlapping(
+                cg_fused.contents() as *const f32,
+                cg_fused_h.as_mut_ptr(),
+                m * n,
+            );
+            std::ptr::copy_nonoverlapping(
+                cu_fused.contents() as *const f32,
+                cu_fused_h.as_mut_ptr(),
+                m * n,
+            );
+        }
+
+        // Tolerance 1e-4 (les MMAs sont identiques modulo l'ordre intra-loop).
+        for i in 0..(m * n) {
+            let denom_g = cg_ref_h[i].abs().max(1e-3);
+            let rel_g = (cg_ref_h[i] - cg_fused_h[i]).abs() / denom_g;
+            assert!(
+                rel_g < 1e-4,
+                "gate mismatch at {i}: ref={} fused={} (rel {:.3e})",
+                cg_ref_h[i],
+                cg_fused_h[i],
+                rel_g
+            );
+            let denom_u = cu_ref_h[i].abs().max(1e-3);
+            let rel_u = (cu_ref_h[i] - cu_fused_h[i]).abs() / denom_u;
+            assert!(
+                rel_u < 1e-4,
+                "up mismatch at {i}: ref={} fused={} (rel {:.3e})",
+                cu_ref_h[i],
+                cu_fused_h[i],
+                rel_u
             );
         }
     }
