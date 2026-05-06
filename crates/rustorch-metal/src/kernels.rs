@@ -5174,6 +5174,9 @@ kernel void sgemv_q4_k_f32_qmv_fast(
         // Process 4 rows : for each row, dequant 16 weights and accumulate.
         // The weights layout in Q4_K depends on which super-block this thread
         // is in (super_in_iter ∈ {0, 1}) and which sub-block.
+        // T162 phase 5-bis : avoir un sum_x_thread INDÉPENDANT par row (au lieu
+        // de hoister) donne 4 réductions indépendantes que le compilo Apple
+        // entrelace mieux → +13% vs hoist version.
         uint super_block_global = k_iter * 2u + super_in_iter;
 
         #pragma clang loop unroll(full)
