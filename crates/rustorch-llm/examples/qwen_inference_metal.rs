@@ -3975,7 +3975,12 @@ struct Scratch {
 /// T121 — Maximum batch size for forward_batch (multi-token forward).
 /// Scratch buffers are pre-allocated for B_MAX tokens; smaller B uses
 /// only the relevant slice.
-const B_MAX: usize = 4;
+///
+/// T162 phase 4 : bumped from 4 to 32 to enable chunked prefill batching.
+/// With our SGEMM kernels (phases 2/3-bis/5/5-bis/7/7-bis), batched matmul
+/// hits ×4-10 vs sgemv loop sur shapes 14B prefill. Chunking prefill_ids
+/// par B_MAX accélère le prefill end-to-end.
+const B_MAX: usize = 32;
 
 impl Scratch {
     fn new(backend: &MetalBackend, cfg: &ModelCfg) -> Self {
@@ -4149,6 +4154,7 @@ fn main() -> ExitCode {
     let mut head_stats_profile = false;
     let mut dump_h_path: Option<String> = None;
     let mut batch_test = false;
+    let mut prefill_batch_size: usize = 1; // T162 phase 4 : 1 = disabled, > 1 = batched prefill
     let mut speculative_b: usize = 0; // 0 = off; 2..=4 = enable with B candidates
     let mut i = 0;
     while i < args.len() {
@@ -4226,6 +4232,14 @@ fn main() -> ExitCode {
                 args.remove(i);
                 continue;
             },
+            "--prefill-batch" => {
+                // T162 phase 4 : enable batched prefill via forward_batch.
+                // Argument is the batch size B (clamped to B_MAX).
+                prefill_batch_size = args[i + 1].parse().unwrap_or(B_MAX).clamp(1, B_MAX);
+                args.remove(i + 1);
+                args.remove(i);
+                continue;
+            },
             "--speculative" => {
                 speculative_b = args[i + 1].parse().unwrap_or(2);
                 args.remove(i + 1);
@@ -4265,66 +4279,106 @@ fn main() -> ExitCode {
     let entropy_aux_h = backend.alloc_shared(model.cfg.d * 4).unwrap();
     let entropy_aux_logits = backend.alloc_shared(model.cfg.vocab * 4).unwrap();
     println!("\n→ prefill {} tokens", prompt_ids.len());
+    if prefill_batch_size > 1 {
+        println!(
+            "  T162 phase 4 : batched prefill enabled (B={prefill_batch_size}, B_MAX={B_MAX})"
+        );
+    }
     let t_pre = Instant::now();
     let mut last = 0u32;
     let mut cur_pos = 0usize;
-    for &tok in prompt_ids.iter() {
-        last = if profile {
-            forward_token_profiled(backend, &model, tok, cur_pos, &mut scratch, &mut stages)
-        } else if sparsity_profile {
-            forward_token_sparsity(backend, &model, tok, cur_pos, &mut scratch, &mut sparsity)
-        } else if rank_profile {
-            forward_token_rank(backend, &model, tok, cur_pos, &mut scratch, &mut rank_stats)
-        } else if entropy_profile {
-            forward_token_entropy(
-                backend,
-                &model,
-                tok,
-                cur_pos,
-                &mut scratch,
-                &entropy_aux_h,
-                &entropy_aux_logits,
-                &mut entropy_stats,
-            )
-        } else if layer_cos_profile {
-            forward_token_layer_cos(
-                backend,
-                &model,
-                tok,
-                cur_pos,
-                &mut scratch,
-                &mut layer_cos_stats,
-            )
-        } else if head_stats_profile {
-            forward_token_head_stats(backend, &model, tok, cur_pos, &mut scratch, &mut head_stats)
-        } else if dump_h_path.is_some() {
-            let out = forward_token_dump_h(
-                backend,
-                &model,
-                tok,
-                cur_pos,
-                &mut scratch,
-                &mut h_scratch_vec,
-            );
-            h_traj_tokens.push(tok);
-            h_traj_vectors.push(h_scratch_vec.clone());
-            out
-        } else if batch_test {
-            // T121 — forward_batch with B=1, parity test vs forward_token
-            let outs = forward_batch(backend, &model, &[tok], cur_pos, &mut scratch);
-            outs[0]
-        } else {
-            forward_token(backend, &model, tok, cur_pos, &mut scratch)
-        };
-        cur_pos += 1;
-    }
-    let prefill_d = t_pre.elapsed();
-    println!(
-        "  prefill: {} tokens in {:.3}s = {:.2} tok/s",
-        prompt_ids.len(),
-        prefill_d.as_secs_f64(),
-        prompt_ids.len() as f64 / prefill_d.as_secs_f64()
-    );
+
+    // T162 phase 4 : batched prefill path. Chunks prompt_ids by B and uses
+    // forward_batch for each chunk. Skips per-token profiling (incompatible).
+    if prefill_batch_size > 1
+        && !profile
+        && !sparsity_profile
+        && !rank_profile
+        && !entropy_profile
+        && !layer_cos_profile
+        && !head_stats_profile
+        && dump_h_path.is_none()
+        && !batch_test
+    {
+        for chunk in prompt_ids.chunks(prefill_batch_size) {
+            let outs = forward_batch(backend, &model, chunk, cur_pos, &mut scratch);
+            last = *outs.last().unwrap();
+            cur_pos += chunk.len();
+        }
+        let prefill_d = t_pre.elapsed();
+        println!(
+            "  prefill: {} tokens in {:.3}s = {:.2} tok/s (batched B={})",
+            prompt_ids.len(),
+            prefill_d.as_secs_f64(),
+            prompt_ids.len() as f64 / prefill_d.as_secs_f64(),
+            prefill_batch_size,
+        );
+    } else {
+        for &tok in prompt_ids.iter() {
+            last = if profile {
+                forward_token_profiled(backend, &model, tok, cur_pos, &mut scratch, &mut stages)
+            } else if sparsity_profile {
+                forward_token_sparsity(backend, &model, tok, cur_pos, &mut scratch, &mut sparsity)
+            } else if rank_profile {
+                forward_token_rank(backend, &model, tok, cur_pos, &mut scratch, &mut rank_stats)
+            } else if entropy_profile {
+                forward_token_entropy(
+                    backend,
+                    &model,
+                    tok,
+                    cur_pos,
+                    &mut scratch,
+                    &entropy_aux_h,
+                    &entropy_aux_logits,
+                    &mut entropy_stats,
+                )
+            } else if layer_cos_profile {
+                forward_token_layer_cos(
+                    backend,
+                    &model,
+                    tok,
+                    cur_pos,
+                    &mut scratch,
+                    &mut layer_cos_stats,
+                )
+            } else if head_stats_profile {
+                forward_token_head_stats(
+                    backend,
+                    &model,
+                    tok,
+                    cur_pos,
+                    &mut scratch,
+                    &mut head_stats,
+                )
+            } else if dump_h_path.is_some() {
+                let out = forward_token_dump_h(
+                    backend,
+                    &model,
+                    tok,
+                    cur_pos,
+                    &mut scratch,
+                    &mut h_scratch_vec,
+                );
+                h_traj_tokens.push(tok);
+                h_traj_vectors.push(h_scratch_vec.clone());
+                out
+            } else if batch_test {
+                // T121 — forward_batch with B=1, parity test vs forward_token
+                let outs = forward_batch(backend, &model, &[tok], cur_pos, &mut scratch);
+                outs[0]
+            } else {
+                forward_token(backend, &model, tok, cur_pos, &mut scratch)
+            };
+            cur_pos += 1;
+        }
+        let prefill_d = t_pre.elapsed();
+        println!(
+            "  prefill: {} tokens in {:.3}s = {:.2} tok/s",
+            prompt_ids.len(),
+            prefill_d.as_secs_f64(),
+            prompt_ids.len() as f64 / prefill_d.as_secs_f64()
+        );
+    } // end T162 phase 4 if/else
 
     let mut generated = vec![last];
     // T85 — when profiling, reset accumulator after warmup so prefill
