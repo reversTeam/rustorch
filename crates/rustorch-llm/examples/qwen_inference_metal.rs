@@ -3759,6 +3759,69 @@ fn forward_token_head_stats(
 //
 // Used by speculative decoding: input = [last_real_token, draft_1, ..., draft_{B-1}].
 // Verifier runs forward_batch, then we accept the longest matching prefix.
+// T163 phase 10 — per-phase timing instrumentation pour identifier le goulot
+// d'étranglement dans forward_batch (cible : closer le gap 14B Q4 prefill 50%
+// vs llama.cpp). Activé via env var RUSTORCH_FBATCH_PROFILE=1.
+//
+// Mesure : RMSNorm pré-attn, Q proj, K proj, V proj, QK norm + RoPE, KV append,
+// GQA decode, W_O, residual, ffn_norm, gate, up, swiglu, w_down, residual.
+// Drains après chaque phase pour timing exact.
+struct PhaseTimer {
+    enabled: bool,
+    timings: std::collections::HashMap<&'static str, std::time::Duration>,
+    last: std::time::Instant,
+    backend_drain_fn: fn(&MetalBackend),
+}
+
+fn drain_backend(backend: &MetalBackend) {
+    backend.drain();
+}
+
+impl PhaseTimer {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            timings: std::collections::HashMap::new(),
+            last: std::time::Instant::now(),
+            backend_drain_fn: drain_backend,
+        }
+    }
+    fn mark(&mut self, backend: &MetalBackend, label: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        (self.backend_drain_fn)(backend);
+        let dt = self.last.elapsed();
+        *self
+            .timings
+            .entry(label)
+            .or_insert(std::time::Duration::ZERO) += dt;
+        self.last = std::time::Instant::now();
+    }
+    fn print(&self, label: &str) {
+        if !self.enabled || self.timings.is_empty() {
+            return;
+        }
+        let total: std::time::Duration = self.timings.values().sum();
+        let mut entries: Vec<_> = self.timings.iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(a.1));
+        println!(
+            "\n=== {} per-phase timings (total {:.3}s) ===",
+            label,
+            total.as_secs_f64()
+        );
+        for (name, dt) in entries {
+            let pct = dt.as_secs_f64() / total.as_secs_f64() * 100.0;
+            println!(
+                "  {:<24} {:>8.3} ms  {:>5.1}%",
+                name,
+                dt.as_secs_f64() * 1000.0,
+                pct
+            );
+        }
+    }
+}
+
 fn forward_batch(
     backend: &MetalBackend,
     model: &ModelMetal,
@@ -3766,6 +3829,7 @@ fn forward_batch(
     pos_base: usize,
     scratch: &mut Scratch,
 ) -> Vec<u32> {
+    let mut timer = PhaseTimer::new(std::env::var("RUSTORCH_FBATCH_PROFILE").is_ok());
     let b = tokens.len();
     assert!(
         b > 0 && b <= B_MAX,
@@ -3791,8 +3855,10 @@ fn forward_batch(
             );
         }
     }
+    timer.mark(backend, "embed");
 
     for (li, layer) in model.layers.iter().enumerate() {
+        let _ = li;
         // 1. Batched RMSNorm (attn_norm) into h_buf [B, d]
         rms_norm_batched_f32(
             backend,
@@ -3804,6 +3870,7 @@ fn forward_batch(
             cfg.rms_eps,
         )
         .unwrap();
+        timer.mark(backend, "rmsnorm_attn");
 
         // 2. QKV: 3 batched matmul (T162 phase 4-bis : SGEMM si éligible).
         dispatch_batched_matmul(
@@ -3817,6 +3884,7 @@ fn forward_batch(
             layer.w_q.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_q");
         dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
@@ -3828,6 +3896,7 @@ fn forward_batch(
             layer.w_k.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_k");
         dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
@@ -3839,6 +3908,7 @@ fn forward_batch(
             layer.w_v.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_v");
 
         // 3. Batched QK norm + RoPE
         if let Some(qn_buf) = layer.attn_q_norm_buf.as_ref() {
@@ -3887,6 +3957,7 @@ fn forward_batch(
             b,
         )
         .unwrap();
+        timer.mark(backend, "qknorm_rope");
 
         // 4. Batched KV cache append
         kv_append_batched_f32(
@@ -3911,6 +3982,7 @@ fn forward_batch(
             max_seq,
         )
         .unwrap();
+        timer.mark(backend, "kv_append");
 
         // 5. Batched GQA decode (causal mask multi-position)
         gqa_decode_batched_f32(
@@ -3927,6 +3999,7 @@ fn forward_batch(
             max_seq,
         )
         .unwrap();
+        timer.mark(backend, "gqa_decode");
 
         // 6. W_O batched matmul + residual add (T162 phase 4-bis : SGEMM si éligible).
         dispatch_batched_matmul(
@@ -3940,7 +4013,9 @@ fn forward_batch(
             layer.w_o.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_o");
         add_inplace_batched_f32(backend, &scratch.xd_buf, &scratch.o_buf, d, b).unwrap();
+        timer.mark(backend, "residual_attn");
 
         // 7. Batched ffn_norm
         rms_norm_batched_f32(
@@ -3953,6 +4028,7 @@ fn forward_batch(
             cfg.rms_eps,
         )
         .unwrap();
+        timer.mark(backend, "rmsnorm_ffn");
 
         // 8. Gate + Up (T162 phase 4-bis : SGEMM si éligible).
         dispatch_batched_matmul(
@@ -3966,6 +4042,7 @@ fn forward_batch(
             layer.w_gate.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_gate");
         dispatch_batched_matmul(
             backend,
             &scratch.h_buf,
@@ -3977,6 +4054,7 @@ fn forward_batch(
             layer.w_up.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_up");
 
         // 9. Batched SwiGLU
         swiglu_batched_f32(
@@ -3988,6 +4066,7 @@ fn forward_batch(
             b,
         )
         .unwrap();
+        timer.mark(backend, "swiglu");
 
         // 10. W_down batched matmul + residual add (T162 phase 4-bis : SGEMM).
         dispatch_batched_matmul(
@@ -4001,7 +4080,9 @@ fn forward_batch(
             layer.w_down.dtype,
         )
         .unwrap();
+        timer.mark(backend, "matmul_down");
         add_inplace_batched_f32(backend, &scratch.xd_buf, &scratch.fc2_buf, d, b).unwrap();
+        timer.mark(backend, "residual_ffn");
     }
 
     // Final norm + lm_head batched
@@ -4015,34 +4096,25 @@ fn forward_batch(
         cfg.rms_eps,
     )
     .unwrap();
-    match model.lm_head.dtype {
-        GgmlType::Q4_K => sgemv_q4_k_f32_lcpp_nr2_batch_into(
-            backend,
-            &scratch.h_buf,
-            &model.lm_head.buffer,
-            &scratch.logits_buf,
-            model.lm_head.k,
-            model.lm_head.n,
-            b,
-        )
-        .unwrap(),
-        GgmlType::Q6_K => sgemv_q6_k_f32_lcpp_nr2_batch_into(
-            backend,
-            &scratch.h_buf,
-            &model.lm_head.buffer,
-            &scratch.logits_buf,
-            model.lm_head.k,
-            model.lm_head.n,
-            b,
-        )
-        .unwrap(),
-        _ => panic!(
-            "forward_batch: unsupported lm_head dtype: {:?}",
-            model.lm_head.dtype
-        ),
-    }
+    // T163 phase 10 — lm_head via SGEMM batched (était sgemv-loop per-token,
+    // 28% du temps prefill total). N=151936 vocab → tile 64×64 alignment :
+    // 151936 % 64 = 0 ✓. SGEMM 64×64 multi-warp ≈ 3× plus rapide que sgemv loop
+    // sur cette shape M=256 N=151936 K=5120.
+    dispatch_batched_matmul(
+        backend,
+        &scratch.h_buf,
+        &model.lm_head.buffer,
+        &scratch.logits_buf,
+        model.lm_head.k,
+        model.lm_head.n,
+        b,
+        model.lm_head.dtype,
+    )
+    .unwrap();
+    timer.mark(backend, "lm_head");
 
     backend.drain();
+    timer.print(&format!("forward_batch B={b}"));
 
     // Argmax for each batch position
     let mut next_tokens = Vec::with_capacity(b);
