@@ -13111,10 +13111,13 @@ pub fn mul_mm_id_map0_into(
             "mul_mm_id_map0: 0 < n_experts <= 1024, B > 0, n_used > 0 (got E={n_experts}, B={b}, n_used={n_used})"
         )));
     }
-    if max_per_expert < b * n_used {
+    // Standard top-K routing returns distinct experts per token, so each expert
+    // is selected at most once per token => max(tpe[e]) <= B. Caller should pass
+    // `max_per_expert >= B`. (Previous check `>= B*n_used` was over-conservative
+    // and balloons the `mul_mm_id_q4_k_f32` dst buffer to E*B*n_used*N.)
+    if max_per_expert < b {
         return Err(MetalError::ShapeMismatch(format!(
-            "mul_mm_id_map0: max_per_expert ({max_per_expert}) must be >= B*n_used ({})",
-            b * n_used
+            "mul_mm_id_map0: max_per_expert ({max_per_expert}) must be >= B ({b})"
         )));
     }
     let pipeline = backend.pipeline("mul_mm_id_map0", MUL_MM_ID_MAP0_SHADER, "mul_mm_id_map0")?;
@@ -18640,6 +18643,228 @@ mod tests {
                 y_seq[i],
                 y_bat[i],
                 r
+            );
+        }
+    }
+
+    /// T174 Day 3 — Bench `mul_mm_id_q4_k_f32` vs per-token sgemv loop on
+    /// realistic Qwen3.6 35B-A3B MoE FFN shapes.
+    ///
+    /// Path A : `mul_mm_id_map0` (Stage 1) + `mul_mm_id_q4_k_f32` (Stage 2)
+    ///   = 2 dispatches total. Reads weights once per active expert tile.
+    ///
+    /// Path B : per-token-per-expert `sgemv_q4_k_f32_lcpp_nsg2_into` loop
+    ///   = B * n_used dispatches. Each call re-reads the same expert weights
+    ///     when multiple tokens route to it (no inter-token reuse).
+    ///
+    /// Shapes are 35B-A3B FFN gate/up : K=2048 hidden, N=512 ffn_inter,
+    /// E=256 experts, n_used=8 active per token. B varies (1, 4, 16, 64,
+    /// 128) to characterize the speedup curve from decode → prefill.
+    ///
+    /// Run with:
+    /// ```bash
+    /// cargo test -p rustorch-metal --features gpu-tests \
+    ///     mul_mm_id_q4_k_bench --release -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    #[ignore]
+    fn mul_mm_id_q4_k_bench() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[mul_mm_id_q4_k_bench] skipping: no Metal3");
+            return;
+        }
+
+        // 35B-A3B FFN gate/up shapes.
+        let n_experts = 256_usize;
+        let n_used = 8_usize;
+        let k = 2048_usize;
+        let n = 512_usize;
+        let blocks_per_row = k / 256;
+
+        // Per-expert weight bytes (gate/up): N × K_blocks × 144.
+        let w_bytes_per_expert = n * blocks_per_row * 144;
+        let w_total_bytes = n_experts * w_bytes_per_expert;
+        eprintln!(
+            "[mul_mm_id_q4_k_bench] weights: {} MB ({} experts × {} × {} Q4_K)",
+            w_total_bytes / (1024 * 1024),
+            n_experts,
+            n,
+            k
+        );
+
+        // Random-ish bytes; for bench only throughput matters, not values.
+        // But d/dmin must be valid f16 (no NaN) to avoid kernel UB.
+        let mut w_bytes = vec![0u8; w_total_bytes];
+        for (i, b) in w_bytes.iter_mut().enumerate() {
+            *b = ((i as u32).wrapping_mul(0x9E3779B9_u32) >> 24) as u8;
+        }
+        for e in 0..n_experts {
+            for nrow in 0..n {
+                for ib in 0..blocks_per_row {
+                    let off = e * w_bytes_per_expert + (nrow * blocks_per_row + ib) * 144;
+                    let d_h = half::f16::from_f32(0.005_f32).to_le_bytes();
+                    w_bytes[off] = d_h[0];
+                    w_bytes[off + 1] = d_h[1];
+                    w_bytes[off + 2] = d_h[0];
+                    w_bytes[off + 3] = d_h[1];
+                }
+            }
+        }
+
+        let w_buf = backend.alloc_shared(w_total_bytes).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_total_bytes,
+            );
+        }
+
+        eprintln!();
+        eprintln!(
+            "{:>4} | {:>10} | {:>10} | {:>8} | {:>10} | {:>10}",
+            "B", "mm_id ms", "sgemv ms", "speedup", "mm_id GB/s", "sgemv GB/s"
+        );
+        eprintln!("{}", "-".repeat(70));
+
+        for &b in &[1_usize, 4, 16, 32, 64, 128] {
+            let b_n_used = b * n_used;
+            let m_max = b.next_multiple_of(32).max(32);
+            // Path A buffers
+            let acts = det_vec(b * k, 1.5);
+            let acts_buf = backend.alloc_shared(b * k * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    acts.as_ptr(),
+                    acts_buf.contents() as *mut f32,
+                    b * k,
+                );
+            }
+            let indices: Vec<u32> = (0..b_n_used)
+                .map(|i| ((i as u32).wrapping_mul(0x9E3779B9) >> 22) % (n_experts as u32))
+                .collect();
+            let indices_buf = backend.alloc_shared(b_n_used * 4).unwrap();
+            let tpe_buf = backend.alloc_shared(n_experts * 4).unwrap();
+            let ids_buf = backend.alloc_shared(n_experts * m_max * 4).unwrap();
+            let dst_buf = backend.alloc_shared(n_experts * m_max * n * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    indices.as_ptr(),
+                    indices_buf.contents() as *mut u32,
+                    b_n_used,
+                );
+            }
+
+            // Warmup
+            for _ in 0..3 {
+                mul_mm_id_map0_into(
+                    backend,
+                    &indices_buf,
+                    &tpe_buf,
+                    &ids_buf,
+                    b,
+                    n_used,
+                    n_experts,
+                    m_max,
+                )
+                .unwrap();
+                mul_mm_id_q4_k_f32_into(
+                    backend, &acts_buf, &w_buf, &ids_buf, &tpe_buf, &dst_buf, n_experts, m_max, n,
+                    k, n_used,
+                )
+                .unwrap();
+            }
+            backend.drain();
+
+            // Path A timing
+            let iters = 30;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                mul_mm_id_map0_into(
+                    backend,
+                    &indices_buf,
+                    &tpe_buf,
+                    &ids_buf,
+                    b,
+                    n_used,
+                    n_experts,
+                    m_max,
+                )
+                .unwrap();
+                mul_mm_id_q4_k_f32_into(
+                    backend, &acts_buf, &w_buf, &ids_buf, &tpe_buf, &dst_buf, n_experts, m_max, n,
+                    k, n_used,
+                )
+                .unwrap();
+            }
+            backend.drain();
+            let mm_id_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+            // Path B: per-token-per-slot sgemv loop. For each (b_idx, slot)
+            // we look up the routed expert and call sgemv on (act_row, expert_w)
+            // → out_row. This is the worst-case "no batching, no reuse" baseline
+            // that mirrors the current rustorch MoE-decode path.
+            let row_buf = backend.alloc_shared(k * 4).unwrap();
+            let out_row_buf = backend.alloc_shared(n * 4).unwrap();
+            // Compute the per-route weight offsets (CPU side, just for bench).
+            let routes: Vec<(usize, usize)> = (0..b_n_used)
+                .map(|i| (i / n_used, indices[i] as usize))
+                .collect();
+
+            for _ in 0..2 {
+                for &(_b_idx, _e) in &routes {
+                    // We can't slice into w_buf easily — sgemv reads the whole
+                    // weight matrix. So we'd actually need per-expert weight buffers.
+                    // For bench fairness we just call sgemv with the global w_buf,
+                    // which is OK because timings only measure dispatch + compute.
+                    let _ = sgemv_q4_k_f32_lcpp_nsg2_into(
+                        backend,
+                        &row_buf,
+                        &w_buf,
+                        &out_row_buf,
+                        k,
+                        n,
+                    );
+                }
+            }
+            backend.drain();
+
+            let iters_b = 5; // expensive at B=128 (1024 dispatches × 5)
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters_b {
+                for &(_b_idx, _e) in &routes {
+                    let _ = sgemv_q4_k_f32_lcpp_nsg2_into(
+                        backend,
+                        &row_buf,
+                        &w_buf,
+                        &out_row_buf,
+                        k,
+                        n,
+                    );
+                }
+            }
+            backend.drain();
+            let sgemv_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters_b as f64;
+
+            // Effective DRAM bandwidth: each call reads N_active × N × (K/256) × 144 bytes.
+            // For Path A : ~ E × N × K_blocks × 144 worst case (every expert touched);
+            // realistic ~ E × N × K_blocks × 144 ≈ w_total_bytes (we always read all).
+            // For Path B : B × n_used × N × K_blocks × 144 (one expert per route).
+            let bytes_a = w_total_bytes as f64;
+            let bytes_b = (b_n_used * n * blocks_per_row * 144) as f64;
+            let gbs_a = bytes_a / (mm_id_ms / 1000.0) / 1e9;
+            let gbs_b = bytes_b / (sgemv_ms / 1000.0) / 1e9;
+
+            eprintln!(
+                "{:>4} | {:>9.3}  | {:>9.3}  | {:>7.2}× | {:>9.1}  | {:>9.1}",
+                b,
+                mm_id_ms,
+                sgemv_ms,
+                sgemv_ms / mm_id_ms,
+                gbs_a,
+                gbs_b
             );
         }
     }
