@@ -4956,7 +4956,7 @@ fn main() -> ExitCode {
         let mut spec_drafts = 0usize;
         let mut spec_accepted = 0usize;
         let mut spec_rounds = 0usize;
-        if (2..=8).contains(&speculative_b) {
+        if (2..=32).contains(&speculative_b) && speculative_b % 8 == 0 {
             // T176 — Speculative decoding with 2-gram lookahead cache (port T167).
             //
             // 1. Build cache (prev2, prev1) → continuation [c0, c1, ..., c_{K-1}]
@@ -4971,32 +4971,61 @@ fn main() -> ExitCode {
             use std::collections::HashMap;
             let b_total = speculative_b;
             let k_draft = b_total - 1;
-            let mut ngram: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
-            let update_ngram =
-                |ngram: &mut HashMap<(u32, u32), Vec<u32>>, history: &[u32], k_draft: usize| {
-                    if history.len() < 3 {
-                        return;
-                    }
-                    for i in 1..history.len() - 1 {
-                        let key = (history[i - 1], history[i]);
+            // T176b — Dual-cache (3-gram primary, 2-gram fallback) for better
+            // acceptance rate on natural text. 3-gram is more specific (lower
+            // hit rate but higher precision when hit), 2-gram is the fallback
+            // when 3-gram misses.
+            let mut ngram3: HashMap<(u32, u32, u32), Vec<u32>> = HashMap::new();
+            let mut ngram2: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+            let update_caches = |ngram3: &mut HashMap<(u32, u32, u32), Vec<u32>>,
+                                 ngram2: &mut HashMap<(u32, u32), Vec<u32>>,
+                                 history: &[u32],
+                                 k_draft: usize| {
+                if history.len() < 3 {
+                    return;
+                }
+                // 3-gram pass : need at least 3 history tokens before pos i+1.
+                if history.len() >= 4 {
+                    for i in 2..history.len() - 1 {
+                        let key3 = (history[i - 2], history[i - 1], history[i]);
                         let end = (i + 1 + k_draft).min(history.len());
                         let cont: Vec<u32> = history[i + 1..end].to_vec();
                         if !cont.is_empty() {
-                            ngram.insert(key, cont);
+                            ngram3.insert(key3, cont);
                         }
                     }
-                };
-            update_ngram(&mut ngram, &prompt_ids, k_draft);
+                }
+                // 2-gram fallback pass.
+                for i in 1..history.len() - 1 {
+                    let key2 = (history[i - 1], history[i]);
+                    let end = (i + 1 + k_draft).min(history.len());
+                    let cont: Vec<u32> = history[i + 1..end].to_vec();
+                    if !cont.is_empty() {
+                        ngram2.insert(key2, cont);
+                    }
+                }
+            };
+            update_caches(&mut ngram3, &mut ngram2, &prompt_ids, k_draft);
             // Seed last + first generated token.
             let mut seed: Vec<u32> = Vec::with_capacity(prompt_ids.len() + 1);
             seed.extend_from_slice(&prompt_ids);
             seed.push(last);
-            update_ngram(&mut ngram, &seed, k_draft);
+            update_caches(&mut ngram3, &mut ngram2, &seed, k_draft);
 
             let mut prev_token: u32 = prompt_ids.last().copied().unwrap_or(last);
+            let mut prev_token2: u32 = if prompt_ids.len() >= 2 {
+                prompt_ids[prompt_ids.len() - 2]
+            } else {
+                prev_token
+            };
 
             const ABORT_WINDOW: usize = 8;
-            const BREAK_EVEN_PCT: f32 = 8.0;
+            // T176b — Break-even depends on B : forward_batch B overhead ≈ alpha + beta*B
+            // vs forward_token ≈ alpha + beta. To gain, accepted tokens > overhead.
+            // Empirically : need ~1.5 accepted tokens minimum to break even at B=8,
+            //              ~2 at B=16, ~3 at B=24, ~4 at B=32.
+            // → BREAK_EVEN_PCT = 100 * (1.5 + 0.05*B) / k_draft for safety margin.
+            let break_even_pct: f32 = 100.0 * (1.5 + 0.05 * b_total as f32) / k_draft as f32;
             let mut recent_accept: std::collections::VecDeque<u32> =
                 std::collections::VecDeque::with_capacity(ABORT_WINDOW);
 
@@ -5006,29 +5035,40 @@ fn main() -> ExitCode {
                 if cur_pos + b_total >= max_seq {
                     break;
                 }
-                let lookup_key = (prev_token, last);
-                let cache_hit = ngram.get(&lookup_key).map_or(0, |v| v.len()) > 0;
+                // T176b — Try 3-gram first (more specific = higher acceptance),
+                // fall back to 2-gram if miss.
+                let key3 = (prev_token2, prev_token, last);
+                let key2 = (prev_token, last);
+                let cont3 = ngram3.get(&key3);
+                let cont2 = ngram2.get(&key2);
+                let chosen_cont = cont3.or(cont2);
+                let cache_hit = chosen_cont.map_or(0, |v| v.len()) > 0;
                 let window_acc = if recent_accept.is_empty() {
                     100.0
                 } else {
                     let total: u32 = recent_accept.iter().sum();
                     100.0 * (total as f32) / (recent_accept.len() as f32 * (k_draft as f32))
                 };
-                let should_spec = cache_hit && window_acc >= BREAK_EVEN_PCT;
+                let should_spec = cache_hit && window_acc >= break_even_pct;
 
                 if !should_spec {
                     match forward_token(backend, &file, &model, &mut state, last, cur_pos) {
                         Ok(out) => {
+                            prev_token2 = prev_token;
                             prev_token = last;
                             last = out;
                             generated.push(last);
                             cur_pos += 1;
-                            // T176 fix : update cache from generated history even
-                            // on fallback steps. Otherwise cache never grows past
-                            // the prompt seed.
+                            // T176 fix : update caches from generated history even
+                            // on fallback steps.
                             if generated.len() >= 3 {
                                 let hist_start = generated.len().saturating_sub(8);
-                                update_ngram(&mut ngram, &generated[hist_start..], k_draft);
+                                update_caches(
+                                    &mut ngram3,
+                                    &mut ngram2,
+                                    &generated[hist_start..],
+                                    k_draft,
+                                );
                             }
                             if stops.contains(&last) {
                                 hit_stop = true;
@@ -5046,7 +5086,7 @@ fn main() -> ExitCode {
                 // Build candidates [last, c0, c1, ..., c_{K-1}].
                 let mut candidates: Vec<u32> = Vec::with_capacity(b_total);
                 candidates.push(last);
-                if let Some(cont) = ngram.get(&lookup_key) {
+                if let Some(cont) = chosen_cont {
                     for &t in cont.iter().take(k_draft) {
                         candidates.push(t);
                     }
@@ -5109,7 +5149,10 @@ fn main() -> ExitCode {
                 // Bonus token.
                 let bonus = outs[accepted];
                 generated.push(bonus);
-                if generated.len() >= 2 {
+                if generated.len() >= 3 {
+                    prev_token2 = generated[generated.len() - 3];
+                    prev_token = generated[generated.len() - 2];
+                } else if generated.len() >= 2 {
                     prev_token = generated[generated.len() - 2];
                 }
                 last = bonus;
@@ -5119,14 +5162,14 @@ fn main() -> ExitCode {
                     break;
                 }
 
-                // Update n-gram cache from recent committed sequence.
-                let history_start = generated.len().saturating_sub(accepted + 3);
-                let hist_window: Vec<u32> = if history_start >= 2 {
-                    generated[history_start - 2..].to_vec()
+                // Update caches from recent committed sequence.
+                let history_start = generated.len().saturating_sub(accepted + 4);
+                let hist_window: Vec<u32> = if history_start >= 3 {
+                    generated[history_start - 3..].to_vec()
                 } else {
                     generated.clone()
                 };
-                update_ngram(&mut ngram, &hist_window, k_draft);
+                update_caches(&mut ngram3, &mut ngram2, &hist_window, k_draft);
             }
         } else {
             for _ in 1..n {
