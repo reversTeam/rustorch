@@ -19086,10 +19086,18 @@ mod tests {
 
         eprintln!();
         eprintln!(
-            "{:>4} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10} | {:>8}",
-            "B", "mm_id ms", "scatter ms", "FFN A ms", "sgemv ms", "FFN B ms", "speedup"
+            "{:>4} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10} | {:>8} | {:>7}",
+            "B",
+            "mm_id ms",
+            "scatter ms",
+            "FFN A ms",
+            "EM ms",
+            "sgemv ms",
+            "FFN best",
+            "vs sgemv",
+            "vs EM"
         );
-        eprintln!("{}", "-".repeat(82));
+        eprintln!("{}", "-".repeat(108));
 
         for &b in &[1_usize, 4, 16, 32, 64, 128] {
             let b_n_used = b * n_used;
@@ -19213,6 +19221,69 @@ mod tests {
             backend.drain();
             let sgemv_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters_b as f64;
 
+            // Path C: Expert-Major (T163, current production path on 35B-A3B
+            // for B*n_used >= n_experts). m_padded = round_up_8(b_eff per expert)
+            // × n_experts. With even routing tpe[e] ≈ b_eff/E, each expert
+            // padded up to 8 → m_padded = 8 × n_experts in worst case (when
+            // tpe[e] in [1, 8]). For 35B-A3B B=128: b_eff=1024, E=256,
+            // tpe[e] ≈ 4 → m_padded ≈ 8 × 256 = 2048 ≈ 2× wasted vs ideal.
+            //
+            // We benchmark only the SGEMM cost (skipping gather_pack/unpermute
+            // which are common overhead between paths). This isolates the core
+            // matmul throughput question: BlockMMA 64×32 (mm_id) vs 8×8 (EM).
+            let em_avg_per_expert = b_n_used.div_ceil(n_experts);
+            let em_padded_per_expert = em_avg_per_expert.next_multiple_of(8).max(8);
+            let m_padded_em = em_padded_per_expert * n_experts;
+            // m_padded_em must be %8 (it is); n must be %8 (512%8=0); k%256 (2048%256=0).
+            let a_em_buf = backend.alloc_shared(m_padded_em * k * 4).unwrap();
+            let c_em_buf = backend.alloc_shared(m_padded_em * n * 4).unwrap();
+            let tile_expert_ids: Vec<u32> = (0..(m_padded_em / 8))
+                .map(|t| (t / em_padded_per_expert.div_ceil(8)) as u32 % (n_experts as u32))
+                .collect();
+            let tile_ids_buf = backend.alloc_shared(tile_expert_ids.len() * 4).unwrap();
+            unsafe {
+                std::ptr::write_bytes(a_em_buf.contents() as *mut u8, 0x3F, m_padded_em * k * 4);
+                std::ptr::copy_nonoverlapping(
+                    tile_expert_ids.as_ptr(),
+                    tile_ids_buf.contents() as *mut u32,
+                    tile_expert_ids.len(),
+                );
+            }
+            let bytes_per_expert = n * (k / 256) * 144;
+
+            // Warmup
+            for _ in 0..3 {
+                let _ = sgemm_q4_k_f32_expert_major_8x8_into(
+                    backend,
+                    &a_em_buf,
+                    &w_buf,
+                    &tile_ids_buf,
+                    &c_em_buf,
+                    m_padded_em,
+                    n,
+                    k,
+                    bytes_per_expert,
+                );
+            }
+            backend.drain();
+            let iters_em = 10;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters_em {
+                let _ = sgemm_q4_k_f32_expert_major_8x8_into(
+                    backend,
+                    &a_em_buf,
+                    &w_buf,
+                    &tile_ids_buf,
+                    &c_em_buf,
+                    m_padded_em,
+                    n,
+                    k,
+                    bytes_per_expert,
+                );
+            }
+            backend.drain();
+            let em_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters_em as f64;
+
             // Path A scatter timing — Stage 3 of the M-major pipeline.
             // Uses down_out[E, M_max, K_hidden] f32 as input (realistic
             // shape post down_proj) and moe_acc[B, K_hidden] as output.
@@ -19277,19 +19348,23 @@ mod tests {
             // End-to-end time = mm_id (for one matmul: gate or up or down)
             // + scatter (after down_proj). For a full FFN block we'd run
             // mm_id × 3 + silu/elemwise + scatter × 1. The headline is
-            // (mm_id × 3 + scatter) vs (sgemv × 3) per FFN block.
+            // (mm_id × 3 + scatter) vs (sgemv × 3) per FFN block, AND vs
+            // (em × 3) which is the actual production path at B*n_used ≥ E.
             let e2e_a = mm_id_ms * 3.0 + scatter_ms;
             let e2e_b = sgemv_ms * 3.0;
+            let e2e_c = em_ms * 3.0;
 
             eprintln!(
-                "{:>4} | {:>9.3}  | {:>9.3}  | {:>9.3}  | {:>9.3}  | {:>9.3}  | {:>7.2}×",
+                "{:>4} | {:>9.3}  | {:>9.3}  | {:>9.3} | {:>9.3}  | {:>9.3}  | {:>9.3} | {:>7.2}× | {:>7.2}×",
                 b,
                 mm_id_ms,
                 scatter_ms,
                 e2e_a,
+                em_ms,
                 sgemv_ms,
-                e2e_b,
-                e2e_b / e2e_a
+                e2e_c.min(e2e_b),
+                e2e_b / e2e_a,
+                e2e_c / e2e_a
             );
         }
     }
