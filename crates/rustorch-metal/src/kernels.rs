@@ -2428,6 +2428,141 @@ pub fn sgemm_f32_simdgroup_matrix_into(
 }
 
 // =============================================================================
+// T175 — Q8_0 SGEMM 8×8 single-warp (port léger du pattern Q4_K 8x8 avec
+// dequant Q8_0 trivial). Critique pour les shared expert weights de
+// Qwen3.6 35B-A3B (Q8_0 dtype) qui passaient par le fallback per-token
+// loop avec drain×M (mesuré 14 ms/call sur 35B-A3B prefill = 9% du temps total).
+//
+// Q8_0 format (34 bytes/block, 32 weights/block) :
+// - bytes 0-1 : fp16 scale `d`
+// - bytes 2-33 : 32 int8 weights
+// - weight[i] = d * (float)int8[i]
+//
+// Pré-conditions : M%8, N%8, K%32 (Q8_0 block size).
+const SGEMM_Q8_0_F32_SIMDGROUP_MATRIX_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q8_0_BYTES = 34u;
+constant uint Q8_0_WEIGHTS = 32u;
+
+kernel void sgemm_q8_0_f32_simdgroup_matrix(
+    device const float*  A      [[buffer(0)]],   // [M, K] f32 row-major
+    device const uchar*  W_q8   [[buffer(1)]],   // [N, K] Q8_0
+    device float*        C      [[buffer(2)]],   // [M, N] f32 row-major
+    constant uint3&      dims   [[buffer(3)]],   // (M, N, K)
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    uint n_tiles_n = N / 8u;
+    uint m_tile = tg_id / n_tiles_n;
+    uint n_tile = tg_id % n_tiles_n;
+    if (m_tile * 8u >= M || n_tile * 8u >= N) return;
+
+    threadgroup float Xs[8 * 32];
+    threadgroup float Ws[8 * 32];
+
+    simdgroup_matrix<float, 8, 8> C_frag = simdgroup_matrix<float, 8, 8>(0.0);
+    simdgroup_matrix<float, 8, 8> A_frag;
+    simdgroup_matrix<float, 8, 8> B_frag;
+
+    uint blocks_per_row = K / Q8_0_WEIGHTS;
+    uint row_stride_bytes = blocks_per_row * Q8_0_BYTES;
+
+    ushort row       = tiisg / 4u;       // 0..7
+    ushort col_chunk = tiisg % 4u;       // 0..3 (×8 cols each)
+
+    for (uint k_offset = 0; k_offset < K; k_offset += Q8_0_WEIGHTS) {
+        // 1. Load Xs[8 × 32] from A[m_tile*8..+8, k_offset..+32].
+        uint a_row_base =
+            (uint)(m_tile * 8u + row) * K + k_offset + (uint)col_chunk * 8u;
+        threadgroup float* xs_row = Xs + (uint)row * 32u + (uint)col_chunk * 8u;
+        for (ushort c = 0; c < 8u; ++c) {
+            xs_row[c] = A[a_row_base + c];
+        }
+
+        // 2. Dequant Ws[8 × 32] from one Q8_0 block per N-row.
+        uint super_block_idx = k_offset / Q8_0_WEIGHTS;
+        uint n_actual = n_tile * 8u + (uint)row;
+        device const uchar* row_block = W_q8
+            + (uint64_t)n_actual * row_stride_bytes
+            + (uint64_t)super_block_idx * Q8_0_BYTES;
+        device const half* d_ptr = (device const half*)(row_block);
+        float d = float(*d_ptr);
+
+        device const char* qs_ptr = (device const char*)(row_block + 2);
+        threadgroup float* ws_row = Ws + (uint)row * 32u + (uint)col_chunk * 8u;
+        #pragma clang loop unroll(full)
+        for (ushort c = 0; c < 8u; ++c) {
+            int q = (int)qs_ptr[(uint)col_chunk * 8u + (uint)c];
+            ws_row[c] = d * (float)q;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 3. 4 K-frags × 1 MMA each (NK=32 / 8 = 4 frags).
+        #pragma clang loop unroll(full)
+        for (ushort k_frag = 0; k_frag < 4u; ++k_frag) {
+            simdgroup_load(A_frag, Xs + (uint)k_frag * 8u, 32);
+            simdgroup_load(B_frag, Ws + (uint)k_frag * 8u, 32, ulong2(0, 0), /*transpose*/ true);
+            simdgroup_multiply_accumulate(C_frag, A_frag, B_frag, C_frag);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float* C_ptr = C
+        + (uint64_t)m_tile * 8u * (uint64_t)N
+        + (uint64_t)n_tile * 8u;
+    simdgroup_store(C_frag, C_ptr, N);
+}
+"#;
+
+/// T175 — Q8_0 SGEMM 8×8 single-warp (drop-in for `matmul_batched_into` Q8_0 path).
+pub fn sgemm_q8_0_f32_simdgroup_matrix_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_q8_buf: &Buffer,
+    c_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q8_0_f32_simdgroup_matrix needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 8 != 0 || n % 8 != 0 || k % 32 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q8_0_f32_simdgroup_matrix: M%8==0, N%8==0, K%32==0 (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q8_0_f32_simdgroup_matrix",
+        SGEMM_Q8_0_F32_SIMDGROUP_MATRIX_SHADER,
+        "sgemm_q8_0_f32_simdgroup_matrix",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_q8_buf), 0);
+        encoder.set_buffer(2, Some(c_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let n_tg = ((m / 8) * (n / 8)) as u64;
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T162 phase 2 — Q4_K SGEMM avec simdgroup_matrix + dequant inline.
 //
 // Premier kernel rustorch combinant Apple Matrix Engine + Q4_K. C'est le
@@ -13754,6 +13889,193 @@ pub fn mul_mm_id_map0_into(
     Ok(())
 }
 
+// T175 P0' — Build expert-major permutation (GPU port of `build_expert_major_perm`).
+//
+// Runs after `topk_softmax_norm_batched_f32` (which produces routing indices
+// on GPU). Eliminates the CPU drain + sort + memcpy pattern that was the
+// bottleneck for `ffn_moe_forward_batch` (~44 ms/call on prefill 35B-A3B).
+//
+// Inputs :
+// - `indices[B, n_used]` : routing expert id per (token, slot)
+// - dims : (B, n_used, n_experts, max_m_padded)
+//
+// Outputs :
+// - `src_indices[m_padded]` : flat sorted route ids (b*n_used+slot), padded
+//   per-expert to mult-8 with SENTINEL=0xFFFFFFFF
+// - `gather_src[m_padded]` : same flat, value = src_id/n_used = b (or SENTINEL)
+// - `tile_expert_ids[m_padded/8]` : expert id per M-tile of 8 rows
+// - `m_padded_out[1]` : actual m_padded length (sum of round_up_8(tpe[e]))
+//
+// Algorithm : 1 TG with `n_experts` threads (rounded to 32-multiple).
+//   1. Each thread e counts its bucket size by scanning indices[B*n_used].
+//   2. Threadgroup-wide inclusive scan over round_up_8(bucket_size) → offsets.
+//   3. Each thread writes its bucket data + sentinels + tile_expert_ids slice.
+//   4. Last thread writes m_padded total.
+//
+// Pre-conditions : n_experts ≤ 1024 (Metal TG size limit). For 35B-A3B (E=256)
+// fits easily. max_m_padded must be ≥ B*n_used + 7*n_experts (worst case).
+const BUILD_EM_PERM_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint SENTINEL = 0xFFFFFFFFu;
+
+kernel void build_em_perm_f32(
+    device const uint*  indices         [[buffer(0)]],   // [B, n_used] expert ids
+    device       uint*  src_indices     [[buffer(1)]],   // [m_padded]
+    device       uint*  gather_src      [[buffer(2)]],   // [m_padded]
+    device       uint*  tile_expert_ids [[buffer(3)]],   // [m_padded / 8]
+    device       uint*  m_padded_out    [[buffer(4)]],   // [1]
+    constant     uint4& dims            [[buffer(5)]],   // (B, n_used, n_experts, max_m_padded)
+    threadgroup  uint*  shm             [[threadgroup(0)]],
+    ushort              tpitg           [[thread_position_in_threadgroup]]
+) {
+    uint expert     = (uint)tpitg;
+    uint B          = dims.x;
+    uint n_used     = dims.y;
+    uint n_experts  = dims.z;
+    uint max_padded = dims.w;
+    uint b_n_used   = B * n_used;
+
+    // Phase 1: count bucket size for this expert.
+    uint count = 0;
+    if (expert < n_experts) {
+        for (uint i = 0; i < b_n_used; ++i) {
+            if (indices[i] == expert) count++;
+        }
+    }
+    uint padded = (count + 7u) & ~7u; // round up to mult-8
+
+    // Phase 2: threadgroup inclusive scan of `padded` via SHM.
+    // shm[i] holds the inclusive scan up to expert i.
+    if (expert < n_experts) {
+        shm[expert] = padded;
+    } else {
+        if ((uint)tpitg < n_experts + 1024u) shm[(uint)tpitg] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Sequential scan in the first thread (n_experts is small, ≤ 1024).
+    if (tpitg == 0) {
+        uint acc = 0;
+        for (uint e = 0; e < n_experts; ++e) {
+            uint padded_e = shm[e];
+            shm[e] = acc;            // exclusive offset (start of expert e's slice)
+            acc += padded_e;
+        }
+        // Total m_padded.
+        m_padded_out[0] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (expert >= n_experts) return;
+
+    uint offset = shm[expert];
+    if (offset + padded > max_padded) return; // safety clamp
+
+    // Phase 3: write bucket data + sentinels + tile_expert_ids.
+    uint write_idx = offset;
+    for (uint i = 0; i < b_n_used && write_idx < offset + count; ++i) {
+        if (indices[i] == expert) {
+            src_indices[write_idx] = i;
+            gather_src[write_idx] = i / n_used;
+            write_idx++;
+        }
+    }
+    // Sentinel padding [count, padded).
+    for (uint i = count; i < padded; ++i) {
+        src_indices[offset + i] = SENTINEL;
+        gather_src[offset + i] = SENTINEL;
+    }
+    // tile_expert_ids[offset/8 .. (offset+padded)/8] = expert.
+    uint tile_start = offset / 8u;
+    uint n_tiles = padded / 8u;
+    for (uint t = 0; t < n_tiles; ++t) {
+        tile_expert_ids[tile_start + t] = expert;
+    }
+
+    // Phase 4: tail fill (positions ≥ actual m_padded, up to max_padded).
+    // Allows callers to dispatch SGEMMs with a fixed worst-case M without
+    // computing on garbage : SENTINEL src_indices → gather_pack writes 0 →
+    // EM SGEMM computes 0 → unpermute_rows skips via SENTINEL.
+    //
+    // Only the LAST expert (the one with the highest non-empty offset+padded)
+    // does this tail clear, to avoid races. We use the "first thread to touch
+    // the boundary" pattern: the thread whose end-of-slice equals m_padded_out.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tpitg == 0) {
+        uint actual_m = m_padded_out[0];
+        for (uint i = actual_m; i < max_padded; ++i) {
+            src_indices[i] = SENTINEL;
+            gather_src[i] = SENTINEL;
+        }
+        uint actual_tiles = actual_m / 8u;
+        uint max_tiles = max_padded / 8u;
+        for (uint t = actual_tiles; t < max_tiles; ++t) {
+            // Tail tiles: expert_id = 0 (gather_pack will fill with zeros via
+            // SENTINEL src_indices, so the SGEMM computes 0 regardless of expert).
+            tile_expert_ids[t] = 0u;
+        }
+    }
+}
+"#;
+
+/// T175 P0' — Build expert-major permutation on GPU (replaces CPU
+/// `build_expert_major_perm` + drain).
+#[allow(clippy::too_many_arguments)]
+pub fn build_em_perm_f32_into(
+    backend: &MetalBackend,
+    indices_buf: &Buffer,
+    src_indices_buf: &Buffer,
+    gather_src_buf: &Buffer,
+    tile_expert_ids_buf: &Buffer,
+    m_padded_buf: &Buffer,
+    b: usize,
+    n_used: usize,
+    n_experts: usize,
+    max_m_padded: usize,
+) -> Result<(), MetalError> {
+    if n_experts == 0 || n_experts > 1024 || b == 0 || n_used == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "build_em_perm_f32: 0 < n_experts <= 1024, B > 0, n_used > 0 (got E={n_experts}, B={b}, n_used={n_used})"
+        )));
+    }
+    if max_m_padded < b * n_used + 7 * n_experts {
+        return Err(MetalError::ShapeMismatch(format!(
+            "build_em_perm_f32: max_m_padded ({max_m_padded}) must be >= B*n_used + 7*n_experts ({})",
+            b * n_used + 7 * n_experts
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "build_em_perm_f32",
+        BUILD_EM_PERM_F32_SHADER,
+        "build_em_perm_f32",
+    )?;
+    let dims = [
+        b as u32,
+        n_used as u32,
+        n_experts as u32,
+        max_m_padded as u32,
+    ];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(indices_buf), 0);
+        encoder.set_buffer(1, Some(src_indices_buf), 0);
+        encoder.set_buffer(2, Some(gather_src_buf), 0);
+        encoder.set_buffer(3, Some(tile_expert_ids_buf), 0);
+        encoder.set_buffer(4, Some(m_padded_buf), 0);
+        encoder.set_bytes(5, 16, dims.as_ptr() as *const std::ffi::c_void);
+        // SHM: n_experts u32 for prefix scan, padded to nearest 32.
+        let shm_bytes = n_experts.div_ceil(32) * 32 * 4;
+        encoder.set_threadgroup_memory_length(0, shm_bytes as u64);
+        let tg_threads = n_experts.div_ceil(32) * 32;
+        let tg_size = MTLSize::new(tg_threads as u64, 1, 1);
+        let groups = MTLSize::new(1, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T174 — Per-expert MoE BlockMMA SGEMM Q4_K (port of llama.cpp `kernel_mul_mm_id`).
 //
 // Stage 2 of the M-major MoE pipeline. Reuses the BlockMMA layout proven by
@@ -16629,6 +16951,246 @@ mod tests {
                 pos_got[i], pos_ref[i],
                 "pos mismatch at i={i}: got {} expected {}",
                 pos_got[i], pos_ref[i]
+            );
+        }
+    }
+
+    /// T175 — `sgemm_q8_0_f32_simdgroup_matrix` parity vs sgemv-loop reference.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemm_q8_0_f32_simdgroup_matrix_matches_sgemv_loop() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            return;
+        }
+
+        // Realistic shape : Qwen3.6-35B-A3B shared expert gate (N=512, K=2048).
+        let m = 32_usize;
+        let n = 64_usize;
+        let k = 256_usize;
+        let blocks_per_row = k / 32;
+
+        // Build deterministic Q8_0 weights.
+        let mut w_bytes = vec![0u8; n * blocks_per_row * 34];
+        for nrow in 0..n {
+            for ib in 0..blocks_per_row {
+                let off = (nrow * blocks_per_row + ib) * 34;
+                let d_val = ((nrow as f32 + 1.0) * 0.005) + (ib as f32) * 0.001;
+                let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                w_bytes[off] = d_h[0];
+                w_bytes[off + 1] = d_h[1];
+                for c in 0..32 {
+                    let q = ((nrow as i32 ^ ib as i32 ^ c as i32) - 16) as i8;
+                    w_bytes[off + 2 + c] = q as u8;
+                }
+            }
+        }
+
+        // Reference: M sgemv calls + concat
+        let a = det_vec(m * k, 1.5);
+        let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        let c_ref_buf = backend.alloc_shared(m * n * 4).unwrap();
+        let row_buf = backend.alloc_shared(k * 4).unwrap();
+        let out_row_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+        }
+        // Reference: M sgemv calls
+        for i in 0..m {
+            unsafe {
+                let src = (a_buf.contents() as *const u8).add(i * k * 4);
+                std::ptr::copy_nonoverlapping(src, row_buf.contents() as *mut u8, k * 4);
+            }
+            sgemv_q8_0_f32_lcpp_nsg2_into(backend, &row_buf, &w_buf, &out_row_buf, k, n).unwrap();
+            backend.drain();
+            unsafe {
+                let dst = (c_ref_buf.contents() as *mut u8).add(i * n * 4);
+                std::ptr::copy_nonoverlapping(out_row_buf.contents() as *const u8, dst, n * 4);
+            }
+        }
+        let mut c_ref = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_ref_buf.contents() as *const f32,
+                c_ref.as_mut_ptr(),
+                m * n,
+            );
+        }
+
+        // GPU SGEMM
+        let c_buf = backend.alloc_shared(m * n * 4).unwrap();
+        sgemm_q8_0_f32_simdgroup_matrix_into(backend, &a_buf, &w_buf, &c_buf, m, n, k).unwrap();
+        backend.drain();
+        let mut c_metal = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_buf.contents() as *const f32,
+                c_metal.as_mut_ptr(),
+                m * n,
+            );
+        }
+        for i in 0..(m * n) {
+            let abs_err = (c_ref[i] - c_metal[i]).abs();
+            let denom = c_ref[i].abs().max(1e-3);
+            let rel = abs_err / denom;
+            assert!(
+                rel < 1e-2,
+                "Q8_0 SGEMM mismatch at {i}: ref={} metal={} (rel {:.3e})",
+                c_ref[i],
+                c_metal[i],
+                rel
+            );
+        }
+    }
+
+    /// T175 P0' — `build_em_perm_f32_into` parity vs CPU `build_expert_major_perm`.
+    ///
+    /// Reproduces the CPU function on GPU (single TG with n_experts threads).
+    /// Verifies bit-exact equivalence on outputs : src_indices, gather_src,
+    /// tile_expert_ids, m_padded.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn build_em_perm_f32_matches_cpu() {
+        let backend = metal_backend();
+
+        // 35B-A3B-style shape : B=64, n_used=8, E=128 (smaller for test).
+        let b = 64_usize;
+        let n_used = 8_usize;
+        let n_experts = 128_usize;
+        let b_n_used = b * n_used;
+        let max_m_padded = b_n_used + 7 * n_experts;
+        const SENTINEL: u32 = u32::MAX;
+
+        // Generate distinct top-K experts per token (Fisher-Yates-like).
+        let mut indices = vec![0u32; b_n_used];
+        for b_idx in 0..b {
+            let mut pool: Vec<u32> = (0..n_experts as u32).collect();
+            for i in (1..pool.len()).rev() {
+                let h = ((b_idx as u64) * 31 + i as u64).wrapping_mul(2654435761);
+                let j = (h % (i as u64 + 1)) as usize;
+                pool.swap(i, j);
+            }
+            for s in 0..n_used {
+                indices[b_idx * n_used + s] = pool[s];
+            }
+        }
+
+        // CPU reference (port of build_expert_major_perm).
+        let mut src_ref: Vec<u32> = Vec::with_capacity(max_m_padded);
+        let mut gather_ref: Vec<u32> = Vec::with_capacity(max_m_padded);
+        let mut tile_ref: Vec<u32> = Vec::with_capacity(max_m_padded / 8);
+        {
+            let mut buckets: Vec<Vec<u32>> = (0..n_experts).map(|_| Vec::new()).collect();
+            for (i, &expert) in indices.iter().enumerate() {
+                buckets[expert as usize].push(i as u32);
+            }
+            for (e, bucket) in buckets.iter().enumerate() {
+                if bucket.is_empty() {
+                    continue;
+                }
+                for &idx in bucket {
+                    src_ref.push(idx);
+                    gather_ref.push(idx / n_used as u32);
+                }
+                let padded = bucket.len().div_ceil(8) * 8;
+                for _ in bucket.len()..padded {
+                    src_ref.push(SENTINEL);
+                    gather_ref.push(SENTINEL);
+                }
+                for _ in 0..(padded / 8) {
+                    tile_ref.push(e as u32);
+                }
+            }
+        }
+        let m_padded_ref = src_ref.len();
+
+        // GPU run.
+        let indices_buf = backend.alloc_shared(b_n_used * 4).unwrap();
+        let src_buf = backend.alloc_shared(max_m_padded * 4).unwrap();
+        let gather_buf = backend.alloc_shared(max_m_padded * 4).unwrap();
+        let tile_buf = backend.alloc_shared((max_m_padded / 8 + 1) * 4).unwrap();
+        let m_padded_buf = backend.alloc_shared(4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                indices.as_ptr(),
+                indices_buf.contents() as *mut u32,
+                b_n_used,
+            );
+            // Pre-fill outputs with a marker to detect missed writes.
+            std::ptr::write_bytes(src_buf.contents() as *mut u8, 0xAA, max_m_padded * 4);
+            std::ptr::write_bytes(gather_buf.contents() as *mut u8, 0xAA, max_m_padded * 4);
+            std::ptr::write_bytes(
+                tile_buf.contents() as *mut u8,
+                0xAA,
+                (max_m_padded / 8 + 1) * 4,
+            );
+            std::ptr::write_bytes(m_padded_buf.contents() as *mut u8, 0, 4);
+        }
+        build_em_perm_f32_into(
+            backend,
+            &indices_buf,
+            &src_buf,
+            &gather_buf,
+            &tile_buf,
+            &m_padded_buf,
+            b,
+            n_used,
+            n_experts,
+            max_m_padded,
+        )
+        .unwrap();
+        backend.drain();
+
+        let m_padded_got = unsafe { *(m_padded_buf.contents() as *const u32) } as usize;
+        assert_eq!(
+            m_padded_got, m_padded_ref,
+            "m_padded mismatch: got {m_padded_got} expected {m_padded_ref}"
+        );
+
+        let mut src_got = vec![0u32; m_padded_ref];
+        let mut gather_got = vec![0u32; m_padded_ref];
+        let mut tile_got = vec![0u32; m_padded_ref / 8];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_buf.contents() as *const u32,
+                src_got.as_mut_ptr(),
+                m_padded_ref,
+            );
+            std::ptr::copy_nonoverlapping(
+                gather_buf.contents() as *const u32,
+                gather_got.as_mut_ptr(),
+                m_padded_ref,
+            );
+            std::ptr::copy_nonoverlapping(
+                tile_buf.contents() as *const u32,
+                tile_got.as_mut_ptr(),
+                m_padded_ref / 8,
+            );
+        }
+
+        for i in 0..m_padded_ref {
+            assert_eq!(
+                src_got[i], src_ref[i],
+                "src_indices mismatch at {i}: got {} expected {}",
+                src_got[i], src_ref[i]
+            );
+            assert_eq!(
+                gather_got[i], gather_ref[i],
+                "gather_src mismatch at {i}: got {} expected {}",
+                gather_got[i], gather_ref[i]
+            );
+        }
+        for i in 0..(m_padded_ref / 8) {
+            assert_eq!(
+                tile_got[i], tile_ref[i],
+                "tile_expert_ids mismatch at tile {i}: got {} expected {}",
+                tile_got[i], tile_ref[i]
             );
         }
     }
