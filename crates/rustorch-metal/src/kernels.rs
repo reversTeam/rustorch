@@ -11252,6 +11252,76 @@ pub fn split_qg_per_head_f32(
     Ok(())
 }
 
+// T162 phase 9a — batched variant for B-token prefill of Qwen3Next attn block.
+// Each batch entry has `qg [n_q, 2 * head_dim]` and produces `q [n_q, head_dim]`
+// and `gate [n_q, head_dim]`. The 3D grid (head_dim, n_q, B) lets each thread
+// handle a single (head, dim, batch) triplet — embarrassingly parallel.
+const SPLIT_QG_PER_HEAD_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void split_qg_per_head_batched_f32(
+    device const float* qg       [[buffer(0)]],   // [B, n_q, 2 * head_dim]
+    device float*       q        [[buffer(1)]],   // [B, n_q, head_dim] out
+    device float*       gate     [[buffer(2)]],   // [B, n_q, head_dim] out
+    constant uint3&     dims     [[buffer(3)]],   // (n_q, head_dim, B)
+    uint3               gid      [[thread_position_in_grid]]
+) {
+    uint n_q = dims.x;
+    uint head_dim = dims.y;
+    uint B = dims.z;
+    uint i = gid.x;
+    uint h = gid.y;
+    uint b = gid.z;
+    if (h >= n_q || i >= head_dim || b >= B) return;
+    uint per_batch_qg = n_q * 2u * head_dim;
+    uint per_batch_q  = n_q * head_dim;
+    uint src_off = b * per_batch_qg + h * 2u * head_dim;
+    uint dst_off = b * per_batch_q  + h * head_dim;
+    q[dst_off + i]    = qg[src_off + i];
+    gate[dst_off + i] = qg[src_off + head_dim + i];
+}
+"#;
+
+/// T162 phase 9a — batched per-head split for Qwen3Next attn prefill.
+/// Equivalent to calling `split_qg_per_head_f32` once per batch entry,
+/// but in a single dispatch (no per-token CPU overhead).
+///
+/// Buffers : `qg_batched` is `[B, n_q, 2 * head_dim]` row-major,
+/// `q_batched` and `gate_batched` are `[B, n_q, head_dim]`.
+pub fn split_qg_per_head_batched_f32(
+    backend: &MetalBackend,
+    qg_buf: &Buffer,
+    q_buf: &Buffer,
+    gate_buf: &Buffer,
+    n_q: usize,
+    head_dim: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if n_q == 0 || head_dim == 0 || b == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "split_qg_per_head_batched_f32: n_q={n_q}, head_dim={head_dim}, B={b}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "split_qg_per_head_batched_f32",
+        SPLIT_QG_PER_HEAD_BATCHED_F32_SHADER,
+        "split_qg_per_head_batched_f32",
+    )?;
+    let dims = [n_q as u32, head_dim as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(qg_buf), 0);
+        encoder.set_buffer(1, Some(q_buf), 0);
+        encoder.set_buffer(2, Some(gate_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(head_dim as u64, n_q as u64, b as u64);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
 // T151 — Split a contiguous `[q_len + k_len + v_len]` source buffer into
 // three destination buffers on GPU. Replaces the CPU `ptr::copy_nonoverlapping`
 // path in `ssm_block_forward` which required a `backend.drain()` to make the
@@ -11458,6 +11528,62 @@ pub fn sigmoid_mul_inplace_f32(
         encoder.set_bytes(2, 4, &n_u as *const u32 as *const std::ffi::c_void);
         let tg = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new(n as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+// T162 phase 9a — batched sigmoid_mul_inplace for B-token prefill.
+// Same as sigmoid_mul_inplace but operates on `[B, n]` row-major buffers.
+const SIGMOID_MUL_INPLACE_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void sigmoid_mul_inplace_batched_f32(
+    device float*        x       [[buffer(0)]],   // [B, n] in/out
+    device const float*  gate    [[buffer(1)]],   // [B, n]
+    constant uint2&      dims    [[buffer(2)]],   // (n, B)
+    uint2                gid     [[thread_position_in_grid]]
+) {
+    uint n = dims.x;
+    uint B = dims.y;
+    uint i = gid.x;
+    uint b = gid.y;
+    if (i >= n || b >= B) return;
+    uint off = b * n + i;
+    float g = gate[off];
+    float sig = 1.0 / (1.0 + exp(-g));
+    x[off] = x[off] * sig;
+}
+"#;
+
+/// T162 phase 9a — batched `x[bi, i] *= sigmoid(gate[bi, i])`.
+/// Both buffers are `[B, n]` row-major. Single dispatch.
+pub fn sigmoid_mul_inplace_batched_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    gate_buf: &Buffer,
+    n: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if n == 0 || b == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sigmoid_mul_inplace_batched_f32: n={n}, B={b}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sigmoid_mul_inplace_batched_f32",
+        SIGMOID_MUL_INPLACE_BATCHED_F32_SHADER,
+        "sigmoid_mul_inplace_batched_f32",
+    )?;
+    let dims = [n as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(gate_buf), 0);
+        encoder.set_bytes(2, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n as u64, b as u64, 1);
         encoder.dispatch_threads(grid, tg);
     });
     Ok(())
@@ -14076,6 +14202,175 @@ mod tests {
                     "batch={batch} i={i} mismatch: seq={a} batch={bv} (rel {r:.3e})"
                 );
             }
+        }
+    }
+
+    /// T162 phase 9a — batched split_qg_per_head must match B sequential calls.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn split_qg_per_head_batched_f32_matches_singles() {
+        let backend = metal_backend();
+        let n_q = 16usize;
+        let head_dim = 128usize;
+        let b = 4usize;
+        let qg_size = n_q * 2 * head_dim;
+        let q_size = n_q * head_dim;
+
+        // Build B different qg rows.
+        let mut qg_all = vec![0.0f32; b * qg_size];
+        for batch in 0..b {
+            for i in 0..qg_size {
+                qg_all[batch * qg_size + i] = ((i as f32 + 1.0 + batch as f32 * 7.0) * 0.013).sin();
+            }
+        }
+        let qg_buf = backend.alloc_shared(b * qg_size * 4).unwrap();
+        let q_seq_buf = backend.alloc_shared(b * q_size * 4).unwrap();
+        let gate_seq_buf = backend.alloc_shared(b * q_size * 4).unwrap();
+        let q_batch_buf = backend.alloc_shared(b * q_size * 4).unwrap();
+        let gate_batch_buf = backend.alloc_shared(b * q_size * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                qg_all.as_ptr(),
+                qg_buf.contents() as *mut f32,
+                b * qg_size,
+            );
+        }
+
+        // Reference: B sequential calls.
+        for batch in 0..b {
+            let qg_b = backend.alloc_shared(qg_size * 4).unwrap();
+            let q_b = backend.alloc_shared(q_size * 4).unwrap();
+            let gate_b = backend.alloc_shared(q_size * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    qg_all[batch * qg_size..(batch + 1) * qg_size].as_ptr(),
+                    qg_b.contents() as *mut f32,
+                    qg_size,
+                );
+            }
+            split_qg_per_head_f32(backend, &qg_b, &q_b, &gate_b, n_q, head_dim).unwrap();
+            backend.drain();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    q_b.contents() as *const f32,
+                    (q_seq_buf.contents() as *mut f32).add(batch * q_size),
+                    q_size,
+                );
+                std::ptr::copy_nonoverlapping(
+                    gate_b.contents() as *const f32,
+                    (gate_seq_buf.contents() as *mut f32).add(batch * q_size),
+                    q_size,
+                );
+            }
+        }
+
+        // Batched call.
+        split_qg_per_head_batched_f32(
+            backend,
+            &qg_buf,
+            &q_batch_buf,
+            &gate_batch_buf,
+            n_q,
+            head_dim,
+            b,
+        )
+        .unwrap();
+        backend.drain();
+
+        let q_seq = unsafe {
+            std::slice::from_raw_parts(q_seq_buf.contents() as *const f32, b * q_size).to_vec()
+        };
+        let q_bat = unsafe {
+            std::slice::from_raw_parts(q_batch_buf.contents() as *const f32, b * q_size).to_vec()
+        };
+        let gate_seq = unsafe {
+            std::slice::from_raw_parts(gate_seq_buf.contents() as *const f32, b * q_size).to_vec()
+        };
+        let gate_bat = unsafe {
+            std::slice::from_raw_parts(gate_batch_buf.contents() as *const f32, b * q_size).to_vec()
+        };
+        for i in 0..b * q_size {
+            assert!(
+                (q_seq[i] - q_bat[i]).abs() < 1e-6,
+                "Q[{i}] mismatch: seq={} bat={}",
+                q_seq[i],
+                q_bat[i]
+            );
+            assert!(
+                (gate_seq[i] - gate_bat[i]).abs() < 1e-6,
+                "Gate[{i}] mismatch: seq={} bat={}",
+                gate_seq[i],
+                gate_bat[i]
+            );
+        }
+    }
+
+    /// T162 phase 9a — batched sigmoid_mul_inplace must match B sequential calls.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sigmoid_mul_inplace_batched_f32_matches_singles() {
+        let backend = metal_backend();
+        let n = 2048usize;
+        let b = 4usize;
+
+        let mut x_all = vec![0.0f32; b * n];
+        let mut g_all = vec![0.0f32; b * n];
+        for batch in 0..b {
+            for i in 0..n {
+                x_all[batch * n + i] = ((i as f32 + 1.0 + batch as f32 * 3.0) * 0.011).sin();
+                g_all[batch * n + i] = ((i as f32 + 1.0 + batch as f32 * 5.0) * 0.017).cos() * 0.5;
+            }
+        }
+
+        // Reference: B sequential calls (each gets its own copy of x).
+        let mut y_seq = x_all.clone();
+        for batch in 0..b {
+            let x_b = backend.alloc_shared(n * 4).unwrap();
+            let g_b = backend.alloc_shared(n * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    y_seq[batch * n..(batch + 1) * n].as_ptr(),
+                    x_b.contents() as *mut f32,
+                    n,
+                );
+                std::ptr::copy_nonoverlapping(
+                    g_all[batch * n..(batch + 1) * n].as_ptr(),
+                    g_b.contents() as *mut f32,
+                    n,
+                );
+            }
+            sigmoid_mul_inplace_f32(backend, &x_b, &g_b, n).unwrap();
+            backend.drain();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    x_b.contents() as *const f32,
+                    y_seq[batch * n..(batch + 1) * n].as_mut_ptr(),
+                    n,
+                );
+            }
+        }
+
+        // Batched call.
+        let x_buf = backend.alloc_shared(b * n * 4).unwrap();
+        let g_buf = backend.alloc_shared(b * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x_all.as_ptr(), x_buf.contents() as *mut f32, b * n);
+            std::ptr::copy_nonoverlapping(g_all.as_ptr(), g_buf.contents() as *mut f32, b * n);
+        }
+        sigmoid_mul_inplace_batched_f32(backend, &x_buf, &g_buf, n, b).unwrap();
+        backend.drain();
+
+        let y_bat =
+            unsafe { std::slice::from_raw_parts(x_buf.contents() as *const f32, b * n).to_vec() };
+        for i in 0..b * n {
+            let r = (y_seq[i] - y_bat[i]).abs() / y_seq[i].abs().max(1e-4);
+            assert!(
+                r < 1e-3,
+                "[{i}] mismatch: seq={} bat={} (rel {:.3e})",
+                y_seq[i],
+                y_bat[i],
+                r
+            );
         }
     }
 }
