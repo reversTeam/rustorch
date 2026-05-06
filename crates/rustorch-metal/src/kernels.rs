@@ -12618,6 +12618,47 @@ pub fn ssm_conv1d_step_f32(
     Ok(())
 }
 
+/// T175 P0 — SSM scan : conv1d_step variant with input buffer offset.
+///
+/// Same shader as `ssm_conv1d_step_f32` but binds `x_in_buf` at byte offset
+/// `x_in_offset_bytes`. Allows reading directly from a batched buffer
+/// `[B, conv_dim]` at slice `bi * conv_dim` without a CPU memcpy + drain.
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_conv1d_step_f32_with_offset(
+    backend: &MetalBackend,
+    x_in_buf: &Buffer,
+    x_in_offset_bytes: usize,
+    conv1d_w_buf: &Buffer,
+    conv_state_buf: &Buffer,
+    y_out_buf: &Buffer,
+    kernel_size: usize,
+    conv_dim: usize,
+) -> Result<(), MetalError> {
+    if kernel_size == 0 || conv_dim == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ssm_conv1d_step_f32_with_offset: kernel_size={kernel_size}, conv_dim={conv_dim}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "ssm_conv1d_step_f32",
+        SSM_CONV1D_STEP_F32_SHADER,
+        "ssm_conv1d_step_f32",
+    )?;
+    let dims = [kernel_size as u32, conv_dim as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_in_buf), x_in_offset_bytes as u64);
+        encoder.set_buffer(1, Some(conv1d_w_buf), 0);
+        encoder.set_buffer(2, Some(conv_state_buf), 0);
+        encoder.set_buffer(3, Some(y_out_buf), 0);
+        encoder.set_bytes(4, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(conv_dim as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
 // ----------------------------------------------------------------------------
 // 2. Per-head L2 normalization (no gamma). Used on Q and K after conv.
 //
@@ -12950,6 +12991,57 @@ pub fn delta_net_step_with_l2_f32(
     Ok(())
 }
 
+/// T175 P0 — delta_net_step_with_l2 variant with per-buffer offsets for the
+/// SSM scan path. Allows binding `gate_h`, `beta`, and `out` directly to a
+/// batched buffer at slice `bi`, eliminating CPU memcpy + drain in the loop.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net_step_with_l2_f32_with_offsets(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    k_buf: &Buffer,
+    v_buf: &Buffer,
+    gate_h_buf: &Buffer,
+    gate_h_offset_bytes: usize,
+    beta_buf: &Buffer,
+    beta_offset_bytes: usize,
+    state_buf: &Buffer,
+    out_buf: &Buffer,
+    out_offset_bytes: usize,
+    n_v_heads: usize,
+    head_dim: usize,
+    n_k_heads: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    if n_v_heads == 0 || head_dim == 0 || n_k_heads == 0 || n_v_heads % n_k_heads != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "delta_net_step_with_l2_f32_with_offsets: n_v_heads={n_v_heads} must be a multiple of n_k_heads={n_k_heads}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "delta_net_step_with_l2_f32",
+        DELTA_NET_STEP_WITH_L2_F32_SHADER,
+        "delta_net_step_with_l2_f32",
+    )?;
+    let repeat = (n_v_heads / n_k_heads) as u32;
+    let dims = [n_v_heads as u32, head_dim as u32, n_k_heads as u32, repeat];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_buf), 0);
+        encoder.set_buffer(2, Some(v_buf), 0);
+        encoder.set_buffer(3, Some(gate_h_buf), gate_h_offset_bytes as u64);
+        encoder.set_buffer(4, Some(beta_buf), beta_offset_bytes as u64);
+        encoder.set_buffer(5, Some(state_buf), 0);
+        encoder.set_buffer(6, Some(out_buf), out_offset_bytes as u64);
+        encoder.set_bytes(7, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(8, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let groups = MTLSize::new(head_dim as u64, n_v_heads as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T144 — gated delta-net step (state update + read-out).
 ///
 /// `state` is read+written in place. Shape: `[n_v_heads, head_dim,
@@ -13083,6 +13175,43 @@ pub fn rms_norm_per_head_gated_f32(
         encoder.set_buffer(0, Some(x_buf), 0);
         encoder.set_buffer(1, Some(gamma_buf), 0);
         encoder.set_buffer(2, Some(z_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        let grid = MTLSize::new(32 * n_heads as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
+/// T175 P0 — rms_norm_per_head_gated variant with per-buffer offsets.
+///
+/// `x_buf` is read+written in-place at offset `x_offset_bytes`. `z_buf` is
+/// read at offset `z_offset_bytes`. Allows the gated norm to write directly
+/// into a batched buffer slice without a CPU memcpy.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_per_head_gated_f32_with_offsets(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    x_offset_bytes: usize,
+    gamma_buf: &Buffer,
+    z_buf: &Buffer,
+    z_offset_bytes: usize,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "rms_norm_per_head_gated_f32",
+        RMS_NORM_PER_HEAD_GATED_F32_SHADER,
+        "rms_norm_per_head_gated_f32",
+    )?;
+    let dims = [n_heads as u32, head_dim as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_offset_bytes as u64);
+        encoder.set_buffer(1, Some(gamma_buf), 0);
+        encoder.set_buffer(2, Some(z_buf), z_offset_bytes as u64);
         encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
         encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
         let tg = MTLSize::new(32, 1, 1);
@@ -15313,6 +15442,349 @@ mod tests {
                 state_a[i],
                 state_b[i],
                 rel
+            );
+        }
+    }
+
+    /// T175 P0 — Parity: `ssm_conv1d_step_f32_with_offset` reads from the
+    /// correct offset position in a batched buffer.
+    ///
+    /// Builds a [2, conv_dim] batched buffer with `data1` at slice 0 and
+    /// `data2` at slice 1. Calls offset variant with offset = conv_dim*4
+    /// → reads data2. Calls non-offset variant on a single-slice buffer
+    /// containing only data2. Outputs must be byte-exact (same shader,
+    /// same data).
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn ssm_conv1d_step_f32_with_offset_matches_non_offset() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[ssm_conv1d_step offset] skipping: no Metal3");
+            return;
+        }
+        let conv_dim = 384_usize; // 35B-A3B-style conv_dim
+        let kernel_size = 4_usize;
+
+        // Two distinct token slices.
+        let data1 = det_vec(conv_dim, 0.3);
+        let data2 = det_vec(conv_dim, 1.7);
+        let conv1d_w = det_vec(kernel_size * conv_dim, 0.05);
+        let conv_state_init = det_vec(conv_dim * kernel_size, 0.01);
+
+        // Path A: non-offset, single-slice buffer.
+        let x_a_buf = backend.alloc_shared(conv_dim * 4).unwrap();
+        let w_buf = backend.alloc_shared(kernel_size * conv_dim * 4).unwrap();
+        let state_a_buf = backend.alloc_shared(conv_dim * kernel_size * 4).unwrap();
+        let y_a_buf = backend.alloc_shared(conv_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(data2.as_ptr(), x_a_buf.contents() as *mut f32, conv_dim);
+            std::ptr::copy_nonoverlapping(
+                conv1d_w.as_ptr(),
+                w_buf.contents() as *mut f32,
+                kernel_size * conv_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                conv_state_init.as_ptr(),
+                state_a_buf.contents() as *mut f32,
+                conv_dim * kernel_size,
+            );
+        }
+        ssm_conv1d_step_f32(
+            backend,
+            &x_a_buf,
+            &w_buf,
+            &state_a_buf,
+            &y_a_buf,
+            kernel_size,
+            conv_dim,
+        )
+        .unwrap();
+        backend.drain();
+        let mut y_a = vec![0.0_f32; conv_dim];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y_a_buf.contents() as *const f32,
+                y_a.as_mut_ptr(),
+                conv_dim,
+            );
+        }
+
+        // Path B: offset variant, batched buffer [2, conv_dim] with data1+data2.
+        let x_b_buf = backend.alloc_shared(2 * conv_dim * 4).unwrap();
+        let state_b_buf = backend.alloc_shared(conv_dim * kernel_size * 4).unwrap();
+        let y_b_buf = backend.alloc_shared(conv_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(data1.as_ptr(), x_b_buf.contents() as *mut f32, conv_dim);
+            std::ptr::copy_nonoverlapping(
+                data2.as_ptr(),
+                (x_b_buf.contents() as *mut f32).add(conv_dim),
+                conv_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                conv_state_init.as_ptr(),
+                state_b_buf.contents() as *mut f32,
+                conv_dim * kernel_size,
+            );
+        }
+        ssm_conv1d_step_f32_with_offset(
+            backend,
+            &x_b_buf,
+            conv_dim * 4, // offset = slice 1
+            &w_buf,
+            &state_b_buf,
+            &y_b_buf,
+            kernel_size,
+            conv_dim,
+        )
+        .unwrap();
+        backend.drain();
+        let mut y_b = vec![0.0_f32; conv_dim];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y_b_buf.contents() as *const f32,
+                y_b.as_mut_ptr(),
+                conv_dim,
+            );
+        }
+
+        // Both should produce identical output (same data2 + same state).
+        for i in 0..conv_dim {
+            assert!(
+                (y_a[i] - y_b[i]).abs() < 1e-6,
+                "ssm_conv1d offset parity at {i}: ref={} got={}",
+                y_a[i],
+                y_b[i]
+            );
+        }
+    }
+
+    /// T175 P0 — Parity: `delta_net_step_with_l2_f32_with_offsets`.
+    /// Same setup, but with offsets on gate_h, beta, and out buffers.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn delta_net_step_with_l2_f32_with_offsets_matches_non_offset() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            return;
+        }
+        let head_dim = 128_usize;
+        let n_k_heads = 16_usize;
+        let n_v_heads = 48_usize;
+        let eps = 1e-5_f32;
+        let key_dim = n_k_heads * head_dim;
+        let value_dim = n_v_heads * head_dim;
+        let state_size = n_v_heads * head_dim * head_dim;
+
+        let q = det_vec(key_dim, 0.7);
+        let k = det_vec(key_dim, 1.3);
+        let v = det_vec(value_dim, 2.1);
+        let gate_h_pad = det_vec(n_v_heads, 0.04);
+        let gate_h = det_vec(n_v_heads, 0.05);
+        let beta_pad = det_vec(n_v_heads, 0.6);
+        let beta = det_vec(n_v_heads, 0.5);
+        let state_init = det_vec(state_size, 0.001);
+
+        // Path A: non-offset.
+        let q_a = backend.alloc_shared(key_dim * 4).unwrap();
+        let k_a = backend.alloc_shared(key_dim * 4).unwrap();
+        let v_a = backend.alloc_shared(value_dim * 4).unwrap();
+        let gate_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let beta_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let state_a = backend.alloc_shared(state_size * 4).unwrap();
+        let out_a = backend.alloc_shared(value_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(q.as_ptr(), q_a.contents() as *mut f32, key_dim);
+            std::ptr::copy_nonoverlapping(k.as_ptr(), k_a.contents() as *mut f32, key_dim);
+            std::ptr::copy_nonoverlapping(v.as_ptr(), v_a.contents() as *mut f32, value_dim);
+            std::ptr::copy_nonoverlapping(
+                gate_h.as_ptr(),
+                gate_a.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(beta.as_ptr(), beta_a.contents() as *mut f32, n_v_heads);
+            std::ptr::copy_nonoverlapping(
+                state_init.as_ptr(),
+                state_a.contents() as *mut f32,
+                state_size,
+            );
+        }
+        delta_net_step_with_l2_f32(
+            backend, &q_a, &k_a, &v_a, &gate_a, &beta_a, &state_a, &out_a, n_v_heads, head_dim,
+            n_k_heads, eps,
+        )
+        .unwrap();
+        backend.drain();
+        let mut out_a_vec = vec![0.0_f32; value_dim];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_a.contents() as *const f32,
+                out_a_vec.as_mut_ptr(),
+                value_dim,
+            );
+        }
+
+        // Path B: offset variant on [2, n_v] gate/beta and [2, value_dim] out.
+        let q_b = backend.alloc_shared(key_dim * 4).unwrap();
+        let k_b = backend.alloc_shared(key_dim * 4).unwrap();
+        let v_b = backend.alloc_shared(value_dim * 4).unwrap();
+        let gate_b = backend.alloc_shared(2 * n_v_heads * 4).unwrap();
+        let beta_b = backend.alloc_shared(2 * n_v_heads * 4).unwrap();
+        let state_b = backend.alloc_shared(state_size * 4).unwrap();
+        let out_b = backend.alloc_shared(2 * value_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(q.as_ptr(), q_b.contents() as *mut f32, key_dim);
+            std::ptr::copy_nonoverlapping(k.as_ptr(), k_b.contents() as *mut f32, key_dim);
+            std::ptr::copy_nonoverlapping(v.as_ptr(), v_b.contents() as *mut f32, value_dim);
+            // gate_b: [pad, real] — real at offset n_v_heads.
+            std::ptr::copy_nonoverlapping(
+                gate_h_pad.as_ptr(),
+                gate_b.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                gate_h.as_ptr(),
+                (gate_b.contents() as *mut f32).add(n_v_heads),
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                beta_pad.as_ptr(),
+                beta_b.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                beta.as_ptr(),
+                (beta_b.contents() as *mut f32).add(n_v_heads),
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                state_init.as_ptr(),
+                state_b.contents() as *mut f32,
+                state_size,
+            );
+            // Pollute out_b[0..value_dim] to detect if kernel writes to wrong offset.
+            std::ptr::write_bytes(out_b.contents() as *mut u8, 0xAA, 2 * value_dim * 4);
+        }
+        delta_net_step_with_l2_f32_with_offsets(
+            backend,
+            &q_b,
+            &k_b,
+            &v_b,
+            &gate_b,
+            n_v_heads * 4, // offset = slice 1
+            &beta_b,
+            n_v_heads * 4,
+            &state_b,
+            &out_b,
+            value_dim * 4,
+            n_v_heads,
+            head_dim,
+            n_k_heads,
+            eps,
+        )
+        .unwrap();
+        backend.drain();
+        let mut out_b_vec = vec![0.0_f32; value_dim];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (out_b.contents() as *const f32).add(value_dim),
+                out_b_vec.as_mut_ptr(),
+                value_dim,
+            );
+        }
+
+        for i in 0..value_dim {
+            assert!(
+                (out_a_vec[i] - out_b_vec[i]).abs() < 1e-5,
+                "delta_net offsets parity at {i}: ref={} got={}",
+                out_a_vec[i],
+                out_b_vec[i]
+            );
+        }
+    }
+
+    /// T175 P0 — Parity: `rms_norm_per_head_gated_f32_with_offsets`.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn rms_norm_per_head_gated_f32_with_offsets_matches_non_offset() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            return;
+        }
+        let n_heads = 48_usize;
+        let head_dim = 128_usize;
+        let value_dim = n_heads * head_dim;
+        let eps = 1e-5_f32;
+
+        let x_data = det_vec(value_dim, 0.4);
+        let gamma = det_vec(head_dim, 0.9);
+        let z_data = det_vec(value_dim, 0.7);
+
+        // Path A: non-offset, single buffer.
+        let x_a = backend.alloc_shared(value_dim * 4).unwrap();
+        let g_a = backend.alloc_shared(head_dim * 4).unwrap();
+        let z_a = backend.alloc_shared(value_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x_data.as_ptr(), x_a.contents() as *mut f32, value_dim);
+            std::ptr::copy_nonoverlapping(gamma.as_ptr(), g_a.contents() as *mut f32, head_dim);
+            std::ptr::copy_nonoverlapping(z_data.as_ptr(), z_a.contents() as *mut f32, value_dim);
+        }
+        rms_norm_per_head_gated_f32(backend, &x_a, &g_a, &z_a, n_heads, head_dim, eps).unwrap();
+        backend.drain();
+        let mut x_a_vec = vec![0.0_f32; value_dim];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                x_a.contents() as *const f32,
+                x_a_vec.as_mut_ptr(),
+                value_dim,
+            );
+        }
+
+        // Path B: offset variant, [2, value_dim] for x and z.
+        let x_b = backend.alloc_shared(2 * value_dim * 4).unwrap();
+        let z_b = backend.alloc_shared(2 * value_dim * 4).unwrap();
+        unsafe {
+            // Pollute slot 0 with junk to detect wrong offset.
+            std::ptr::write_bytes(x_b.contents() as *mut u8, 0xBB, value_dim * 4);
+            std::ptr::write_bytes(z_b.contents() as *mut u8, 0xCC, value_dim * 4);
+            std::ptr::copy_nonoverlapping(
+                x_data.as_ptr(),
+                (x_b.contents() as *mut f32).add(value_dim),
+                value_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                z_data.as_ptr(),
+                (z_b.contents() as *mut f32).add(value_dim),
+                value_dim,
+            );
+        }
+        rms_norm_per_head_gated_f32_with_offsets(
+            backend,
+            &x_b,
+            value_dim * 4,
+            &g_a,
+            &z_b,
+            value_dim * 4,
+            n_heads,
+            head_dim,
+            eps,
+        )
+        .unwrap();
+        backend.drain();
+        let mut x_b_vec = vec![0.0_f32; value_dim];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (x_b.contents() as *const f32).add(value_dim),
+                x_b_vec.as_mut_ptr(),
+                value_dim,
+            );
+        }
+
+        for i in 0..value_dim {
+            assert!(
+                (x_a_vec[i] - x_b_vec[i]).abs() < 1e-5,
+                "rms_norm offsets parity at {i}: ref={} got={}",
+                x_a_vec[i],
+                x_b_vec[i]
             );
         }
     }

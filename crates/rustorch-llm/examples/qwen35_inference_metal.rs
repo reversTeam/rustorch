@@ -48,10 +48,11 @@ use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, delta_net_step_f32, delta_net_step_with_l2_f32,
-    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32,
-    kv_append_f32, l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32,
-    rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
-    rope_half_split_f32, rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
+    delta_net_step_with_l2_f32_with_offsets, gather_pack_rows_f32, gqa_decode_batched_f32,
+    gqa_decode_f32, kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32,
+    rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32, rms_norm_per_head_f32,
+    rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
+    rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
     sgemm_q4_k_f32_expert_major_8x8_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
     sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q5_k_f32_expert_major_8x8_into,
@@ -63,10 +64,10 @@ use rustorch_metal::kernels::{
     sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
     sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32,
     sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
-    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_batched_f32,
-    swiglu_f32, topk_softmax_norm_batched_f32, topk_softmax_norm_f32, unpermute_rows_f32,
-    weighted_add_inplace_f32, weighted_reduce_add_batched_f32, weighted_reduce_add_f32,
-    weighted_scatter_add_f32, zero_f32,
+    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
+    ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
+    topk_softmax_norm_f32, unpermute_rows_f32, weighted_add_inplace_f32,
+    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
 };
 
 /// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
@@ -1313,49 +1314,32 @@ fn ssm_block_forward_batch(
         b,
     )?;
 
-    // 4. Per-token scan (recurrent). Drain pour que les batched dispatches
-    //    soient visibles avant CPU memcpy slice.
-    backend.drain();
+    // 4. Per-token scan (recurrent). T175 P0 — drain-free path : on bind les
+    //    inputs `qkv_mixed` / `gate_h` / `beta_sig` / `z` directement à
+    //    `batch_scratch.*` avec offset bi via les variantes `_with_offsets`,
+    //    et on écrit l'output directement dans `batch_scratch.ssm_out_buf[bi]`.
+    //    Élimine 4 memcpy CPU + 1 drain par token (scaling B × N_layers
+    //    × 250 µs sur 35B-A3B).
+    //
+    //    Le scan reste séquentiel (s.state et s.conv_state sont read+write par
+    //    iter), mais les hazards mémoire sont gérés automatiquement par Metal
+    //    intra-CB ; pas besoin de drain pour les sérialiser.
+    let conv_off_stride = conv_dim * 4;
+    let value_off_stride = value_dim * 4;
+    let n_v_off_stride = n_v * 4;
     for bi in 0..b {
-        // Slice les inputs depuis batch_scratch → scratch (per-token buffers).
-        unsafe {
-            // qkv_mixed [conv_dim]
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.qkv_mixed.contents() as *const f32).add(bi * conv_dim),
-                scratch.qkv_mixed.contents() as *mut f32,
-                conv_dim,
-            );
-            // z [value_dim]
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.z.contents() as *const f32).add(bi * value_dim),
-                scratch.z.contents() as *mut f32,
-                value_dim,
-            );
-            // gate_h [n_v]
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.gate_h.contents() as *const f32).add(bi * n_v),
-                scratch.gate_h.contents() as *mut f32,
-                n_v,
-            );
-            // beta_sig [n_v]
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.beta_sig.contents() as *const f32).add(bi * n_v),
-                scratch.beta_sig.contents() as *mut f32,
-                n_v,
-            );
-        }
-
-        // Conv1d step + ring buffer update (mutates s.conv_state).
-        ssm_conv1d_step_f32(
+        // Conv1d step lit batch_scratch.qkv_mixed[bi*conv_dim..] directement.
+        ssm_conv1d_step_f32_with_offset(
             backend,
-            &scratch.qkv_mixed,
+            &batch_scratch.qkv_mixed,
+            bi * conv_off_stride,
             &ssm.conv1d,
             &s.conv_state,
             &scratch.conv_out,
             cfg.ssm_conv_kernel,
             conv_dim,
         )?;
-        // GPU split q/k/v (réutilise le path T154-fast — fused L2 + delta_net).
+        // GPU split q/k/v (single-token scratch, pas d'offset).
         split_qkv_f32(
             backend,
             &scratch.conv_out,
@@ -1366,40 +1350,38 @@ fn ssm_block_forward_batch(
             key_dim,
             value_dim,
         )?;
-        // T154-fast — fused L2 + delta_net (mutates s.state).
-        delta_net_step_with_l2_f32(
+        // delta_net : lit gate_h[bi*n_v..] et beta_sig[bi*n_v..] depuis batch,
+        // écrit directement dans batch_scratch.ssm_out_buf[bi*value_dim..].
+        delta_net_step_with_l2_f32_with_offsets(
             backend,
             &scratch.q_ssm,
             &scratch.k_ssm,
             &scratch.v_ssm,
-            &scratch.gate_h,
-            &scratch.beta_sig,
+            &batch_scratch.gate_h,
+            bi * n_v_off_stride,
+            &batch_scratch.beta_sig,
+            bi * n_v_off_stride,
             &s.state,
-            &scratch.ssm_out_buf,
+            &batch_scratch.ssm_out_buf,
+            bi * value_off_stride,
             n_v,
             head_v_dim,
             n_k,
             eps,
         )?;
-        // Per-head RMSNorm gated by silu(z).
-        rms_norm_per_head_gated_f32(
+        // RMS norm gated by silu(z) : in-place sur batch_scratch.ssm_out_buf[bi]
+        // avec gating depuis batch_scratch.z[bi].
+        rms_norm_per_head_gated_f32_with_offsets(
             backend,
-            &scratch.ssm_out_buf,
+            &batch_scratch.ssm_out_buf,
+            bi * value_off_stride,
             &ssm.ssm_norm,
-            &scratch.z,
+            &batch_scratch.z,
+            bi * value_off_stride,
             n_v,
             head_v_dim,
             eps,
         )?;
-        backend.drain();
-        // Copy scratch.ssm_out_buf → batch_scratch.ssm_out_buf[bi].
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scratch.ssm_out_buf.contents() as *const f32,
-                (batch_scratch.ssm_out_buf.contents() as *mut f32).add(bi * value_dim),
-                value_dim,
-            );
-        }
     }
 
     // 5. Batched output projection ssm_out_buf → o.
