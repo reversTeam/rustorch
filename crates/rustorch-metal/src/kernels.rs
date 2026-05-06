@@ -2688,8 +2688,10 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
     uint sgi = (uint)sgitg / WN;       // 0..WM-1 = 0..1
     uint sgj = (uint)sgitg % WN;       // 0..WN-1 = 0..1
 
-    threadgroup float Xs[64 * 32];     // BM × BK
-    threadgroup float Ws[64 * 32];     // BN × BK
+    // T162 phase 9h-bis : SHM en HALF (vs float). MMAs simdgroup_half8x8 plus
+    // rapides sur Apple GPU. Réduit aussi la SHM de 16KB → 8KB.
+    threadgroup half Xs[64 * 32];     // BM × BK
+    threadgroup half Ws[64 * 32];     // BN × BK
 
     // 16 C fragments per simdgroup, accumulators.
     simdgroup_matrix<float, 8, 8> C_frag[4][4];
@@ -2708,17 +2710,17 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
     uint load_chunk = tid % 2u;                    // 0..1 (cols 0..16 or 16..32)
 
     for (uint k_offset = 0; k_offset < K; k_offset += BK) {
-        // Phase 1 : load Xs[BM=64, BK=32] = 2048 floats coopérativement.
+        // Phase 1 : load Xs[BM=64, BK=32] = 2048 halves coopérativement.
         uint a_row_global = m_tile * BM + load_row;
-        threadgroup float* xs_dst = Xs + load_row * BK + load_chunk * 16u;
+        threadgroup half* xs_dst = Xs + load_row * BK + load_chunk * 16u;
         if (a_row_global < M) {
             uint a_base = a_row_global * K + k_offset + load_chunk * 16u;
             for (uint c = 0; c < 16u; ++c) {
-                xs_dst[c] = A[a_base + c];
+                xs_dst[c] = (half)A[a_base + c];
             }
         } else {
             for (uint c = 0; c < 16u; ++c) {
-                xs_dst[c] = 0.0;
+                xs_dst[c] = (half)0.0;
             }
         }
 
@@ -2729,7 +2731,7 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
         bool is_high = (sb_in_super & 1u) != 0u;
 
         uint w_row_global = n_tile * BN + load_row;
-        threadgroup float* ws_dst = Ws + load_row * BK + load_chunk * 16u;
+        threadgroup half* ws_dst = Ws + load_row * BK + load_chunk * 16u;
         if (w_row_global < N) {
             device const uchar* row_block = W_q4k
                 + (uint64_t)w_row_global * row_stride_bytes
@@ -2756,11 +2758,11 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
                 uint byte_pos  = load_chunk * 16u + c;
                 uchar byte_val = qs_ptr[byte_pos];
                 uchar nibble   = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
-                ws_dst[c] = scale * float(nibble) - min_val;
+                ws_dst[c] = (half)(scale * float(nibble) - min_val);
             }
         } else {
             for (uint c = 0; c < 16u; ++c) {
-                ws_dst[c] = 0.0;
+                ws_dst[c] = (half)0.0;
             }
         }
 
@@ -2774,8 +2776,8 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
         // les dépendances false sur les registres simdgroup.
         #pragma clang loop unroll(full)
         for (uint k_frag = 0; k_frag < BK / 8u; ++k_frag) {
-            simdgroup_matrix<float, 8, 8> A_frags[4];
-            simdgroup_matrix<float, 8, 8> B_frags[4];
+            simdgroup_matrix<half, 8, 8> A_frags[4];
+            simdgroup_matrix<half, 8, 8> B_frags[4];
 
             simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
@@ -3425,6 +3427,7 @@ kernel void sgemm_q3_k_f32_simdgroup_matrix_64(
     uint sgi = (uint)sgitg / WN_Q3K_64;
     uint sgj = (uint)sgitg % WN_Q3K_64;
 
+    // Q3_K reste en float (half precision accumule >5% rel error sur K=512).
     threadgroup float Xs[64 * 32];
     threadgroup float Ws[64 * 32];
 
@@ -3865,6 +3868,7 @@ kernel void sgemm_q6_k_f32_simdgroup_matrix_64(
     uint sgi = (uint)sgitg / WN_Q6K_64;
     uint sgj = (uint)sgitg % WN_Q6K_64;
 
+    // Q6_K reste en float (half precision accumule >5% rel error sur K=512).
     threadgroup float Xs[64 * 32];
     threadgroup float Ws[64 * 32];
 
