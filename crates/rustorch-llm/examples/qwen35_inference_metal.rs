@@ -3294,10 +3294,18 @@ fn forward_token(
             _ => return Err(format!("layer {li}: kind/state mismatch")),
         }
         // T146c — CPU↔GPU pipelining via mid-token commits. Sweet spot from
-        // the 14B (T133) was every 5 layers, gives the GPU steady work while
-        // CPU continues encoding the next segment. Disabled when dumping
-        // (we drain at every hook anyway).
-        if dump_mode() == 0 && (li + 1) % 5 == 0 && li + 1 < cfg.n_layers {
+        // the 14B (T133) was every 5 layers. T176 — make the period
+        // configurable to A/B test on 35B-A3B (different layer count).
+        // RUSTORCH_COMMIT_PERIOD=0 disables; default = 5 (legacy).
+        let commit_period: usize = std::env::var("RUSTORCH_COMMIT_PERIOD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        if dump_mode() == 0
+            && commit_period > 0
+            && (li + 1) % commit_period == 0
+            && li + 1 < cfg.n_layers
+        {
             backend.commit_async();
         }
     }
@@ -3348,17 +3356,23 @@ struct BatchScratch {
     ffn: BatchScratchFfn,
     ssm: BatchScratchSsm,
     moe: BatchScratchMoe,
+    // T176 — Speculative decoding scratch : batched final norm + lm_head outputs.
+    h_final_batched: Buffer, // [B_MAX, d] post-final-norm
+    logits_batched: Buffer,  // [B_MAX, vocab]
 }
 
 impl BatchScratch {
     fn new(backend: &MetalBackend, cfg: &Qwen35Config) -> Self {
         let d = cfg.d;
+        let vocab = cfg.vocab;
         Self {
             xd: backend.alloc_shared(B_MAX_BATCH * d * 4).unwrap(),
             attn: BatchScratchAttn::new(backend, cfg),
             ffn: BatchScratchFfn::new(backend, cfg),
             ssm: BatchScratchSsm::new(backend, cfg),
             moe: BatchScratchMoe::new(backend, cfg),
+            h_final_batched: backend.alloc_shared(B_MAX_BATCH * d * 4).unwrap(),
+            logits_batched: backend.alloc_shared(B_MAX_BATCH * vocab * 4).unwrap(),
         }
     }
 }
@@ -3395,6 +3409,40 @@ fn forward_batch(
     tokens: &[u32],
     pos_base: usize,
 ) -> Result<u32, String> {
+    let outs = forward_batch_argmax(
+        backend,
+        file,
+        model,
+        state,
+        batch_scratch,
+        tokens,
+        pos_base,
+        false,
+    )?;
+    Ok(*outs.last().unwrap())
+}
+
+/// T176 — Forward batch with per-token argmax option (speculative-friendly).
+///
+/// Same layer-by-layer body as `forward_batch`, but the final norm + lm_head
+/// can be applied to either :
+/// - just the LAST token (`all_argmax=false`, current prefill behavior)
+/// - ALL B tokens (`all_argmax=true`, needed for speculative decoding to
+///   verify each candidate's predicted next token).
+///
+/// Returns Vec of argmax tokens — length 1 if `all_argmax=false`, length B
+/// if `all_argmax=true`.
+#[allow(clippy::too_many_arguments)]
+fn forward_batch_argmax(
+    backend: &MetalBackend,
+    file: &GgufFile,
+    model: &Qwen35MetalModel,
+    state: &mut DecodeState,
+    batch_scratch: &BatchScratch,
+    tokens: &[u32],
+    pos_base: usize,
+    all_argmax: bool,
+) -> Result<Vec<u32>, String> {
     let b = tokens.len();
     if b == 0 || b > B_MAX_BATCH {
         return Err(format!(
@@ -3642,31 +3690,72 @@ fn forward_batch(
         }
     }
 
-    // 3. Final norm + lm_head sur le DERNIER token uniquement (next-token pred).
-    //    Copie xd_batched[B-1] → scratch.xd, puis run le path forward_token final.
-    //    CRITICAL : drain pour que les GPU writes de la dernière layer soient
-    //    visibles avant la CPU-memcpy lecture.
-    backend.drain();
-    unsafe {
-        let src = (batch_scratch.xd.contents() as *const f32).add((b - 1) * d);
-        let dst = state.scratch.xd.contents() as *mut f32;
-        std::ptr::copy_nonoverlapping(src, dst, d);
+    // 3. Final norm + lm_head — branch sur all_argmax.
+    if !all_argmax {
+        // Path classique : seulement le dernier token (next-token pred prefill).
+        backend.drain();
+        unsafe {
+            let src = (batch_scratch.xd.contents() as *const f32).add((b - 1) * d);
+            let dst = state.scratch.xd.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(src, dst, d);
+        }
+        rms_norm_f32(
+            backend,
+            &state.scratch.xd,
+            &model.output_norm,
+            &state.scratch.h,
+            d,
+            cfg.rms_eps,
+        )
+        .map_err(|e| format!("final norm: {e:?}"))?;
+        model
+            .output
+            .matmul_into(backend, &state.scratch.h, &state.scratch.logits)
+            .map_err(|e| format!("lm_head: {e:?}"))?;
+        backend.drain();
+        Ok(vec![argmax_cpu(&state.scratch.logits, cfg.vocab)])
+    } else {
+        // T176 — Speculative path : final norm + lm_head batched sur tous les B
+        // tokens. Renvoie un argmax par row → Vec<u32> de taille B.
+        rms_norm_batched_f32(
+            backend,
+            &batch_scratch.xd,
+            &model.output_norm,
+            &batch_scratch.h_final_batched,
+            d,
+            b,
+            cfg.rms_eps,
+        )
+        .map_err(|e| format!("final_norm batched: {e:?}"))?;
+        model
+            .output
+            .matmul_batched_into(
+                backend,
+                b,
+                &batch_scratch.h_final_batched,
+                &batch_scratch.logits_batched,
+            )
+            .map_err(|e| format!("lm_head batched: {e:?}"))?;
+        backend.drain();
+        // CPU argmax per row.
+        let mut outs = Vec::with_capacity(b);
+        let logits_ptr = batch_scratch.logits_batched.contents() as *const f32;
+        let vocab = cfg.vocab;
+        for bi in 0..b {
+            let row_offset = bi * vocab;
+            let mut best_idx = 0_u32;
+            let mut best_val = f32::NEG_INFINITY;
+            for k in 0..vocab {
+                let v = unsafe { *logits_ptr.add(row_offset + k) };
+                if v > best_val {
+                    best_val = v;
+                    best_idx = k as u32;
+                }
+            }
+            outs.push(best_idx);
+        }
+        Ok(outs)
     }
-    rms_norm_f32(
-        backend,
-        &state.scratch.xd,
-        &model.output_norm,
-        &state.scratch.h,
-        d,
-        cfg.rms_eps,
-    )
-    .map_err(|e| format!("final norm: {e:?}"))?;
-    model
-        .output
-        .matmul_into(backend, &state.scratch.h, &state.scratch.logits)
-        .map_err(|e| format!("lm_head: {e:?}"))?;
-    backend.drain();
-    Ok(argmax_cpu(&state.scratch.logits, cfg.vocab))
 }
 
 /// T162 phase 9d helper — single-layer per-token fallback for Attn+MoE / SSM+MoE.
@@ -4667,6 +4756,14 @@ fn main() -> ExitCode {
         .and_then(|a| a.parse::<usize>().ok())
         .unwrap_or(0)
         .min(B_MAX_BATCH);
+    // T176 — `--speculative N` : speculative decoding with N-gram lookahead.
+    // 0 = off (default), 2..=8 enables with B = N candidates per round.
+    let speculative_b: usize = env::args()
+        .skip_while(|a| a != "--speculative")
+        .nth(1)
+        .and_then(|a| a.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(B_MAX_BATCH);
 
     // High-level chat: --prompt "text" auto-tokenises through the GGUF's
     // embedded vocab+merges and wraps the prompt in the Qwen ChatML
@@ -4852,34 +4949,220 @@ fn main() -> ExitCode {
         let mut generated = vec![last];
         let t0 = Instant::now();
         let mut hit_stop = false;
-        for _ in 1..n {
-            if cur_pos + 1 >= max_seq {
-                break;
-            }
-            match forward_token(backend, &file, &model, &mut state, last, cur_pos) {
-                Ok(out) => {
-                    last = out;
-                    generated.push(last);
-                    cur_pos += 1;
-                    if stops.contains(&last) {
+        let mut spec_drafts = 0usize;
+        let mut spec_accepted = 0usize;
+        let mut spec_rounds = 0usize;
+        if (2..=8).contains(&speculative_b) {
+            // T176 — Speculative decoding with 2-gram lookahead cache (port T167).
+            //
+            // 1. Build cache (prev2, prev1) → continuation [c0, c1, ..., c_{K-1}]
+            //    seeded from prompt_ids + first decode token.
+            // 2. Each round : if cache hit, build candidates = [last] + cont (size B),
+            //    forward_batch_argmax(all=true) → B argmax. Walk longest prefix
+            //    where outs[i] == candidates[i+1]. Commit accepted + 1 bonus.
+            // 3. Update cache from accepted sequence.
+            //
+            // Dynamic abort : if rolling acceptance < BREAK_EVEN, fall back to
+            // forward_token for that round (never regress baseline).
+            use std::collections::HashMap;
+            let b_total = speculative_b;
+            let k_draft = b_total - 1;
+            let mut ngram: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+            let update_ngram =
+                |ngram: &mut HashMap<(u32, u32), Vec<u32>>, history: &[u32], k_draft: usize| {
+                    if history.len() < 3 {
+                        return;
+                    }
+                    for i in 1..history.len() - 1 {
+                        let key = (history[i - 1], history[i]);
+                        let end = (i + 1 + k_draft).min(history.len());
+                        let cont: Vec<u32> = history[i + 1..end].to_vec();
+                        if !cont.is_empty() {
+                            ngram.insert(key, cont);
+                        }
+                    }
+                };
+            update_ngram(&mut ngram, &prompt_ids, k_draft);
+            // Seed last + first generated token.
+            let mut seed: Vec<u32> = Vec::with_capacity(prompt_ids.len() + 1);
+            seed.extend_from_slice(&prompt_ids);
+            seed.push(last);
+            update_ngram(&mut ngram, &seed, k_draft);
+
+            let mut prev_token: u32 = prompt_ids.last().copied().unwrap_or(last);
+
+            const ABORT_WINDOW: usize = 8;
+            const BREAK_EVEN_PCT: f32 = 8.0;
+            let mut recent_accept: std::collections::VecDeque<u32> =
+                std::collections::VecDeque::with_capacity(ABORT_WINDOW);
+
+            let batch_scratch_dec = BatchScratch::new(backend, &cfg);
+
+            while generated.len() < n {
+                if cur_pos + b_total >= max_seq {
+                    break;
+                }
+                let lookup_key = (prev_token, last);
+                let cache_hit = ngram.get(&lookup_key).map_or(0, |v| v.len()) > 0;
+                let window_acc = if recent_accept.is_empty() {
+                    100.0
+                } else {
+                    let total: u32 = recent_accept.iter().sum();
+                    100.0 * (total as f32) / (recent_accept.len() as f32 * (k_draft as f32))
+                };
+                let should_spec = cache_hit && window_acc >= BREAK_EVEN_PCT;
+
+                if !should_spec {
+                    match forward_token(backend, &file, &model, &mut state, last, cur_pos) {
+                        Ok(out) => {
+                            prev_token = last;
+                            last = out;
+                            generated.push(last);
+                            cur_pos += 1;
+                            // T176 fix : update cache from generated history even
+                            // on fallback steps. Otherwise cache never grows past
+                            // the prompt seed.
+                            if generated.len() >= 3 {
+                                let hist_start = generated.len().saturating_sub(8);
+                                update_ngram(&mut ngram, &generated[hist_start..], k_draft);
+                            }
+                            if stops.contains(&last) {
+                                hit_stop = true;
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("forward error at decode (spec fallback): {e}");
+                            return ExitCode::FAILURE;
+                        },
+                    }
+                    continue;
+                }
+
+                // Build candidates [last, c0, c1, ..., c_{K-1}].
+                let mut candidates: Vec<u32> = Vec::with_capacity(b_total);
+                candidates.push(last);
+                if let Some(cont) = ngram.get(&lookup_key) {
+                    for &t in cont.iter().take(k_draft) {
+                        candidates.push(t);
+                    }
+                }
+                while candidates.len() < b_total {
+                    candidates.push(last);
+                }
+
+                let outs = match forward_batch_argmax(
+                    backend,
+                    &file,
+                    &model,
+                    &mut state,
+                    &batch_scratch_dec,
+                    &candidates,
+                    cur_pos,
+                    true,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("forward error at decode (speculative): {e}");
+                        return ExitCode::FAILURE;
+                    },
+                };
+                spec_rounds += 1;
+                spec_drafts += k_draft;
+
+                // Walk longest prefix accepted.
+                let mut accepted = 0usize;
+                for i in 0..k_draft {
+                    if outs[i] == candidates[i + 1] {
+                        accepted += 1;
+                    } else {
+                        break;
+                    }
+                }
+                spec_accepted += accepted;
+                if recent_accept.len() == ABORT_WINDOW {
+                    recent_accept.pop_front();
+                }
+                recent_accept.push_back(accepted as u32);
+
+                // Commit accepted drafts.
+                let mut local_stop = false;
+                for i in 0..accepted {
+                    let t = candidates[i + 1];
+                    generated.push(t);
+                    if generated.len() >= n {
+                        break;
+                    }
+                    if stops.contains(&t) {
+                        local_stop = true;
                         hit_stop = true;
                         break;
                     }
-                },
-                Err(e) => {
-                    eprintln!("forward error at decode: {e}");
-                    return ExitCode::FAILURE;
-                },
+                }
+                if local_stop || generated.len() >= n {
+                    break;
+                }
+                // Bonus token.
+                let bonus = outs[accepted];
+                generated.push(bonus);
+                if generated.len() >= 2 {
+                    prev_token = generated[generated.len() - 2];
+                }
+                last = bonus;
+                cur_pos += accepted + 1;
+                if stops.contains(&last) {
+                    hit_stop = true;
+                    break;
+                }
+
+                // Update n-gram cache from recent committed sequence.
+                let history_start = generated.len().saturating_sub(accepted + 3);
+                let hist_window: Vec<u32> = if history_start >= 2 {
+                    generated[history_start - 2..].to_vec()
+                } else {
+                    generated.clone()
+                };
+                update_ngram(&mut ngram, &hist_window, k_draft);
+            }
+        } else {
+            for _ in 1..n {
+                if cur_pos + 1 >= max_seq {
+                    break;
+                }
+                match forward_token(backend, &file, &model, &mut state, last, cur_pos) {
+                    Ok(out) => {
+                        last = out;
+                        generated.push(last);
+                        cur_pos += 1;
+                        if stops.contains(&last) {
+                            hit_stop = true;
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("forward error at decode: {e}");
+                        return ExitCode::FAILURE;
+                    },
+                }
             }
         }
         let decode_d = t0.elapsed();
         let n_decoded = generated.len().saturating_sub(1) as f64;
+        let spec_info = if speculative_b > 0 && spec_rounds > 0 {
+            let acc_pct = 100.0 * (spec_accepted as f32) / (spec_drafts.max(1) as f32);
+            format!(
+                " [spec={speculative_b} rounds={spec_rounds} acc={spec_accepted}/{spec_drafts} ({acc_pct:.0}%)]"
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "  decode : {} tok in {:.3}s ({:.2} tok/s){}",
+            "  decode : {} tok in {:.3}s ({:.2} tok/s){}{}",
             n_decoded as usize,
             decode_d.as_secs_f64(),
             n_decoded / decode_d.as_secs_f64().max(1e-9),
-            if hit_stop { " [STOP]" } else { "" }
+            if hit_stop { " [STOP]" } else { "" },
+            spec_info
         );
         // Strip a trailing stop token if present so the answer doesn't
         // include the marker text.
