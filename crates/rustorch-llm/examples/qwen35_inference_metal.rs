@@ -69,6 +69,18 @@ use rustorch_metal::kernels::{
     weighted_scatter_add_f32, zero_f32,
 };
 
+/// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
+/// Created on first access (when RUSTORCH_AMX_ROUTING_ASYNC=1 triggers the
+/// hybrid path). Spawns one CPU worker thread that lives for the process.
+fn amx_executor(backend: &MetalBackend) -> &'static rustorch_metal::async_amx::AsyncAmxExecutor {
+    use std::sync::OnceLock;
+    static EXEC: OnceLock<rustorch_metal::async_amx::AsyncAmxExecutor> = OnceLock::new();
+    EXEC.get_or_init(|| {
+        let event = backend.device.new_shared_event();
+        rustorch_metal::async_amx::AsyncAmxExecutor::with_event(event)
+    })
+}
+
 /// One quantised weight tensor resident in a Metal buffer, tagged with
 /// its dtype so [`HybridMetalWeight::matmul_into`] can dispatch to the
 /// right sgemv kernel without per-call branching at the user site.
@@ -2589,9 +2601,32 @@ fn ffn_dense_forward(
             // Code kept as opt-in for validation point; env-gated so default
             // runs unaffected.
             let _moe_t0_routing = std::time::Instant::now();
-            let use_amx = std::env::var("RUSTORCH_AMX_ROUTING").is_ok()
+            let use_amx_sync = std::env::var("RUSTORCH_AMX_ROUTING").is_ok()
                 && matches!(gate_inp.dtype, GgmlType::F32);
-            if use_amx {
+            let use_amx_async = std::env::var("RUSTORCH_AMX_ROUTING_ASYNC").is_ok()
+                && matches!(gate_inp.dtype, GgmlType::F32);
+            if use_amx_async {
+                // T172 Day 5 — async hybrid GPU+CPU routing.
+                // GPU just produced h (post-norm). Encode signal_event,
+                // CPU AMX worker runs routing in parallel with GPU's
+                // continuation, GPU waits for AMX before reading logits.
+                // No drain — fully in-band sync via MTLSharedEvent.
+                let exec = amx_executor(backend);
+                let (wait_v, signal_v) = exec.next_event_pair();
+                backend.encode_signal_event(exec.event(), wait_v);
+                exec.submit_with_sync(
+                    rustorch_metal::async_amx::AmxJob {
+                        h_ptr: scratch.h.contents() as *const f32,
+                        w_ptr: gate_inp.buffer.contents() as *const f32,
+                        out_ptr: scratch.moe_logits.contents() as *mut f32,
+                        k: gate_inp.k,
+                        n: gate_inp.n,
+                    },
+                    wait_v,
+                    signal_v,
+                );
+                backend.encode_wait_for_event(exec.event(), signal_v);
+            } else if use_amx_sync {
                 // Drain GPU so h is fully written before CPU AMX reads it.
                 backend.drain();
                 let k = gate_inp.k;
