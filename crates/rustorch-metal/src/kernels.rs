@@ -2628,6 +2628,199 @@ pub fn sgemm_q4_k_f32_simdgroup_matrix_into(
 }
 
 // =============================================================================
+// T163 phase 9f-ter — Q4_K SGEMM EXPERT-MAJOR pour MoE batched.
+//
+// Variante du SGEMM Q4_K 8×8 single-warp avec INDIRECTION par M-tile. Au lieu
+// d'une seule weight matrix, chaque M-tile lit un buffer de tile_expert_ids
+// et offset W vers W_stacked + expert_id * expert_stride_bytes.
+//
+// Pré-condition caller :
+// - Rows triées par expert (rows consécutives utilisent même expert)
+// - Padding à mult-8 par groupe expert (pour aligner avec BM=8)
+// - tile_expert_ids[M/8] : un expert_id par M-tile (= 8 rows)
+//
+// Output : C[M, N] où chaque tile-row de 8 utilise un expert différent.
+// Le caller scatter ensuite les rows valides vers moe_acc avec pondération.
+//
+// Avantages vs gather sgemv :
+// - SGEMM tile 8×8 → throughput MMA simdgroup_matrix (≈4-8× sgemv)
+// - Single dispatch pour tous les expert evals (vs N_dispatches × n_used)
+// - GPU saturation contrôlée par padding (M total = nb_evals_padded)
+const SGEMM_Q4_K_F32_EXPERT_MAJOR_8X8_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q4K_BYTES_EM = 144u;
+constant uint Q4K_WEIGHTS_EM = 256u;
+constant uint BM_EM = 8u;
+constant uint BN_EM = 8u;
+constant uint BK_EM = 32u;
+
+kernel void sgemm_q4_k_f32_expert_major_8x8(
+    device const float*  A         [[buffer(0)]],   // [M, K] f32 row-major (gathered/packed)
+    device const uchar*  W_stacked [[buffer(1)]],   // [E, N, K] Q4_K stacked
+    device const uint*   tile_expert_ids [[buffer(2)]], // [M/8] expert id par M-tile
+    device float*        C         [[buffer(3)]],   // [M, N] f32 row-major
+    constant uint3&      dims      [[buffer(4)]],   // (M, N, K)
+    constant uint&       expert_stride [[buffer(5)]], // bytes per expert (= N*(K/256)*144)
+    uint                 tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiisg     [[thread_index_in_simdgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    uint n_tiles_n = N / BN_EM;
+    uint m_tile = tg_id / n_tiles_n;
+    uint n_tile = tg_id % n_tiles_n;
+    if (m_tile * BM_EM >= M || n_tile * BN_EM >= N) return;
+
+    // Per-tile expert lookup : all 8 rows in this M-tile share the same expert.
+    uint expert_id = tile_expert_ids[m_tile];
+    device const uchar* W_q4k = W_stacked + (uint64_t)expert_id * (uint64_t)expert_stride;
+
+    // Float SHM + float MMA : le tile 8×8 single-warp est sensible à l'accumulation
+    // error half (rel diff > 10% sur K=512). Le 64×64 multi-warp tolère bien
+    // half MMA (parité < 1e-2) probablement grâce au plus grand fanout.
+    threadgroup float Xs[8 * 32];
+    threadgroup float Ws[8 * 32];
+
+    simdgroup_matrix<float, 8, 8> C_frag = simdgroup_matrix<float, 8, 8>(0.0);
+    simdgroup_matrix<float, 8, 8> A_frag;
+    simdgroup_matrix<float, 8, 8> B_frag;
+
+    uint blocks_per_row = K / Q4K_WEIGHTS_EM;
+    uint row_stride_bytes = blocks_per_row * Q4K_BYTES_EM;
+
+    ushort row       = tiisg / 4u;
+    ushort col_chunk = tiisg % 4u;
+
+    for (uint k_offset = 0; k_offset < K; k_offset += BK_EM) {
+        // 1. Load Xs from A.
+        uint a_row_base =
+            (uint)(m_tile * BM_EM + row) * K + k_offset + (uint)col_chunk * 8u;
+        threadgroup float* xs_row = Xs + (uint)row * BK_EM + (uint)col_chunk * 8u;
+        for (ushort c = 0; c < 8u; ++c) {
+            xs_row[c] = A[a_row_base + c];
+        }
+
+        // 2. Dequant Ws from Q4_K bytes (using expert_id-offsetted W).
+        uint super_block_idx = k_offset / Q4K_WEIGHTS_EM;
+        uint sb_in_super = (k_offset % Q4K_WEIGHTS_EM) / 32u;
+        uint pair_idx    = sb_in_super / 2u;
+        bool is_high     = (sb_in_super & 1u) != 0u;
+
+        uint n_actual = n_tile * BN_EM + (uint)row;
+        device const uchar* row_block = W_q4k
+            + (uint64_t)n_actual * row_stride_bytes
+            + (uint64_t)super_block_idx * Q4K_BYTES_EM;
+        device const half* d_ptr = (device const half*)(row_block);
+        float d    = float(d_ptr[0]);
+        float dmin = float(d_ptr[1]);
+
+        device const uchar* sc_raw = row_block + 4;
+        uchar sc6, m6;
+        if (sb_in_super < 4u) {
+            sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+            m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+        } else {
+            uint i = sb_in_super - 4u;
+            sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+            m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+        }
+        float scale   = d    * float(sc6);
+        float min_val = dmin * float(m6);
+
+        device const uchar* qs_ptr = row_block + 16u + pair_idx * 32u;
+        threadgroup float* ws_row = Ws + (uint)row * BK_EM + (uint)col_chunk * 8u;
+        for (ushort c = 0; c < 8u; ++c) {
+            ushort byte_pos = col_chunk * 8u + c;
+            uchar byte_val  = qs_ptr[byte_pos];
+            uchar nibble    = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+            ws_row[c] = scale * float(nibble) - min_val;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (ushort k_frag = 0; k_frag < 4u; ++k_frag) {
+            simdgroup_load(A_frag, Xs + (uint)k_frag * 8u, BK_EM);
+            simdgroup_load(
+                B_frag,
+                Ws + (uint)k_frag * 8u,
+                BK_EM,
+                ulong2(0, 0),
+                /* transpose */ true);
+            simdgroup_multiply_accumulate(C_frag, A_frag, B_frag, C_frag);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float* C_ptr = C
+        + (uint64_t)m_tile * BM_EM * (uint64_t)N
+        + (uint64_t)n_tile * BN_EM;
+    simdgroup_store(C_frag, C_ptr, N);
+}
+"#;
+
+/// T163 phase 9f-ter — Q4_K SGEMM EXPERT-MAJOR pour MoE batched.
+///
+/// Pour MoE prefill : caller permute les expert evaluations par expert_id et
+/// pad à mult-8 par groupe expert. Le kernel dispatch comme un SGEMM standard
+/// mais lit `tile_expert_ids[m_tile]` pour offsetter W_stacked.
+///
+/// Pré-conditions :
+/// - Metal3 (Apple7+)
+/// - M%8==0, N%8==0, K%256==0
+/// - tile_expert_ids buffer : exactly M/8 entries u32
+/// - Tous les rows d'un même 8-row M-tile partagent le même expert_id
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_q4_k_f32_expert_major_8x8_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_stacked_buf: &Buffer,
+    tile_expert_ids_buf: &Buffer,
+    c_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+    expert_stride_bytes: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q4_k_f32_expert_major needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 8 != 0 || n % 8 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q4_k_f32_expert_major: M%8==0, N%8==0, K%256==0 (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q4_k_f32_expert_major_8x8",
+        SGEMM_Q4_K_F32_EXPERT_MAJOR_8X8_SHADER,
+        "sgemm_q4_k_f32_expert_major_8x8",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    let stride_u32 = expert_stride_bytes as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_stacked_buf), 0);
+        encoder.set_buffer(2, Some(tile_expert_ids_buf), 0);
+        encoder.set_buffer(3, Some(c_buf), 0);
+        encoder.set_bytes(4, 12, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let n_tg = ((m / 8) * (n / 8)) as u64;
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T162 phase 3 — Q4_K SGEMM avec tiles 64×64 multi-warp.
 //
 // Évolution de phase 2 (tile 8×8 single-simdgroup) : passage à BM=BN=64 avec
@@ -13928,6 +14121,142 @@ mod tests {
             assert!(
                 rel < 1e-2,
                 "Q4_K SGEMM simdmat mismatch at {i}: ref={} metal={} (rel {:.3e})",
+                c_ref[i],
+                c_metal[i],
+                rel
+            );
+        }
+    }
+
+    /// T163 phase 9f-ter — Q4_K SGEMM EXPERT-MAJOR : test parité avec stacked
+    /// weights, tile_expert_ids buffer, et per-tile expert offset.
+    /// Validation : 2 experts différents, 16 rows total (8 par expert), parité
+    /// vs CPU dequant-puis-matmul row by row par expert.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemm_q4_k_f32_expert_major_8x8_matches_cpu() {
+        use rustorch_gguf::dequant::dequant_q4_k;
+
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[sgemm_q4_k_expert_major] skipping: no Metal3");
+            return;
+        }
+
+        // 4 experts, 16 rows (4 M-tiles × 8 rows), 8 cols, K=512.
+        // Tile 0 expert 1, tile 1 expert 2, tile 2 expert 0, tile 3 expert 3
+        // (intentionally non-sorted to verify per-tile indirection).
+        let n_experts = 4_usize;
+        let m = 32_usize; // 4 tiles × 8 rows
+        let n = 8_usize;
+        let k = 512_usize;
+        let blocks_per_row = k / 256;
+        let bytes_per_expert = n * blocks_per_row * 144;
+
+        // Build n_experts stacked Q4_K matrices.
+        let mut w_stacked = vec![0u8; n_experts * bytes_per_expert];
+        for e in 0..n_experts {
+            for nrow in 0..n {
+                for ib in 0..blocks_per_row {
+                    let off = e * bytes_per_expert + (nrow * blocks_per_row + ib) * 144;
+                    let d_val = ((nrow as f32 + 1.0 + e as f32 * 2.0) * 0.01) + (ib as f32) * 0.001;
+                    let dmin_val = ((nrow as f32 + e as f32) * 0.005) + (ib as f32) * 0.0005;
+                    let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                    let dmin_h = half::f16::from_f32(dmin_val).to_le_bytes();
+                    w_stacked[off] = d_h[0];
+                    w_stacked[off + 1] = d_h[1];
+                    w_stacked[off + 2] = dmin_h[0];
+                    w_stacked[off + 3] = dmin_h[1];
+                    for i in 0..12 {
+                        w_stacked[off + 4 + i] = (0x10_u8
+                            .wrapping_add((nrow as u8) ^ (i as u8) ^ (ib as u8) ^ (e as u8 * 7)))
+                            | 0x05;
+                    }
+                    for i in 0..128 {
+                        w_stacked[off + 16 + i] =
+                            ((nrow as u8) ^ (i as u8) ^ (ib as u8) ^ (e as u8 * 13))
+                                .wrapping_add(0x37);
+                    }
+                }
+            }
+        }
+
+        // Tile expert IDs (one per M-tile = 4 entries).
+        let tile_expert_ids: Vec<u32> = vec![1, 2, 0, 3];
+
+        // CPU reference : for each tile, dequant the appropriate expert's W,
+        // then matmul tile's 8 rows of A.
+        let a = det_vec(m * k, 1.7);
+        let mut c_ref = vec![0.0_f32; m * n];
+        for (tile_idx, &tile_expert_id) in tile_expert_ids.iter().enumerate().take(m / 8) {
+            let expert_id = tile_expert_id as usize;
+            let mut w_f32 = vec![0.0_f32; n * k];
+            for nrow in 0..n {
+                let off_w = expert_id * bytes_per_expert + nrow * blocks_per_row * 144;
+                let row_bytes = &w_stacked[off_w..off_w + blocks_per_row * 144];
+                let row_dst = &mut w_f32[nrow * k..(nrow + 1) * k];
+                dequant_q4_k(row_bytes, row_dst).unwrap();
+            }
+            for i in 0..8 {
+                let row_idx = tile_idx * 8 + i;
+                for j in 0..n {
+                    let mut s = 0.0_f32;
+                    for l in 0..k {
+                        s += a[row_idx * k + l] * w_f32[j * k + l];
+                    }
+                    c_ref[row_idx * n + j] = s;
+                }
+            }
+        }
+
+        // GPU path.
+        let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_stacked.len()).unwrap();
+        let tile_buf = backend.alloc_shared(tile_expert_ids.len() * 4).unwrap();
+        let c_buf = backend.alloc_shared(m * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+            std::ptr::copy_nonoverlapping(
+                w_stacked.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_stacked.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                tile_expert_ids.as_ptr(),
+                tile_buf.contents() as *mut u32,
+                tile_expert_ids.len(),
+            );
+        }
+        sgemm_q4_k_f32_expert_major_8x8_into(
+            backend,
+            &a_buf,
+            &w_buf,
+            &tile_buf,
+            &c_buf,
+            m,
+            n,
+            k,
+            bytes_per_expert,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut c_metal = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_buf.contents() as *const f32,
+                c_metal.as_mut_ptr(),
+                m * n,
+            );
+        }
+
+        for i in 0..(m * n) {
+            let abs_err = (c_ref[i] - c_metal[i]).abs();
+            let denom = c_ref[i].abs().max(1e-3);
+            let rel = abs_err / denom;
+            assert!(
+                rel < 1e-2,
+                "Q4_K SGEMM expert_major mismatch at {i}: ref={} metal={} (rel {:.3e})",
                 c_ref[i],
                 c_metal[i],
                 rel
