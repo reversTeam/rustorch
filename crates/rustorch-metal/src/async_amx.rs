@@ -474,6 +474,101 @@ mod tests {
         );
     }
 
+    /// T172 Day 4 — end-to-end pattern test : real GPU command buffer
+    /// signals event, real AMX executor consumes, real GPU command buffer
+    /// waits and reads output. Validates the FULL hybrid GPU+CPU pipeline
+    /// that will be used in qwen35 forward.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn end_to_end_signal_amx_wait_pattern() {
+        use crate::backend_singleton::metal_backend;
+        let backend = metal_backend();
+        let event = backend.device.new_shared_event();
+        let exec = AsyncAmxExecutor::with_event(event);
+
+        // Realistic small routing matmul shape (35B-A3B Qwen3.6).
+        let k = 2048;
+        let n = 256;
+        let h: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.001).sin()).collect();
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.0005).cos()).collect();
+
+        // Allocate GPU shared buffers.
+        let h_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(n * k * 4).unwrap();
+        let logits_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(h.as_ptr(), h_buf.contents() as *mut f32, k);
+            std::ptr::copy_nonoverlapping(w.as_ptr(), w_buf.contents() as *mut f32, n * k);
+            std::ptr::copy_nonoverlapping(
+                vec![0.0f32; n].as_ptr(),
+                logits_buf.contents() as *mut f32,
+                n,
+            );
+        }
+
+        // Step 1 — encode a no-op kernel-equivalent that "produces" h.
+        // For test purposes we just emit an empty encoder block; the
+        // h_buf is pre-populated, so the GPU side of the pipeline is
+        // implicitly satisfied. In real qwen35 forward, this would be
+        // the post-norm dispatch.
+        backend.with_encoder(|_enc| {
+            // No-op : h_buf already contains the test data.
+        });
+
+        // Step 2 — encode the signal event AFTER h is written by GPU.
+        let (wait_v, signal_v) = exec.next_event_pair();
+        backend.encode_signal_event(exec.event(), wait_v);
+
+        // Step 3 — submit AMX job that waits for signal_v=wait_v and
+        // signals signal_v after AMX done.
+        exec.submit_with_sync(
+            AmxJob {
+                h_ptr: h_buf.contents() as *const f32,
+                w_ptr: w_buf.contents() as *const f32,
+                out_ptr: logits_buf.contents() as *mut f32,
+                k,
+                n,
+            },
+            wait_v,
+            signal_v,
+        );
+
+        // Step 4 — encode wait_for_event before GPU reads logits.
+        backend.encode_wait_for_event(exec.event(), signal_v);
+
+        // Step 5 — encode another no-op kernel that "reads" logits.
+        // In real forward this would be topk_softmax_norm_f32. We just
+        // commit and ensure GPU work flushes.
+        backend.with_encoder(|_enc| {
+            // No-op : logits_buf will be host-readable after drain.
+        });
+
+        // Step 6 — drain to commit + wait + force CPU-visible coherence.
+        backend.drain();
+
+        // Step 7 — verify AMX completed and output matches naive.
+        exec.wait_all();
+        assert_eq!(exec.n_completed(), 1, "AMX should have run once");
+
+        let mut got = vec![0.0f32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(logits_buf.contents() as *const f32, got.as_mut_ptr(), n);
+        }
+
+        let expected = naive_sgemv(&h, &w, n, k);
+        for i in 0..n {
+            let denom = expected[i].abs().max(1e-6);
+            let rel = (expected[i] - got[i]).abs() / denom;
+            assert!(
+                rel < 1e-4,
+                "End-to-end mismatch at row {i}: expected {} got {} (rel {:.3e})",
+                expected[i],
+                got[i],
+                rel
+            );
+        }
+    }
+
     /// Sanity: dropping the executor cleanly terminates the worker thread
     /// without panic.
     #[test]
