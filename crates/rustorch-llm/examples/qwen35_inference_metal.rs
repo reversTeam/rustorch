@@ -59,10 +59,12 @@ use rustorch_metal::kernels::{
     sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
     sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
     sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32,
-    sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
-    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_batched_f32,
-    swiglu_f32, topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_f32, zero_f32,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32,
+    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
+    ssm_conv1d_step_f32, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
+    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_batched_f32,
+    weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -1392,6 +1394,311 @@ fn ssm_block_forward_batch(
     Ok(())
 }
 
+/// T162 phase 9f — Per-MoE-block batched scratch buffers (B_MAX-sized).
+/// Sized for the worst case 35B-A3B (B_MAX × n_used × max(d, ef) floats).
+/// Allocates ~30MB total (acceptable, single allocation amortized across layers).
+struct BatchScratchMoe {
+    h_post: Buffer,       // [B_MAX, d] post-attn-norm input
+    logits: Buffer,       // [B_MAX, n_experts]
+    indices: Buffer,      // [B_MAX, n_used] u32
+    topw: Buffer,         // [B_MAX, n_used] f32
+    h_repl: Buffer,       // [B_MAX * n_used, d] — h replicated for gather x_stride=K
+    gate_gather: Buffer,  // [B_MAX * n_used, ef]
+    up_gather: Buffer,    // [B_MAX * n_used, ef]
+    fd_gather: Buffer,    // [B_MAX * n_used, ef]
+    down_gather: Buffer,  // [B_MAX * n_used, d]
+    moe_acc: Buffer,      // [B_MAX, d] weighted sum of routed experts
+    shexp_gate: Buffer,   // [B_MAX, ef] shared expert gate proj
+    shexp_up: Buffer,     // [B_MAX, ef]
+    shexp_fd: Buffer,     // [B_MAX, ef] post-SwiGLU
+    shexp_out: Buffer,    // [B_MAX, d] shared expert down proj
+    shexp_scalar: Buffer, // [B_MAX] gate_inp_shexp · h scalar gate
+}
+
+impl BatchScratchMoe {
+    fn new(backend: &MetalBackend, cfg: &Qwen35Config) -> Self {
+        let d = cfg.d;
+        let ef = cfg.expert_f.max(1);
+        let n_experts = cfg.n_experts.max(1);
+        let n_used = cfg.n_experts_used.max(1);
+        let b = B_MAX_BATCH;
+        let alloc = |bytes: usize| backend.alloc_shared(bytes.max(4)).unwrap();
+        Self {
+            h_post: alloc(b * d * 4),
+            logits: alloc(b * n_experts * 4),
+            indices: alloc(b * n_used * 4),
+            topw: alloc(b * n_used * 4),
+            h_repl: alloc(b * n_used * d * 4),
+            gate_gather: alloc(b * n_used * ef * 4),
+            up_gather: alloc(b * n_used * ef * 4),
+            fd_gather: alloc(b * n_used * ef * 4),
+            down_gather: alloc(b * n_used * d * 4),
+            moe_acc: alloc(b * d * 4),
+            shexp_gate: alloc(b * ef * 4),
+            shexp_up: alloc(b * ef * 4),
+            shexp_fd: alloc(b * ef * 4),
+            shexp_out: alloc(b * d * 4),
+            shexp_scalar: alloc(b * 4),
+        }
+    }
+}
+
+/// T162 phase 9f — gather dispatch helper (Q4_K/Q5_K/Q6_K stacked experts).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_gather_sgemv(
+    backend: &MetalBackend,
+    stacked: &StackedQuantizedExperts,
+    x: &Buffer,
+    out: &Buffer,
+    indices: &Buffer,
+    b_eff: usize, // B * n_used (total expert evaluations)
+    k: usize,
+    n: usize,
+    x_stride: usize,
+) -> Result<(), MetalError> {
+    match stacked.dtype {
+        GgmlType::Q4_K => sgemv_q4_k_gather_f32_lcpp_nsg2_into(
+            backend,
+            x,
+            &stacked.buffer,
+            indices,
+            b_eff,
+            out,
+            k,
+            n,
+            stacked.bytes_per_expert,
+            x_stride,
+        ),
+        GgmlType::Q5_K => sgemv_q5_k_gather_f32_lcpp_nsg2_into(
+            backend,
+            x,
+            &stacked.buffer,
+            indices,
+            b_eff,
+            out,
+            k,
+            n,
+            stacked.bytes_per_expert,
+            x_stride,
+        ),
+        GgmlType::Q6_K => sgemv_q6_k_gather_f32_lcpp_nsg2_into(
+            backend,
+            x,
+            &stacked.buffer,
+            indices,
+            b_eff,
+            out,
+            k,
+            n,
+            stacked.bytes_per_expert,
+            x_stride,
+        ),
+        other => Err(MetalError::Unsupported(format!(
+            "MoE gather: dtype {other:?} not supported"
+        ))),
+    }
+}
+
+/// T162 phase 9f — Batched MoE FFN forward.
+///
+/// Equivalent à B sequential `ffn_dense_forward(FfnLayerMetal::Moe { .. })`.
+/// Approche : routing batched + replicate h pour gather B*n_used → 1 dispatch
+/// pour gate/up/down (vs B per-token loops). Top-K, weighted_reduce, et
+/// shared-gate scalar restent per-token (loops simples, GPU 1-dispatch each).
+///
+/// La projection shared-expert (gate/up/down + swiglu) est BATCHÉE via les
+/// dispatch_batched_attn_matmul (déjà SGEMM tile 64×64 si M ≥ 64).
+///
+/// Status : foundation phase 9f-a. La per-token boucle pour topk / reduce /
+/// sigmoid_add peut être remplacée par des kernels batched dans 9f-b.
+#[allow(clippy::too_many_arguments)]
+fn ffn_moe_forward_batch(
+    backend: &MetalBackend,
+    ffn_norm: &Buffer,
+    gate_inp: &HybridMetalWeight,
+    gate_inp_shexp: &Buffer,
+    gate_shexp: &HybridMetalWeight,
+    up_shexp: &HybridMetalWeight,
+    down_shexp: &HybridMetalWeight,
+    gate_exps_stacked: &StackedQuantizedExperts,
+    up_exps_stacked: &StackedQuantizedExperts,
+    down_exps_stacked: &StackedQuantizedExperts,
+    xd_batched: &Buffer,
+    scratch: &Scratch,
+    batch_scratch: &BatchScratchMoe,
+    cfg: &Qwen35Config,
+    b: usize,
+) -> Result<(), MetalError> {
+    if b == 0 || b > B_MAX_BATCH {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ffn_moe_forward_batch: B must be in 1..={B_MAX_BATCH} (got {b})"
+        )));
+    }
+    let d = cfg.d;
+    let ef = cfg.expert_f;
+    let n_experts = cfg.n_experts;
+    let n_used = cfg.n_experts_used;
+    let eps = cfg.rms_eps;
+    let b_eff = b * n_used; // total expert evaluations across all tokens
+
+    // 1. Batched post-attn norm (xd → h_post, gamma=ffn_norm).
+    rms_norm_batched_f32(
+        backend,
+        xd_batched,
+        ffn_norm,
+        &batch_scratch.h_post,
+        d,
+        b,
+        eps,
+    )?;
+
+    // 2. Batched routing logits : gate_inp_batched @ h_post → logits [B, n_experts].
+    dispatch_batched_attn_matmul(
+        backend,
+        gate_inp,
+        b,
+        &batch_scratch.h_post,
+        &batch_scratch.logits,
+    )?;
+    backend.drain();
+
+    // 3. Batched top-K + softmax + renormalize : 1 dispatch (B threadgroups)
+    //    au lieu de B per-token loops + drains.
+    topk_softmax_norm_batched_f32(
+        backend,
+        &batch_scratch.logits,
+        &batch_scratch.indices,
+        &batch_scratch.topw,
+        n_experts,
+        n_used,
+        b,
+    )?;
+
+    // 4. Replicate h_post for gather x_stride=K. h_repl[bi * n_used + k] = h_post[bi].
+    //    All replicated rows for token bi share the same h. CPU memcpy in shared mem.
+    unsafe {
+        let h_src = batch_scratch.h_post.contents() as *const f32;
+        let h_dst = batch_scratch.h_repl.contents() as *mut f32;
+        for bi in 0..b {
+            for k in 0..n_used {
+                let src = h_src.add(bi * d);
+                let dst = h_dst.add((bi * n_used + k) * d);
+                std::ptr::copy_nonoverlapping(src, dst, d);
+            }
+        }
+    }
+
+    // 5. Gather gate + up : 1 dispatch each over B*n_used rows.
+    dispatch_gather_sgemv(
+        backend,
+        gate_exps_stacked,
+        &batch_scratch.h_repl,
+        &batch_scratch.gate_gather,
+        &batch_scratch.indices,
+        b_eff,
+        d,
+        ef,
+        d, // x_stride=d (per-row from replication)
+    )?;
+    dispatch_gather_sgemv(
+        backend,
+        up_exps_stacked,
+        &batch_scratch.h_repl,
+        &batch_scratch.up_gather,
+        &batch_scratch.indices,
+        b_eff,
+        d,
+        ef,
+        d,
+    )?;
+
+    // 6. Element-wise SwiGLU on B*n_used*ef floats (treated as 1D).
+    swiglu_f32(
+        backend,
+        &batch_scratch.gate_gather,
+        &batch_scratch.up_gather,
+        &batch_scratch.fd_gather,
+        b_eff * ef,
+    )?;
+
+    // 7. Gather down : output [B*n_used, d] per-row.
+    dispatch_gather_sgemv(
+        backend,
+        down_exps_stacked,
+        &batch_scratch.fd_gather,
+        &batch_scratch.down_gather,
+        &batch_scratch.indices,
+        b_eff,
+        ef,
+        d,
+        ef, // x_stride=ef (per-row)
+    )?;
+    backend.drain();
+
+    // 8. Batched weighted reduce : moe_acc[t, d] += sum_k topw[t, k] * down_gather[t, k, d].
+    //    Zero the accumulator first (one batched dispatch sized [B, d]).
+    zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
+    weighted_reduce_add_batched_f32(
+        backend,
+        &batch_scratch.down_gather,
+        &batch_scratch.topw,
+        &batch_scratch.moe_acc,
+        n_used,
+        d,
+        b,
+    )?;
+
+    // 9. Shared expert pipeline (BATCHED dense FFN).
+    dispatch_batched_attn_matmul(
+        backend,
+        gate_shexp,
+        b,
+        &batch_scratch.h_post,
+        &batch_scratch.shexp_gate,
+    )?;
+    dispatch_batched_attn_matmul(
+        backend,
+        up_shexp,
+        b,
+        &batch_scratch.h_post,
+        &batch_scratch.shexp_up,
+    )?;
+    swiglu_batched_f32(
+        backend,
+        &batch_scratch.shexp_gate,
+        &batch_scratch.shexp_up,
+        &batch_scratch.shexp_fd,
+        ef,
+        b,
+    )?;
+    dispatch_batched_attn_matmul(
+        backend,
+        down_shexp,
+        b,
+        &batch_scratch.shexp_fd,
+        &batch_scratch.shexp_out,
+    )?;
+    backend.drain();
+
+    // 10. Batched fused gate-scalar + sigmoid_add_moe (final residual).
+    //     1 dispatch (B threadgroups, 4 simdgroups each) au lieu de B per-token
+    //     loops avec 2 sgemv + 1 sigmoid_add. Économise B drains + 4*B alloc.
+    sigmoid_add_moe_batched_f32(
+        backend,
+        &batch_scratch.moe_acc,
+        &batch_scratch.shexp_out,
+        gate_inp_shexp,
+        &batch_scratch.h_post,
+        xd_batched,
+        d,
+        b,
+    )?;
+
+    // Silence unused warning on scratch (kept in signature for future direct use).
+    let _ = scratch;
+    Ok(())
+}
+
 /// Top-level decode state — per-layer caches + scratch + max sequence length.
 struct DecodeState {
     layers: Vec<LayerState>,
@@ -2543,6 +2850,7 @@ struct BatchScratch {
     attn: BatchScratchAttn,
     ffn: BatchScratchFfn,
     ssm: BatchScratchSsm,
+    moe: BatchScratchMoe,
 }
 
 impl BatchScratch {
@@ -2553,6 +2861,7 @@ impl BatchScratch {
             attn: BatchScratchAttn::new(backend, cfg),
             ffn: BatchScratchFfn::new(backend, cfg),
             ssm: BatchScratchSsm::new(backend, cfg),
+            moe: BatchScratchMoe::new(backend, cfg),
         }
     }
 }
@@ -2655,17 +2964,56 @@ fn forward_batch(
                 )
                 .map_err(|e| format!("L{li} ffn batched: {e:?}"))?;
             },
-            (LayerMetal::Attn { .. }, LayerState::Attn(_)) => {
-                // Attn + MoE : per-token loop. (Phase 9f portera le batched MoE.)
-                forward_batch_per_token_layer(
+            (
+                LayerMetal::Attn {
+                    attn,
+                    ffn:
+                        FfnLayerMetal::Moe {
+                            gate_inp,
+                            gate_inp_shexp,
+                            gate_shexp,
+                            up_shexp,
+                            down_shexp,
+                            gate_exps_stacked,
+                            up_exps_stacked,
+                            down_exps_stacked,
+                        },
+                },
+                LayerState::Attn(cache),
+            ) => {
+                // T162 phase 9f — Attn batched + MoE batched (gather x_replicate).
+                attn_block_forward_batch(
                     backend,
-                    model,
-                    state,
-                    batch_scratch,
-                    li,
-                    b,
+                    attn,
+                    cache,
+                    &batch_scratch.xd,
+                    &state.rope_cos,
+                    &state.rope_sin,
+                    &batch_scratch.attn,
+                    cfg,
                     pos_base,
-                )?;
+                    b,
+                    state.max_seq,
+                )
+                .map_err(|e| format!("L{li} attn batched: {e:?}"))?;
+                ffn_moe_forward_batch(
+                    backend,
+                    &attn.attn_post_norm,
+                    gate_inp,
+                    gate_inp_shexp,
+                    gate_shexp,
+                    up_shexp,
+                    down_shexp,
+                    gate_exps_stacked,
+                    up_exps_stacked,
+                    down_exps_stacked,
+                    &batch_scratch.xd,
+                    &state.scratch,
+                    &batch_scratch.moe,
+                    cfg,
+                    b,
+                )
+                .map_err(|e| format!("L{li} attn-moe batched: {e:?}"))?;
             },
             (
                 LayerMetal::Ssm {
@@ -2706,17 +3054,53 @@ fn forward_batch(
                 )
                 .map_err(|e| format!("L{li} ssm-ffn batched: {e:?}"))?;
             },
-            (LayerMetal::Ssm { .. }, LayerState::Ssm(_)) => {
-                // SSM + MoE : per-token loop full layer.
-                forward_batch_per_token_layer(
+            (
+                LayerMetal::Ssm {
+                    ssm,
+                    ffn:
+                        FfnLayerMetal::Moe {
+                            gate_inp,
+                            gate_inp_shexp,
+                            gate_shexp,
+                            up_shexp,
+                            down_shexp,
+                            gate_exps_stacked,
+                            up_exps_stacked,
+                            down_exps_stacked,
+                        },
+                },
+                LayerState::Ssm(s),
+            ) => {
+                // T162 phase 9f — SSM batched + MoE batched.
+                ssm_block_forward_batch(
                     backend,
-                    model,
-                    state,
-                    batch_scratch,
-                    li,
+                    ssm,
+                    s,
+                    &batch_scratch.xd,
+                    &batch_scratch.ssm,
+                    &state.scratch,
+                    cfg,
                     b,
-                    pos_base,
-                )?;
+                )
+                .map_err(|e| format!("L{li} ssm batched: {e:?}"))?;
+                ffn_moe_forward_batch(
+                    backend,
+                    &ssm.attn_post_norm,
+                    gate_inp,
+                    gate_inp_shexp,
+                    gate_shexp,
+                    up_shexp,
+                    down_shexp,
+                    gate_exps_stacked,
+                    up_exps_stacked,
+                    down_exps_stacked,
+                    &batch_scratch.xd,
+                    &state.scratch,
+                    &batch_scratch.moe,
+                    cfg,
+                    b,
+                )
+                .map_err(|e| format!("L{li} ssm-moe batched: {e:?}"))?;
             },
             _ => return Err(format!("L{li}: kind/state mismatch")),
         }
@@ -3831,9 +4215,9 @@ fn main() -> ExitCode {
             println!("  T162 phase 9d : prefill batched (B={prefill_batch}, B_MAX={B_MAX_BATCH})");
             if any_moe && !any_dense {
                 println!(
-                    "  WARNING : modèle MoE-only (35B-A3B style) — phase 9d fallback \
-                     per-token, regression attendue (~-15-20%). Phase 9f (MoE batched) \
-                     à venir."
+                    "  WARNING : modèle MoE-only (35B-A3B style) — phase 9f-foundation \
+                     batched mais REGRESSION (gather_sgemv satur. + 128MB memcpy/layer). \
+                     Phase 9f-bis (gather_sgemm_q4_k simdgroup_matrix) requise pour gain."
                 );
             } else if any_moe {
                 println!(

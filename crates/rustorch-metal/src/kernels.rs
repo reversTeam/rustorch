@@ -11053,6 +11053,128 @@ kernel void topk_softmax_norm_f32(
 }
 "#;
 
+// T162 phase 9f — Batched top-K softmax + normalize. Une threadgroup par token.
+// Tous les tokens en parallèle dans 1 dispatch (au lieu de B dispatches + drains).
+const TOPK_SOFTMAX_NORM_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MAX_N_EXPERTS = 256u;
+constant uint TG_SIZE = 256u;
+constant uint MAX_K = 16u;
+
+kernel void topk_softmax_norm_batched_f32(
+    device const float* logits  [[buffer(0)]],   // [B, N]
+    device       uint*  out_idx [[buffer(1)]],   // [B, K] u32
+    device       float* out_w   [[buffer(2)]],   // [B, K] f32
+    constant uint3&     dims    [[buffer(3)]],   // (N, K, B)
+    uint                tg_id   [[threadgroup_position_in_grid]],
+    uint                lid     [[thread_position_in_threadgroup]],
+    uint                lane    [[thread_index_in_simdgroup]],
+    uint                sg_idx  [[simdgroup_index_in_threadgroup]]
+) {
+    uint N = dims.x;
+    uint K = dims.y;
+    uint B = dims.z;
+    uint b = tg_id;
+    if (b >= B) return;
+
+    device const float* logits_b = logits + (uint64_t)b * (uint64_t)N;
+    device       uint*  out_idx_b = out_idx + (uint64_t)b * (uint64_t)K;
+    device       float* out_w_b   = out_w   + (uint64_t)b * (uint64_t)K;
+
+    threadgroup float s_buf[MAX_N_EXPERTS];
+    threadgroup float s_red[8];
+
+    float v = (lid < N) ? logits_b[lid] : -INFINITY;
+
+    float m_local = simd_max(v);
+    if (lane == 0) s_red[sg_idx] = m_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0) {
+        float t = (lane < TG_SIZE / 32u) ? s_red[lane] : -INFINITY;
+        float m_global = simd_max(t);
+        if (lane == 0) s_red[0] = m_global;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m_global = s_red[0];
+
+    float e = (lid < N) ? exp(v - m_global) : 0.0;
+    float s_local = simd_sum(e);
+    if (lane == 0) s_red[sg_idx] = s_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0) {
+        float t = (lane < TG_SIZE / 32u) ? s_red[lane] : 0.0;
+        float s_global = simd_sum(t);
+        if (lane == 0) s_red[0] = s_global;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s_global = s_red[0];
+
+    float p = (lid < N) ? e / max(s_global, 1e-30f) : -INFINITY;
+    if (lid < N) s_buf[lid] = p;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+        float top_w_local[MAX_K];
+        uint  top_idx_local[MAX_K];
+        for (uint k = 0; k < K; ++k) {
+            float best = -INFINITY;
+            uint  best_idx = 0;
+            for (uint i = 0; i < N; ++i) {
+                float pv = s_buf[i];
+                if (pv > best) { best = pv; best_idx = i; }
+            }
+            top_idx_local[k] = best_idx;
+            top_w_local[k]   = best;
+            s_buf[best_idx]  = -INFINITY;
+        }
+        float sum_w = 0.0;
+        for (uint k = 0; k < K; ++k) sum_w += top_w_local[k];
+        float inv = 1.0 / max(sum_w, 6.103515625e-5f);
+        for (uint k = 0; k < K; ++k) {
+            out_idx_b[k] = top_idx_local[k];
+            out_w_b[k]   = top_w_local[k] * inv;
+        }
+    }
+}
+"#;
+
+/// T162 phase 9f — Batched top-K softmax + normalize. Une threadgroup par token,
+/// tous les tokens en parallèle dans 1 dispatch.
+pub fn topk_softmax_norm_batched_f32(
+    backend: &MetalBackend,
+    logits_buf: &Buffer,
+    out_idx_buf: &Buffer,
+    out_w_buf: &Buffer,
+    n_experts: usize,
+    k: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if n_experts == 0 || k == 0 || b == 0 || n_experts > 256 || k > 16 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "topk_softmax_norm_batched: 0 < N <= 256, 0 < K <= 16, 0 < B (got N={n_experts}, K={k}, B={b})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "topk_softmax_norm_batched_f32",
+        TOPK_SOFTMAX_NORM_BATCHED_F32_SHADER,
+        "topk_softmax_norm_batched_f32",
+    )?;
+    let dims = [n_experts as u32, k as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(logits_buf), 0);
+        encoder.set_buffer(1, Some(out_idx_buf), 0);
+        encoder.set_buffer(2, Some(out_w_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(256, 1, 1);
+        let groups = MTLSize::new(b as u64, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T152.1b — top-K softmax + normalize 100% GPU sur 1 threadgroup.
 /// Pré-condition : `n_experts <= 256` et `k <= 16`. Pour le 35B-A3B :
 /// n_experts=256, k=8 → OK.
@@ -11118,6 +11240,103 @@ kernel void sigmoid_add_moe_f32(
 }
 "#;
 
+// T162 phase 9f — Batched fused dot product + sigmoid_add_moe.
+// Computes per token b :
+//   scalar[b] = dot(gate_inp_shexp, h_post[b])
+//   xd[b, i] += moe_acc[b, i] + sigmoid(scalar[b]) * shared_out[b, i]
+// One threadgroup per token. The simdgroup cooperatively reduces the dot
+// product, then writes the per-element output across the full D.
+// Avoids T per-token drains in the MoE end-of-block.
+const SIGMOID_ADD_MOE_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void sigmoid_add_moe_batched_f32(
+    device const float* moe_acc      [[buffer(0)]],   // [B, D]
+    device const float* shared_out   [[buffer(1)]],   // [B, D]
+    device const float* gate_inp_shexp [[buffer(2)]], // [D]
+    device const float* h_post       [[buffer(3)]],   // [B, D]
+    device       float* xd           [[buffer(4)]],   // [B, D] in/out
+    constant uint2&     dims         [[buffer(5)]],   // (D, B)
+    uint                tg_id        [[threadgroup_position_in_grid]],
+    ushort              tiisg        [[thread_index_in_simdgroup]],
+    ushort              sgitg        [[simdgroup_index_in_threadgroup]]
+) {
+    uint D = dims.x;
+    uint B = dims.y;
+    uint b = tg_id;
+    if (b >= B) return;
+
+    // Threadgroup = 4 simdgroups × 32 threads = 128 threads.
+    // Phase 1 : compute dot(gate_inp_shexp, h_post[b]) cooperatively.
+    threadgroup float s_red[4];
+    device const float* h_b = h_post + (uint64_t)b * (uint64_t)D;
+    float partial = 0.0;
+    for (uint i = sgitg * 32u + tiisg; i < D; i += 128u) {
+        partial += gate_inp_shexp[i] * h_b[i];
+    }
+    float sg_sum = simd_sum(partial);
+    if (tiisg == 0) s_red[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        float t = (tiisg < 4) ? s_red[tiisg] : 0.0;
+        float dot_global = simd_sum(t);
+        if (tiisg == 0) s_red[0] = dot_global;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float dot_b = s_red[0];
+    float sig_b = 1.0 / (1.0 + exp(-dot_b));
+
+    // Phase 2 : write xd[b, i] += moe_acc[b, i] + sig_b * shared_out[b, i].
+    device const float* acc_b = moe_acc + (uint64_t)b * (uint64_t)D;
+    device const float* out_b = shared_out + (uint64_t)b * (uint64_t)D;
+    device       float* xd_b  = xd + (uint64_t)b * (uint64_t)D;
+    for (uint i = sgitg * 32u + tiisg; i < D; i += 128u) {
+        xd_b[i] += acc_b[i] + sig_b * out_b[i];
+    }
+}
+"#;
+
+/// T162 phase 9f — Batched fused dot + sigmoid_add_moe. Une threadgroup par
+/// token, dot product cooperatively (4 simdgroups × 32 threads), puis écriture
+/// xd[b, i] += moe_acc[b, i] + sigmoid(dot_b) * shared_out[b, i].
+#[allow(clippy::too_many_arguments)]
+pub fn sigmoid_add_moe_batched_f32(
+    backend: &MetalBackend,
+    moe_acc_buf: &Buffer,
+    shared_out_buf: &Buffer,
+    gate_inp_shexp_buf: &Buffer,
+    h_post_buf: &Buffer,
+    xd_buf: &Buffer,
+    d: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if d == 0 || b == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sigmoid_add_moe_batched_f32: D={d}, B={b}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sigmoid_add_moe_batched_f32",
+        SIGMOID_ADD_MOE_BATCHED_F32_SHADER,
+        "sigmoid_add_moe_batched_f32",
+    )?;
+    let dims = [d as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(moe_acc_buf), 0);
+        encoder.set_buffer(1, Some(shared_out_buf), 0);
+        encoder.set_buffer(2, Some(gate_inp_shexp_buf), 0);
+        encoder.set_buffer(3, Some(h_post_buf), 0);
+        encoder.set_buffer(4, Some(xd_buf), 0);
+        encoder.set_bytes(5, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1);
+        let groups = MTLSize::new(b as u64, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T152.1 — `xd[i] += moe_acc[i] + sigmoid(dot_scalar[0]) * shared_out[i]`.
 /// Élimine le drain `backend.drain() + CPU sigmoid + CPU add` qui suivait
 /// les 4 sgemv de l'expert partagé dans le path MoE. Économie : 1 drain
@@ -11179,6 +11398,71 @@ kernel void weighted_reduce_add_f32(
     acc[gid] += s;
 }
 "#;
+
+// T162 phase 9f — Batched weighted reduce per token.
+// `acc[t, d] += sum_b weights[t, b] * src[t, b, d]` pour T tokens en parallèle.
+// Remplace T per-token weighted_reduce_add (T drains).
+const WEIGHTED_REDUCE_ADD_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void weighted_reduce_add_batched_f32(
+    device const float* src      [[buffer(0)]],   // [T, B_inner, D]
+    device const float* weights  [[buffer(1)]],   // [T, B_inner]
+    device       float* acc      [[buffer(2)]],   // [T, D] in/out
+    constant uint3&     dims     [[buffer(3)]],   // (B_inner, D, T)
+    uint2               gid      [[thread_position_in_grid]]
+) {
+    uint B = dims.x;
+    uint D = dims.y;
+    uint T = dims.z;
+    uint d = gid.x;
+    uint t = gid.y;
+    if (d >= D || t >= T) return;
+    float s = 0.0;
+    uint src_base = t * B * D;
+    uint w_base = t * B;
+    for (uint b = 0; b < B; b++) {
+        s += weights[w_base + b] * src[src_base + b * D + d];
+    }
+    acc[t * D + d] += s;
+}
+"#;
+
+/// T162 phase 9f — Batched weighted reduce. Pour T tokens × B_inner experts :
+/// `acc[t, d] += sum_b weights[t, b] * src[t, b, d]`.
+pub fn weighted_reduce_add_batched_f32(
+    backend: &MetalBackend,
+    src_buf: &Buffer,
+    weights_buf: &Buffer,
+    acc_buf: &Buffer,
+    b_inner: usize,
+    d: usize,
+    t: usize,
+) -> Result<(), MetalError> {
+    if b_inner == 0 || d == 0 || t == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "weighted_reduce_add_batched_f32: B_inner={b_inner}, D={d}, T={t}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "weighted_reduce_add_batched_f32",
+        WEIGHTED_REDUCE_ADD_BATCHED_F32_SHADER,
+        "weighted_reduce_add_batched_f32",
+    )?;
+    let dims = [b_inner as u32, d as u32, t as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src_buf), 0);
+        encoder.set_buffer(1, Some(weights_buf), 0);
+        encoder.set_buffer(2, Some(acc_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(d as u64, t as u64, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
 
 /// T152 — `acc[d] += sum_b weights[b] * src[b, d]` en un seul dispatch.
 /// Utilisé après les 3 gather sgemv MoE pour combiner les `n_used` outputs
