@@ -2765,17 +2765,20 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Phase 3 : 4 K-fragments × 4×4 MMAs per simdgroup.
+        // T162 phase 3-bis : full unroll des boucles fragment pour permettre
+        // au compilateur Apple Metal de pipeliner les MMAs (sans unroll, le
+        // compilateur peut sérialiser → 64× moins de throughput théorique).
+        #pragma clang loop unroll(full)
         for (uint k_frag = 0; k_frag < BK / 8u; ++k_frag) {
             simdgroup_matrix<float, 8, 8> A_frags[4];
             simdgroup_matrix<float, 8, 8> B_frags[4];
 
-            // Load 4 A fragments (rows [sgi*TM + i*8] of Xs, cols [k_frag*8])
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < FM; ++i) {
                 uint a_row = sgi * TM + i * 8u;
                 simdgroup_load(A_frags[i], Xs + a_row * BK + k_frag * 8u, BK);
             }
-            // Load 4 B fragments TRANSPOSED (Ws stored [BN, BK] row-major,
-            // we want B[K, N] = Ws^T) — cols are rows in B.
+            #pragma clang loop unroll(full)
             for (uint j = 0; j < FN; ++j) {
                 uint w_row = sgj * TN + j * 8u;
                 simdgroup_load(
@@ -2786,8 +2789,10 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix_64(
                     /* transpose */ true);
             }
 
-            // Outer product : C[i][j] += A[i] @ B[j].
+            // Outer product : C[i][j] += A[i] @ B[j], full unroll.
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < FM; ++i) {
+                #pragma clang loop unroll(full)
                 for (uint j = 0; j < FN; ++j) {
                     simdgroup_multiply_accumulate(
                         C_frag[i][j], A_frags[i], B_frags[j], C_frag[i][j]);
