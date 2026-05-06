@@ -57,14 +57,14 @@ use rustorch_metal::kernels::{
     sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
     sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into,
     sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32,
-    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
-    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
-    ssm_conv1d_step_f32, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
-    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_batched_f32,
-    weighted_reduce_add_f32, zero_f32,
+    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
+    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
+    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
+    sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32,
+    sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
+    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_batched_f32,
+    swiglu_f32, topk_softmax_norm_batched_f32, topk_softmax_norm_f32, weighted_add_inplace_f32,
+    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -1574,84 +1574,69 @@ fn ffn_moe_forward_batch(
         b,
     )?;
 
-    // 4-7. Hybrid : per-token gather (proven fast at n_used=8 rows/dispatch),
-    //      batched zero. Avoids the 128MB memcpy h_repl + gather saturation issue.
+    // 4-7. T162 phase 9f-bis : gather PER-TOKEN dans le kernel (b_token = b/n_used).
+    //      Tous les B*n_used = b_eff expert-evals en 1 dispatch / projection.
+    //      Pas de memcpy h_repl (économie 128MB/layer) ni de boucle CPU per-token.
     zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
-    backend.drain();
-    let _ = b_eff; // unused in hybrid path
-    for bi in 0..b {
-        // Per-token views (sub-buffer offsets via memcpy of small chunks).
-        let h_view = backend.alloc_shared(d * 4).unwrap();
-        let idx_view = backend.alloc_shared(n_used * 4).unwrap();
-        let topw_view = backend.alloc_shared(n_used * 4).unwrap();
-        let gate_view = backend.alloc_shared(n_used * ef * 4).unwrap();
-        let up_view = backend.alloc_shared(n_used * ef * 4).unwrap();
-        let fd_view = backend.alloc_shared(n_used * ef * 4).unwrap();
-        let down_view = backend.alloc_shared(n_used * d * 4).unwrap();
-        let acc_view = backend.alloc_shared(d * 4).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.h_post.contents() as *const f32).add(bi * d),
-                h_view.contents() as *mut f32,
-                d,
-            );
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.indices.contents() as *const u32).add(bi * n_used),
-                idx_view.contents() as *mut u32,
-                n_used,
-            );
-            std::ptr::copy_nonoverlapping(
-                (batch_scratch.topw.contents() as *const f32).add(bi * n_used),
-                topw_view.contents() as *mut f32,
-                n_used,
-            );
-        }
-        // Gather gate + up (broadcast h, n_used experts each).
-        dispatch_gather_sgemv(
-            backend,
-            gate_exps_stacked,
-            &h_view,
-            &gate_view,
-            &idx_view,
-            n_used,
-            d,
-            ef,
-            0, // x_stride=0 → broadcast
-        )?;
-        dispatch_gather_sgemv(
-            backend,
-            up_exps_stacked,
-            &h_view,
-            &up_view,
-            &idx_view,
-            n_used,
-            d,
-            ef,
-            0,
-        )?;
-        swiglu_f32(backend, &gate_view, &up_view, &fd_view, n_used * ef)?;
-        dispatch_gather_sgemv(
-            backend,
-            down_exps_stacked,
-            &fd_view,
-            &down_view,
-            &idx_view,
-            n_used,
-            ef,
-            d,
-            ef, // x_stride=ef per-row
-        )?;
-        zero_f32(backend, &acc_view, d)?;
-        weighted_reduce_add_f32(backend, &down_view, &topw_view, &acc_view, n_used, d)?;
-        backend.drain();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                acc_view.contents() as *const f32,
-                (batch_scratch.moe_acc.contents() as *mut f32).add(bi * d),
-                d,
-            );
-        }
-    }
+
+    // Gate gather : Q4_K, lit h_post[b_token, :] via b_token=b/n_used in-kernel.
+    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
+        backend,
+        &batch_scratch.h_post,
+        &gate_exps_stacked.buffer,
+        &batch_scratch.indices,
+        b_eff,
+        n_used,
+        &batch_scratch.gate_gather,
+        d,
+        ef,
+        gate_exps_stacked.bytes_per_expert,
+    )?;
+    // Up gather : Q4_K, idem.
+    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
+        backend,
+        &batch_scratch.h_post,
+        &up_exps_stacked.buffer,
+        &batch_scratch.indices,
+        b_eff,
+        n_used,
+        &batch_scratch.up_gather,
+        d,
+        ef,
+        up_exps_stacked.bytes_per_expert,
+    )?;
+    // SwiGLU : element-wise sur b_eff*ef floats.
+    swiglu_f32(
+        backend,
+        &batch_scratch.gate_gather,
+        &batch_scratch.up_gather,
+        &batch_scratch.fd_gather,
+        b_eff * ef,
+    )?;
+    // Down gather : input = fd_gather [b_eff, ef] (per-row, déjà packed),
+    // donc x_stride=ef et le standard gather kernel suffit (pas per-token).
+    dispatch_gather_sgemv(
+        backend,
+        down_exps_stacked,
+        &batch_scratch.fd_gather,
+        &batch_scratch.down_gather,
+        &batch_scratch.indices,
+        b_eff,
+        ef,
+        d,
+        ef,
+    )?;
+
+    // 8. Batched weighted reduce : moe_acc[t, d] += sum_k topw[t, k] * down_gather[t, k, d].
+    weighted_reduce_add_batched_f32(
+        backend,
+        &batch_scratch.down_gather,
+        &batch_scratch.topw,
+        &batch_scratch.moe_acc,
+        n_used,
+        d,
+        b,
+    )?;
 
     // 9. Shared expert pipeline (BATCHED dense FFN).
     dispatch_batched_attn_matmul(
@@ -4217,24 +4202,31 @@ fn main() -> ExitCode {
                     }
                 )
             });
-            // T162 phase 9f-route : MoE-only models (35B-A3B style) regress
-            // -50% en batched mode (gather_sgemv saturation + per-token loop
-            // overhead). On force le path per-token forward_token jusqu'à la
-            // phase 9f-bis (gather_sgemm_q4_k_simdgroup_matrix).
-            let force_pertoken = any_moe && !any_dense;
+            // T162 phase 9f-bis bench : nouveau gather_per_token kernel évite le
+            // memcpy h_repl 128MB MAIS la saturation GPU à B_eff=B*n_used élevé
+            // (65K TGs > 1280 simdgroups concurrents M4 Max) reste limitante.
+            // 35B-A3B B=16 : 23 t/s (-45% vs baseline 42 t/s per-token).
+            // Conclusion : MLX 1276 t/s n'utilise pas un gather sgemv per-eval mais
+            // un kernel SGEMM-style avec sort tokens par expert (M-major dispatch).
+            // Auto-route reste actif sur MoE-only ; opt-in batched via env var.
+            let force_batched_moe =
+                (any_moe && !any_dense) && std::env::var("RUSTORCH_MOE_BATCHED").is_ok();
+            let force_pertoken = (any_moe && !any_dense) && !force_batched_moe;
             if force_pertoken {
                 println!(
-                    "  NOTE : modèle MoE-only — auto-route per-token forward_token \
-                     (--prefill-batch ignoré jusqu'à phase 9f-bis avec gather_sgemm_q4_k)."
+                    "  NOTE : modèle MoE-only — auto-route per-token (gather kernel sat. à \
+                     B_eff > 64). Force batched : env RUSTORCH_MOE_BATCHED=1."
                 );
             } else {
                 println!(
                     "  T162 phase 9d : prefill batched (B={prefill_batch}, B_MAX={B_MAX_BATCH})"
                 );
-                if any_moe {
+                if any_moe && !any_dense {
                     println!(
-                        "  NOTE : modèle hybride avec layers MoE — gain partiel sur layers Dense."
+                        "  T162 phase 9f-bis : MoE batched (gather_per_token kernel, sans memcpy)"
                     );
+                } else if any_moe {
+                    println!("  NOTE : hybride avec layers MoE — gain partiel sur layers Dense.");
                 }
             }
             if force_pertoken {

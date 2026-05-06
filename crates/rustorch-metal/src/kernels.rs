@@ -5845,6 +5845,195 @@ pub fn sgemv_q4_k_gather_f32_lcpp_nsg2_into(
     Ok(())
 }
 
+// T162 phase 9f-bis — Q4_K gather PER-TOKEN sgemv : version optimisée pour
+// le batched MoE prefill. Au lieu de replicater h en x_repl [B*n_used, K]
+// (= 128MB/layer pour 35B-A3B B=32), le kernel calcule directement le token
+// index : `b_token = b_row / n_used` et lit x[b_token * K + k]. Économie : 0
+// memcpy CPU + accès x cache-friendly (consécutifs n_used rows partagent x).
+//
+// Différence avec sgemv_q4_k_gather_f32_lcpp_nsg2 : ajout de `n_used` dans
+// dims, `x_stride` n'est plus utilisé (toujours K virtuel via b_token).
+const SGEMV_Q4_K_GATHER_PER_TOKEN_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES_PT = 144u;
+constant uint BLOCK_WEIGHTS_PT = 256u;
+constant short NR0_PT = 2;
+constant short NSG_PT = 2;
+constant ushort KMASK1_PT = 0x3f3f;
+constant ushort KMASK2_PT = 0x0f0f;
+constant ushort KMASK3_PT = 0xc0c0;
+
+kernel void sgemv_q4_k_gather_per_token_f32_lcpp_nsg2(
+    device const float*  x         [[buffer(0)]],   // [B_tokens, K]
+    device const uchar*  w_q4k     [[buffer(1)]],   // [E, N, K] Q4_K stacked
+    device const uint*   indices   [[buffer(2)]],   // [B_eff = B_tokens * n_used]
+    device float*        y         [[buffer(3)]],   // [B_eff, N]
+    constant uint4&      dims      [[buffer(4)]],   // (K, N, B_eff, expert_stride_bytes)
+    constant uint&       n_used    [[buffer(5)]],   // routing top-k size
+    uint2                tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiisg     [[thread_index_in_simdgroup]],
+    ushort               sgitg     [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B_eff = dims.z;
+    uint expert_stride = dims.w;
+    uint b = tg_id.y;
+    if (b >= B_eff) return;
+
+    uint expert = indices[b];
+    uint b_token = b / n_used;     // intra-kernel "replication" sans memcpy
+
+    device const uchar* w_base = w_q4k + (uint64_t)expert * (uint64_t)expert_stride;
+    device const float* x_base = x + (uint64_t)b_token * (uint64_t)K;
+    device       float* y_base = y + (uint64_t)b * (uint64_t)N;
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS_PT;
+    uint first_row = (tg_id.x * (uint)NSG_PT + (uint)sgitg) * (uint)NR0_PT;
+    if (first_row >= N) return;
+
+    short ix = (short)(tiisg / 8u);
+    short it = (short)(tiisg % 8u);
+    short iq = it / 4;
+    short ir = it % 4;
+
+    int nb = (int)blocks_per_row;
+    device const float* y4 = x_base + ix * 256 + 64 * iq + 8 * ir;
+
+    float yl[16];
+    float yh[16];
+    float sumf[2] = {0.0, 0.0};
+
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    uint row_stride = blocks_per_row * BLOCK_BYTES_PT;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.0, 0.0, 0.0, 0.0};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        for (short row = 0; row < NR0_PT; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_base + (uint64_t)nrow * row_stride + (uint)ib * BLOCK_BYTES_PT;
+            device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+            float d    = float(as_type<half>(dh_ptr[0]));
+            float dmin = float(as_type<half>(dh_ptr[1]));
+
+            device const uint16_t* sc = (device const uint16_t*)(block + 4) + iq;
+            device const uint16_t* q1 = (device const uint16_t*)(block + 16) + 16 * iq + 4 * ir;
+            device const uint16_t* q2 = q1 + 32;
+
+            sc16[0] = sc[0] & KMASK1_PT;
+            sc16[1] = sc[2] & KMASK1_PT;
+            sc16[2] = ((sc[4] >> 0) & KMASK2_PT) | ((sc[0] & KMASK3_PT) >> 2);
+            sc16[3] = ((sc[4] >> 4) & KMASK2_PT) | ((sc[2] & KMASK3_PT) >> 2);
+
+            float4 acc1 = {0.0, 0.0, 0.0, 0.0};
+            float4 acc2 = {0.0, 0.0, 0.0, 0.0};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[row] += d * ((acc1[0] + 1.0f/256.0f * acc1[1]) * float(sc8[0]) +
+                              (acc1[2] + 1.0f/256.0f * acc1[3]) * float(sc8[1]) * 1.0f/16.0f +
+                              (acc2[0] + 1.0f/256.0f * acc2[1]) * float(sc8[4]) +
+                              (acc2[2] + 1.0f/256.0f * acc2[3]) * float(sc8[5]) * 1.0f/16.0f) -
+                       dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                               sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        y4 += 4 * (int)BLOCK_WEIGHTS_PT;
+    }
+
+    for (short row = 0; row < NR0_PT; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            y_base[nrow] = sum_all;
+        }
+    }
+}
+"#;
+
+/// T162 phase 9f-bis — Q4_K gather sgemv per-token (sans memcpy h_repl).
+/// Pour B_eff = B_tokens × n_used : `y[b, :] = W[indices[b], :, :] @ x[b/n_used, :]`.
+///
+/// Économie vs `sgemv_q4_k_gather_f32_lcpp_nsg2_into` avec x_repl :
+/// - Pas de memcpy CPU 128MB/layer (B_tokens=32 × n_used=8 × d=2048 × 4)
+/// - Accès x cache-friendly (n_used rows consécutifs partagent x[b_token])
+#[allow(clippy::too_many_arguments)]
+pub fn sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_stacked_buf: &Buffer,
+    indices_buf: &Buffer,
+    b_eff: usize,
+    n_used: usize,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    expert_stride_bytes: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_gather_per_token needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 || n % 4 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_gather_per_token: K%256==0 && N%4==0 required (K={k}, N={n})"
+        )));
+    }
+    if b_eff == 0 || n_used == 0 {
+        return Ok(());
+    }
+    if b_eff % n_used != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_gather_per_token: b_eff={b_eff} must be multiple of n_used={n_used}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_gather_per_token_f32_lcpp_nsg2",
+        SGEMV_Q4_K_GATHER_PER_TOKEN_F32_LCPP_NSG2_SHADER,
+        "sgemv_q4_k_gather_per_token_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32, b_eff as u32, expert_stride_bytes as u32];
+    let n_used_u32 = n_used as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_stacked_buf), 0);
+        encoder.set_buffer(2, Some(indices_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &n_used_u32 as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(4);
+        let groups = MTLSize::new(n_tg, b_eff as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T152 — Q5_K gather sgemv : variante gather du `sgemv_q5_k_f32_lcpp_nsg2`.
 // Utilisé pour `down_exps` du Qwen3.6-35B-A3B (Q5_K, alors que gate/up
 // sont en Q4_K). Même logique que la variante Q4_K : indirection sur expert
