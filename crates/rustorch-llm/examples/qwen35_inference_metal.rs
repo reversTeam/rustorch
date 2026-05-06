@@ -578,7 +578,14 @@ pub fn load_metal_model(
 
     let tok_embd = load_2d("token_embd.weight", &mut stats)?;
     let output_norm = load_1d_f32("output_norm.weight", &mut stats)?;
-    let output = load_2d("output.weight", &mut stats)?;
+    // Some Qwen models (small variants like Qwen3.5-4B) tie the output to the
+    // token embedding (no separate output.weight). Detect & reuse.
+    let output = if file.tensor("output.weight").is_some() {
+        load_2d("output.weight", &mut stats)?
+    } else {
+        eprintln!("  [tied embeddings detected — reusing token_embd as output]");
+        load_2d("token_embd.weight", &mut stats)?
+    };
 
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for li in 0..cfg.n_layers {
