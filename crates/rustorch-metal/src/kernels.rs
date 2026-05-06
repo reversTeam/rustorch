@@ -10575,6 +10575,12 @@ mod tests {
             (64, 1024, 1024),
             (128, 1024, 1024),
             (32, 5120, 5120),
+            // 14B FFN realistic shapes (prefill M=24 ≈ 19-token prompt rounded up).
+            (24, 5120, 5120),  // Q/K/V/O proj : K=hidden, N=hidden
+            (24, 14336, 5120), // FFN gate/up : N=intermediate, K=hidden
+            (24, 5120, 14336), // FFN down : N=hidden, K=intermediate
+            (64, 5120, 5120),
+            (64, 14336, 5120),
         ]
         .iter()
         {
