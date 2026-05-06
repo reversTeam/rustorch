@@ -3049,6 +3049,200 @@ pub fn sgemm_q6_k_f32_simdgroup_matrix_into(
 }
 
 // =============================================================================
+// T162 phase 7 — Q3_K SGEMM avec simdgroup_matrix + dequant inline.
+//
+// Étend la couverture batched matmul à Q3_K (le 4e K-quant : on a maintenant
+// Q3, Q4, Q5 partial via existing, Q6 full). Q3_K format : 110 bytes /
+// super-block de 256 weights : hmask[32] + qs[64] + scales[12] + d (f16).
+// 16 sub-blocks de 16 weights, scales 6-bit signed packés dans 12 bytes.
+//
+// Per-thread : 8 weights d'une sub-block. Layout col_chunk ∈ 0..3 :
+//   col_chunk=0 : sb_in_chunk=0, l_in_sb=0  (premières 8 weights sub 0)
+//   col_chunk=1 : sb_in_chunk=0, l_in_sb=8  (dernières 8 weights sub 0)
+//   col_chunk=2 : sb_in_chunk=1, l_in_sb=0  (premières 8 weights sub 1)
+//   col_chunk=3 : sb_in_chunk=1, l_in_sb=8  (dernières 8 weights sub 1)
+//
+// BK=32 = 2 Q3_K sub-blocks consécutifs. K-iter avance par 32.
+const SGEMM_Q3_K_F32_SIMDGROUP_MATRIX_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q3K_BYTES_SGEMM = 110u;
+constant uint Q3K_WEIGHTS_SGEMM = 256u;
+constant uint BM_Q3K = 8u;
+constant uint BN_Q3K = 8u;
+constant uint BK_Q3K = 32u;
+
+kernel void sgemm_q3_k_f32_simdgroup_matrix(
+    device const float*  A      [[buffer(0)]],
+    device const uchar*  W_q3k  [[buffer(1)]],
+    device float*        C      [[buffer(2)]],
+    constant uint3&      dims   [[buffer(3)]],
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    uint n_tiles_n = N / BN_Q3K;
+    uint m_tile = tg_id / n_tiles_n;
+    uint n_tile = tg_id % n_tiles_n;
+    if (m_tile * BM_Q3K >= M || n_tile * BN_Q3K >= N) return;
+
+    threadgroup float Xs[8 * 32];
+    threadgroup float Ws[8 * 32];
+
+    simdgroup_matrix<float, 8, 8> C_frag = simdgroup_matrix<float, 8, 8>(0.0);
+    simdgroup_matrix<float, 8, 8> A_frag;
+    simdgroup_matrix<float, 8, 8> B_frag;
+
+    uint blocks_per_row = K / Q3K_WEIGHTS_SGEMM;
+    uint row_stride_bytes = blocks_per_row * Q3K_BYTES_SGEMM;
+
+    ushort row       = tiisg / 4u;
+    ushort col_chunk = tiisg % 4u;
+
+    // Per-thread Q3_K constants (sub-block within 2-sub-block K-chunk).
+    uint sb_in_chunk = (uint)col_chunk / 2u;     // 0 or 1
+    uint l_in_sb_base = ((uint)col_chunk % 2u) * 8u;  // 0 or 8 within sub-block
+
+    for (uint k_offset = 0; k_offset < K; k_offset += BK_Q3K) {
+        // 1. Load Xs[8 × 32] from A.
+        uint a_row_base =
+            (uint)(m_tile * BM_Q3K + row) * K + k_offset + (uint)col_chunk * 8u;
+        threadgroup float* xs_row = Xs + (uint)row * BK_Q3K + (uint)col_chunk * 8u;
+        for (ushort c = 0; c < 8u; ++c) {
+            xs_row[c] = A[a_row_base + c];
+        }
+
+        // 2. Dequant Ws[8 × 32] from Q3_K bytes.
+        uint super_block_idx = k_offset / Q3K_WEIGHTS_SGEMM;
+        // The 2 Q3_K sub-blocks covered : sb_base, sb_base+1.
+        uint sb_base = (k_offset % Q3K_WEIGHTS_SGEMM) / 16u;
+        uint sb_global = sb_base + sb_in_chunk;     // 0..15
+
+        uint half_idx     = sb_global / 8u;          // 0 or 1
+        uint sb_in_half   = sb_global % 8u;          // 0..7
+        uint shift        = (sb_in_half / 2u) * 2u;  // 0,2,4,6
+        uint qs_byte_base = half_idx * 32u + (sb_in_half % 2u) * 16u;
+        uint hmask_base   = (sb_in_half % 2u) * 16u;
+        uint j_global     = half_idx * 4u + (sb_in_half / 2u);
+        uint m_bit        = 1u << j_global;
+
+        uint n_actual = n_tile * BN_Q3K + (uint)row;
+        device const uchar* row_block = W_q3k
+            + (uint64_t)n_actual * row_stride_bytes
+            + (uint64_t)super_block_idx * Q3K_BYTES_SGEMM;
+        device const uchar* hmask = row_block;
+        device const uchar* qs    = row_block + 32;
+        device const uchar* sc_raw = row_block + 96;
+        device const half*  d_ptr = (device const half*)(row_block + 108);
+        float d_all = float(*d_ptr);
+
+        // Compute scale_byte for sb_global (4-way cascade).
+        uchar scale_byte;
+        if (sb_global < 4u) {
+            scale_byte = (sc_raw[sb_global] & 0x0Fu)
+                       | ((sc_raw[8u + sb_global] & 0x03u) << 4u);
+        } else if (sb_global < 8u) {
+            uint i = sb_global - 4u;
+            scale_byte = (sc_raw[4u + i] & 0x0Fu)
+                       | (((sc_raw[8u + i] >> 2u) & 0x03u) << 4u);
+        } else if (sb_global < 12u) {
+            uint i = sb_global - 8u;
+            scale_byte = (sc_raw[i] >> 4u)
+                       | (((sc_raw[8u + i] >> 4u) & 0x03u) << 4u);
+        } else {
+            uint i = sb_global - 12u;
+            scale_byte = (sc_raw[4u + i] >> 4u)
+                       | (((sc_raw[8u + i] >> 6u) & 0x03u) << 4u);
+        }
+        float dl = d_all * (float)((int)((char)scale_byte) - 32);
+
+        // 8 weights at (l_in_sb_base + c) for c ∈ 0..8.
+        threadgroup float* ws_row = Ws + (uint)row * BK_Q3K + (uint)col_chunk * 8u;
+        #pragma clang loop unroll(full)
+        for (ushort c = 0; c < 8u; ++c) {
+            uint l = l_in_sb_base + (uint)c;
+            uchar qs_byte    = qs[qs_byte_base + l];
+            uchar hmask_byte = hmask[hmask_base + l];
+            int q_lo  = (int)(((uint)qs_byte >> shift) & 0x03u);
+            int h_bit = ((uint)hmask_byte & m_bit) != 0u;
+            int v     = q_lo - (h_bit ? 0 : 4);
+            ws_row[c] = dl * (float)v;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (ushort k_frag = 0; k_frag < 4u; ++k_frag) {
+            simdgroup_load(A_frag, Xs + (uint)k_frag * 8u, BK_Q3K);
+            simdgroup_load(
+                B_frag,
+                Ws + (uint)k_frag * 8u,
+                BK_Q3K,
+                ulong2(0, 0),
+                /* transpose */ true);
+            simdgroup_multiply_accumulate(C_frag, A_frag, B_frag, C_frag);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float* C_ptr = C
+        + (uint64_t)m_tile * BM_Q3K * (uint64_t)N
+        + (uint64_t)n_tile * BN_Q3K;
+    simdgroup_store(C_frag, C_ptr, N);
+}
+"#;
+
+/// T162 phase 7 — Q3_K SGEMM via simdgroup_matrix avec dequant inline.
+///
+/// `C = A @ W^T` où A est `[M, K]` f32 row-major, W est `[N, K]` Q3_K
+/// (row-major en super-blocks de 256 weights × 110 bytes).
+///
+/// Pré-conditions : Metal3, M et N multiples de 8, K multiple de 256.
+pub fn sgemm_q3_k_f32_simdgroup_matrix_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_q3k_buf: &Buffer,
+    c_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q3_k_f32_simdgroup_matrix needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 8 != 0 || n % 8 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q3_k_f32_simdgroup_matrix: M, N must be multiples of 8 and K multiple of 256 (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q3_k_f32_simdgroup_matrix",
+        SGEMM_Q3_K_F32_SIMDGROUP_MATRIX_SHADER,
+        "sgemm_q3_k_f32_simdgroup_matrix",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_q3k_buf), 0);
+        encoder.set_buffer(2, Some(c_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let n_tg = ((m / 8) * (n / 8)) as u64;
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T162 phase 5-bis — Q6_K SGEMM tiles 64×64 multi-warp (4 simdgroups par TG).
 //
 // Évolution de phase 5 (tile 8×8) : passage à BM=BN=64 avec 4 simdgroups
@@ -11445,6 +11639,107 @@ mod tests {
 
             eprintln!(
                 "M={m:4}, N={n_dim:5}, K={k:5}: Q4_K phase2(8x8)={sgemm_ms:7.3}ms (×{speedup:5.2}), phase3(64x64)={sgemm64_ms:7.3}ms (×{speedup64:5.2}), sgemv_loop={sgemv_ms:7.3}ms"
+            );
+        }
+    }
+
+    /// T162 phase 7 — Q3_K SGEMM simdgroup_matrix vs CPU dequant + naive matmul.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemm_q3_k_f32_simdgroup_matrix_matches_cpu() {
+        use rustorch_gguf::dequant::dequantize_block_chunk;
+        use rustorch_gguf::tensor::GgmlType;
+
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[sgemm_q3_k_simdmat] skipping: no Metal3");
+            return;
+        }
+
+        // M=16, N=16, K=512 (2 super-blocks Q3_K par row).
+        let m = 16_usize;
+        let n = 16_usize;
+        let k = 512_usize;
+        let blocks_per_row = k / 256;
+
+        // Build deterministic Q3_K bytes (110 bytes / super-block).
+        let mut w_bytes = vec![0u8; n * blocks_per_row * 110];
+        for nrow in 0..n {
+            for ib in 0..blocks_per_row {
+                let off = (nrow * blocks_per_row + ib) * 110;
+                for i in 0..32 {
+                    w_bytes[off + i] = if (nrow + i + ib) % 2 == 0 { 0xAA } else { 0x55 };
+                }
+                for i in 0..64 {
+                    w_bytes[off + 32 + i] = ((i as u8) & 0xC0)
+                        | ((((i as u8).wrapping_add(ib as u8)) << 2) & 0x30)
+                        | ((((i as u8).wrapping_add(ib as u8)) << 4) & 0x0C)
+                        | ((((i as u8).wrapping_add(ib as u8)) << 6) & 0x03);
+                }
+                for i in 0..12 {
+                    w_bytes[off + 96 + i] =
+                        (0x40_u8.wrapping_add((nrow as u8) ^ (i as u8) ^ (ib as u8))) | 0x10;
+                }
+                let d_val = ((nrow as f32 + 1.0) * 0.005) + (ib as f32) * 0.001;
+                let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                w_bytes[off + 108] = d_h[0];
+                w_bytes[off + 109] = d_h[1];
+            }
+        }
+
+        let a = det_vec(m * k, 1.5);
+        let mut w_f32 = vec![0.0_f32; n * k];
+        for nrow in 0..n {
+            let row_off = nrow * blocks_per_row * 110;
+            let row_bytes = &w_bytes[row_off..row_off + blocks_per_row * 110];
+            let row_dst = &mut w_f32[nrow * k..(nrow + 1) * k];
+            dequantize_block_chunk(GgmlType::Q3_K, row_bytes, row_dst).unwrap();
+        }
+
+        let mut c_ref = vec![0.0_f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0_f32;
+                for l in 0..k {
+                    s += a[i * k + l] * w_f32[j * k + l];
+                }
+                c_ref[i * n + j] = s;
+            }
+        }
+
+        let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        let c_buf = backend.alloc_shared(m * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+        }
+        sgemm_q3_k_f32_simdgroup_matrix_into(backend, &a_buf, &w_buf, &c_buf, m, n, k).unwrap();
+        backend.drain();
+
+        let mut c_metal = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_buf.contents() as *const f32,
+                c_metal.as_mut_ptr(),
+                m * n,
+            );
+        }
+
+        for i in 0..(m * n) {
+            let abs_err = (c_ref[i] - c_metal[i]).abs();
+            let denom = c_ref[i].abs().max(1e-3);
+            let rel = abs_err / denom;
+            assert!(
+                rel < 1e-2,
+                "Q3_K SGEMM mismatch at {i}: ref={} metal={} (rel {:.3e})",
+                c_ref[i],
+                c_metal[i],
+                rel
             );
         }
     }

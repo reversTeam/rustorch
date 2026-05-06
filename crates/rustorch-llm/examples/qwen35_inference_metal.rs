@@ -49,16 +49,16 @@ use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_f32, delta_net_step_f32, delta_net_step_with_l2_f32, gqa_decode_f32, kv_append_f32,
     l2_norm_per_head_f32, rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
-    rope_half_split_f32, sgemm_q4_k_f32_simdgroup_matrix_64_into,
-    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
-    sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
-    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
-    sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
-    sigmoid_mul_inplace_f32, split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32,
-    ssm_conv1d_step_f32, swiglu_f32, topk_softmax_norm_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_f32, zero_f32,
+    rope_half_split_f32, sgemm_q3_k_f32_simdgroup_matrix_into,
+    sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
+    sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
+    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into,
+    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32, sigmoid_mul_inplace_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
+    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -193,6 +193,25 @@ impl HybridMetalWeight {
             return self.matmul_into(backend, x_batched, out_batched);
         }
         match self.dtype {
+            GgmlType::Q3_K => {
+                // T162 phase 7 — Q3_K SGEMM tile 8×8 (pas de variante 64×64 yet).
+                if m >= 8 && m % 8 == 0 && self.n % 8 == 0 && self.k % 256 == 0 {
+                    sgemm_q3_k_f32_simdgroup_matrix_into(
+                        backend,
+                        x_batched,
+                        &self.buffer,
+                        out_batched,
+                        m,
+                        self.n,
+                        self.k,
+                    )
+                } else {
+                    Err(MetalError::Unsupported(format!(
+                        "HybridMetalWeight::matmul_batched_into: Q3_K SGEMM requires M >= 8, M%8 == 0, N%8 == 0, K%256 == 0 (got M={m}, N={}, K={})",
+                        self.n, self.k
+                    )))
+                }
+            },
             GgmlType::Q4_K => {
                 if m >= 64 && m % 64 == 0 && self.n % 64 == 0 && self.k % 256 == 0 {
                     sgemm_q4_k_f32_simdgroup_matrix_64_into(
@@ -2260,9 +2279,9 @@ fn bench_batched_matmul_on_loaded_weights(backend: &MetalBackend, model: &Qwen35
         let mut total_loop_ms = 0.0_f64;
 
         for (label, w) in &weights {
-            if w.dtype != GgmlType::Q4_K && w.dtype != GgmlType::Q6_K {
+            if !matches!(w.dtype, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K) {
                 println!(
-                    "  {label} [K={}, N={}] dtype={:?} : skipped (non-Q4_K/Q6_K)",
+                    "  {label} [K={}, N={}] dtype={:?} : skipped (non-Q3/Q4/Q6_K)",
                     w.k, w.n, w.dtype
                 );
                 continue;
