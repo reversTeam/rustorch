@@ -2821,6 +2821,203 @@ pub fn sgemm_q4_k_f32_expert_major_8x8_into(
 }
 
 // =============================================================================
+// T163 phase 9f-cinq — Q5_K SGEMM EXPERT-MAJOR (port pour 35B-A3B down weights).
+//
+// Q5_K format (176 bytes/super-block) :
+// - bytes 0-3 : d (fp16), dmin (fp16)
+// - bytes 4-15 : 12 packed scales bytes (Q4_K packing)
+// - bytes 16-47 : 32 bytes qh (high bits, 1 par weight)
+// - bytes 48-175 : 128 bytes qs (low 4 bits, packed 2 par byte)
+//
+// Per weight w : q5 = low_4 + (high_bit << 4), val = scale × q5 - min_val
+// Pour notre layout (sb_in_super, load_chunk) :
+//   - pair_idx = sb / 2 → offset qs : 48 + pair_idx * 32
+//   - is_high  = sb & 1 → low_4 = (qs[byte] >> (is_high*4)) & 0x0F
+//   - qh_byte = qh[load_chunk*16 + l]
+//   - high_bit = (qh_byte >> sb) & 1
+const SGEMM_Q5_K_F32_EXPERT_MAJOR_8X8_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q5K_BYTES_EM = 176u;
+constant uint Q5K_WEIGHTS_EM = 256u;
+constant uint BM_EM5 = 8u;
+constant uint BN_EM5 = 8u;
+constant uint BK_EM5 = 32u;
+
+kernel void sgemm_q5_k_f32_expert_major_8x8(
+    device const float*  A         [[buffer(0)]],
+    device const uchar*  W_stacked [[buffer(1)]],
+    device const uint*   tile_expert_ids [[buffer(2)]],
+    device float*        C         [[buffer(3)]],
+    constant uint3&      dims      [[buffer(4)]],
+    constant uint&       expert_stride [[buffer(5)]],
+    uint                 tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiisg     [[thread_index_in_simdgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    uint n_tiles_n = N / BN_EM5;
+    uint m_tile = tg_id / n_tiles_n;
+    uint n_tile = tg_id % n_tiles_n;
+    if (m_tile * BM_EM5 >= M || n_tile * BN_EM5 >= N) return;
+
+    uint expert_id = tile_expert_ids[m_tile];
+    device const uchar* W_q5k = W_stacked + (uint64_t)expert_id * (uint64_t)expert_stride;
+
+    threadgroup float Xs[8 * 32];
+    threadgroup float Ws[8 * 32];
+
+    simdgroup_matrix<float, 8, 8> C_frag = simdgroup_matrix<float, 8, 8>(0.0);
+    simdgroup_matrix<float, 8, 8> A_frag;
+    simdgroup_matrix<float, 8, 8> B_frag;
+
+    uint blocks_per_row = K / Q5K_WEIGHTS_EM;
+    uint row_stride_bytes = blocks_per_row * Q5K_BYTES_EM;
+
+    ushort row       = tiisg / 4u;
+    ushort col_chunk = tiisg % 4u;
+
+    for (uint k_offset = 0; k_offset < K; k_offset += BK_EM5) {
+        // 1. Load Xs from A.
+        uint a_row_base =
+            (uint)(m_tile * BM_EM5 + row) * K + k_offset + (uint)col_chunk * 8u;
+        threadgroup float* xs_row = Xs + (uint)row * BK_EM5 + (uint)col_chunk * 8u;
+        for (ushort c = 0; c < 8u; ++c) {
+            xs_row[c] = A[a_row_base + c];
+        }
+
+        // 2. Dequant Ws Q5_K.
+        uint super_block_idx = k_offset / Q5K_WEIGHTS_EM;
+        uint sb_in_super = (k_offset % Q5K_WEIGHTS_EM) / 32u;
+        uint pair_idx    = sb_in_super / 2u;
+        bool is_high     = (sb_in_super & 1u) != 0u;
+
+        uint n_actual = n_tile * BN_EM5 + (uint)row;
+        device const uchar* row_block = W_q5k
+            + (uint64_t)n_actual * row_stride_bytes
+            + (uint64_t)super_block_idx * Q5K_BYTES_EM;
+        device const half* d_ptr = (device const half*)(row_block);
+        float d    = float(d_ptr[0]);
+        float dmin = float(d_ptr[1]);
+
+        // Q5_K uses same scale packing as Q4_K (12 scales bytes at offset 4).
+        device const uchar* sc_raw = row_block + 4;
+        uchar sc6, m6;
+        if (sb_in_super < 4u) {
+            sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+            m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+        } else {
+            uint i = sb_in_super - 4u;
+            sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+            m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+        }
+        float scale   = d    * float(sc6);
+        float min_val = dmin * float(m6);
+
+        // qh at offset 16 (32 bytes), qs at offset 48 (128 bytes).
+        device const uchar* qh_ptr = row_block + 16u;
+        device const uchar* qs_ptr = row_block + 48u + pair_idx * 32u;
+        threadgroup float* ws_row = Ws + (uint)row * BK_EM5 + (uint)col_chunk * 8u;
+
+        // load_chunk in our convention selects which 16-weight half within sb (0..1).
+        // For SGEMM tile BM=8 BN=8 BK=32, col_chunk in 0..3 (8 cols each = 32/8).
+        // Each col_chunk loads 8 weights from the sub-block.
+        // But Q5_K qh extracts based on (load_chunk_q5k = col_chunk / 2 ?) — different
+        // mapping. Let me handle 8 weights (1 col_chunk) using direct offset math.
+        for (ushort c = 0; c < 8u; ++c) {
+            ushort byte_pos = col_chunk * 8u + c;  // byte idx within pair (0..32)
+            uchar qs_byte  = qs_ptr[byte_pos];
+            uchar low_4    = is_high ? (qs_byte >> 4u) : (qs_byte & 0x0Fu);
+
+            // Q5_K qh extraction. For Q4_K nibble 0..15. For Q5_K nibble 0..31 (5-bit).
+            // Per weight w within sub-block (w = byte_pos in 0..32) :
+            //   load_chunk_q5k = byte_pos / 16 (0 or 1, which qh half)
+            //   l_in_qh_half = byte_pos % 16
+            //   qh_byte = qh[load_chunk_q5k * 16 + l_in_qh_half]
+            //   high_bit = (qh_byte >> sb_in_super) & 1
+            uint load_chunk_q5k = byte_pos / 16u;
+            uint l_in_qh = byte_pos % 16u;
+            uchar qh_byte = qh_ptr[load_chunk_q5k * 16u + l_in_qh];
+            uint high_bit = ((uint)qh_byte >> sb_in_super) & 1u;
+
+            uint q5 = (uint)low_4 + (high_bit << 4u);  // 0..31
+            ws_row[c] = scale * float(q5) - min_val;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (ushort k_frag = 0; k_frag < 4u; ++k_frag) {
+            simdgroup_load(A_frag, Xs + (uint)k_frag * 8u, BK_EM5);
+            simdgroup_load(
+                B_frag,
+                Ws + (uint)k_frag * 8u,
+                BK_EM5,
+                ulong2(0, 0),
+                /* transpose */ true);
+            simdgroup_multiply_accumulate(C_frag, A_frag, B_frag, C_frag);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float* C_ptr = C
+        + (uint64_t)m_tile * BM_EM5 * (uint64_t)N
+        + (uint64_t)n_tile * BN_EM5;
+    simdgroup_store(C_frag, C_ptr, N);
+}
+"#;
+
+/// T163 phase 9f-cinq — Q5_K SGEMM EXPERT-MAJOR pour MoE 35B-A3B (down weights).
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_q5_k_f32_expert_major_8x8_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_stacked_buf: &Buffer,
+    tile_expert_ids_buf: &Buffer,
+    c_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+    expert_stride_bytes: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q5_k_f32_expert_major needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 8 != 0 || n % 8 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q5_k_f32_expert_major: M%8==0, N%8==0, K%256==0 (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q5_k_f32_expert_major_8x8",
+        SGEMM_Q5_K_F32_EXPERT_MAJOR_8X8_SHADER,
+        "sgemm_q5_k_f32_expert_major_8x8",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    let stride_u32 = expert_stride_bytes as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_stacked_buf), 0);
+        encoder.set_buffer(2, Some(tile_expert_ids_buf), 0);
+        encoder.set_buffer(3, Some(c_buf), 0);
+        encoder.set_bytes(4, 12, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let n_tg = ((m / 8) * (n / 8)) as u64;
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T163 phase 9f-quater — gather rows from x according to permutation.
 //
 // Pour expert-major MoE pipeline : pack les rows de x dans un layout permuté
@@ -14493,6 +14690,140 @@ mod tests {
             assert!(
                 rel < 1e-2,
                 "Q4_K SGEMM expert_major mismatch at {i}: ref={} metal={} (rel {:.3e})",
+                c_ref[i],
+                c_metal[i],
+                rel
+            );
+        }
+    }
+
+    /// T163 phase 9f-cinq — Q5_K SGEMM EXPERT-MAJOR : test parité
+    /// (avec stacked Q5_K weights, tile_expert_ids non-trié).
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemm_q5_k_f32_expert_major_8x8_matches_cpu() {
+        use rustorch_gguf::dequant::dequant_q5_k;
+
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[sgemm_q5_k_expert_major] skipping: no Metal3");
+            return;
+        }
+
+        let n_experts = 4_usize;
+        let m = 32_usize;
+        let n = 8_usize;
+        let k = 512_usize;
+        let blocks_per_row = k / 256;
+        let bytes_per_expert = n * blocks_per_row * 176; // Q5_K: 176 bytes/super-block
+
+        let mut w_stacked = vec![0u8; n_experts * bytes_per_expert];
+        for e in 0..n_experts {
+            for nrow in 0..n {
+                for ib in 0..blocks_per_row {
+                    let off = e * bytes_per_expert + (nrow * blocks_per_row + ib) * 176;
+                    let d_val =
+                        ((nrow as f32 + 1.0 + e as f32 * 2.0) * 0.005) + (ib as f32) * 0.001;
+                    let dmin_val = ((nrow as f32 + e as f32) * 0.002) + (ib as f32) * 0.0005;
+                    let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                    let dmin_h = half::f16::from_f32(dmin_val).to_le_bytes();
+                    w_stacked[off] = d_h[0];
+                    w_stacked[off + 1] = d_h[1];
+                    w_stacked[off + 2] = dmin_h[0];
+                    w_stacked[off + 3] = dmin_h[1];
+                    // 12 packed scales bytes.
+                    for i in 0..12 {
+                        w_stacked[off + 4 + i] = (0x12_u8
+                            .wrapping_add((nrow as u8) ^ (i as u8) ^ (ib as u8) ^ (e as u8 * 7)))
+                            | 0x05;
+                    }
+                    // 32 qh bytes.
+                    for i in 0..32 {
+                        w_stacked[off + 16 + i] =
+                            ((nrow as u8) ^ (i as u8) ^ (e as u8 * 11)).wrapping_add(0x33);
+                    }
+                    // 128 qs bytes.
+                    for i in 0..128 {
+                        w_stacked[off + 48 + i] =
+                            ((nrow as u8) ^ (i as u8) ^ (ib as u8) ^ (e as u8 * 13))
+                                .wrapping_add(0x37);
+                    }
+                }
+            }
+        }
+
+        let tile_expert_ids: Vec<u32> = vec![1, 2, 0, 3];
+
+        let a = det_vec(m * k, 1.7);
+        let mut c_ref = vec![0.0_f32; m * n];
+        for (tile_idx, &tile_expert_id) in tile_expert_ids.iter().enumerate().take(m / 8) {
+            let expert_id = tile_expert_id as usize;
+            let mut w_f32 = vec![0.0_f32; n * k];
+            for nrow in 0..n {
+                let off_w = expert_id * bytes_per_expert + nrow * blocks_per_row * 176;
+                let row_bytes = &w_stacked[off_w..off_w + blocks_per_row * 176];
+                let row_dst = &mut w_f32[nrow * k..(nrow + 1) * k];
+                dequant_q5_k(row_bytes, row_dst).unwrap();
+            }
+            for i in 0..8 {
+                let row_idx = tile_idx * 8 + i;
+                for j in 0..n {
+                    let mut s = 0.0_f32;
+                    for l in 0..k {
+                        s += a[row_idx * k + l] * w_f32[j * k + l];
+                    }
+                    c_ref[row_idx * n + j] = s;
+                }
+            }
+        }
+
+        let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_stacked.len()).unwrap();
+        let tile_buf = backend.alloc_shared(tile_expert_ids.len() * 4).unwrap();
+        let c_buf = backend.alloc_shared(m * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+            std::ptr::copy_nonoverlapping(
+                w_stacked.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_stacked.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                tile_expert_ids.as_ptr(),
+                tile_buf.contents() as *mut u32,
+                tile_expert_ids.len(),
+            );
+        }
+        sgemm_q5_k_f32_expert_major_8x8_into(
+            backend,
+            &a_buf,
+            &w_buf,
+            &tile_buf,
+            &c_buf,
+            m,
+            n,
+            k,
+            bytes_per_expert,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut c_metal = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_buf.contents() as *const f32,
+                c_metal.as_mut_ptr(),
+                m * n,
+            );
+        }
+
+        for i in 0..(m * n) {
+            let abs_err = (c_ref[i] - c_metal[i]).abs();
+            let denom = c_ref[i].abs().max(1e-3);
+            let rel = abs_err / denom;
+            assert!(
+                rel < 1e-2,
+                "Q5_K SGEMM expert_major mismatch at {i}: ref={} metal={} (rel {:.3e})",
                 c_ref[i],
                 c_metal[i],
                 rel

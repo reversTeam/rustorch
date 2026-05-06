@@ -300,7 +300,7 @@ pub fn dequant_q4_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
 //     u1 <<= 2 ; u2 <<= 2     (each sub-block-pair uses adjacent qh bits)
 // =============================================================================
 
-fn dequant_q5_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
+pub fn dequant_q5_k(src: &[u8], dst: &mut [f32]) -> Result<(), DequantError> {
     if dst.len() % QK_K != 0 {
         return Err(DequantError::OutputSize {
             expected: dst.len() / QK_K * QK_K,

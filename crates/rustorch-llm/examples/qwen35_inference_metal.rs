@@ -54,18 +54,19 @@ use rustorch_metal::kernels::{
     rope_half_split_f32, rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
     sgemm_q4_k_f32_expert_major_8x8_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
-    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
-    sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
-    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
-    sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into,
-    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32,
-    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
-    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
-    ssm_conv1d_step_f32, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
-    topk_softmax_norm_f32, unpermute_rows_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
+    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q5_k_f32_expert_major_8x8_into,
+    sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
+    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into,
+    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
+    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
+    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
+    sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32,
+    sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
+    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_batched_f32,
+    swiglu_f32, topk_softmax_norm_batched_f32, topk_softmax_norm_f32, unpermute_rows_f32,
+    weighted_add_inplace_f32, weighted_reduce_add_batched_f32, weighted_reduce_add_f32,
+    weighted_scatter_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -1637,19 +1638,59 @@ fn ffn_moe_forward_batch(
         b,
     )?;
 
-    // 4-7. T163 phase 9f-quater : EXPERT-MAJOR pipeline.
-    //      - Si TOUS Q4_K → full expert-major (gate, up, down via SGEMM 8×8).
-    //      - Si gate+up Q4_K mais down ≠ Q4_K (35B-A3B Q5_K down) → HYBRID :
-    //        gate/up via expert_major SGEMM, unpermute em_fd → fd_gather, puis
-    //        down via gather_sgemv standard.
-    //      - Sinon fallback complet gather_per_token.
-    let gate_q4k = matches!(gate_exps_stacked.dtype, GgmlType::Q4_K);
-    let up_q4k = matches!(up_exps_stacked.dtype, GgmlType::Q4_K);
-    let down_q4k = matches!(down_exps_stacked.dtype, GgmlType::Q4_K);
-    let all_q4k_moe = gate_q4k && up_q4k && down_q4k;
-    let hybrid_q4k_gate_up = gate_q4k && up_q4k && !down_q4k;
+    // 4-7. T163 phase 9f-quater + 9f-cinq : EXPERT-MAJOR pipeline étendu Q4_K + Q5_K.
+    //      Dispatch SGEMM expert_major selon dtype par projection (gate/up/down).
+    //
+    // **DÉCOUVERTE CRITIQUE T163 phase 9f-six** : la stratégie expert_major avec
+    // padding mult-8 par expert SE DÉGRADE QUAND n_experts >> B*n_used. Pour
+    // 35B-A3B (n_experts=256, B*n_used=256 avec B=32), chaque expert reçoit en
+    // moyenne 1 eval → padded à 8 rows = 87% de padding wasted. Le SGEMM fait
+    // alors ~8× plus de compute que nécessaire, devenant plus lent que per-token.
+    //
+    // GUARD : expert_major rentable seulement quand B*n_used >> n_experts (i.e.,
+    // experts répétés en moyenne). Heuristique : `b_eff >= n_experts`.
+    let gate_em = matches!(gate_exps_stacked.dtype, GgmlType::Q4_K | GgmlType::Q5_K);
+    let up_em = matches!(up_exps_stacked.dtype, GgmlType::Q4_K | GgmlType::Q5_K);
+    let down_em = matches!(down_exps_stacked.dtype, GgmlType::Q4_K | GgmlType::Q5_K);
+    let all_em = gate_em && up_em && down_em && b_eff >= n_experts;
 
-    if all_q4k_moe || hybrid_q4k_gate_up {
+    let dispatch_em_sgemm = |stacked: &StackedQuantizedExperts,
+                             a_buf: &Buffer,
+                             c_buf: &Buffer,
+                             m: usize,
+                             n: usize,
+                             k: usize|
+     -> Result<(), MetalError> {
+        match stacked.dtype {
+            GgmlType::Q4_K => sgemm_q4_k_f32_expert_major_8x8_into(
+                backend,
+                a_buf,
+                &stacked.buffer,
+                &batch_scratch.em_tile_expert_ids,
+                c_buf,
+                m,
+                n,
+                k,
+                stacked.bytes_per_expert,
+            ),
+            GgmlType::Q5_K => sgemm_q5_k_f32_expert_major_8x8_into(
+                backend,
+                a_buf,
+                &stacked.buffer,
+                &batch_scratch.em_tile_expert_ids,
+                c_buf,
+                m,
+                n,
+                k,
+                stacked.bytes_per_expert,
+            ),
+            other => Err(MetalError::Unsupported(format!(
+                "expert_major SGEMM: dtype {other:?} not yet ported"
+            ))),
+        }
+    };
+
+    if all_em {
         // CPU sort indices.
         backend.drain();
         let mut src_indices_vec: Vec<u32> = Vec::with_capacity(b_eff + 7 * n_experts);
@@ -1696,27 +1737,22 @@ fn ffn_moe_forward_batch(
             d,
             m_padded,
         )?;
-        sgemm_q4_k_f32_expert_major_8x8_into(
-            backend,
+        // Gate, up, down all via expert_major SGEMM (Q4_K or Q5_K dispatched).
+        dispatch_em_sgemm(
+            gate_exps_stacked,
             &batch_scratch.em_x_packed,
-            &gate_exps_stacked.buffer,
-            &batch_scratch.em_tile_expert_ids,
             &batch_scratch.em_out_ef_gate,
             m_padded,
             ef,
             d,
-            gate_exps_stacked.bytes_per_expert,
         )?;
-        sgemm_q4_k_f32_expert_major_8x8_into(
-            backend,
+        dispatch_em_sgemm(
+            up_exps_stacked,
             &batch_scratch.em_x_packed,
-            &up_exps_stacked.buffer,
-            &batch_scratch.em_tile_expert_ids,
             &batch_scratch.em_out_ef_up,
             m_padded,
             ef,
             d,
-            up_exps_stacked.bytes_per_expert,
         )?;
         swiglu_f32(
             backend,
@@ -1725,62 +1761,35 @@ fn ffn_moe_forward_batch(
             &batch_scratch.em_fd,
             m_padded * ef,
         )?;
-        if all_q4k_moe {
-            // Down also Q4_K → expert_major SGEMM end-to-end + atomic scatter.
-            sgemm_q4_k_f32_expert_major_8x8_into(
-                backend,
-                &batch_scratch.em_fd,
-                &down_exps_stacked.buffer,
-                &batch_scratch.em_tile_expert_ids,
-                &batch_scratch.em_out_d,
-                m_padded,
-                d,
-                ef,
-                down_exps_stacked.bytes_per_expert,
-            )?;
-            weighted_scatter_add_f32(
-                backend,
-                &batch_scratch.em_out_d,
-                &batch_scratch.em_src_indices,
-                &batch_scratch.topw,
-                &batch_scratch.moe_acc,
-                d,
-                m_padded,
-                n_used,
-            )?;
-        } else {
-            // HYBRID : gate/up via expert_major (Q4_K), unpermute em_fd →
-            // fd_gather (original [b_eff, ef] layout), puis down via gather_sgemv
-            // standard (compatible Q5_K, Q6_K, Q8_0).
-            unpermute_rows_f32(
-                backend,
-                &batch_scratch.em_fd,
-                &batch_scratch.em_src_indices,
-                &batch_scratch.fd_gather,
-                ef,
-                m_padded,
-            )?;
-            dispatch_gather_sgemv(
-                backend,
-                down_exps_stacked,
-                &batch_scratch.fd_gather,
-                &batch_scratch.down_gather,
-                &batch_scratch.indices,
-                b_eff,
-                ef,
-                d,
-                ef,
-            )?;
-            weighted_reduce_add_batched_f32(
-                backend,
-                &batch_scratch.down_gather,
-                &batch_scratch.topw,
-                &batch_scratch.moe_acc,
-                n_used,
-                d,
-                b,
-            )?;
-        }
+        dispatch_em_sgemm(
+            down_exps_stacked,
+            &batch_scratch.em_fd,
+            &batch_scratch.em_out_d,
+            m_padded,
+            d,
+            ef,
+        )?;
+        // T163 phase 9f-six : remplace atomic scatter par unpermute + weighted_reduce
+        // (atomics serializaient → bottleneck). Unpermute em_out_d → down_gather
+        // [b_eff, d] dans l'ordre original, puis weighted_reduce_add_batched
+        // (no atomics, parallèle sur d × b).
+        unpermute_rows_f32(
+            backend,
+            &batch_scratch.em_out_d,
+            &batch_scratch.em_src_indices,
+            &batch_scratch.down_gather,
+            d,
+            m_padded,
+        )?;
+        weighted_reduce_add_batched_f32(
+            backend,
+            &batch_scratch.down_gather,
+            &batch_scratch.topw,
+            &batch_scratch.moe_acc,
+            n_used,
+            d,
+            b,
+        )?;
     } else {
         // Fallback : gather_per_token (T162 phase 9f-bis) pour les modèles
         // mixed-dtype (e.g., 35B-A3B Q4_K gate/up + Q5_K down).
