@@ -2537,6 +2537,7 @@ fn ffn_dense_forward(
             let ef = cfg.expert_f;
 
             // 1. Routing logits = gate_inp @ h  → [n_experts]
+            let _moe_t0_routing = std::time::Instant::now();
             gate_inp.matmul_into(backend, &scratch.h, &scratch.moe_logits)?;
 
             // 2. T152.1b — Top-K + softmax + renormalize 100% GPU.
@@ -2544,6 +2545,11 @@ fn ffn_dense_forward(
             //    1 dispatch d'un threadgroup unique 256 threads qui produit
             //    `moe_indices_buf [n_used] u32` + `moe_topw_buf [n_used] f32`.
             //    Économie : 1 drain × 16 MoE layers = 16 drains/token sur 35B-A3B.
+            //
+            // Note T165 (negative result) : tentative de fusion en 1 kernel
+            // (routing_topk_softmax_norm_f32) régresse -50% car le matmul
+            // perd son parallélisme massif (256 sgs //) en se contractant à
+            // 1 TG (8 sgs serial). Voir gotcha pour le détail.
             topk_softmax_norm_f32(
                 backend,
                 &scratch.moe_logits,
@@ -2552,6 +2558,7 @@ fn ffn_dense_forward(
                 n_experts,
                 n_used,
             )?;
+            profile_drain_record(backend, "  moe.routing", _moe_t0_routing);
 
             // 3. T147a — zero the accumulator on GPU (no drain).
             zero_f32(backend, &scratch.moe_acc, d)?;
@@ -2614,6 +2621,7 @@ fn ffn_dense_forward(
             };
 
             // gate_proj : [n_used, ef] = stacked_gate[indices, :, :] @ h (broadcast)
+            let _moe_t0_gate = std::time::Instant::now();
             gather_dispatch(
                 gate_exps_stacked,
                 &scratch.h,
@@ -2623,8 +2631,10 @@ fn ffn_dense_forward(
                 0, // x_stride_floats=0 → broadcast
             )
             .map_err(|e| MetalError::Unsupported(format!("moe gate gather: {e:?}")))?;
+            profile_drain_record(backend, "  moe.gather_gate", _moe_t0_gate);
 
             // up_proj : [n_used, ef] = stacked_up[indices, :, :] @ h (broadcast)
+            let _moe_t0_up = std::time::Instant::now();
             gather_dispatch(
                 up_exps_stacked,
                 &scratch.h,
@@ -2634,9 +2644,11 @@ fn ffn_dense_forward(
                 0,
             )
             .map_err(|e| MetalError::Unsupported(format!("moe up gather: {e:?}")))?;
+            profile_drain_record(backend, "  moe.gather_up", _moe_t0_up);
 
             // swiglu : fd_gather[b, i] = silu(gate[b, i]) * up[b, i] sur n_used*ef
             // éléments traités comme un tableau 1D (kernel élément-wise pur).
+            let _moe_t0_swiglu = std::time::Instant::now();
             swiglu_f32(
                 backend,
                 &scratch.moe_gate_gather,
@@ -2644,8 +2656,10 @@ fn ffn_dense_forward(
                 &scratch.moe_fd_gather,
                 n_used * ef,
             )?;
+            profile_drain_record(backend, "  moe.swiglu_top", _moe_t0_swiglu);
 
             // down_proj : [n_used, d] = stacked_down[indices, :, :] @ fd_gather (per-row)
+            let _moe_t0_down = std::time::Instant::now();
             gather_dispatch(
                 down_exps_stacked,
                 &scratch.moe_fd_gather,
@@ -2655,8 +2669,10 @@ fn ffn_dense_forward(
                 ef, // x_stride_floats=ef → per-row input
             )
             .map_err(|e| MetalError::Unsupported(format!("moe down gather: {e:?}")))?;
+            profile_drain_record(backend, "  moe.gather_down", _moe_t0_down);
 
             // T152 — somme pondérée multi-row : moe_acc += sum_b top_w[b] * down_gather[b, :]
+            let _moe_t0_reduce = std::time::Instant::now();
             weighted_reduce_add_f32(
                 backend,
                 &scratch.moe_down_gather,
@@ -2665,6 +2681,7 @@ fn ffn_dense_forward(
                 n_used,
                 d,
             )?;
+            profile_drain_record(backend, "  moe.reduce_top", _moe_t0_reduce);
 
             // 5. Shared expert: standard SwiGLU FFN with sigmoid gate scalar.
             //    shared_gate is a vector of size d (per-element gate, not scalar).
@@ -2674,6 +2691,7 @@ fn ffn_dense_forward(
             //    `shared_gate = build_lora_mm(ffn_gate_inp_shexp, cur)` with
             //    ffn_gate_inp_shexp of shape [d] would imply a 1×d matrix → output
             //    is a scalar per token. So a dot product.
+            let _moe_t0_shared = std::time::Instant::now();
             gate_shexp.matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
             up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
             swiglu_f32(
@@ -2684,6 +2702,7 @@ fn ffn_dense_forward(
                 ef,
             )?;
             down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
+            profile_drain_record(backend, "  moe.shared", _moe_t0_shared);
 
             // T152.1 — Shared expert gating + final add ENTIÈREMENT GPU.
             // Avant : drain + CPU dot + CPU sigmoid + CPU add. Maintenant :
@@ -2692,6 +2711,7 @@ fn ffn_dense_forward(
             //   `xd[i] += moe_acc[i] + sigmoid(scalar) * moe_expert_out[i]`
             // 1 dispatch GPU au lieu de 1 drain + 2 CPU loops sur d éléments.
             // Économie : 1 drain × 16 MoE layers = 16 drains/token sur 35B-A3B.
+            let _moe_t0_final = std::time::Instant::now();
             sgemv_f32_lcpp_simd_into(
                 backend,
                 &scratch.h,
@@ -2708,6 +2728,7 @@ fn ffn_dense_forward(
                 &scratch.xd,
                 d,
             )?;
+            profile_drain_record(backend, "  moe.final_add", _moe_t0_final);
             Ok(())
         },
     }
