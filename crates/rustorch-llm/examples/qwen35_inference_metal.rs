@@ -56,19 +56,20 @@ use rustorch_metal::kernels::{
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
     sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
     sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
-    sgemm_q5_k_f32_expert_major_8x8_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
-    sgemm_q6_k_f32_simdgroup_matrix_into, sgemm_q8_0_f32_simdgroup_matrix_into,
-    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into,
-    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
-    sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32,
-    sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
-    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
-    ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
-    topk_softmax_norm_f32, unpermute_rows_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
+    sgemm_q5_k_f32_expert_major_8x64_half_into, sgemm_q5_k_f32_expert_major_8x8_into,
+    sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
+    sgemm_q8_0_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
+    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+    sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into,
+    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32,
+    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
+    ssm_conv1d_step_f32, ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32,
+    topk_softmax_norm_batched_f32, topk_softmax_norm_f32, unpermute_rows_f32,
+    weighted_add_inplace_f32, weighted_reduce_add_batched_f32, weighted_reduce_add_f32,
+    weighted_scatter_add_f32, zero_f32,
 };
 
 /// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
@@ -1770,17 +1771,35 @@ fn ffn_moe_forward_batch(
                     )
                 }
             },
-            GgmlType::Q5_K => sgemm_q5_k_f32_expert_major_8x8_into(
-                backend,
-                a_buf,
-                &stacked.buffer,
-                &batch_scratch.em_tile_expert_ids,
-                c_buf,
-                m,
-                n,
-                k,
-                stacked.bytes_per_expert,
-            ),
+            GgmlType::Q5_K => {
+                // T175 — Same 8×64 wire-up as Q4_K. Q5_K down_proj on 35B-A3B
+                // is ~33% of MoE compute → 1.25× speedup expected.
+                if n % 64 == 0 {
+                    sgemm_q5_k_f32_expert_major_8x64_half_into(
+                        backend,
+                        a_buf,
+                        &stacked.buffer,
+                        &batch_scratch.em_tile_expert_ids,
+                        c_buf,
+                        m,
+                        n,
+                        k,
+                        stacked.bytes_per_expert,
+                    )
+                } else {
+                    sgemm_q5_k_f32_expert_major_8x8_into(
+                        backend,
+                        a_buf,
+                        &stacked.buffer,
+                        &batch_scratch.em_tile_expert_ids,
+                        c_buf,
+                        m,
+                        n,
+                        k,
+                        stacked.bytes_per_expert,
+                    )
+                }
+            },
             other => Err(MetalError::Unsupported(format!(
                 "expert_major SGEMM: dtype {other:?} not yet ported"
             ))),
