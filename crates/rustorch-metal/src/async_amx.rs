@@ -1,19 +1,22 @@
-//! T172 — `AsyncAmxExecutor` (Innovation 1, Day 2)
+//! T172 — `AsyncAmxExecutor` (Innovation 1, Days 2-3)
 //!
 //! Concurrent CPU AMX (Apple Accelerate) executor for offloading small F32
 //! matmul ops in parallel with GPU compute. Designed to enable hybrid
 //! GPU+CPU forward where the CPU AMX channel runs independently of the GPU
 //! Metal channel — both use Apple Silicon unified memory.
 //!
-//! ## Day 2 scope (this module)
+//! ## Two API levels
 //!
-//! Pure CPU concurrency. NO Metal sync yet. Caller is responsible for
-//! ensuring input buffers are coherent (e.g. via `backend.drain()` before
-//! submit) and for waiting on completion before reading outputs.
+//! 1. **`submit(AmxJob)`** (Day 2) : pure CPU concurrency, no GPU sync.
+//!    Caller must ensure input coherency (e.g. `backend.drain()` first)
+//!    and wait for completion before reading outputs.
 //!
-//! Day 3 will add `metal::SharedEvent` integration so the worker thread
-//! waits on GPU events and signals back, removing the need for explicit
-//! drains in the integration code.
+//! 2. **`submit_with_sync(AmxJob, wait_value, signal_value)`** (Day 3) :
+//!    integrates `metal::SharedEvent` for fine-grained GPU↔CPU sync.
+//!    Worker thread waits on `event.signaled_value() >= wait_value`
+//!    before running AMX, then `set_signaled_value(signal_value)` after.
+//!    Caller pairs this with `command_buffer.encode_signal_event(..., wait_value)`
+//!    before and `encode_wait_for_event(..., signal_value)` after.
 //!
 //! ## Architecture
 //!
@@ -36,6 +39,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+
+use metal::SharedEvent;
+
+/// Wraps `metal::SharedEvent` with `Send + Sync` markers so it can be moved
+/// into the worker thread. SharedEvent's whole purpose is GPU↔CPU sync, so
+/// it's logically thread-safe (Apple-documented). The metal-rs binding
+/// doesn't add the markers automatically (foreign_obj_type macro is
+/// conservative).
+struct SharedEventHandle(SharedEvent);
+
+// SAFETY: Apple's MTLSharedEvent is documented as thread-safe for
+// signaledValue/setSignaledValue. The Objective-C runtime handles the
+// underlying refcount.
+unsafe impl Send for SharedEventHandle {}
+unsafe impl Sync for SharedEventHandle {}
+
+impl SharedEventHandle {
+    fn signaled_value(&self) -> u64 {
+        self.0.signaled_value()
+    }
+    fn set_signaled_value(&self, v: u64) {
+        self.0.set_signaled_value(v);
+    }
+    fn inner(&self) -> &SharedEvent {
+        &self.0
+    }
+}
 
 /// A single AMX matmul job: `out[n] = w[n, k] @ h[k]` (row-major, F32).
 ///
@@ -61,31 +91,66 @@ pub struct AmxJob {
 unsafe impl Send for AmxJob {}
 
 /// Concurrent AMX executor. Spawns one CPU worker thread that polls a
-/// channel for jobs and runs `cblas_sgemv` on each.
+/// channel for jobs and runs `cblas_sgemv` on each. Optionally synced to a
+/// `metal::SharedEvent` for fine-grained GPU↔CPU coordination.
 pub struct AsyncAmxExecutor {
     job_tx: Option<mpsc::Sender<Message>>,
     submitted: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
+    /// Optional shared event for GPU↔CPU sync. When `None`, the worker
+    /// only does CPU concurrency (Day 2 path).
+    sync_event: Option<Arc<SharedEventHandle>>,
+    /// Monotonic counter for generating event values. Caller should use
+    /// `next_event_value()` to allocate fresh values for each
+    /// signal/wait pair.
+    next_value: AtomicU64,
 }
+
+/// A job paired with optional GPU sync values. If `wait_value > 0`, the
+/// worker spins on `event.signaled_value() >= wait_value` before running
+/// AMX. After AMX completes, if `signal_value > 0`, the worker calls
+/// `event.set_signaled_value(signal_value)` to unblock GPU consumers.
+struct SyncedJob {
+    job: AmxJob,
+    /// Worker waits for `event.signaled_value() >= wait_value` (0 = no wait).
+    wait_value: u64,
+    /// Worker calls `event.set_signaled_value(signal_value)` post-AMX (0 = no signal).
+    signal_value: u64,
+}
+
+// SAFETY: same as AmxJob — caller manages buffer lifetime.
+unsafe impl Send for SyncedJob {}
 
 /// Internal message between submitter and worker.
 enum Message {
-    Job(AmxJob),
+    Job(SyncedJob),
     Shutdown,
 }
 
 impl AsyncAmxExecutor {
-    /// Create a new executor with one worker thread.
+    /// Create a new executor with one worker thread, no GPU sync (Day 2 mode).
     pub fn new() -> Self {
+        Self::new_inner(None)
+    }
+
+    /// Create a new executor with a shared `metal::SharedEvent` for GPU sync
+    /// (Day 3 mode). Use `submit_with_sync` to coordinate with GPU command
+    /// buffers via `encode_signal_event` / `encode_wait_for_event`.
+    pub fn with_event(event: SharedEvent) -> Self {
+        Self::new_inner(Some(Arc::new(SharedEventHandle(event))))
+    }
+
+    fn new_inner(sync_event: Option<Arc<SharedEventHandle>>) -> Self {
         let (tx, rx) = mpsc::channel::<Message>();
         let submitted = Arc::new(AtomicU64::new(0));
         let completed = Arc::new(AtomicU64::new(0));
         let completed_for_worker = Arc::clone(&completed);
+        let event_for_worker = sync_event.as_ref().map(Arc::clone);
 
         let worker = thread::Builder::new()
             .name("rustorch-amx-worker".to_string())
-            .spawn(move || worker_loop(rx, completed_for_worker))
+            .spawn(move || worker_loop(rx, completed_for_worker, event_for_worker))
             .expect("spawn AMX worker thread");
 
         Self {
@@ -93,18 +158,68 @@ impl AsyncAmxExecutor {
             submitted,
             completed,
             worker: Some(worker),
+            sync_event,
+            next_value: AtomicU64::new(1),
         }
     }
 
-    /// Submit a job to be processed asynchronously by the worker.
+    /// Submit a job to be processed asynchronously, no GPU sync.
     /// Returns immediately. Use `wait_all()` to block until all submitted
     /// jobs have completed.
     pub fn submit(&self, job: AmxJob) {
+        self.submit_inner(SyncedJob {
+            job,
+            wait_value: 0,
+            signal_value: 0,
+        });
+    }
+
+    /// Submit a job with GPU sync. Worker waits for
+    /// `event.signaled_value() >= wait_value` before running AMX, then
+    /// calls `event.set_signaled_value(signal_value)` after completion.
+    ///
+    /// Caller pairs this with on the GPU command buffer:
+    /// 1. `cmd.encode_signal_event(&exec.event(), wait_value)` after the
+    ///    GPU dispatch that produces the AMX input
+    /// 2. `cmd.encode_wait_for_event(&exec.event(), signal_value)` before
+    ///    the GPU dispatch that consumes the AMX output
+    ///
+    /// Requires the executor was created with `with_event(...)`.
+    pub fn submit_with_sync(&self, job: AmxJob, wait_value: u64, signal_value: u64) {
+        debug_assert!(
+            self.sync_event.is_some(),
+            "submit_with_sync requires AsyncAmxExecutor::with_event(...)"
+        );
+        self.submit_inner(SyncedJob {
+            job,
+            wait_value,
+            signal_value,
+        });
+    }
+
+    fn submit_inner(&self, synced: SyncedJob) {
         self.submitted.fetch_add(1, Ordering::Release);
         if let Some(tx) = &self.job_tx {
             // Channel send is infallible while the worker is alive.
-            let _ = tx.send(Message::Job(job));
+            let _ = tx.send(Message::Job(synced));
         }
+    }
+
+    /// Allocate a fresh, monotonically increasing value for use as a
+    /// signal/wait token. Returns `(wait_value, signal_value)` pair where
+    /// `signal_value = wait_value + 1`.
+    pub fn next_event_pair(&self) -> (u64, u64) {
+        let v = self.next_value.fetch_add(2, Ordering::AcqRel);
+        (v, v + 1)
+    }
+
+    /// Returns the shared event so callers can encode signal/wait on
+    /// their command buffers. Panics if executor has no event.
+    pub fn event(&self) -> &SharedEvent {
+        self.sync_event
+            .as_ref()
+            .expect("AsyncAmxExecutor was created without an event")
+            .inner()
     }
 
     /// Block until all submitted jobs have been processed.
@@ -146,11 +261,33 @@ impl Default for AsyncAmxExecutor {
     }
 }
 
-fn worker_loop(rx: mpsc::Receiver<Message>, completed: Arc<AtomicU64>) {
+fn worker_loop(
+    rx: mpsc::Receiver<Message>,
+    completed: Arc<AtomicU64>,
+    sync_event: Option<Arc<SharedEventHandle>>,
+) {
     while let Ok(msg) = rx.recv() {
         match msg {
-            Message::Job(job) => {
-                run_amx_sgemv(&job);
+            Message::Job(synced) => {
+                // If we have a sync event and a non-zero wait value, spin
+                // until the GPU has signaled that the input is ready.
+                if synced.wait_value > 0 {
+                    if let Some(ev) = &sync_event {
+                        while ev.signaled_value() < synced.wait_value {
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+
+                run_amx_sgemv(&synced.job);
+
+                // Signal completion to the GPU side if requested.
+                if synced.signal_value > 0 {
+                    if let Some(ev) = &sync_event {
+                        ev.set_signaled_value(synced.signal_value);
+                    }
+                }
+
                 completed.fetch_add(1, Ordering::Release);
             },
             Message::Shutdown => break,
@@ -274,6 +411,67 @@ mod tests {
         }
         assert_eq!(exec.n_submitted(), n_jobs as u64);
         assert_eq!(exec.n_completed(), n_jobs as u64);
+    }
+
+    /// T172 Day 3 — verify that submit_with_sync correctly waits for the
+    /// shared event before running AMX, and signals after completion.
+    /// Simulates GPU by directly setting/checking the event value from
+    /// the test thread.
+    #[test]
+    fn submit_with_sync_waits_and_signals() {
+        let backend = crate::backend_singleton::metal_backend();
+        let event = backend.device.new_shared_event();
+        let exec = AsyncAmxExecutor::with_event(event);
+
+        let k = 64;
+        let n = 32;
+        let h: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.005).cos()).collect();
+        let mut out = vec![0.0f32; n];
+
+        // Allocate a fresh event-value pair.
+        let (wait_v, signal_v) = exec.next_event_pair();
+        assert_eq!(signal_v, wait_v + 1);
+
+        // Submit before signaling — worker should spin on event.
+        exec.submit_with_sync(
+            AmxJob {
+                h_ptr: h.as_ptr(),
+                w_ptr: w.as_ptr(),
+                out_ptr: out.as_mut_ptr(),
+                k,
+                n,
+            },
+            wait_v,
+            signal_v,
+        );
+
+        // Worker should still be waiting (no AMX done yet).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(exec.n_completed(), 0, "worker should be waiting on event");
+
+        // "GPU" signals that input is ready — simulated by setting event value.
+        exec.event().set_signaled_value(wait_v);
+
+        // Worker now runs AMX. Wait for completion.
+        exec.wait_all();
+        assert_eq!(exec.n_completed(), 1);
+
+        // Verify output (parity vs naive).
+        let expected = naive_sgemv(&h, &w, n, k);
+        for i in 0..n {
+            let denom = expected[i].abs().max(1e-6);
+            let rel = (expected[i] - out[i]).abs() / denom;
+            assert!(rel < 1e-4, "row {i}: rel {rel:.3e}");
+        }
+
+        // Verify the worker signaled the completion value.
+        assert!(
+            exec.event().signaled_value() >= signal_v,
+            "expected event signaled to {} got {}",
+            signal_v,
+            exec.event().signaled_value()
+        );
     }
 
     /// Sanity: dropping the executor cleanly terminates the worker thread
