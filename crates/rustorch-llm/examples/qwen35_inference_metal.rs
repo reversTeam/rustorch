@@ -2280,7 +2280,10 @@ fn ssm_block_forward(
     let conv_dim = 2 * key_dim + value_dim;
 
     // 1. RMSNorm on residual stream.
+    let _ssm_t0 = std::time::Instant::now();
     rms_norm_f32(backend, &scratch.xd, &ssm.attn_norm, &scratch.h, d, eps)?;
+    profile_drain_record(backend, "  ssm.in_norm", _ssm_t0);
+    let _ssm_t0_proj = std::time::Instant::now();
     dump_buf(
         backend,
         &scratch.h,
@@ -2320,9 +2323,11 @@ fn ssm_block_forward(
         n_v,
         &format!("{dump_prefix}/ssm/05_beta"),
     );
+    profile_drain_record(backend, "  ssm.in_proj", _ssm_t0_proj);
 
     // 3. T146a — fused GPU kernel: gate_h = softplus(alpha + dt_bias) * ssm_a,
     //    beta_sig = sigmoid(beta). No drain needed.
+    let _ssm_t0_gate = std::time::Instant::now();
     ssm_apply_gate_f32(
         backend,
         &scratch.alpha,
@@ -2345,8 +2350,10 @@ fn ssm_block_forward(
         n_v,
         &format!("{dump_prefix}/ssm/07_beta_sig"),
     );
+    profile_drain_record(backend, "  ssm.gate_apply", _ssm_t0_gate);
 
     // 4. Conv1d step + ring-buffer update.
+    let _ssm_t0_conv = std::time::Instant::now();
     ssm_conv1d_step_f32(
         backend,
         &scratch.qkv_mixed,
@@ -2372,6 +2379,8 @@ fn ssm_block_forward(
     //    35B-A3B: 32 = 2 × 16), so we keep q,k at length [n_k_heads, head_dim]
     //    (key_dim each) and let delta_net_step broadcast inline. Only v is
     //    n_v_heads-wide (value_dim).
+    profile_drain_record(backend, "  ssm.conv1d", _ssm_t0_conv);
+    let _ssm_t0_split = std::time::Instant::now();
     split_qkv_f32(
         backend,
         &scratch.conv_out,
@@ -2382,6 +2391,8 @@ fn ssm_block_forward(
         key_dim,
         value_dim,
     )?;
+    profile_drain_record(backend, "  ssm.split_qkv", _ssm_t0_split);
+    let _ssm_t0_dnet = std::time::Instant::now();
     dump_buf(
         backend,
         &scratch.q_ssm,
@@ -2465,8 +2476,10 @@ fn ssm_block_forward(
         value_dim,
         &format!("{dump_prefix}/ssm/14_dnet_out"),
     );
+    profile_drain_record(backend, "  ssm.delta_net", _ssm_t0_dnet);
 
     // 10. Per-head RMSNorm gated by silu(z).
+    let _ssm_t0_gnorm = std::time::Instant::now();
     rms_norm_per_head_gated_f32(
         backend,
         &scratch.ssm_out_buf,
@@ -2483,11 +2496,15 @@ fn ssm_block_forward(
         &format!("{dump_prefix}/ssm/15_gated_norm"),
     );
 
+    profile_drain_record(backend, "  ssm.gated_norm", _ssm_t0_gnorm);
+
     // 11. ssm_out @ out_gated → result, then xd += result.
+    let _ssm_t0_out = std::time::Instant::now();
     ssm.ssm_out
         .matmul_into(backend, &scratch.ssm_out_buf, &scratch.o)?;
     dump_buf(backend, &scratch.o, d, &format!("{dump_prefix}/ssm/16_o"));
     add_inplace_f32(backend, &scratch.xd, &scratch.o, d)?;
+    profile_drain_record(backend, "  ssm.out_proj", _ssm_t0_out);
     Ok(())
 }
 

@@ -6768,6 +6768,227 @@ pub fn sgemv_q4_k_gather_f32_lcpp_nsg2_into(
     Ok(())
 }
 
+// T168 — Q4_K gather sgemv with qmv_fast pattern (port MLX `affine_gather_qmv_fast`).
+//
+// Combines T152 gather pattern (per-row expert lookup via indices[b]) with
+// T162 phase 5 qmv_fast inner kernel (NR0=4, 16w/thread, threads independent).
+//
+// vs T152 `sgemv_q4_k_gather_f32_lcpp_nsg2_into`:
+// - NR0=4 (8 rows/TG) vs NR0=2 (4 rows/TG) : 2× fewer TGs → less dispatch
+//   overhead + better register reuse of x_thread (loaded once, dot×4 rows)
+// - threads independent on K (no ix-distribution, no intermediate simd_sums)
+// - block_size=512 (2 super-blocks/iter) vs 256 (1/iter) : larger amortization
+//
+// Pre-conditions : Metal3, K%512==0, N%8==0.
+//
+// `x_stride_floats == 0` : input partagé broadcast (gate_proj, up_proj de MoE).
+// `x_stride_floats == K` : input par-row (down_proj de MoE).
+const SGEMV_Q4_K_GATHER_QMV_FAST_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q4K_BYTES_GF = 144u;
+constant uint Q4K_WEIGHTS_GF = 256u;
+constant uint NSG_GF = 2u;
+constant uint NR0_GF = 4u;
+constant uint VALUES_PER_THREAD_GF = 16u;
+constant uint BLOCK_SIZE_GF = 512u;  // VALUES_PER_THREAD × SIMD_SIZE
+
+kernel void sgemv_q4_k_gather_qmv_fast(
+    device const float*  x         [[buffer(0)]],
+    device const uchar*  w_q4k     [[buffer(1)]],
+    device const uint*   indices   [[buffer(2)]],
+    device float*        y         [[buffer(3)]],
+    constant uint4&      dims      [[buffer(4)]],   // (K, N, B, expert_stride_bytes)
+    constant uint&       x_stride  [[buffer(5)]],   // 0 (broadcast) or K (per-row)
+    uint2                tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiisg     [[thread_index_in_simdgroup]],
+    ushort               sgitg     [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B = dims.z;
+    uint expert_stride = dims.w;
+    uint b = tg_id.y;
+    if (b >= B) return;
+
+    uint expert = indices[b];
+
+    // Per-expert weight base, per-b x base, per-b output base.
+    device const uchar* w_base = w_q4k + (uint64_t)expert * (uint64_t)expert_stride;
+    device const float* x_base = x + (uint64_t)b * (uint64_t)x_stride;
+    device       float* y_base = y + (uint64_t)b * (uint64_t)N;
+
+    uint blocks_per_row = K / Q4K_WEIGHTS_GF;
+    uint row_stride_bytes = blocks_per_row * Q4K_BYTES_GF;
+
+    // 8 rows per TG (NSG=2 simdgroups × NR0=4 each).
+    uint first_row = (tg_id.x * NSG_GF + (uint)sgitg) * NR0_GF;
+    if (first_row >= N) return;
+
+    // Per-thread layout (constant across K-loop) — same as qmv_fast.
+    uint super_in_iter = (uint)tiisg / 16u;
+    uint sub_in_super = ((uint)tiisg % 16u) / 2u;  // 0..7
+    uint half_in_sub  = (uint)tiisg % 2u;
+    uint pair_qs_offset = (sub_in_super / 2u) * 32u;
+    bool sub_is_high = (sub_in_super % 2u) == 1u;
+    uint l_start = half_in_sub * 16u;
+
+    float result[4] = {0.0, 0.0, 0.0, 0.0};
+    float x_thread[16];
+
+    uint k_iters = K / BLOCK_SIZE_GF;
+
+    for (uint k_iter = 0; k_iter < k_iters; ++k_iter) {
+        uint k_thread_offset = k_iter * BLOCK_SIZE_GF + (uint)tiisg * 16u;
+
+        // Load 16 x values for this thread's K-slice (from per-b x base).
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 16u; ++i) {
+            x_thread[i] = x_base[k_thread_offset + i];
+        }
+
+        uint super_block_global = k_iter * 2u + super_in_iter;
+
+        // Process NR0=4 rows : for each, dequant 16 weights and accumulate.
+        #pragma clang loop unroll(full)
+        for (uint row_off = 0; row_off < NR0_GF; ++row_off) {
+            uint nrow = first_row + row_off;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_base
+                + (uint64_t)nrow * row_stride_bytes
+                + (uint64_t)super_block_global * Q4K_BYTES_GF;
+            device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+            float d    = float(as_type<half>(dh_ptr[0]));
+            float dmin = float(as_type<half>(dh_ptr[1]));
+
+            // Q4_K (sc6, m6) unpacking via KMASK1/2/3 logic.
+            device const uchar* scales_bytes = block + 4;
+            uint sb = sub_in_super;
+            uchar sc6_byte, m6_byte;
+            if (sb < 4u) {
+                sc6_byte = scales_bytes[sb]      & 0x3Fu;
+                m6_byte  = scales_bytes[sb + 4u] & 0x3Fu;
+            } else {
+                uint i = sb - 4u;
+                sc6_byte = (scales_bytes[i + 8u] & 0x0Fu)
+                         | ((scales_bytes[i]      >> 6u) << 4u);
+                m6_byte  = (scales_bytes[i + 8u] >> 4u)
+                         | ((scales_bytes[i + 4u] >> 6u) << 4u);
+            }
+            float scale   = d    * (float)sc6_byte;
+            float min_val = dmin * (float)m6_byte;
+
+            // Dequant 16 weights and dot product with x_thread[].
+            device const uchar* qs = block + 16 + pair_qs_offset + l_start;
+            float sum_w_x = 0.0;
+            float sum_x_thread = 0.0;
+            #pragma clang loop unroll(full)
+            for (uint l = 0; l < 16u; ++l) {
+                uchar byte = qs[l];
+                uint nibble = sub_is_high ? ((uint)byte >> 4u) : ((uint)byte & 0x0Fu);
+                float w_val = (float)nibble;
+                sum_w_x      += w_val * x_thread[l];
+                sum_x_thread += x_thread[l];
+            }
+            // Q4_K dequant : weight = scale * nibble - min_val
+            // sum = scale * sum(nibble * x) - min_val * sum(x)
+            result[row_off] += scale * sum_w_x - min_val * sum_x_thread;
+        }
+    }
+
+    // simd_sum across 32 threads, write 4 rows per simdgroup.
+    #pragma clang loop unroll(full)
+    for (uint row_off = 0; row_off < NR0_GF; ++row_off) {
+        uint nrow = first_row + row_off;
+        if (nrow >= N) continue;
+        float row_sum = simd_sum(result[row_off]);
+        if (tiisg == 0) {
+            y_base[nrow] = row_sum;
+        }
+    }
+}
+"#;
+
+/// T168 — **NEGATIVE RESULT, dead code conservé pour référence**.
+///
+/// Q4_K gather sgemv avec qmv_fast pattern (NR0=4, 16w/thread, threads
+/// indépendants, block_size=512). Théoriquement 2× moins de TGs et
+/// meilleure ALU density vs T152 lcpp_nsg2 (NR0=2, ix-coop).
+///
+/// **Test parité PASS** vs `sgemv_q4_k_gather_f32_lcpp_nsg2_into`.
+///
+/// **Bench réel sur 35B-A3B Q4_K_M decode : 0% gain** (42.82 vs 42.82 t/s).
+/// Confirme T162 phase 5 sur sgemv régulier (+1-2% seulement) — la
+/// complexité du dequant Q4_K (KMASK packed scales, half-nibble splits)
+/// sature l'ALU per-K-iter, masquant tout gain de parallélisme du pattern
+/// qmv_fast.
+///
+/// **Méta-leçon** : sur Apple Metal3 + Q4_K decode, le pattern qmv_fast (MLX
+/// référence) ne donne PAS d'avantage significatif. Le gap 3× vs MLX sur
+/// 35B-A3B vient probablement de techniques au-dessus du niveau kernel-level
+/// (custom dispatch pipeline, command buffer parallelism, ou format quant
+/// simplifié comme MLX affine). Voir gotcha `e9571b6f`, `61b1e10a`.
+///
+/// Kernel + parity test conservés au cas où on se retrouverait dans un
+/// régime ALU-non-saturé (e.g. decode B>1, KV-bound shapes).
+///
+/// Pre-conditions : Metal3, K%512==0, N%8==0, x_stride∈{0, K}.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn sgemv_q4_k_gather_qmv_fast_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_stacked_buf: &Buffer,
+    indices_buf: &Buffer,
+    b: usize,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+    expert_stride_bytes: usize,
+    x_stride_floats: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_gather_qmv_fast needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 512 != 0 || n % 8 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_gather_qmv_fast: K%512==0 && N%8==0 required (K={k}, N={n})"
+        )));
+    }
+    if b == 0 {
+        return Ok(());
+    }
+    if x_stride_floats != 0 && x_stride_floats != k {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_gather_qmv_fast: x_stride_floats must be 0 or K={k}, got {x_stride_floats}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_gather_qmv_fast",
+        SGEMV_Q4_K_GATHER_QMV_FAST_SHADER,
+        "sgemv_q4_k_gather_qmv_fast",
+    )?;
+    let dims = [k as u32, n as u32, b as u32, expert_stride_bytes as u32];
+    let x_stride_u32 = x_stride_floats as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_stacked_buf), 0);
+        encoder.set_buffer(2, Some(indices_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &x_stride_u32 as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1); // 2 simdgroups × 32
+        let n_tg = (n as u64).div_ceil(8); // NR0=4 × NSG=2 = 8 rows/TG
+        let groups = MTLSize::new(n_tg, b as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T162 phase 9f-bis — Q4_K gather PER-TOKEN sgemv : version optimisée pour
 // le batched MoE prefill. Au lieu de replicater h en x_repl [B*n_used, K]
 // (= 128MB/layer pour 35B-A3B B=32), le kernel calcule directement le token
@@ -14785,6 +15006,138 @@ mod tests {
                 "qmv_fast Q4_K mismatch at row {j}: ref={} metal={} (rel {:.3e})",
                 y_ref[j],
                 y_metal[j],
+                rel
+            );
+        }
+    }
+
+    /// T168 — Q4_K gather sgemv with qmv_fast pattern vs T152 lcpp_nsg2 reference.
+    /// Verifies bit-near-perfect output equivalence (same math, different
+    /// thread layout). Tolerance 1e-3 for f32 round-off.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemv_q4_k_gather_qmv_fast_matches_lcpp_nsg2() {
+        let backend = metal_backend();
+
+        // Realistic 35B-A3B MoE shapes : K=2048 (d), N=512 (ef), B=8 (n_used),
+        // n_experts=4 (small for test; real has 256, but we just need >= max(indices)+1).
+        let k = 2048_usize;
+        let n = 512_usize; // must be %8 for qmv_fast
+        let b = 8_usize;
+        let n_experts = 4_usize;
+
+        let blocks_per_row = k / 256;
+        let bytes_per_expert = n * blocks_per_row * 144;
+
+        // Build distinct Q4_K weights for 4 experts (different patterns).
+        let mut w_bytes = vec![0u8; n_experts * bytes_per_expert];
+        for ex in 0..n_experts {
+            for nrow in 0..n {
+                for ib in 0..blocks_per_row {
+                    let off = ex * bytes_per_expert + (nrow * blocks_per_row + ib) * 144;
+                    let d_val =
+                        ((ex as f32) * 0.1 + (nrow as f32 + 1.0) * 0.005) + (ib as f32) * 0.001;
+                    let dmin_val =
+                        ((ex as f32) * 0.05 + (nrow as f32) * 0.002) + (ib as f32) * 0.0005;
+                    let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                    let dmin_h = half::f16::from_f32(dmin_val).to_le_bytes();
+                    w_bytes[off] = d_h[0];
+                    w_bytes[off + 1] = d_h[1];
+                    w_bytes[off + 2] = dmin_h[0];
+                    w_bytes[off + 3] = dmin_h[1];
+                    for i in 0..12 {
+                        w_bytes[off + 4 + i] = (0x10_u8.wrapping_add(
+                            (ex as u8).wrapping_mul(7) ^ (nrow as u8) ^ (i as u8) ^ (ib as u8),
+                        )) | 0x05;
+                    }
+                    for i in 0..128 {
+                        w_bytes[off + 16 + i] =
+                            ((ex as u8).wrapping_mul(11) ^ (nrow as u8) ^ (i as u8) ^ (ib as u8))
+                                .wrapping_add(0x37);
+                    }
+                }
+            }
+        }
+
+        // Indices : assign each b to a different expert (cycles through 4).
+        let indices_data: Vec<u32> = (0..b).map(|i| (i % n_experts) as u32).collect();
+
+        // Input x (broadcast).
+        let x = det_vec(k, 1.5);
+
+        // Buffers
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        let idx_buf = backend.alloc_shared(b * 4).unwrap();
+        let y_ref_buf = backend.alloc_shared(b * n * 4).unwrap();
+        let y_test_buf = backend.alloc_shared(b * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+            std::ptr::copy_nonoverlapping(indices_data.as_ptr(), idx_buf.contents() as *mut u32, b);
+        }
+
+        // Reference : T152 lcpp_nsg2 gather
+        sgemv_q4_k_gather_f32_lcpp_nsg2_into(
+            backend,
+            &x_buf,
+            &w_buf,
+            &idx_buf,
+            b,
+            &y_ref_buf,
+            k,
+            n,
+            bytes_per_expert,
+            0, // broadcast
+        )
+        .unwrap();
+        backend.drain();
+
+        // Test : T168 qmv_fast gather
+        sgemv_q4_k_gather_qmv_fast_into(
+            backend,
+            &x_buf,
+            &w_buf,
+            &idx_buf,
+            b,
+            &y_test_buf,
+            k,
+            n,
+            bytes_per_expert,
+            0,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut y_ref = vec![0.0_f32; b * n];
+        let mut y_test = vec![0.0_f32; b * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y_ref_buf.contents() as *const f32,
+                y_ref.as_mut_ptr(),
+                b * n,
+            );
+            std::ptr::copy_nonoverlapping(
+                y_test_buf.contents() as *const f32,
+                y_test.as_mut_ptr(),
+                b * n,
+            );
+        }
+
+        for i in 0..(b * n) {
+            let denom = y_ref[i].abs().max(1e-3);
+            let rel = (y_ref[i] - y_test[i]).abs() / denom;
+            assert!(
+                rel < 1e-3,
+                "T168 gather qmv_fast mismatch at idx {i} (b={}, row={}): ref={} test={} rel={:.3e}",
+                i / n,
+                i % n,
+                y_ref[i],
+                y_test[i],
                 rel
             );
         }
