@@ -3801,7 +3801,45 @@ fn main() -> ExitCode {
         // T162 phase 9d : si --prefill-batch B est set et B > 1, utilise
         // forward_batch en chunks. Sinon, legacy per-token forward_token.
         if prefill_batch > 1 {
+            // Detect MoE-only model — phase 9d falls back to per-token loop on
+            // MoE FFN layers, which adds memcpy/drain overhead. Warn user (9f
+            // will bring batched MoE).
+            let any_moe = model.layers.iter().any(|l| {
+                matches!(
+                    l,
+                    LayerMetal::Attn {
+                        ffn: FfnLayerMetal::Moe { .. },
+                        ..
+                    } | LayerMetal::Ssm {
+                        ffn: FfnLayerMetal::Moe { .. },
+                        ..
+                    }
+                )
+            });
+            let any_dense = model.layers.iter().any(|l| {
+                matches!(
+                    l,
+                    LayerMetal::Attn {
+                        ffn: FfnLayerMetal::Dense { .. },
+                        ..
+                    } | LayerMetal::Ssm {
+                        ffn: FfnLayerMetal::Dense { .. },
+                        ..
+                    }
+                )
+            });
             println!("  T162 phase 9d : prefill batched (B={prefill_batch}, B_MAX={B_MAX_BATCH})");
+            if any_moe && !any_dense {
+                println!(
+                    "  WARNING : modèle MoE-only (35B-A3B style) — phase 9d fallback \
+                     per-token, regression attendue (~-15-20%). Phase 9f (MoE batched) \
+                     à venir."
+                );
+            } else if any_moe {
+                println!(
+                    "  NOTE : modèle hybride avec layers MoE — gain partiel sur layers Dense."
+                );
+            }
             let batch_scratch = BatchScratch::new(backend, &cfg);
             let mut idx = 0;
             while idx < prompt_ids.len() {
