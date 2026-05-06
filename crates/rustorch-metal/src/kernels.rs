@@ -15744,6 +15744,217 @@ mod tests {
         );
     }
 
+    /// T174 Day 2 — `mul_mm_id_q4_k_f32` parity at 35B-A3B-realistic K.
+    ///
+    /// Companion to `mul_mm_id_q4_k_f32_matches_naive` with K=2048 (Qwen3.6
+    /// 35B-A3B hidden_dim) instead of K=512. Past Q4_K kernel ports had a
+    /// precision gotcha where K=512 looked fine but rel err ballooned at
+    /// real K (half SHM accumulation drift). This test guards that frontier:
+    /// the half MMA accumulator is in `simdgroup_matrix<float, 8, 8>` (mc[i]),
+    /// so accumulation precision should hold, but the SHM tiles are halves
+    /// — any drift would surface as K grows.
+    ///
+    /// Shape: B=32, n_used=8, E=4, K=2048, N=64, M_max=256. Tolerance 4e-2
+    /// — natural drift for half SHM tiles accumulating over 2048 K-positions
+    /// (vs 1e-2 at K=512 in the lcpp_ported test, scaling ~ sqrt(K_ratio)).
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn mul_mm_id_q4_k_f32_matches_naive_realistic_k() {
+        use rustorch_gguf::dequant::dequant_q4_k;
+
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[mul_mm_id_q4_k_realistic] skipping: no Metal3");
+            return;
+        }
+
+        let b = 32_usize;
+        let n_used = 8_usize;
+        let n_experts = 4_usize;
+        let k = 2048_usize; // Qwen3.6 35B-A3B hidden
+        let n = 64_usize;
+        // map0 needs max_per_expert >= B*n_used = 256. Round up to 32-multiple.
+        // (At runtime, real callers can pass a tighter bound based on histogram
+        // analysis of routing, but for parity-correctness this safe ceiling is fine.)
+        let m_max = 256_usize;
+        let blocks_per_row = k / 256;
+
+        let w_bytes_per_expert = n * blocks_per_row * 144;
+        let w_total_bytes = n_experts * w_bytes_per_expert;
+        let mut w_bytes = vec![0u8; w_total_bytes];
+        for e in 0..n_experts {
+            for nrow in 0..n {
+                for ib in 0..blocks_per_row {
+                    let off = e * w_bytes_per_expert + (nrow * blocks_per_row + ib) * 144;
+                    let d_val = ((e as f32 + 1.0) * 0.001)
+                        + ((nrow as f32 + 1.0) * 0.0007)
+                        + (ib as f32) * 0.0003;
+                    let dmin_val =
+                        ((e as f32) * 0.0005) + ((nrow as f32) * 0.0003) + (ib as f32) * 0.0001;
+                    let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                    let dmin_h = half::f16::from_f32(dmin_val).to_le_bytes();
+                    w_bytes[off] = d_h[0];
+                    w_bytes[off + 1] = d_h[1];
+                    w_bytes[off + 2] = dmin_h[0];
+                    w_bytes[off + 3] = dmin_h[1];
+                    for i in 0..12 {
+                        w_bytes[off + 4 + i] = (0x0A_u8
+                            .wrapping_add((e as u8) ^ (nrow as u8) ^ (i as u8) ^ (ib as u8)))
+                            | 0x05;
+                    }
+                    for i in 0..128 {
+                        w_bytes[off + 16 + i] =
+                            ((e as u8) ^ (nrow as u8) ^ (i as u8) ^ (ib as u8)).wrapping_add(0x17);
+                    }
+                }
+            }
+        }
+
+        let mut w_f32 = vec![0.0_f32; n_experts * n * k];
+        for e in 0..n_experts {
+            for nrow in 0..n {
+                let row_off = e * w_bytes_per_expert + nrow * blocks_per_row * 144;
+                let row_bytes = &w_bytes[row_off..row_off + blocks_per_row * 144];
+                let row_dst = &mut w_f32[(e * n + nrow) * k..(e * n + nrow + 1) * k];
+                dequant_q4_k(row_bytes, row_dst).unwrap();
+            }
+        }
+
+        // Activations using `det_vec` (sin-based bounded magnitude). This
+        // matches the lcpp_ported test regime — analogous to post-RMSNorm
+        // activations in the Qwen3.6 forward pass where magnitudes are
+        // already bounded. Adversarial uniform-random activations would
+        // produce cancellation-driven near-zero references that amplify
+        // half-precision SHM round-off into 30%+ relative errors (a
+        // documented Q4_K kernel gotcha — see project notes).
+        let acts = det_vec(b * k, 1.5);
+
+        let b_n_used = b * n_used;
+        let indices: Vec<u32> = (0..b_n_used)
+            .map(|i| ((i as u32).wrapping_mul(0x9E3779B9) >> 22) % (n_experts as u32))
+            .collect();
+
+        let max_per_expert = m_max;
+        // Sanity: with E=4 and uniform routing, max(tpe) should be ~b_n_used/E=64.
+        // If by chance > 64 we cap (test would still pass on the valid prefix).
+
+        let mut tpe_ref = vec![0u32; n_experts];
+        let mut ids_ref = vec![0u32; n_experts * max_per_expert];
+        for (i, &id) in indices.iter().enumerate() {
+            let e = id as usize;
+            let pos = tpe_ref[e] as usize;
+            if pos < max_per_expert {
+                ids_ref[e * max_per_expert + pos] = i as u32;
+                tpe_ref[e] += 1;
+            }
+        }
+
+        let mut dst_ref = vec![0.0_f32; n_experts * m_max * n];
+        for (e, &tpe_e) in tpe_ref.iter().enumerate() {
+            for m_idx in 0..(tpe_e as usize) {
+                let token_slot_id = ids_ref[e * max_per_expert + m_idx] as usize;
+                let b_idx = token_slot_id / n_used;
+                for nn in 0..n {
+                    let mut s = 0.0_f32;
+                    for kk in 0..k {
+                        s += acts[b_idx * k + kk] * w_f32[(e * n + nn) * k + kk];
+                    }
+                    dst_ref[(e * m_max + m_idx) * n + nn] = s;
+                }
+            }
+        }
+
+        let acts_buf = backend.alloc_shared(b * k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_total_bytes).unwrap();
+        let indices_buf = backend.alloc_shared(b_n_used * 4).unwrap();
+        let tpe_buf = backend.alloc_shared(n_experts * 4).unwrap();
+        let ids_buf = backend
+            .alloc_shared(n_experts * max_per_expert * 4)
+            .unwrap();
+        let dst_buf = backend.alloc_shared(n_experts * m_max * n * 4).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(acts.as_ptr(), acts_buf.contents() as *mut f32, b * k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_total_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                indices.as_ptr(),
+                indices_buf.contents() as *mut u32,
+                b_n_used,
+            );
+            std::ptr::write_bytes(tpe_buf.contents() as *mut u8, 0, n_experts * 4);
+            std::ptr::write_bytes(
+                ids_buf.contents() as *mut u8,
+                0,
+                n_experts * max_per_expert * 4,
+            );
+            std::ptr::write_bytes(dst_buf.contents() as *mut u8, 0, n_experts * m_max * n * 4);
+        }
+
+        mul_mm_id_map0_into(
+            backend,
+            &indices_buf,
+            &tpe_buf,
+            &ids_buf,
+            b,
+            n_used,
+            n_experts,
+            max_per_expert,
+        )
+        .unwrap();
+        mul_mm_id_q4_k_f32_into(
+            backend, &acts_buf, &w_buf, &ids_buf, &tpe_buf, &dst_buf, n_experts, m_max, n, k,
+            n_used,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut dst_got = vec![0.0_f32; n_experts * m_max * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                dst_buf.contents() as *const f32,
+                dst_got.as_mut_ptr(),
+                n_experts * m_max * n,
+            );
+        }
+
+        let mut max_rel: f32 = 0.0;
+        let mut max_abs: f32 = 0.0;
+        for (e, &tpe_e) in tpe_ref.iter().enumerate() {
+            for m_idx in 0..(tpe_e as usize) {
+                for nn in 0..n {
+                    let idx = (e * m_max + m_idx) * n + nn;
+                    let r = dst_ref[idx];
+                    let g = dst_got[idx];
+                    let abs_err = (r - g).abs();
+                    let denom = r.abs().max(1e-3);
+                    let rel = abs_err / denom;
+                    if rel > max_rel {
+                        max_rel = rel;
+                    }
+                    if abs_err > max_abs {
+                        max_abs = abs_err;
+                    }
+                    assert!(
+                        rel < 4e-2,
+                        "mul_mm_id_q4_k (K={k}) mismatch e={e} m={m_idx} n={nn}: ref={r} got={g} (rel {:.3e})",
+                        rel
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[mul_mm_id_q4_k realistic K={k}] {} active tokens × {} cols, max_rel={:.3e} max_abs={:.3e}",
+            tpe_ref.iter().sum::<u32>(),
+            n,
+            max_rel,
+            max_abs
+        );
+    }
+
     /// T168 — Q4_K gather sgemv with qmv_fast pattern vs T152 lcpp_nsg2 reference.
     /// Verifies bit-near-perfect output equivalence (same math, different
     /// thread layout). Tolerance 1e-3 for f32 round-off.
