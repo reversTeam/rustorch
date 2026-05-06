@@ -60,8 +60,9 @@ use rustorch_metal::kernels::{
     sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
     sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
     sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
-    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
-    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_f32, zero_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
+    swiglu_batched_f32, swiglu_f32, topk_softmax_norm_f32, weighted_add_inplace_f32,
+    weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -1061,6 +1062,82 @@ fn attn_block_forward_batch(
     // 10. W_O batched matmul → o, then xd += o (batched).
     dispatch_batched_attn_matmul(backend, &attn.w_o, b, &scratch.attn_out, &scratch.o)?;
     add_inplace_batched_f32(backend, xd_batched, &scratch.o, d, b)?;
+    Ok(())
+}
+
+/// T162 phase 9c — Per-FFN-block batched scratch buffers (B_MAX-sized).
+/// Used by `ffn_dense_forward_batch` for the dense FFN path (gate/up/down +
+/// SwiGLU + residual). MoE FFN handled separately in phase 9f.
+struct BatchScratchFfn {
+    h_post: Buffer, // [B_MAX, d] — post-norm residual input
+    gate: Buffer,   // [B_MAX, f]
+    up: Buffer,     // [B_MAX, f]
+    fd: Buffer,     // [B_MAX, f] — post-SwiGLU
+    fc2: Buffer,    // [B_MAX, d] — post-down output
+}
+
+impl BatchScratchFfn {
+    fn new(backend: &MetalBackend, cfg: &Qwen35Config) -> Self {
+        let d = cfg.d;
+        let f = cfg.f.max(1);
+        let b = B_MAX_BATCH;
+        let alloc = |bytes: usize| backend.alloc_shared(bytes.max(4)).unwrap();
+        Self {
+            h_post: alloc(b * d * 4),
+            gate: alloc(b * f * 4),
+            up: alloc(b * f * 4),
+            fd: alloc(b * f * 4),
+            fc2: alloc(b * d * 4),
+        }
+    }
+}
+
+/// T162 phase 9c — Batched dense FFN forward.
+///
+/// Equivalent to B sequential `ffn_dense_forward(FfnLayerMetal::Dense)` calls
+/// but uses batched primitives (rms_norm_batched, dispatch_batched_attn_matmul,
+/// swiglu_batched, add_inplace_batched).
+///
+/// Pré-conditions :
+///   - `xd_batched` : `[B, d]` row-major (in/out — résidu cumulé sur place)
+///   - `1 ≤ b ≤ B_MAX_BATCH`
+///   - FFN doit être de la variante `Dense` (caller doit checker).
+///
+/// Status : non wiré — foundation pour phase 9d.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn ffn_dense_forward_batch(
+    backend: &MetalBackend,
+    ffn_norm: &Buffer,
+    w_gate: &HybridMetalWeight,
+    w_up: &HybridMetalWeight,
+    w_down: &HybridMetalWeight,
+    xd_batched: &Buffer,
+    scratch: &BatchScratchFfn,
+    cfg: &Qwen35Config,
+    b: usize,
+) -> Result<(), MetalError> {
+    if b == 0 || b > B_MAX_BATCH {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ffn_dense_forward_batch: B must be in 1..={B_MAX_BATCH} (got {b})"
+        )));
+    }
+    let d = cfg.d;
+    let f = cfg.f;
+    let eps = cfg.rms_eps;
+
+    // 1. Batched FFN norm (xd → h_post).
+    rms_norm_batched_f32(backend, xd_batched, ffn_norm, &scratch.h_post, d, b, eps)?;
+
+    // 2. Batched gate + up matmul.
+    dispatch_batched_attn_matmul(backend, w_gate, b, &scratch.h_post, &scratch.gate)?;
+    dispatch_batched_attn_matmul(backend, w_up, b, &scratch.h_post, &scratch.up)?;
+
+    // 3. Batched SwiGLU : fd[bi, i] = silu(gate[bi, i]) * up[bi, i].
+    swiglu_batched_f32(backend, &scratch.gate, &scratch.up, &scratch.fd, f, b)?;
+
+    // 4. Batched down + residual.
+    dispatch_batched_attn_matmul(backend, w_down, b, &scratch.fd, &scratch.fc2)?;
+    add_inplace_batched_f32(backend, xd_batched, &scratch.fc2, d, b)?;
     Ok(())
 }
 
@@ -2502,7 +2579,10 @@ fn parity_attn_batch_on_loaded_weights(
     cfg: &Qwen35Config,
     model: &Qwen35MetalModel,
 ) -> Result<(), String> {
-    // Sélection : 1ère layer Attn du modèle (variant Qwen3.5/3.6 = has_q_gate).
+    // Sélection : 1ère layer Attn du modèle. FFN dense optionnel : si trouvé
+    // on teste aussi ffn_dense_forward_batch (phase 9c) end-to-end ; sinon
+    // (35B-A3B = MoE-only) on teste juste attn_block_forward_batch (phase 9b)
+    // — le MoE batched arrive en phase 9f.
     let attn = model
         .layers
         .iter()
@@ -2511,6 +2591,19 @@ fn parity_attn_batch_on_loaded_weights(
             _ => None,
         })
         .ok_or("no Attn layer found")?;
+    let ffn_dense: Option<(&HybridMetalWeight, &HybridMetalWeight, &HybridMetalWeight)> =
+        model.layers.iter().find_map(|l| match l {
+            LayerMetal::Attn {
+                ffn:
+                    FfnLayerMetal::Dense {
+                        w_gate,
+                        w_up,
+                        w_down,
+                    },
+                ..
+            } => Some((w_gate, w_up, w_down)),
+            _ => None,
+        });
 
     let d = cfg.d;
     let head_dim = cfg.attn_head_dim;
@@ -2522,7 +2615,12 @@ fn parity_attn_batch_on_loaded_weights(
                      // production — phase 9d utilisera B ≥ 32 systématiquement.
     let pos_base = 0_usize;
 
-    println!("=== T162 phase 9b — Parity attn_block_forward_batch (B={b}) ===");
+    let phase_label = if ffn_dense.is_some() {
+        "phase 9b+9c (attn + FFN dense)"
+    } else {
+        "phase 9b only (no Attn+Dense — MoE-only model)"
+    };
+    println!("=== T162 {phase_label} — Parity batched (B={b}) ===");
     println!(
         "  d={d} head_dim={head_dim} n_q={} n_kv={n_kv} rope_dim={}",
         cfg.n_q_heads, cfg.rope_dim
@@ -2599,8 +2697,38 @@ fn parity_attn_batch_on_loaded_weights(
             max_seq,
         )
         .map_err(|e| format!("seq[{bi}] forward: {e:?}"))?;
+        // Post-attn norm + FFN dense (only if model has Attn+Dense layer).
+        if let Some((w_gate, w_up, w_down)) = ffn_dense {
+            rms_norm_f32(
+                backend,
+                &scratch_seq.xd,
+                &attn.attn_post_norm,
+                &scratch_seq.h,
+                d,
+                cfg.rms_eps,
+            )
+            .map_err(|e| format!("seq[{bi}] post-norm: {e:?}"))?;
+            w_gate
+                .matmul_into(backend, &scratch_seq.h, &scratch_seq.gate_ffn)
+                .map_err(|e| format!("seq[{bi}] gate: {e:?}"))?;
+            w_up.matmul_into(backend, &scratch_seq.h, &scratch_seq.up_ffn)
+                .map_err(|e| format!("seq[{bi}] up: {e:?}"))?;
+            swiglu_f32(
+                backend,
+                &scratch_seq.gate_ffn,
+                &scratch_seq.up_ffn,
+                &scratch_seq.fd_ffn,
+                cfg.f,
+            )
+            .map_err(|e| format!("seq[{bi}] swiglu: {e:?}"))?;
+            w_down
+                .matmul_into(backend, &scratch_seq.fd_ffn, &scratch_seq.fc2)
+                .map_err(|e| format!("seq[{bi}] down: {e:?}"))?;
+            add_inplace_f32(backend, &scratch_seq.xd, &scratch_seq.fc2, d)
+                .map_err(|e| format!("seq[{bi}] residual: {e:?}"))?;
+        }
         backend.drain();
-        // Read back xd post-attention.
+        // Read back xd post-FFN.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 scratch_seq.xd.contents() as *const f32,
@@ -2639,7 +2767,23 @@ fn parity_attn_batch_on_loaded_weights(
         b,
         max_seq,
     )
-    .map_err(|e| format!("batched forward: {e:?}"))?;
+    .map_err(|e| format!("batched attn forward: {e:?}"))?;
+    // Phase 9c — batched FFN dense (post-attn norm + gate/up/swiglu/down + residual).
+    if let Some((w_gate, w_up, w_down)) = ffn_dense {
+        let scratch_ffn = BatchScratchFfn::new(backend, cfg);
+        ffn_dense_forward_batch(
+            backend,
+            &attn.attn_post_norm,
+            w_gate,
+            w_up,
+            w_down,
+            &xd_bat_buf,
+            &scratch_ffn,
+            cfg,
+            b,
+        )
+        .map_err(|e| format!("batched ffn forward: {e:?}"))?;
+    }
     backend.drain();
 
     let mut xd_bat = vec![0.0_f32; b * d];
