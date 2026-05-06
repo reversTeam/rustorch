@@ -15647,6 +15647,96 @@ pub fn zero_f32(backend: &MetalBackend, buf: &Buffer, n: usize) -> Result<(), Me
     Ok(())
 }
 
+// T176 — Batched argmax over [B, vocab] f32 logits → [B] u32 indices.
+// One TG per row b, simdgroup-cooperative max reduction over vocab.
+// Avoids the ~1.2 M CPU comparisons per speculative round on logits.
+const ARGMAX_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint TG_SIZE = 256u;
+
+kernel void argmax_batched_f32(
+    device const float*  logits     [[buffer(0)]],   // [B, vocab]
+    device       uint*   indices    [[buffer(1)]],   // [B]
+    constant     uint2&  dims       [[buffer(2)]],   // (B, vocab)
+    threadgroup  float*  shm_val    [[threadgroup(0)]],
+    threadgroup  uint*   shm_idx    [[threadgroup(1)]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    ushort               tiitg      [[thread_index_in_threadgroup]]
+) {
+    uint B = dims.x;
+    uint vocab = dims.y;
+    if (tg_id >= B) return;
+
+    uint base = tg_id * vocab;
+    float local_max = -INFINITY;
+    uint local_idx = 0u;
+    for (uint i = (uint)tiitg; i < vocab; i += TG_SIZE) {
+        float v = logits[base + i];
+        if (v > local_max) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+
+    shm_val[tiitg] = local_max;
+    shm_idx[tiitg] = local_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // TG-wide reduction (256 → 1).
+    for (uint stride = TG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if ((uint)tiitg < stride) {
+            float v_a = shm_val[tiitg];
+            float v_b = shm_val[tiitg + stride];
+            if (v_b > v_a) {
+                shm_val[tiitg] = v_b;
+                shm_idx[tiitg] = shm_idx[tiitg + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tiitg == 0) {
+        indices[tg_id] = shm_idx[0];
+    }
+}
+"#;
+
+/// T176 — Batched argmax over [B, vocab] logits. Used by speculative decoding
+/// to extract one predicted token per row in 1 GPU dispatch (vs CPU loop ~5 ms).
+pub fn argmax_batched_f32(
+    backend: &MetalBackend,
+    logits_buf: &Buffer,
+    indices_buf: &Buffer,
+    b: usize,
+    vocab: usize,
+) -> Result<(), MetalError> {
+    if b == 0 || vocab == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "argmax_batched_f32: B={b}, vocab={vocab}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "argmax_batched_f32",
+        ARGMAX_BATCHED_F32_SHADER,
+        "argmax_batched_f32",
+    )?;
+    let dims = [b as u32, vocab as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(logits_buf), 0);
+        encoder.set_buffer(1, Some(indices_buf), 0);
+        encoder.set_bytes(2, 8, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_threadgroup_memory_length(0, 256 * 4); // shm_val
+        encoder.set_threadgroup_memory_length(1, 256 * 4); // shm_idx
+        let tg_size = MTLSize::new(256, 1, 1);
+        let groups = MTLSize::new(b as u64, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T144c — Fused `out *= sigmoid(gate)` in place. Used by Qwen3Next
 // attention to apply the per-head gate to the post-GQA output before the
 // W_O projection. Eliminates one drain + CPU pass per attention layer
