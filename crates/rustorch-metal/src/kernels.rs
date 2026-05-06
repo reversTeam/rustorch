@@ -13056,6 +13056,7 @@ kernel void mul_mm_id_map0(
     device const uint*  indices,    // [B, n_used] expert ids per (token, slot)
     device       uint*  tpe,        // [E] : token-per-expert count
     device       uint*  ids,        // [E, max_per_expert] : sorted (b*n_used+slot) values
+    device       uint*  pos,        // [B*n_used] : inverse map, pos[i] = m position of route i in expert e
     constant uint4&     dims,       // (B, n_used, n_experts, max_per_expert)
     ushort              tpitg [[thread_position_in_threadgroup]]
 ) {
@@ -13073,10 +13074,18 @@ kernel void mul_mm_id_map0(
     // Linear scan : O(B × n_used) per expert thread.
     // For Qwen3.6 35B-A3B B=128 n_used=8 = 1024 reads/thread × 256 threads
     // = 256K reads parallel. Trivially fast (~5 µs).
+    //
+    // Two outputs per match:
+    //   ids[e * max_per_expert + count] = i   (token-slot index)
+    //   pos[i]                          = count (position-in-expert)
+    // The pos table lets the scatter kernel be conflict-free: each (b, slot)
+    // contributes to exactly one (e, m) position in down_out, so a single
+    // TG-per-token can read its n_used contributions without atomics.
     for (uint i = 0; i < b_n_used; ++i) {
         uint id = indices[i];
         if (id == expert && count < max_per_expert) {
-            my_ids[count] = i;  // i = b * n_used + slot, encodes both token & slot
+            my_ids[count] = i;
+            pos[i] = count;
             count++;
         }
     }
@@ -13086,21 +13095,25 @@ kernel void mul_mm_id_map0(
 
 /// T174 — Sort tokens by expert (Stage 1 of M-major MoE pipeline).
 ///
-/// Port of llama.cpp's `kernel_mul_mm_id_map0`. Takes routing indices and
-/// produces (tpe[E], ids[E, max_per_expert]) suitable for per-expert SGEMM.
+/// Port of llama.cpp's `kernel_mul_mm_id_map0`, extended to also output an
+/// inverse position table `pos[i] = m` (where token-slot `i = b*n_used+slot`
+/// lands at position `m` in expert e's `ids` list). The pos table allows
+/// a conflict-free scatter (one TG per token b reads its n_used contributions).
 ///
 /// Pre-conditions :
 /// - `indices_buf` shape [B, n_used] u32
 /// - `tpe_buf` shape [E] u32 (output)
 /// - `ids_buf` shape [E, max_per_expert] u32 (output)
+/// - `pos_buf` shape [B * n_used] u32 (output)
 /// - `n_experts <= 1024` (Metal TG size limit)
-/// - `max_per_expert >= B * n_used` (worst case: all routes to same expert)
-///   In practice, callers can pass `B * n_used` for a safe upper bound.
+/// - `max_per_expert >= B` (top-K routing distinct experts per token)
+#[allow(clippy::too_many_arguments)]
 pub fn mul_mm_id_map0_into(
     backend: &MetalBackend,
     indices_buf: &Buffer,
     tpe_buf: &Buffer,
     ids_buf: &Buffer,
+    pos_buf: &Buffer,
     b: usize,
     n_used: usize,
     n_experts: usize,
@@ -13132,7 +13145,8 @@ pub fn mul_mm_id_map0_into(
         encoder.set_buffer(0, Some(indices_buf), 0);
         encoder.set_buffer(1, Some(tpe_buf), 0);
         encoder.set_buffer(2, Some(ids_buf), 0);
-        encoder.set_bytes(3, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_buffer(3, Some(pos_buf), 0);
+        encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
         // 1 TG with n_experts threads (round up to nearest 32 for SIMD efficiency).
         let tg_threads = n_experts.div_ceil(32) * 32;
         let tg_size = MTLSize::new(tg_threads as u64, 1, 1);
@@ -13438,6 +13452,124 @@ pub fn mul_mm_id_q4_k_f32_into(
         let n_tg_y = (m_max / 32) as u64;
         let n_tg_z = n_experts as u64;
         let groups = MTLSize::new(n_tg_x, n_tg_y, n_tg_z);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// T174 Day 4 — Scatter per-expert MoE outputs back to moe_acc[B, K] weighted.
+//
+// Stage 3 of the M-major MoE pipeline. Folds `down_out[E, M_max, K]` (the
+// per-expert SGEMM output from `mul_mm_id_q4_k_f32`) back into the standard
+// dense `moe_acc[B, K]` layout, weighted by routing weights.
+//
+// Conflict-free design: one TG per token b. Each TG reads its n_used
+// contributions via the `pos[]` inverse table from map0 (no atomics needed).
+// Per token b:
+//   for k in tiitg..K stride TG_SIZE:
+//     sum = 0
+//     for slot in 0..n_used:
+//       e = topk_idx[b, slot]
+//       m = pos[b * n_used + slot]
+//       w = topk_w[b, slot]
+//       sum += w * down_out[e, m, k]
+//     moe_acc[b, k] = sum  // overwrites — caller initializes moe_acc to 0
+//
+// One memory pass over down_out (each entry read exactly once from the
+// 1 TG that owns its target token). DRAM-bound at ~B × n_used × K f32 reads
+// + B × K f32 writes.
+const SCATTER_MOE_ACC_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint TG_SIZE = 256u;
+
+kernel void scatter_moe_acc_f32(
+    device const float*  down_out  [[buffer(0)]],   // [E, M_max, K]
+    device const uint*   topk_idx  [[buffer(1)]],   // [B, n_used]
+    device const float*  topk_w    [[buffer(2)]],   // [B, n_used]
+    device const uint*   pos       [[buffer(3)]],   // [B*n_used]
+    device       float*  moe_acc   [[buffer(4)]],   // [B, K] (output)
+    constant uint4&      dims      [[buffer(5)]],   // (B, n_used, M_max, K)
+    uint                 tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiitg     [[thread_index_in_threadgroup]]
+) {
+    uint B = dims.x;
+    uint n_used = dims.y;
+    uint M_max = dims.z;
+    uint K = dims.w;
+
+    uint b = tg_id;
+    if (b >= B) return;
+
+    // Per-token routing tables (read once per TG).
+    // We can't trivially share via threadgroup memory because n_used is small
+    // (~8) — each thread just re-reads its slots from device memory. Each
+    // thread does n_used reads × K/TG_SIZE iterations, fully cached after
+    // first iter.
+    for (uint k = (uint)tiitg; k < K; k += TG_SIZE) {
+        float sum = 0.0;
+        for (uint s = 0; s < n_used; ++s) {
+            uint route_id = b * n_used + s;
+            uint e = topk_idx[route_id];
+            uint m = pos[route_id];
+            float w = topk_w[route_id];
+            // down_out layout: [E, M_max, K] row-major flat.
+            uint64_t off = (uint64_t)e * (uint64_t)M_max * (uint64_t)K
+                         + (uint64_t)m * (uint64_t)K
+                         + (uint64_t)k;
+            sum += w * down_out[off];
+        }
+        moe_acc[(uint64_t)b * (uint64_t)K + (uint64_t)k] = sum;
+    }
+}
+"#;
+
+/// T174 Day 4 — Scatter per-expert MoE outputs back to `moe_acc[B, K]`.
+///
+/// Stage 3 of the M-major MoE pipeline. See `SCATTER_MOE_ACC_F32_SHADER`
+/// docs for the algorithm.
+///
+/// Pre-conditions :
+/// - `down_out_buf` shape [E, M_max, K] f32 (output of `mul_mm_id_q4_k_f32`)
+/// - `topk_idx_buf` shape [B, n_used] u32 (raw routing indices)
+/// - `topk_w_buf`   shape [B, n_used] f32 (raw routing weights, normalized)
+/// - `pos_buf`      shape [B*n_used] u32 (output of `mul_mm_id_map0_into`)
+/// - `moe_acc_buf`  shape [B, K] f32 (output, fully written each call)
+#[allow(clippy::too_many_arguments)]
+pub fn scatter_moe_acc_f32_into(
+    backend: &MetalBackend,
+    down_out_buf: &Buffer,
+    topk_idx_buf: &Buffer,
+    topk_w_buf: &Buffer,
+    pos_buf: &Buffer,
+    moe_acc_buf: &Buffer,
+    b: usize,
+    n_used: usize,
+    m_max: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    if b == 0 || n_used == 0 || m_max == 0 || k == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "scatter_moe_acc_f32: all of B, n_used, M_max, K must be > 0 (got B={b}, n_used={n_used}, M_max={m_max}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "scatter_moe_acc_f32",
+        SCATTER_MOE_ACC_F32_SHADER,
+        "scatter_moe_acc_f32",
+    )?;
+    let dims = [b as u32, n_used as u32, m_max as u32, k as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(down_out_buf), 0);
+        encoder.set_buffer(1, Some(topk_idx_buf), 0);
+        encoder.set_buffer(2, Some(topk_w_buf), 0);
+        encoder.set_buffer(3, Some(pos_buf), 0);
+        encoder.set_buffer(4, Some(moe_acc_buf), 0);
+        encoder.set_bytes(5, 16, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(256, 1, 1);
+        let groups = MTLSize::new(b as u64, 1, 1);
         encoder.dispatch_thread_groups(groups, tg_size);
     });
     Ok(())
@@ -15464,6 +15596,7 @@ mod tests {
         let ids_buf = backend
             .alloc_shared(n_experts * max_per_expert * 4)
             .unwrap();
+        let pos_buf = backend.alloc_shared(b_n_used * 4).unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(
                 indices.as_ptr(),
@@ -15477,6 +15610,7 @@ mod tests {
                 0,
                 n_experts * max_per_expert * 4,
             );
+            std::ptr::write_bytes(pos_buf.contents() as *mut u8, 0xFF, b_n_used * 4);
         }
 
         mul_mm_id_map0_into(
@@ -15484,6 +15618,7 @@ mod tests {
             &indices_buf,
             &tpe_buf,
             &ids_buf,
+            &pos_buf,
             b,
             n_used,
             n_experts,
@@ -15530,6 +15665,31 @@ mod tests {
         // Sanity: total tokens routed = B × n_used.
         let total_routed: u32 = tpe_got.iter().sum();
         assert_eq!(total_routed, b_n_used as u32);
+
+        // Verify pos[] inverse table: for each i in [0, B*n_used), the GPU
+        // wrote pos[i] = m where ids[e][m] = i. Reconstruct the CPU expectation.
+        let mut pos_ref = vec![u32::MAX; b_n_used];
+        let mut counts = vec![0u32; n_experts];
+        for (i, &id) in indices.iter().enumerate() {
+            let e = id as usize;
+            pos_ref[i] = counts[e];
+            counts[e] += 1;
+        }
+        let mut pos_got = vec![0u32; b_n_used];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                pos_buf.contents() as *const u32,
+                pos_got.as_mut_ptr(),
+                b_n_used,
+            );
+        }
+        for i in 0..b_n_used {
+            assert_eq!(
+                pos_got[i], pos_ref[i],
+                "pos mismatch at i={i}: got {} expected {}",
+                pos_got[i], pos_ref[i]
+            );
+        }
     }
 
     /// T174 Day 2 — `mul_mm_id_q4_k_f32` parity vs CPU reference.
@@ -15664,6 +15824,7 @@ mod tests {
             .alloc_shared(n_experts * max_per_expert * 4)
             .unwrap();
         let dst_buf = backend.alloc_shared(n_experts * m_max * n * 4).unwrap();
+        let pos_buf = backend.alloc_shared(b_n_used * 4).unwrap();
 
         unsafe {
             std::ptr::copy_nonoverlapping(acts.as_ptr(), acts_buf.contents() as *mut f32, b * k);
@@ -15684,6 +15845,7 @@ mod tests {
                 n_experts * max_per_expert * 4,
             );
             std::ptr::write_bytes(dst_buf.contents() as *mut u8, 0, n_experts * m_max * n * 4);
+            std::ptr::write_bytes(pos_buf.contents() as *mut u8, 0xFF, b_n_used * 4);
         }
 
         // Stage 1: map0.
@@ -15692,6 +15854,7 @@ mod tests {
             &indices_buf,
             &tpe_buf,
             &ids_buf,
+            &pos_buf,
             b,
             n_used,
             n_experts,
@@ -15875,6 +16038,7 @@ mod tests {
             .alloc_shared(n_experts * max_per_expert * 4)
             .unwrap();
         let dst_buf = backend.alloc_shared(n_experts * m_max * n * 4).unwrap();
+        let pos_buf = backend.alloc_shared(b_n_used * 4).unwrap();
 
         unsafe {
             std::ptr::copy_nonoverlapping(acts.as_ptr(), acts_buf.contents() as *mut f32, b * k);
@@ -15895,6 +16059,7 @@ mod tests {
                 n_experts * max_per_expert * 4,
             );
             std::ptr::write_bytes(dst_buf.contents() as *mut u8, 0, n_experts * m_max * n * 4);
+            std::ptr::write_bytes(pos_buf.contents() as *mut u8, 0xFF, b_n_used * 4);
         }
 
         mul_mm_id_map0_into(
@@ -15902,6 +16067,7 @@ mod tests {
             &indices_buf,
             &tpe_buf,
             &ids_buf,
+            &pos_buf,
             b,
             n_used,
             n_experts,
@@ -15955,6 +16121,202 @@ mod tests {
             n,
             max_rel,
             max_abs
+        );
+    }
+
+    /// T174 Day 4 — `scatter_moe_acc_f32` parity vs CPU reference.
+    ///
+    /// Validates Stage 3 (scatter) independently of Stage 1+2: synthesizes
+    /// fake `down_out[E, M_max, K]` with deterministic values, runs map0 to
+    /// build ids/tpe/pos, then runs scatter and compares moe_acc[B, K] to
+    /// a direct CPU sum:
+    ///
+    /// ```text
+    /// for b in 0..B:
+    ///   for k in 0..K:
+    ///     sum = 0
+    ///     for slot in 0..n_used:
+    ///       e = topk_idx[b, slot]
+    ///       m = pos[b * n_used + slot]
+    ///       w = topk_w[b, slot]
+    ///       sum += w * down_out[e, m, k]
+    ///     moe_acc[b, k] = sum
+    /// ```
+    ///
+    /// Top-K routing is generated with distinct experts per token (the GPU
+    /// scatter assumes this for the conflict-free design). Tolerance 5e-5
+    /// — pure f32 path, only summation-order round-off.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn scatter_moe_acc_f32_matches_naive() {
+        let backend = metal_backend();
+
+        // Realistic 35B-A3B-style shape: B=32 tokens, n_used=8, E=16, K=512.
+        // (Smaller E than 35B-A3B's 256 to keep test fast; algorithm is
+        // independent of E.)
+        let b = 32_usize;
+        let n_used = 8_usize;
+        let n_experts = 16_usize;
+        let k = 512_usize;
+        let max_per_expert = b; // top-K ⇒ each expert ≤ B times
+        let m_max = b.next_multiple_of(32).max(32);
+        let b_n_used = b * n_used;
+
+        // Generate distinct top-K experts per token (Fisher-Yates-like).
+        // For each b, pick `n_used` distinct experts in [0, E).
+        let mut topk_idx = vec![0u32; b_n_used];
+        let mut topk_w = vec![0.0_f32; b_n_used];
+        for b_idx in 0..b {
+            let mut pool: Vec<u32> = (0..n_experts as u32).collect();
+            // Deterministic shuffle.
+            for i in (1..pool.len()).rev() {
+                let h = ((b_idx as u64) * 31 + i as u64).wrapping_mul(2654435761);
+                let j = (h % (i as u64 + 1)) as usize;
+                pool.swap(i, j);
+            }
+            let mut wsum = 0.0_f32;
+            for s in 0..n_used {
+                topk_idx[b_idx * n_used + s] = pool[s];
+                let w = ((b_idx * n_used + s + 1) as f32 * 0.13).sin().abs() + 0.1;
+                topk_w[b_idx * n_used + s] = w;
+                wsum += w;
+            }
+            // Normalize weights so each token's sum = 1 (mimics softmax-norm).
+            for s in 0..n_used {
+                topk_w[b_idx * n_used + s] /= wsum;
+            }
+        }
+
+        // Synthesize down_out[E, M_max, K] with bounded magnitude.
+        // Only positions m < tpe[e] will be read by scatter; we still fill
+        // the whole buffer with deterministic values to ensure the test
+        // catches any off-by-one bug.
+        let down_out: Vec<f32> = (0..(n_experts * m_max * k))
+            .map(|i| ((i as f32 + 1.0) * 0.0007).sin())
+            .collect();
+
+        // === CPU reference: map0 + scatter ===
+        let mut tpe_ref = vec![0u32; n_experts];
+        let mut pos_ref = vec![u32::MAX; b_n_used];
+        for (i, &e) in topk_idx.iter().enumerate() {
+            let count = tpe_ref[e as usize];
+            pos_ref[i] = count;
+            tpe_ref[e as usize] = count + 1;
+        }
+        let mut moe_acc_ref = vec![0.0_f32; b * k];
+        for b_idx in 0..b {
+            for k_idx in 0..k {
+                let mut sum = 0.0_f32;
+                for s in 0..n_used {
+                    let route_id = b_idx * n_used + s;
+                    let e = topk_idx[route_id] as usize;
+                    let m = pos_ref[route_id] as usize;
+                    let w = topk_w[route_id];
+                    sum += w * down_out[(e * m_max + m) * k + k_idx];
+                }
+                moe_acc_ref[b_idx * k + k_idx] = sum;
+            }
+        }
+
+        // === GPU run ===
+        let down_out_buf = backend.alloc_shared(n_experts * m_max * k * 4).unwrap();
+        let topk_idx_buf = backend.alloc_shared(b_n_used * 4).unwrap();
+        let topk_w_buf = backend.alloc_shared(b_n_used * 4).unwrap();
+        let tpe_buf = backend.alloc_shared(n_experts * 4).unwrap();
+        let ids_buf = backend
+            .alloc_shared(n_experts * max_per_expert * 4)
+            .unwrap();
+        let pos_buf = backend.alloc_shared(b_n_used * 4).unwrap();
+        let moe_acc_buf = backend.alloc_shared(b * k * 4).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                down_out.as_ptr(),
+                down_out_buf.contents() as *mut f32,
+                n_experts * m_max * k,
+            );
+            std::ptr::copy_nonoverlapping(
+                topk_idx.as_ptr(),
+                topk_idx_buf.contents() as *mut u32,
+                b_n_used,
+            );
+            std::ptr::copy_nonoverlapping(
+                topk_w.as_ptr(),
+                topk_w_buf.contents() as *mut f32,
+                b_n_used,
+            );
+            std::ptr::write_bytes(tpe_buf.contents() as *mut u8, 0, n_experts * 4);
+            std::ptr::write_bytes(
+                ids_buf.contents() as *mut u8,
+                0,
+                n_experts * max_per_expert * 4,
+            );
+            std::ptr::write_bytes(pos_buf.contents() as *mut u8, 0xFF, b_n_used * 4);
+            std::ptr::write_bytes(moe_acc_buf.contents() as *mut u8, 0xAA, b * k * 4);
+        }
+
+        // Stage 1: map0 (produces ids/tpe/pos).
+        mul_mm_id_map0_into(
+            backend,
+            &topk_idx_buf,
+            &tpe_buf,
+            &ids_buf,
+            &pos_buf,
+            b,
+            n_used,
+            n_experts,
+            max_per_expert,
+        )
+        .unwrap();
+        // Stage 3: scatter (skip Stage 2 — feed synthetic down_out directly).
+        scatter_moe_acc_f32_into(
+            backend,
+            &down_out_buf,
+            &topk_idx_buf,
+            &topk_w_buf,
+            &pos_buf,
+            &moe_acc_buf,
+            b,
+            n_used,
+            m_max,
+            k,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut moe_acc_got = vec![0.0_f32; b * k];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                moe_acc_buf.contents() as *const f32,
+                moe_acc_got.as_mut_ptr(),
+                b * k,
+            );
+        }
+
+        let mut max_rel: f32 = 0.0;
+        let mut max_abs: f32 = 0.0;
+        for i in 0..(b * k) {
+            let r = moe_acc_ref[i];
+            let g = moe_acc_got[i];
+            let abs_err = (r - g).abs();
+            let denom = r.abs().max(1e-3);
+            let rel = abs_err / denom;
+            if rel > max_rel {
+                max_rel = rel;
+            }
+            if abs_err > max_abs {
+                max_abs = abs_err;
+            }
+            assert!(
+                rel < 5e-5,
+                "scatter mismatch at flat={i} (b={}, k={}): ref={r} got={g} (rel {:.3e})",
+                i / k,
+                i % k,
+                rel
+            );
+        }
+        eprintln!(
+            "[scatter_moe_acc] B={b} n_used={n_used} E={n_experts} K={k}: max_rel={max_rel:.3e} max_abs={max_abs:.3e}"
         );
     }
 
@@ -18724,10 +19086,10 @@ mod tests {
 
         eprintln!();
         eprintln!(
-            "{:>4} | {:>10} | {:>10} | {:>8} | {:>10} | {:>10}",
-            "B", "mm_id ms", "sgemv ms", "speedup", "mm_id GB/s", "sgemv GB/s"
+            "{:>4} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10} | {:>8}",
+            "B", "mm_id ms", "scatter ms", "FFN A ms", "sgemv ms", "FFN B ms", "speedup"
         );
-        eprintln!("{}", "-".repeat(70));
+        eprintln!("{}", "-".repeat(82));
 
         for &b in &[1_usize, 4, 16, 32, 64, 128] {
             let b_n_used = b * n_used;
@@ -18749,6 +19111,7 @@ mod tests {
             let tpe_buf = backend.alloc_shared(n_experts * 4).unwrap();
             let ids_buf = backend.alloc_shared(n_experts * m_max * 4).unwrap();
             let dst_buf = backend.alloc_shared(n_experts * m_max * n * 4).unwrap();
+            let pos_buf = backend.alloc_shared(b_n_used * 4).unwrap();
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     indices.as_ptr(),
@@ -18764,6 +19127,7 @@ mod tests {
                     &indices_buf,
                     &tpe_buf,
                     &ids_buf,
+                    &pos_buf,
                     b,
                     n_used,
                     n_experts,
@@ -18787,6 +19151,7 @@ mod tests {
                     &indices_buf,
                     &tpe_buf,
                     &ids_buf,
+                    &pos_buf,
                     b,
                     n_used,
                     n_experts,
@@ -18848,23 +19213,83 @@ mod tests {
             backend.drain();
             let sgemv_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters_b as f64;
 
-            // Effective DRAM bandwidth: each call reads N_active × N × (K/256) × 144 bytes.
-            // For Path A : ~ E × N × K_blocks × 144 worst case (every expert touched);
-            // realistic ~ E × N × K_blocks × 144 ≈ w_total_bytes (we always read all).
-            // For Path B : B × n_used × N × K_blocks × 144 (one expert per route).
-            let bytes_a = w_total_bytes as f64;
-            let bytes_b = (b_n_used * n * blocks_per_row * 144) as f64;
-            let gbs_a = bytes_a / (mm_id_ms / 1000.0) / 1e9;
-            let gbs_b = bytes_b / (sgemv_ms / 1000.0) / 1e9;
+            // Path A scatter timing — Stage 3 of the M-major pipeline.
+            // Uses down_out[E, M_max, K_hidden] f32 as input (realistic
+            // shape post down_proj) and moe_acc[B, K_hidden] as output.
+            // K_hidden = K = 2048 in 35B-A3B FFN.
+            let k_hidden = k; // post down_proj: same as input hidden_dim
+            let down_out_buf = backend
+                .alloc_shared(n_experts * m_max * k_hidden * 4)
+                .unwrap();
+            let topk_w_buf = backend.alloc_shared(b_n_used * 4).unwrap();
+            let moe_acc_buf = backend.alloc_shared(b * k_hidden * 4).unwrap();
+            unsafe {
+                std::ptr::write_bytes(
+                    down_out_buf.contents() as *mut u8,
+                    0x3F,
+                    n_experts * m_max * k_hidden * 4,
+                );
+                let w_vals: Vec<f32> = (0..b_n_used).map(|i| 1.0 / (i as f32 + 1.0)).collect();
+                std::ptr::copy_nonoverlapping(
+                    w_vals.as_ptr(),
+                    topk_w_buf.contents() as *mut f32,
+                    b_n_used,
+                );
+            }
+
+            // Warmup
+            for _ in 0..3 {
+                scatter_moe_acc_f32_into(
+                    backend,
+                    &down_out_buf,
+                    &indices_buf,
+                    &topk_w_buf,
+                    &pos_buf,
+                    &moe_acc_buf,
+                    b,
+                    n_used,
+                    m_max,
+                    k_hidden,
+                )
+                .unwrap();
+            }
+            backend.drain();
+            let iters_s = 30;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters_s {
+                scatter_moe_acc_f32_into(
+                    backend,
+                    &down_out_buf,
+                    &indices_buf,
+                    &topk_w_buf,
+                    &pos_buf,
+                    &moe_acc_buf,
+                    b,
+                    n_used,
+                    m_max,
+                    k_hidden,
+                )
+                .unwrap();
+            }
+            backend.drain();
+            let scatter_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters_s as f64;
+
+            // End-to-end time = mm_id (for one matmul: gate or up or down)
+            // + scatter (after down_proj). For a full FFN block we'd run
+            // mm_id × 3 + silu/elemwise + scatter × 1. The headline is
+            // (mm_id × 3 + scatter) vs (sgemv × 3) per FFN block.
+            let e2e_a = mm_id_ms * 3.0 + scatter_ms;
+            let e2e_b = sgemv_ms * 3.0;
 
             eprintln!(
-                "{:>4} | {:>9.3}  | {:>9.3}  | {:>7.2}× | {:>9.1}  | {:>9.1}",
+                "{:>4} | {:>9.3}  | {:>9.3}  | {:>9.3}  | {:>9.3}  | {:>9.3}  | {:>7.2}×",
                 b,
                 mm_id_ms,
+                scatter_ms,
+                e2e_a,
                 sgemv_ms,
-                sgemv_ms / mm_id_ms,
-                gbs_a,
-                gbs_b
+                e2e_b,
+                e2e_b / e2e_a
             );
         }
     }
