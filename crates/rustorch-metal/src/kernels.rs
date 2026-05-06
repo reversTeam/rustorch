@@ -2550,6 +2550,8 @@ kernel void sgemm_q4_k_f32_simdgroup_matrix(
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         // 3. 4 MMAs : BK=32 → 4 fragments de 8 le long de K.
+        // T162 phase 2-bis : unroll explicite (apprentissage de phase 3-bis).
+        #pragma clang loop unroll(full)
         for (ushort k_frag = 0; k_frag < 4u; ++k_frag) {
             simdgroup_load(A_frag, Xs + (uint)k_frag * 8u, BK);
             // B is W transposed : load with transpose=true. stride = BK
