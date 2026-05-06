@@ -12626,6 +12626,190 @@ pub fn topk_softmax_norm_batched_f32(
     Ok(())
 }
 
+// =============================================================================
+// T165 — Fused MoE routing : matmul (W_gate_inp @ h) + topk + softmax + renorm.
+//
+// Avant : 2 dispatches séparés (sgemv F32 puis topk_softmax_norm_f32). Le
+// sub-profil sur 35B-A3B mesure 241 µs/call cumulé pour ces 2 étapes — soit
+// 21% du ffn_moe et 8.8% du temps decode total. Sur 1440 calls/30 tokens =
+// 347 ms total dépensé en routing alors que la compute pure est <2 µs.
+//
+// Architecture du kernel fusé :
+// - 1 TG = 256 threads = 8 simdgroups, 1 dispatch unique.
+// - Phase A (matmul) : chaque simdgroup calcule N/8 = 32 logits en série.
+//     Per logit : 32 lanes coopèrent via simd_sum sur K_dim FMAs.
+// - threadgroup_barrier
+// - Phase B (topk + softmax + renorm) : identique à `topk_softmax_norm_f32`,
+//     1 thread par logit (lid < N), réductions inter-simdgroup.
+//
+// Pré-conditions :
+// - W_gate_inp : F32 [N, K_dim] row-major (output rows of input columns).
+// - n_experts (N) <= 256, k_top <= 16, K_dim libre (typique 2048 sur 35B-A3B).
+const ROUTING_TOPK_SOFTMAX_NORM_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MAX_N_EXPERTS = 256u;
+constant uint TG_SIZE = 256u;
+constant uint MAX_K_TOP = 16u;
+
+kernel void routing_topk_softmax_norm_f32(
+    device const float*  h          [[buffer(0)]], // [K_dim] activation
+    device const float*  w_gate_inp [[buffer(1)]], // [N, K_dim] row-major
+    device       uint*   out_idx    [[buffer(2)]], // [K_top]
+    device       float*  out_w      [[buffer(3)]], // [K_top]
+    constant uint3&      dims       [[buffer(4)]], // (K_dim, N, K_top)
+    uint                 lid        [[thread_position_in_threadgroup]],
+    uint                 lane       [[thread_index_in_simdgroup]],
+    uint                 sg_idx     [[simdgroup_index_in_threadgroup]]
+) {
+    uint K_dim = dims.x;
+    uint N     = dims.y;
+    uint K_top = dims.z;
+
+    threadgroup float s_buf[MAX_N_EXPERTS];
+    threadgroup float s_red[8];
+
+    // ===== Phase A : matmul logits = W @ h via simdgroup-cooperative dot =====
+    // 8 simdgroups, chaque sg traite ceil(N/8) logits sequentiellement.
+    uint n_per_sg = (N + 7u) / 8u;
+    for (uint i = 0; i < n_per_sg; ++i) {
+        uint n_idx = sg_idx * n_per_sg + i;
+        if (n_idx >= N) break;
+
+        uint base = n_idx * K_dim;
+        float partial = 0.0f;
+        for (uint k = lane; k < K_dim; k += 32u) {
+            partial += w_gate_inp[base + k] * h[k];
+        }
+        float logit = simd_sum(partial);
+        if (lane == 0u) {
+            s_buf[n_idx] = logit;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ===== Phase B : topk + softmax + renorm (identique à topk_softmax_norm_f32) =====
+    float v = (lid < N) ? s_buf[lid] : -INFINITY;
+
+    // Max global via simd_max + reduction inter-simdgroup.
+    float m_local = simd_max(v);
+    if (lane == 0u) s_red[sg_idx] = m_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0u) {
+        float t = (lane < TG_SIZE / 32u) ? s_red[lane] : -INFINITY;
+        float m_global = simd_max(t);
+        if (lane == 0u) s_red[0] = m_global;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m_global = s_red[0];
+
+    // exp(logit - max), réduction de la somme.
+    float e = (lid < N) ? exp(v - m_global) : 0.0f;
+    float s_local = simd_sum(e);
+    if (lane == 0u) s_red[sg_idx] = s_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0u) {
+        float t = (lane < TG_SIZE / 32u) ? s_red[lane] : 0.0f;
+        float s_global = simd_sum(t);
+        if (lane == 0u) s_red[0] = s_global;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s_global = s_red[0];
+
+    // Probabilité (overwrite s_buf — phase A est terminée).
+    float p = (lid < N) ? e / max(s_global, 1e-30f) : -INFINITY;
+    if (lid < N) s_buf[lid] = p;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Top-K serial dans thread 0.
+    if (lid == 0u) {
+        float top_w_local[MAX_K_TOP];
+        uint  top_idx_local[MAX_K_TOP];
+        for (uint k = 0; k < K_top; ++k) {
+            float best = -INFINITY;
+            uint  best_idx = 0u;
+            for (uint j = 0; j < N; ++j) {
+                float pv = s_buf[j];
+                if (pv > best) { best = pv; best_idx = j; }
+            }
+            top_idx_local[k] = best_idx;
+            top_w_local[k]   = best;
+            s_buf[best_idx]  = -INFINITY;
+        }
+        float sum_w = 0.0f;
+        for (uint k = 0; k < K_top; ++k) sum_w += top_w_local[k];
+        float inv = 1.0f / max(sum_w, 6.103515625e-5f);
+        for (uint k = 0; k < K_top; ++k) {
+            out_idx[k] = top_idx_local[k];
+            out_w[k]   = top_w_local[k] * inv;
+        }
+    }
+}
+"#;
+
+/// T165 — **NEGATIVE RESULT, dead code conservé pour référence**.
+///
+/// Tentative de fusion routing : matmul + topk + softmax + renorm en 1 dispatch.
+/// Test parité PASS, mais bench réel sur 35B-A3B → **decode -50%** (43 → 21 t/s).
+///
+/// **Cause racine** : le matmul gate_inp [N=256, K=2048] @ h dans le path
+/// original utilise 256 simdgroups en parallèle (1 par output, 256 TGs sur
+/// la grille). En contractant le calcul dans 1 TG fusé (8 simdgroups série
+/// sur 32 logits chacun), on perd la parallélisation massive — le matmul
+/// devient ~32× plus lent.
+///
+/// **Méta-leçon** : le 21% d'overhead routing mesuré sous `RUSTORCH_PROFILE=1`
+/// était inflé par les `backend.drain()` artificiels ajoutés entre dispatches.
+/// En chained mode normal (production), les 2 dispatches `sgemv` puis
+/// `topk_softmax_norm` enchaînent sans drain et coûtent ~10-20 µs total.
+/// La fusion ne pouvait offrir que cet overhead minimal en gain — moins
+/// que le coût de perdre le parallélisme matmul.
+///
+/// **Pattern à NE PAS reproduire** : fusionner un op massivement parallèle
+/// (sgemv N grands) avec un op réducteur (1-TG softmax). Voir aussi T164
+/// (gate+up fusion) et T86 (CPU silu fusion) — même piège.
+///
+/// Pré-conditions (du kernel, si jamais réutilisé sous d'autres conditions) :
+/// - `w_gate_inp` : F32 row-major [N=n_experts, K=k_dim]
+/// - `n_experts <= 256`, `k_top <= 16`, `k_dim` libre.
+#[allow(dead_code)]
+pub fn routing_topk_softmax_norm_f32(
+    backend: &MetalBackend,
+    h_buf: &Buffer,
+    w_gate_inp_buf: &Buffer,
+    out_idx_buf: &Buffer,
+    out_w_buf: &Buffer,
+    k_dim: usize,
+    n_experts: usize,
+    k_top: usize,
+) -> Result<(), MetalError> {
+    if n_experts == 0 || k_top == 0 || n_experts > 256 || k_top > 16 || k_dim == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "routing_topk_softmax_norm: needs 0 < n_experts <= 256, 0 < k_top <= 16, k_dim > 0 (got K_dim={k_dim}, N={n_experts}, K_top={k_top})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "routing_topk_softmax_norm_f32",
+        ROUTING_TOPK_SOFTMAX_NORM_F32_SHADER,
+        "routing_topk_softmax_norm_f32",
+    )?;
+    let dims = [k_dim as u32, n_experts as u32, k_top as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(h_buf), 0);
+        encoder.set_buffer(1, Some(w_gate_inp_buf), 0);
+        encoder.set_buffer(2, Some(out_idx_buf), 0);
+        encoder.set_buffer(3, Some(out_w_buf), 0);
+        encoder.set_bytes(4, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(256, 1, 1);
+        let groups = MTLSize::new(1, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T152.1b — top-K softmax + normalize 100% GPU sur 1 threadgroup.
 /// Pré-condition : `n_experts <= 256` et `k <= 16`. Pour le 35B-A3B :
 /// n_experts=256, k=8 → OK.
@@ -14149,6 +14333,119 @@ mod tests {
                 cu_ref_h[i],
                 cu_fused_h[i],
                 rel_u
+            );
+        }
+    }
+
+    /// T165 — Fused MoE routing kernel (matmul + topk + softmax + renorm) vs
+    /// reference 2-dispatch path (sgemv_f32_lcpp_simd + topk_softmax_norm).
+    /// Vérifie que le kernel fusé produit les mêmes indices ET les mêmes
+    /// poids que la chaîne séparée (tolerance 1e-5 sur les poids).
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn routing_topk_softmax_norm_f32_matches_separate() {
+        let backend = metal_backend();
+
+        // Shape réaliste : Qwen3.6-35B-A3B routing (K_dim=2048, N=256, K_top=8).
+        let k_dim = 2048_usize;
+        let n_experts = 256_usize;
+        let k_top = 8_usize;
+
+        let h = det_vec(k_dim, 0.7);
+        let w = det_vec(n_experts * k_dim, 1.3);
+
+        // Buffers shared.
+        let h_buf = backend.alloc_shared(k_dim * 4).unwrap();
+        let w_buf = backend.alloc_shared(n_experts * k_dim * 4).unwrap();
+        let logits_buf = backend.alloc_shared(n_experts * 4).unwrap();
+        let idx_ref_buf = backend.alloc_shared(k_top * 4).unwrap();
+        let w_ref_buf = backend.alloc_shared(k_top * 4).unwrap();
+        let idx_fused_buf = backend.alloc_shared(k_top * 4).unwrap();
+        let w_fused_buf = backend.alloc_shared(k_top * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(h.as_ptr(), h_buf.contents() as *mut f32, k_dim);
+            std::ptr::copy_nonoverlapping(
+                w.as_ptr(),
+                w_buf.contents() as *mut f32,
+                n_experts * k_dim,
+            );
+        }
+
+        // Reference : 2 dispatchs séparés.
+        sgemv_f32_lcpp_simd_into(backend, &h_buf, &w_buf, &logits_buf, k_dim, n_experts).unwrap();
+        topk_softmax_norm_f32(
+            backend,
+            &logits_buf,
+            &idx_ref_buf,
+            &w_ref_buf,
+            n_experts,
+            k_top,
+        )
+        .unwrap();
+        backend.drain();
+
+        // Fused dispatch.
+        routing_topk_softmax_norm_f32(
+            backend,
+            &h_buf,
+            &w_buf,
+            &idx_fused_buf,
+            &w_fused_buf,
+            k_dim,
+            n_experts,
+            k_top,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut idx_ref = vec![0u32; k_top];
+        let mut w_ref = vec![0f32; k_top];
+        let mut idx_fused = vec![0u32; k_top];
+        let mut w_fused = vec![0f32; k_top];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                idx_ref_buf.contents() as *const u32,
+                idx_ref.as_mut_ptr(),
+                k_top,
+            );
+            std::ptr::copy_nonoverlapping(
+                w_ref_buf.contents() as *const f32,
+                w_ref.as_mut_ptr(),
+                k_top,
+            );
+            std::ptr::copy_nonoverlapping(
+                idx_fused_buf.contents() as *const u32,
+                idx_fused.as_mut_ptr(),
+                k_top,
+            );
+            std::ptr::copy_nonoverlapping(
+                w_fused_buf.contents() as *const f32,
+                w_fused.as_mut_ptr(),
+                k_top,
+            );
+        }
+
+        // Indices doivent être strictement identiques (top-K déterministe à
+        // ordre fixé tant que les logits sont les mêmes).
+        for k in 0..k_top {
+            assert_eq!(
+                idx_ref[k], idx_fused[k],
+                "index mismatch at top-{k}: ref={} fused={}",
+                idx_ref[k], idx_fused[k]
+            );
+        }
+
+        // Poids : tolerance 1e-5 (même softmax+renorm, juste matmul intra-kernel
+        // au lieu de séparé — l'ordre des FMA est identique en simd_sum coop).
+        for k in 0..k_top {
+            let denom = w_ref[k].abs().max(1e-6);
+            let rel = (w_ref[k] - w_fused[k]).abs() / denom;
+            assert!(
+                rel < 1e-5,
+                "weight mismatch at top-{k}: ref={} fused={} (rel {:.3e})",
+                w_ref[k],
+                w_fused[k],
+                rel
             );
         }
     }
