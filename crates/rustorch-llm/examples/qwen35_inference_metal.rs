@@ -2569,8 +2569,55 @@ fn ffn_dense_forward(
             let ef = cfg.expert_f;
 
             // 1. Routing logits = gate_inp @ h  → [n_experts]
+            // T171 — Sync AMX (Apple Accelerate) offload for routing matmul.
+            // Opt-in via RUSTORCH_AMX_ROUTING=1.
+            //
+            // **EXPERIMENTAL VALIDATION RESULT (negative for sync, validates
+            // need for async)**:
+            //   Standalone bench : AMX 9.4 µs/call vs GPU 50-70 µs (5-7× speedup).
+            //   Sync end-to-end on 35B-A3B Qwen3.6 :
+            //     baseline (no AMX)        : 39.48 t/s prefill, 41.80 t/s decode
+            //     RUSTORCH_AMX_ROUTING=1   : 29.58 t/s prefill (-25%), 34.60 t/s (-17%)
+            //   Quality : bit-identical greedy output.
+            //
+            // The drain cost (~250 µs × 40 layers = 10 ms/token) eats the AMX
+            // savings (~1.6 ms compute saved). ASYNC pattern (MTLEvent + CPU
+            // thread) is required to actually exploit AMX. See note 1ce4dd46
+            // for the future async design and 3a0040ea for the full Innovation 1
+            // RFC.
+            //
+            // Code kept as opt-in for validation point; env-gated so default
+            // runs unaffected.
             let _moe_t0_routing = std::time::Instant::now();
-            gate_inp.matmul_into(backend, &scratch.h, &scratch.moe_logits)?;
+            let use_amx = std::env::var("RUSTORCH_AMX_ROUTING").is_ok()
+                && matches!(gate_inp.dtype, GgmlType::F32);
+            if use_amx {
+                // Drain GPU so h is fully written before CPU AMX reads it.
+                backend.drain();
+                let k = gate_inp.k;
+                let n = gate_inp.n;
+                unsafe {
+                    let h_ptr = scratch.h.contents() as *const f32;
+                    let w_ptr = gate_inp.buffer.contents() as *const f32;
+                    let y_ptr = scratch.moe_logits.contents() as *mut f32;
+                    rustorch_cpu::accelerate::cblas_sgemv(
+                        rustorch_cpu::accelerate::CBLAS_ROW_MAJOR,
+                        rustorch_cpu::accelerate::CBLAS_NO_TRANS,
+                        n as i32, // m of A
+                        k as i32, // n of A
+                        1.0,
+                        w_ptr,
+                        k as i32, // lda
+                        h_ptr,
+                        1,
+                        0.0,
+                        y_ptr,
+                        1,
+                    );
+                }
+            } else {
+                gate_inp.matmul_into(backend, &scratch.h, &scratch.moe_logits)?;
+            }
 
             // 2. T152.1b — Top-K + softmax + renormalize 100% GPU.
             //    Avant : drain + CPU softmax + argsort + renormalize. Maintenant :
