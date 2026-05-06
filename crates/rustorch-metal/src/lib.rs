@@ -55,6 +55,11 @@ pub mod transfer;
 #[cfg(target_os = "macos")]
 pub mod fused_adamw;
 
+/// T172 — Async AMX (Apple Accelerate) executor for Innovation 1
+/// hybrid GPU+CPU forward. See module docs.
+#[cfg(target_os = "macos")]
+pub mod async_amx;
+
 /// Re-export `metal::Buffer` so downstream crates (rustorch-optim
 /// FusedAdamW state, rustorch-autograd dispatch) can name the type
 /// without depending on the `metal` crate directly.
