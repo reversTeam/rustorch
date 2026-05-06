@@ -3294,10 +3294,18 @@ fn forward_token(
             _ => return Err(format!("layer {li}: kind/state mismatch")),
         }
         // T146c — CPU↔GPU pipelining via mid-token commits. Sweet spot from
-        // the 14B (T133) was every 5 layers, gives the GPU steady work while
-        // CPU continues encoding the next segment. Disabled when dumping
-        // (we drain at every hook anyway).
-        if dump_mode() == 0 && (li + 1) % 5 == 0 && li + 1 < cfg.n_layers {
+        // the 14B (T133) was every 5 layers. T176 — make the period
+        // configurable to A/B test on 35B-A3B (different layer count).
+        // RUSTORCH_COMMIT_PERIOD=0 disables; default = 5 (legacy).
+        let commit_period: usize = std::env::var("RUSTORCH_COMMIT_PERIOD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        if dump_mode() == 0
+            && commit_period > 0
+            && (li + 1) % commit_period == 0
+            && li + 1 < cfg.n_layers
+        {
             backend.commit_async();
         }
     }
