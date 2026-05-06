@@ -2428,6 +2428,204 @@ pub fn sgemm_f32_simdgroup_matrix_into(
 }
 
 // =============================================================================
+// T162 phase 2 — Q4_K SGEMM avec simdgroup_matrix + dequant inline.
+//
+// Premier kernel rustorch combinant Apple Matrix Engine + Q4_K. C'est le
+// gros levier de la roadmap "fastest engine" : `simdgroup_multiply_accumulate`
+// donne 8×8×8 = 512 FMA/cycle vs 32 FMA/cycle pour notre sgemv-en-boucle,
+// et la lecture Q4_K (-7× DRAM vs F32) reste possible via dequant inline en
+// threadgroup memory.
+//
+// Architecture :
+// - 1 simdgroup (32 threads) = 1 TG, produit 1 tile C 8×8
+// - Threadgroup mem (4 KB total) :
+//     Xs[8 × 32] f32 = morceau de A[8 rows × 32 cols K]
+//     Ws[8 × 32] f32 = morceau de W[8 rows N × 32 cols K] dequant
+// - Boucle externe : K en chunks de BK=32 (1 sub-block Q4_K)
+//   Pour chaque chunk :
+//     1) 32 threads chargent coopérativement Xs depuis A (8 floats/thread)
+//     2) 32 threads dequant coopérativement Ws depuis bytes Q4_K (8 weights/thread)
+//     3) simdgroup_barrier
+//     4) 4 MMAs (BK=32 = 4 fragments de 8 sur K) :
+//          load A_frag[8x8] depuis Xs (row-major)
+//          load B_frag[8x8] depuis Ws TRANSPOSE (Ws[n,k] → B[k,n])
+//          C += A_frag @ B_frag
+// - Store C 8×8 vers DRAM
+//
+// Pré-conditions :
+// - M, N multiples de 8 ; K multiple de 256 (Q4_K super-block)
+// - W layout : [N, K] row-major, K/256 super-blocks de 144 bytes par row
+//
+// Ce kernel s'utilise pour M ≥ 8 (prefill, batched, spec decoding verify).
+// Pour M=1 (decode autoregressive), le path sgemv (T132 NSG=2 NR0=2) reste
+// optimal.
+const SGEMM_Q4_K_F32_SIMDGROUP_MATRIX_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q4K_BYTES = 144u;
+constant uint Q4K_WEIGHTS = 256u;
+constant uint BM = 8u;
+constant uint BN = 8u;
+constant uint BK = 32u;
+
+kernel void sgemm_q4_k_f32_simdgroup_matrix(
+    device const float*  A      [[buffer(0)]],   // [M, K] f32 row-major
+    device const uchar*  W_q4k  [[buffer(1)]],   // [N, K] Q4_K
+    device float*        C      [[buffer(2)]],   // [M, N] f32 row-major
+    constant uint3&      dims   [[buffer(3)]],   // (M, N, K)
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]]
+) {
+    uint M = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+
+    uint n_tiles_n = N / BN;
+    uint m_tile = tg_id / n_tiles_n;
+    uint n_tile = tg_id % n_tiles_n;
+    if (m_tile * BM >= M || n_tile * BN >= N) return;
+
+    threadgroup float Xs[8 * 32];
+    threadgroup float Ws[8 * 32];
+
+    simdgroup_matrix<float, 8, 8> C_frag = simdgroup_matrix<float, 8, 8>(0.0);
+    simdgroup_matrix<float, 8, 8> A_frag;
+    simdgroup_matrix<float, 8, 8> B_frag;
+
+    uint blocks_per_row = K / Q4K_WEIGHTS;
+    uint row_stride_bytes = blocks_per_row * Q4K_BYTES;
+
+    // Each thread's coordinates inside the [BM=8 rows, BK=32 cols] tile.
+    ushort row       = tiisg / 4u;        // 0..7 — selects N row (and A row)
+    ushort col_chunk = tiisg % 4u;        // 0..3 — chunk of 8 cols within BK
+
+    for (uint k_offset = 0; k_offset < K; k_offset += BK) {
+        // 1. Load Xs[8 × 32] from A[m_tile*8 .. +8, k_offset .. +32].
+        uint a_row_base =
+            (uint)(m_tile * BM + row) * K + k_offset + (uint)col_chunk * 8u;
+        threadgroup float* xs_row = Xs + (uint)row * BK + (uint)col_chunk * 8u;
+        for (ushort c = 0; c < 8u; ++c) {
+            xs_row[c] = A[a_row_base + c];
+        }
+
+        // 2. Dequant Ws[8 × 32] from Q4_K bytes.
+        uint super_block_idx = k_offset / Q4K_WEIGHTS;
+        uint sb_in_super = (k_offset % Q4K_WEIGHTS) / 32u;  // 0..7
+        uint pair_idx    = sb_in_super / 2u;                // 0..3
+        bool is_high     = (sb_in_super & 1u) != 0u;
+
+        uint n_actual = n_tile * BN + (uint)row;
+        device const uchar* row_block = W_q4k
+            + (uint64_t)n_actual * row_stride_bytes
+            + (uint64_t)super_block_idx * Q4K_BYTES;
+        device const half* d_ptr = (device const half*)(row_block);
+        float d    = float(d_ptr[0]);
+        float dmin = float(d_ptr[1]);
+
+        // Unpack 6-bit scales/mins (cf rustorch-gguf::unpack_q4_k_sc_m).
+        device const uchar* sc_raw = row_block + 4;
+        uchar sc6, m6;
+        if (sb_in_super < 4u) {
+            sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+            m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+        } else {
+            uint i = sb_in_super - 4u;
+            sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+            m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+        }
+        float scale   = d    * float(sc6);
+        float min_val = dmin * float(m6);
+
+        device const uchar* qs_ptr = row_block + 16u + pair_idx * 32u;
+        threadgroup float* ws_row = Ws + (uint)row * BK + (uint)col_chunk * 8u;
+        for (ushort c = 0; c < 8u; ++c) {
+            ushort byte_pos = col_chunk * 8u + c;
+            uchar byte_val  = qs_ptr[byte_pos];
+            uchar nibble    = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+            ws_row[c] = scale * float(nibble) - min_val;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 3. 4 MMAs : BK=32 → 4 fragments de 8 le long de K.
+        for (ushort k_frag = 0; k_frag < 4u; ++k_frag) {
+            simdgroup_load(A_frag, Xs + (uint)k_frag * 8u, BK);
+            // B is W transposed : load with transpose=true. stride = BK
+            // (Ws is stored [BN=8 rows, BK=32 cols]).
+            simdgroup_load(
+                B_frag,
+                Ws + (uint)k_frag * 8u,
+                BK,
+                ulong2(0, 0),
+                /* transpose */ true);
+            simdgroup_multiply_accumulate(C_frag, A_frag, B_frag, C_frag);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // 4. Store C tile.
+    device float* C_ptr = C
+        + (uint64_t)m_tile * BM * (uint64_t)N
+        + (uint64_t)n_tile * BN;
+    simdgroup_store(C_frag, C_ptr, N);
+}
+"#;
+
+/// T162 phase 2 — Q4_K SGEMM via simdgroup_matrix avec dequant inline.
+///
+/// `C = A @ W^T` où A est `[M, K]` f32 row-major, W est `[N, K]` Q4_K
+/// (row-major en super-blocks de 256 weights × 144 bytes), C est `[M, N]`
+/// f32 row-major.
+///
+/// Pré-conditions :
+/// - Metal3 (Apple7+)
+/// - M, N multiples de 8 ; K multiple de 256
+///
+/// Performance attendue : à M=128, K=1024, N=1024 : 7-10× plus rapide que
+/// sgemv_q4_k-en-boucle (path prefill rustorch actuel). Pour M=1, sgemv
+/// reste optimal.
+pub fn sgemm_q4_k_f32_simdgroup_matrix_into(
+    backend: &MetalBackend,
+    a_buf: &Buffer,
+    w_q4k_buf: &Buffer,
+    c_buf: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemm_q4_k_f32_simdgroup_matrix needs Metal3".to_string(),
+        ));
+    }
+    if m == 0 || n == 0 || k == 0 || m % 8 != 0 || n % 8 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemm_q4_k_f32_simdgroup_matrix: M, N must be multiples of 8 and K multiple of 256 (got M={m}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemm_q4_k_f32_simdgroup_matrix",
+        SGEMM_Q4_K_F32_SIMDGROUP_MATRIX_SHADER,
+        "sgemm_q4_k_f32_simdgroup_matrix",
+    )?;
+    let dims = [m as u32, n as u32, k as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_buf), 0);
+        encoder.set_buffer(2, Some(c_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let n_tg = ((m / 8) * (n / 8)) as u64;
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // sgemv_q4_k_f32 — direct sgemv on Q4_K-quantised weights, no f32 expansion.
 //
 // Reads 144-byte Q4_K super-blocks straight from the GPU buffer, dequantises
@@ -10348,6 +10546,229 @@ mod tests {
                 "state mismatch at {i}: legacy={} fused={} rel={:.3e}",
                 state_a[i],
                 state_b[i],
+                rel
+            );
+        }
+    }
+
+    /// T162 phase 2 — Bench Q4_K SGEMM simdgroup_matrix vs sgemv_q4_k loop.
+    ///
+    /// Le path actuel rustorch pour prefill : `sgemv_q4_k_f32_lcpp_nsg2` appelé
+    /// M fois (1 par token). Le nouveau path : 1 seul kernel SGEMM Q4_K avec
+    /// simdgroup_matrix.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    #[ignore]
+    fn sgemm_q4_k_f32_simdgroup_matrix_bench() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            return;
+        }
+
+        // Shape représentative d'un slice prefill 14B-style :
+        // K = 5120 hidden_dim, N = 5120 (Q proj) ou 14336 (FFN).
+        // BUT : K must be multiple of 256, N multiple of 8.
+        for &(m, n_dim, k) in [
+            (8, 1024, 1024),
+            (16, 1024, 1024),
+            (32, 1024, 1024),
+            (64, 1024, 1024),
+            (128, 1024, 1024),
+            (32, 5120, 5120),
+        ]
+        .iter()
+        {
+            let blocks_per_row = k / 256;
+            let mut w_bytes = vec![0u8; n_dim * blocks_per_row * 144];
+            // Random-ish bytes (no specific pattern needed for bench).
+            for (i, b) in w_bytes.iter_mut().enumerate() {
+                *b = ((i as u32).wrapping_mul(0x9E3779B9_u32) >> 24) as u8;
+            }
+            // Make d / dmin valid f16 (avoid NaN).
+            for nrow in 0..n_dim {
+                for ib in 0..blocks_per_row {
+                    let off = (nrow * blocks_per_row + ib) * 144;
+                    let d_h = half::f16::from_f32(0.01_f32).to_le_bytes();
+                    w_bytes[off] = d_h[0];
+                    w_bytes[off + 1] = d_h[1];
+                    w_bytes[off + 2] = d_h[0];
+                    w_bytes[off + 3] = d_h[1];
+                }
+            }
+
+            let a = det_vec(m * k, 1.5);
+            let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+            let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+            let c_buf = backend.alloc_shared(m * n_dim * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+                std::ptr::copy_nonoverlapping(
+                    w_bytes.as_ptr(),
+                    w_buf.contents() as *mut u8,
+                    w_bytes.len(),
+                );
+            }
+
+            // Path A : SGEMM simdgroup_matrix (1 dispatch).
+            for _ in 0..3 {
+                sgemm_q4_k_f32_simdgroup_matrix_into(backend, &a_buf, &w_buf, &c_buf, m, n_dim, k)
+                    .unwrap();
+            }
+            backend.drain();
+            let iters = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                sgemm_q4_k_f32_simdgroup_matrix_into(backend, &a_buf, &w_buf, &c_buf, m, n_dim, k)
+                    .unwrap();
+            }
+            backend.drain();
+            let sgemm_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+            // Path B : sgemv_q4_k loop (M dispatches).
+            let row_buf = backend.alloc_shared(k * 4).unwrap();
+            let out_row_buf = backend.alloc_shared(n_dim * 4).unwrap();
+            for _ in 0..3 {
+                for _row in 0..m {
+                    let _ = sgemv_q4_k_f32_lcpp_nsg2_into(
+                        backend,
+                        &row_buf,
+                        &w_buf,
+                        &out_row_buf,
+                        k,
+                        n_dim,
+                    );
+                }
+            }
+            backend.drain();
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                for _row in 0..m {
+                    let _ = sgemv_q4_k_f32_lcpp_nsg2_into(
+                        backend,
+                        &row_buf,
+                        &w_buf,
+                        &out_row_buf,
+                        k,
+                        n_dim,
+                    );
+                }
+            }
+            backend.drain();
+            let sgemv_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+            let speedup = sgemv_ms / sgemm_ms;
+            eprintln!(
+                "M={m:4}, N={n_dim:5}, K={k:5}: Q4_K sgemm_simdmat={sgemm_ms:7.3}ms, sgemv_loop={sgemv_ms:7.3}ms, speedup={speedup:5.2}×"
+            );
+        }
+    }
+
+    /// T162 phase 2 — Q4_K SGEMM simdgroup_matrix vs CPU dequant + naive matmul.
+    ///
+    /// PREMIER kernel rustorch combinant Apple AMX et Q4_K. Test gate de toute
+    /// la phase 2 (port to prefill + spec decoding). Si ce test passe, on a
+    /// validé le path Q4_K simdgroup_matrix de bout en bout.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn sgemm_q4_k_f32_simdgroup_matrix_matches_cpu() {
+        use rustorch_gguf::dequant::dequant_q4_k;
+
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[sgemm_q4_k_simdmat] skipping: no Metal3");
+            return;
+        }
+
+        // M=16, N=16, K=512 (= 2 super-blocks par row). Petit mais exerce
+        // tous les chemins (multi-tile output, multi-superblock K loop).
+        let m = 16_usize;
+        let n = 16_usize;
+        let k = 512_usize;
+        let blocks_per_row = k / 256;
+
+        // Build deterministic Q4_K bytes : N rows × blocks_per_row × 144 bytes.
+        let mut w_bytes = vec![0u8; n * blocks_per_row * 144];
+        for nrow in 0..n {
+            for ib in 0..blocks_per_row {
+                let off = (nrow * blocks_per_row + ib) * 144;
+                // d, dmin in half-float
+                let d_val = ((nrow as f32 + 1.0) * 0.01) + (ib as f32) * 0.001;
+                let dmin_val = ((nrow as f32) * 0.005) + (ib as f32) * 0.0005;
+                let d_h = half::f16::from_f32(d_val).to_le_bytes();
+                let dmin_h = half::f16::from_f32(dmin_val).to_le_bytes();
+                w_bytes[off] = d_h[0];
+                w_bytes[off + 1] = d_h[1];
+                w_bytes[off + 2] = dmin_h[0];
+                w_bytes[off + 3] = dmin_h[1];
+
+                // 12 packed scales bytes — non-trivial pattern.
+                for i in 0..12 {
+                    w_bytes[off + 4 + i] =
+                        (0x10_u8.wrapping_add((nrow as u8) ^ (i as u8) ^ (ib as u8))) | 0x05;
+                }
+
+                // 128 qs bytes — varied nibbles.
+                for i in 0..128 {
+                    w_bytes[off + 16 + i] =
+                        ((nrow as u8) ^ (i as u8) ^ (ib as u8)).wrapping_add(0x37);
+                }
+            }
+        }
+
+        // CPU reference : dequant W rows then naive matmul C = A @ W^T.
+        let a = det_vec(m * k, 1.5);
+        let mut w_f32 = vec![0.0_f32; n * k];
+        for nrow in 0..n {
+            let row_off = nrow * blocks_per_row * 144;
+            let row_bytes = &w_bytes[row_off..row_off + blocks_per_row * 144];
+            let row_dst = &mut w_f32[nrow * k..(nrow + 1) * k];
+            dequant_q4_k(row_bytes, row_dst).unwrap();
+        }
+
+        let mut c_ref = vec![0.0_f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0_f32;
+                for l in 0..k {
+                    s += a[i * k + l] * w_f32[j * k + l]; // W^T : W[j, l]
+                }
+                c_ref[i * n + j] = s;
+            }
+        }
+
+        // GPU path.
+        let a_buf = backend.alloc_shared(m * k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w_bytes.len()).unwrap();
+        let c_buf = backend.alloc_shared(m * n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_buf.contents() as *mut f32, m * k);
+            std::ptr::copy_nonoverlapping(
+                w_bytes.as_ptr(),
+                w_buf.contents() as *mut u8,
+                w_bytes.len(),
+            );
+        }
+        sgemm_q4_k_f32_simdgroup_matrix_into(backend, &a_buf, &w_buf, &c_buf, m, n, k).unwrap();
+        backend.drain();
+
+        let mut c_metal = vec![0.0_f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_buf.contents() as *const f32,
+                c_metal.as_mut_ptr(),
+                m * n,
+            );
+        }
+
+        for i in 0..(m * n) {
+            let abs_err = (c_ref[i] - c_metal[i]).abs();
+            let denom = c_ref[i].abs().max(1e-3);
+            let rel = abs_err / denom;
+            assert!(
+                rel < 1e-2,
+                "Q4_K SGEMM simdmat mismatch at {i}: ref={} metal={} (rel {:.3e})",
+                c_ref[i],
+                c_metal[i],
                 rel
             );
         }
