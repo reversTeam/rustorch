@@ -49,7 +49,8 @@ use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_f32, delta_net_step_f32, delta_net_step_with_l2_f32, gqa_decode_f32, kv_append_f32,
     l2_norm_per_head_f32, rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
-    rope_half_split_f32, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
+    rope_half_split_f32, sgemm_q4_k_f32_simdgroup_matrix_64_into,
+    sgemm_q4_k_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
     sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
     sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
     sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
@@ -154,6 +155,73 @@ impl HybridMetalWeight {
             },
             other => Err(MetalError::Unsupported(format!(
                 "HybridMetalWeight::matmul_into: dtype {:?} not supported by any sgemv kernel",
+                other
+            ))),
+        }
+    }
+
+    /// T162 — batched matmul `out[M, N] = x[M, K] @ W[N, K]^T` (M ≥ 1).
+    ///
+    /// Pour M = 1 : équivalent à `matmul_into` (sgemv path optimal).
+    /// Pour M ≥ 8 : utilise les kernels SGEMM simdgroup_matrix avec dispatcher
+    /// heuristique :
+    /// - M ≥ 64 et N % 64 == 0 : `sgemm_q4_k_f32_simdgroup_matrix_64_into`
+    ///   (tile 64×64 multi-warp, ×4 vs sgemv loop sur shapes 14B FFN)
+    /// - M ≥ 8 et N % 8 == 0 : `sgemm_q4_k_f32_simdgroup_matrix_into`
+    ///   (tile 8×8 single-warp, ×2 vs sgemv loop)
+    ///
+    /// Pour M ∈ [2, 7] : pas encore de path dédié, retourne erreur (le caller
+    /// doit padder ou loopper sgemv).
+    ///
+    /// Pré-conditions : `x_batched` est `[M, K]` f32 row-major, `out_batched`
+    /// est `[M, N]` f32 row-major. K doit être multiple de 256 (Q4_K) ou 8 (autres).
+    ///
+    /// Status : Q4_K supporté avec dispatcher complet. Autres quants : fallback
+    /// vers sgemv-loop M fois (à venir, gain attendu mineur car decode reste M=1).
+    pub fn matmul_batched_into(
+        &self,
+        backend: &MetalBackend,
+        m: usize,
+        x_batched: &Buffer,
+        out_batched: &Buffer,
+    ) -> Result<(), MetalError> {
+        if m == 0 {
+            return Ok(());
+        }
+        if m == 1 {
+            return self.matmul_into(backend, x_batched, out_batched);
+        }
+        match self.dtype {
+            GgmlType::Q4_K => {
+                if m >= 64 && m % 64 == 0 && self.n % 64 == 0 && self.k % 256 == 0 {
+                    sgemm_q4_k_f32_simdgroup_matrix_64_into(
+                        backend,
+                        x_batched,
+                        &self.buffer,
+                        out_batched,
+                        m,
+                        self.n,
+                        self.k,
+                    )
+                } else if m >= 8 && m % 8 == 0 && self.n % 8 == 0 && self.k % 256 == 0 {
+                    sgemm_q4_k_f32_simdgroup_matrix_into(
+                        backend,
+                        x_batched,
+                        &self.buffer,
+                        out_batched,
+                        m,
+                        self.n,
+                        self.k,
+                    )
+                } else {
+                    Err(MetalError::Unsupported(format!(
+                        "HybridMetalWeight::matmul_batched_into: Q4_K SGEMM requires M >= 8, M%8 == 0, N%8 == 0, K%256 == 0 (got M={m}, N={}, K={})",
+                        self.n, self.k
+                    )))
+                }
+            },
+            other => Err(MetalError::Unsupported(format!(
+                "HybridMetalWeight::matmul_batched_into: dtype {:?} not yet supported for M > 1 batched path",
                 other
             ))),
         }
@@ -2110,6 +2178,127 @@ impl GgufTokenizer {
     }
 }
 
+/// T162 — Benche `matmul_batched_into` sur une vraie weight Q4_K du modèle.
+///
+/// Sélectionne la 1ère FFN gate Q4_K (= matrice [K=hidden, N=intermediate]) et
+/// mesure le speedup du path SGEMM simdgroup_matrix vs sgemv-loop M fois sur
+/// les exact mêmes bytes que ceux utilisés en inférence. C'est le bench le plus
+/// fidèle à l'usage réel : aucune génération synthétique de bytes Q4_K.
+fn bench_batched_matmul_on_loaded_weights(backend: &MetalBackend, model: &Qwen35MetalModel) {
+    // Sélection : 1ère couche avec FFN dense Q4_K (Qwen3-14B = qwen3 dense).
+    let mut target: Option<&HybridMetalWeight> = None;
+    for layer in &model.layers {
+        let ffn = match layer {
+            LayerMetal::Attn { ffn, .. } => ffn,
+            LayerMetal::Ssm { ffn, .. } => ffn,
+        };
+        if let FfnLayerMetal::Dense { w_gate, .. } = ffn {
+            if w_gate.dtype == GgmlType::Q4_K {
+                target = Some(w_gate);
+                break;
+            }
+        }
+    }
+    let w = match target {
+        Some(w) => w,
+        None => {
+            eprintln!("bench-batched: pas de FFN Q4_K dans ce modèle (model variant non-dense ?)");
+            return;
+        },
+    };
+    println!(
+        "\n=== T162 bench-batched sur FFN gate Q4_K [{} (K=in) × {} (N=out)] ===",
+        w.k, w.n
+    );
+
+    // Test 4 valeurs de M représentatives :
+    //   M=1   : decode autoregressive (référence sgemv pure)
+    //   M=8   : prefill alignement minimum SGEMM phase 2
+    //   M=24  : prefill 19 tokens rounded up (cas réel court prompt)
+    //   M=64  : prefill batch SGEMM phase 3 (multi-warp)
+    //   M=128 : prefill long prompt
+    let m_values = [1usize, 8, 24, 64, 128];
+
+    for &m in &m_values {
+        // Allocation : x [M, K], out [M, N]
+        let x_buf = match backend.alloc_shared(m * w.k * 4) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("alloc x failed: {e:?}");
+                continue;
+            },
+        };
+        let out_buf = match backend.alloc_shared(m * w.n * 4) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("alloc out failed: {e:?}");
+                continue;
+            },
+        };
+        // Init x avec valeurs déterministes (sin-seed).
+        unsafe {
+            let x_ptr = x_buf.contents() as *mut f32;
+            for i in 0..(m * w.k) {
+                *x_ptr.add(i) = ((i as f32 + 1.0) * 0.001).sin();
+            }
+        }
+
+        // Path A : matmul_batched_into (SGEMM si possible, sinon erreur).
+        let warmups = 3;
+        let iters = 30;
+        let batched_ms = {
+            let mut errored = false;
+            for _ in 0..warmups {
+                if w.matmul_batched_into(backend, m, &x_buf, &out_buf).is_err() {
+                    errored = true;
+                    break;
+                }
+            }
+            backend.drain();
+            if errored {
+                f64::NAN
+            } else {
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let _ = w.matmul_batched_into(backend, m, &x_buf, &out_buf);
+                }
+                backend.drain();
+                t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+            }
+        };
+
+        // Path B : matmul_into M fois (= sgemv loop).
+        // Note : matmul_into prend x_buf entier (suppose M=1 = K floats).
+        // Pour simuler la loop M=1, on utilise le même buffer (les valeurs
+        // varient peu entre rows pour un bench). Réaliste car sgemv ignore
+        // le M-stride.
+        for _ in 0..warmups {
+            for _row in 0..m {
+                let _ = w.matmul_into(backend, &x_buf, &out_buf);
+            }
+        }
+        backend.drain();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for _row in 0..m {
+                let _ = w.matmul_into(backend, &x_buf, &out_buf);
+            }
+        }
+        backend.drain();
+        let loop_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        let speedup = if batched_ms.is_finite() {
+            loop_ms / batched_ms
+        } else {
+            f64::NAN
+        };
+        println!(
+            "  M={m:4}: batched={:7.3}ms  loop={:7.3}ms  speedup={:5.2}×",
+            batched_ms, loop_ms, speedup
+        );
+    }
+}
+
 fn main() -> ExitCode {
     let path = match env::args().nth(1) {
         Some(p) => PathBuf::from(p),
@@ -2169,6 +2358,15 @@ fn main() -> ExitCode {
             *bytes as f64 / 1024.0 / 1024.0,
             100.0 * (*bytes as f64) / (stats.total_bytes as f64)
         );
+    }
+
+    // T162 — `--bench-batched` mode : benche `matmul_batched_into` sur une
+    // vraie weight Q4_K du modèle chargé (FFN gate de la layer 0). Mesure
+    // le speedup SGEMM (phase 2 / 3) vs sgemv-loop M fois sur les exact mêmes
+    // bytes que ceux utilisés en inférence.
+    if env::args().any(|a| a == "--bench-batched") {
+        bench_batched_matmul_on_loaded_weights(backend, &model);
+        return ExitCode::SUCCESS;
     }
 
     // Sanity: walk the layer list to confirm we successfully loaded each
