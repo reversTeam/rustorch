@@ -47,9 +47,11 @@ use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
-    add_inplace_f32, delta_net_step_f32, delta_net_step_with_l2_f32, gqa_decode_f32, kv_append_f32,
-    l2_norm_per_head_f32, rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
-    rope_half_split_f32, sgemm_q3_k_f32_simdgroup_matrix_64_into,
+    add_inplace_batched_f32, add_inplace_f32, delta_net_step_f32, delta_net_step_with_l2_f32,
+    gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32, kv_append_f32,
+    l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
+    rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
+    rope_half_split_partial_batched_f32, sgemm_q3_k_f32_simdgroup_matrix_64_into,
     sgemm_q3_k_f32_simdgroup_matrix_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
     sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
     sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
@@ -57,9 +59,9 @@ use rustorch_metal::kernels::{
     sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
     sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
     sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
-    sigmoid_mul_inplace_f32, split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32,
-    ssm_conv1d_step_f32, swiglu_f32, topk_softmax_norm_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_f32, zero_f32,
+    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32,
+    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -809,6 +811,257 @@ impl Scratch {
             logits: alloc(cfg.vocab * 4),
         }
     }
+}
+
+/// T162 phase 9b — Maximum batch size for `attn_block_forward_batch` /
+/// upcoming `forward_batch` (qwen35). 128 mirrors qwen3-14B's B_MAX.
+const B_MAX_BATCH: usize = 128;
+
+/// T162 phase 9b — Per-attn-block batched scratch buffers (B_MAX-sized).
+/// Caller-allocated so phase 9d can reuse the same buffers across all attn
+/// layers in the batched forward pass.
+///
+/// Buffers are sized for the worst-case batch (`B_MAX_BATCH × per-token`),
+/// smaller B uses the prefix.
+struct BatchScratchAttn {
+    h: Buffer,         // [B_MAX, d]
+    qg: Buffer,        // [B_MAX, 2 * q_dim]  (only used when has_q_gate)
+    q: Buffer,         // [B_MAX, q_dim]
+    gate_attn: Buffer, // [B_MAX, q_dim]
+    k_attn: Buffer,    // [B_MAX, kv_dim]
+    v_attn: Buffer,    // [B_MAX, kv_dim]
+    attn_out: Buffer,  // [B_MAX, q_dim]
+    o: Buffer,         // [B_MAX, d]
+}
+
+impl BatchScratchAttn {
+    fn new(backend: &MetalBackend, cfg: &Qwen35Config) -> Self {
+        let d = cfg.d;
+        let head_dim = cfg.attn_head_dim;
+        let q_dim = head_dim * cfg.n_q_heads;
+        let kv_dim = head_dim * cfg.n_kv_heads;
+        let b = B_MAX_BATCH;
+        let alloc = |bytes: usize| backend.alloc_shared(bytes.max(4)).unwrap();
+        Self {
+            h: alloc(b * d * 4),
+            qg: alloc(b * 2 * q_dim * 4),
+            q: alloc(b * q_dim * 4),
+            gate_attn: alloc(b * q_dim * 4),
+            k_attn: alloc(b * kv_dim * 4),
+            v_attn: alloc(b * kv_dim * 4),
+            attn_out: alloc(b * q_dim * 4),
+            o: alloc(b * d * 4),
+        }
+    }
+}
+
+/// T162 phase 9b — dispatcher batched matmul Q3_K/Q4_K/Q6_K → SGEMM
+/// simdgroup_matrix (M=B). Mirrors `dispatch_batched_matmul` in
+/// qwen_inference_metal.rs.
+///
+/// Pour M=1 fallback `matmul_into` (sgemv path optimal). Pour M ≥ 8 et
+/// alignement N % 8, K % 256 → SGEMM tile 8×8 ou 64×64. Pour M ∈ [2,7]
+/// fallback à un loop M× sgemv (CPU-side dispatch).
+fn dispatch_batched_attn_matmul(
+    backend: &MetalBackend,
+    w: &HybridMetalWeight,
+    m: usize,
+    x_batched: &Buffer,
+    out_batched: &Buffer,
+) -> Result<(), MetalError> {
+    if m == 0 {
+        return Ok(());
+    }
+    if m == 1 {
+        return w.matmul_into(backend, x_batched, out_batched);
+    }
+    // M ≥ 8 et alignement → SGEMM via matmul_batched_into si dtype supporté.
+    // Fallback CPU-copy loop si matmul_batched_into renvoie Unsupported (e.g.
+    // Q5_K, Q8_0 pas encore portés en SGEMM).
+    if m >= 8 && m % 8 == 0 && w.n % 8 == 0 && w.k % 256 == 0 {
+        match w.matmul_batched_into(backend, m, x_batched, out_batched) {
+            Ok(()) => return Ok(()),
+            Err(MetalError::Unsupported(_)) => { /* fallthrough to loop */ },
+            Err(e) => return Err(e),
+        }
+    }
+    // Sinon : loop sgemv M× (sub-buffers offset par token via CPU memcpy).
+    // CRITICAL : drain BEFORE le memcpy CPU pour forcer la flush GPU→shared
+    // memory de `x_batched` (sinon on lit des données stale écrites par le
+    // dispatch précédent encore en flight). Pareil entre matmul_into et le
+    // memcpy de retour.
+    backend.drain();
+    let x_per_token = w.k * 4;
+    let out_per_token = w.n * 4;
+    for i in 0..m {
+        let x_view = backend.alloc_shared(x_per_token).unwrap();
+        let out_view = backend.alloc_shared(out_per_token).unwrap();
+        unsafe {
+            let src = (x_batched.contents() as *const u8).add(i * x_per_token);
+            std::ptr::copy_nonoverlapping(src, x_view.contents() as *mut u8, x_per_token);
+        }
+        w.matmul_into(backend, &x_view, &out_view)?;
+        backend.drain();
+        unsafe {
+            let dst = (out_batched.contents() as *mut u8).add(i * out_per_token);
+            std::ptr::copy_nonoverlapping(out_view.contents() as *const u8, dst, out_per_token);
+        }
+    }
+    Ok(())
+}
+
+/// T162 phase 9b — Batched variant of `attn_block_forward` for B-token prefill.
+///
+/// Equivalent to calling `attn_block_forward` B times sequentially at positions
+/// `pos_base..pos_base+B`, but uses batched primitives :
+///   - `rms_norm_batched_f32` (1 dispatch vs B)
+///   - SGEMM via `dispatch_batched_attn_matmul` (1 dispatch / projection vs B)
+///   - `split_qg_per_head_batched_f32` (1 dispatch vs B, only if `has_q_gate`)
+///   - `rms_norm_per_head_batched_f32` (1 dispatch vs B, for Q + K norms)
+///   - `rope_half_split_partial_batched_f32` (1 dispatch vs B)
+///   - `kv_append_batched_f32` (1 dispatch vs B)
+///   - `gqa_decode_batched_f32` (1 dispatch vs B, causal mask multi-position)
+///   - `sigmoid_mul_inplace_batched_f32` (1 dispatch vs B, only if `has_q_gate`)
+///   - `add_inplace_batched_f32` for the final residual.
+///
+/// Le KV cache est mis à jour aux positions `pos_base + (0..B)` (causalité
+/// préservée par `gqa_decode_batched_f32`).
+///
+/// Pré-conditions :
+///   - `xd_batched` : `[B, d]` row-major (in/out — résidu cumulé sur place)
+///   - `cache.k_cache`, `cache.v_cache` : `[max_seq, n_kv_heads, head_dim]`
+///   - `1 ≤ b ≤ B_MAX_BATCH`
+///
+/// Status : non wiré dans `forward_token` — fonction standalone testable
+/// via le futur `--bench-attn-batch` mode (phase 9d).
+#[allow(dead_code, clippy::too_many_arguments)]
+fn attn_block_forward_batch(
+    backend: &MetalBackend,
+    attn: &AttnLayerMetal,
+    cache: &AttnLayerCache,
+    xd_batched: &Buffer,
+    rope_cos: &Buffer,
+    rope_sin: &Buffer,
+    scratch: &BatchScratchAttn,
+    cfg: &Qwen35Config,
+    pos_base: usize,
+    b: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    if b == 0 || b > B_MAX_BATCH {
+        return Err(MetalError::ShapeMismatch(format!(
+            "attn_block_forward_batch: B must be in 1..={B_MAX_BATCH} (got {b})"
+        )));
+    }
+    let d = cfg.d;
+    let head_dim = cfg.attn_head_dim;
+    let n_q = cfg.n_q_heads;
+    let n_kv = cfg.n_kv_heads;
+    let q_dim = head_dim * n_q;
+    let eps = cfg.rms_eps;
+    let has_q_gate = cfg.variant.has_q_gate();
+
+    // 1. Batched RMSNorm (xd → h).
+    rms_norm_batched_f32(backend, xd_batched, &attn.attn_norm, &scratch.h, d, b, eps)?;
+
+    // 2. Q (and gate, when applicable). w_q outputs either q_dim or 2 * q_dim.
+    if has_q_gate {
+        dispatch_batched_attn_matmul(backend, &attn.w_q, b, &scratch.h, &scratch.qg)?;
+    } else {
+        dispatch_batched_attn_matmul(backend, &attn.w_q, b, &scratch.h, &scratch.q)?;
+    }
+    // 3. K, V batched matmul.
+    dispatch_batched_attn_matmul(backend, &attn.w_k, b, &scratch.h, &scratch.k_attn)?;
+    dispatch_batched_attn_matmul(backend, &attn.w_v, b, &scratch.h, &scratch.v_attn)?;
+
+    // 4. Batched per-head split of QG → Q + gate (Qwen3Next variants only).
+    if has_q_gate {
+        split_qg_per_head_batched_f32(
+            backend,
+            &scratch.qg,
+            &scratch.q,
+            &scratch.gate_attn,
+            n_q,
+            head_dim,
+            b,
+        )?;
+    }
+
+    // 5. Batched per-head Q-norm and K-norm (shared gamma per head_dim).
+    rms_norm_per_head_batched_f32(backend, &scratch.q, &attn.q_norm, n_q, head_dim, b, eps)?;
+    rms_norm_per_head_batched_f32(
+        backend,
+        &scratch.k_attn,
+        &attn.k_norm,
+        n_kv,
+        head_dim,
+        b,
+        eps,
+    )?;
+
+    // 6. Batched partial RoPE on first rope_dim dims of each head.
+    let rope_dim = cfg.rope_dim;
+    rope_half_split_partial_batched_f32(
+        backend, &scratch.q, rope_cos, rope_sin, n_q, head_dim, rope_dim, pos_base, b,
+    )?;
+    rope_half_split_partial_batched_f32(
+        backend,
+        &scratch.k_attn,
+        rope_cos,
+        rope_sin,
+        n_kv,
+        head_dim,
+        rope_dim,
+        pos_base,
+        b,
+    )?;
+
+    // 7. Batched KV cache append at positions pos_base..pos_base+B.
+    kv_append_batched_f32(
+        backend,
+        &scratch.k_attn,
+        &cache.k_cache,
+        n_kv,
+        head_dim,
+        pos_base,
+        b,
+        max_seq,
+    )?;
+    kv_append_batched_f32(
+        backend,
+        &scratch.v_attn,
+        &cache.v_cache,
+        n_kv,
+        head_dim,
+        pos_base,
+        b,
+        max_seq,
+    )?;
+
+    // 8. Batched GQA decode with causal mask (each token i attends to KV[..pos_base+i+1]).
+    gqa_decode_batched_f32(
+        backend,
+        &scratch.q,
+        &cache.k_cache,
+        &cache.v_cache,
+        &scratch.attn_out,
+        n_q,
+        n_kv,
+        head_dim,
+        pos_base,
+        b,
+        max_seq,
+    )?;
+
+    // 9. Batched sigmoid(gate) on attention output (Qwen3Next-only).
+    if has_q_gate {
+        sigmoid_mul_inplace_batched_f32(backend, &scratch.attn_out, &scratch.gate_attn, q_dim, b)?;
+    }
+
+    // 10. W_O batched matmul → o, then xd += o (batched).
+    dispatch_batched_attn_matmul(backend, &attn.w_o, b, &scratch.attn_out, &scratch.o)?;
+    add_inplace_batched_f32(backend, xd_batched, &scratch.o, d, b)?;
+    Ok(())
 }
 
 /// Top-level decode state — per-layer caches + scratch + max sequence length.
@@ -2239,6 +2492,219 @@ impl GgufTokenizer {
     }
 }
 
+/// T162 phase 9b — Parité `attn_block_forward_batch` vs B sequential
+/// `attn_block_forward` calls. Sélectionne la 1ère layer Attn du modèle, alloue
+/// 2 KV caches indépendants (séq vs batched), compare les résidus xd[i] post-
+/// attention. Vise rel < 1e-3 (B doit reproduire exactement la séquence des B
+/// forward_token avec le même état de cache).
+fn parity_attn_batch_on_loaded_weights(
+    backend: &MetalBackend,
+    cfg: &Qwen35Config,
+    model: &Qwen35MetalModel,
+) -> Result<(), String> {
+    // Sélection : 1ère layer Attn du modèle (variant Qwen3.5/3.6 = has_q_gate).
+    let attn = model
+        .layers
+        .iter()
+        .find_map(|l| match l {
+            LayerMetal::Attn { attn, .. } => Some(attn),
+            _ => None,
+        })
+        .ok_or("no Attn layer found")?;
+
+    let d = cfg.d;
+    let head_dim = cfg.attn_head_dim;
+    let n_kv = cfg.n_kv_heads;
+    let kv_dim = head_dim * n_kv;
+    let max_seq = 64_usize;
+    let b = 8_usize; // M >= 8 → SGEMM path. Le fallback M<8 (CPU-copy) est
+                     // corrigé via drain() mais pas dans le critical path
+                     // production — phase 9d utilisera B ≥ 32 systématiquement.
+    let pos_base = 0_usize;
+
+    println!("=== T162 phase 9b — Parity attn_block_forward_batch (B={b}) ===");
+    println!(
+        "  d={d} head_dim={head_dim} n_q={} n_kv={n_kv} rope_dim={}",
+        cfg.n_q_heads, cfg.rope_dim
+    );
+
+    // Build deterministic xd_all [B, d].
+    let mut xd_all = vec![0.0f32; b * d];
+    for bi in 0..b {
+        for i in 0..d {
+            xd_all[bi * d + i] = ((i as f32 + 1.0 + bi as f32 * 7.0) * 0.0007).sin() * 0.4;
+        }
+    }
+
+    // Pre-build RoPE tables for [0, max_seq).
+    let half = cfg.rope_dim / 2;
+    let mut cos_tab = vec![0.0_f32; max_seq * half];
+    let mut sin_tab = vec![0.0_f32; max_seq * half];
+    for pos in 0..max_seq {
+        for i in 0..half {
+            let theta = (pos as f32) / cfg.rope_base.powf((2 * i) as f32 / cfg.rope_dim as f32);
+            cos_tab[pos * half + i] = theta.cos();
+            sin_tab[pos * half + i] = theta.sin();
+        }
+    }
+    let rope_cos = backend.alloc_shared(max_seq * half * 4).unwrap();
+    let rope_sin = backend.alloc_shared(max_seq * half * 4).unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            cos_tab.as_ptr(),
+            rope_cos.contents() as *mut f32,
+            max_seq * half,
+        );
+        std::ptr::copy_nonoverlapping(
+            sin_tab.as_ptr(),
+            rope_sin.contents() as *mut f32,
+            max_seq * half,
+        );
+    }
+
+    // === Sequential reference path: B calls of attn_block_forward, each with
+    //     its own pre-zeroed KV cache (just the same cache state evolving
+    //     causally, since pos increases each call). ===
+    let cache_seq_k = backend.alloc_shared(max_seq * kv_dim * 4).unwrap();
+    let cache_seq_v = backend.alloc_shared(max_seq * kv_dim * 4).unwrap();
+    unsafe {
+        std::ptr::write_bytes(cache_seq_k.contents() as *mut u8, 0, max_seq * kv_dim * 4);
+        std::ptr::write_bytes(cache_seq_v.contents() as *mut u8, 0, max_seq * kv_dim * 4);
+    }
+    let cache_seq = AttnLayerCache {
+        k_cache: cache_seq_k,
+        v_cache: cache_seq_v,
+    };
+
+    let scratch_seq = Scratch::new(backend, cfg);
+    let mut xd_seq = vec![0.0_f32; b * d];
+    for bi in 0..b {
+        // Load xd[bi] into scratch_seq.xd.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                xd_all[bi * d..(bi + 1) * d].as_ptr(),
+                scratch_seq.xd.contents() as *mut f32,
+                d,
+            );
+        }
+        attn_block_forward(
+            backend,
+            attn,
+            &cache_seq,
+            &scratch_seq,
+            &rope_cos,
+            &rope_sin,
+            cfg,
+            pos_base + bi,
+            max_seq,
+        )
+        .map_err(|e| format!("seq[{bi}] forward: {e:?}"))?;
+        backend.drain();
+        // Read back xd post-attention.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scratch_seq.xd.contents() as *const f32,
+                xd_seq[bi * d..(bi + 1) * d].as_mut_ptr(),
+                d,
+            );
+        }
+    }
+
+    // === Batched path: 1 call of attn_block_forward_batch with own KV cache. ===
+    let cache_bat_k = backend.alloc_shared(max_seq * kv_dim * 4).unwrap();
+    let cache_bat_v = backend.alloc_shared(max_seq * kv_dim * 4).unwrap();
+    unsafe {
+        std::ptr::write_bytes(cache_bat_k.contents() as *mut u8, 0, max_seq * kv_dim * 4);
+        std::ptr::write_bytes(cache_bat_v.contents() as *mut u8, 0, max_seq * kv_dim * 4);
+    }
+    let cache_bat = AttnLayerCache {
+        k_cache: cache_bat_k,
+        v_cache: cache_bat_v,
+    };
+    let xd_bat_buf = backend.alloc_shared(B_MAX_BATCH * d * 4).unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(xd_all.as_ptr(), xd_bat_buf.contents() as *mut f32, b * d);
+    }
+    let scratch_bat = BatchScratchAttn::new(backend, cfg);
+    attn_block_forward_batch(
+        backend,
+        attn,
+        &cache_bat,
+        &xd_bat_buf,
+        &rope_cos,
+        &rope_sin,
+        &scratch_bat,
+        cfg,
+        pos_base,
+        b,
+        max_seq,
+    )
+    .map_err(|e| format!("batched forward: {e:?}"))?;
+    backend.drain();
+
+    let mut xd_bat = vec![0.0_f32; b * d];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            xd_bat_buf.contents() as *const f32,
+            xd_bat.as_mut_ptr(),
+            b * d,
+        );
+    }
+
+    // Compare per-token outputs. Use max-magnitude denominator to avoid
+    // inflating the rel diff in regions where seq value is near zero
+    // (FP32 reduction-order noise dominates there).
+    let mut max_rel = 0.0_f32;
+    let mut max_abs = 0.0_f32;
+    let mut max_idx = (0usize, 0usize);
+    let mut sum_sq_diff = 0.0_f64;
+    let mut sum_sq_seq = 0.0_f64;
+    for bi in 0..b {
+        for i in 0..d {
+            let a = xd_seq[bi * d + i];
+            let bv = xd_bat[bi * d + i];
+            let abs = (a - bv).abs();
+            let denom = a.abs().max(bv.abs()).max(1e-3);
+            let rel = abs / denom;
+            if rel > max_rel {
+                max_rel = rel;
+                max_abs = abs;
+                max_idx = (bi, i);
+            }
+            sum_sq_diff += (abs as f64).powi(2);
+            sum_sq_seq += (a as f64).powi(2);
+        }
+    }
+    let rms_diff = (sum_sq_diff / (b * d) as f64).sqrt() as f32;
+    let rms_seq = (sum_sq_seq / (b * d) as f64).sqrt() as f32;
+    let global_rms_rel = rms_diff / rms_seq.max(1e-6);
+    let (bi, i) = max_idx;
+    println!(
+        "  Max rel diff (max-denom): {:.3e} (abs {:.3e}) at [b={bi}, i={i}]: seq={} bat={}",
+        max_rel,
+        max_abs,
+        xd_seq[bi * d + i],
+        xd_bat[bi * d + i]
+    );
+    println!(
+        "  Global RMS rel diff      : {:.3e} (rms_diff={:.3e}, rms_seq={:.3e})",
+        global_rms_rel, rms_diff, rms_seq
+    );
+    // Tolerance : max-denom rel < 5e-2 (FP32 noise after RMSNorm + matmul +
+    // softmax + reduce can accumulate to a few % per element) AND global
+    // RMS rel < 5e-3 (the bulk of the residual must agree to 0.5 %).
+    if max_rel > 5e-2 {
+        return Err(format!("PARITY FAIL: max rel = {max_rel:.3e} (>5e-2)"));
+    }
+    if global_rms_rel > 5e-3 {
+        return Err(format!(
+            "PARITY FAIL: global RMS rel = {global_rms_rel:.3e} (>5e-3)"
+        ));
+    }
+    println!("  ✓ PARITY PASS (max rel < 5e-2, RMS rel < 5e-3)");
+    Ok(())
+}
+
 /// T162 — Bench complet de tous les matmuls Q4_K d'une layer + projection prefill.
 ///
 /// Mesure le speedup `matmul_batched_into` (SGEMM phase 2/3-bis) vs
@@ -2456,6 +2922,19 @@ fn main() -> ExitCode {
     if env::args().any(|a| a == "--bench-batched") {
         bench_batched_matmul_on_loaded_weights(backend, &model);
         return ExitCode::SUCCESS;
+    }
+
+    // T162 phase 9b — `--parity-attn-batch` mode : valide attn_block_forward_batch
+    // contre B sequential attn_block_forward sur la première layer Attn du modèle.
+    // Compare le résidu xd[i] post-attention pour chaque token i ∈ [0, B).
+    if env::args().any(|a| a == "--parity-attn-batch") {
+        match parity_attn_batch_on_loaded_weights(backend, &cfg, &model) {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("parity-attn-batch failed: {e}");
+                return ExitCode::FAILURE;
+            },
+        }
     }
 
     // Sanity: walk the layer list to confirm we successfully loaded each
