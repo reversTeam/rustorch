@@ -322,6 +322,41 @@ impl HybridMetalWeight {
                     )))
                 }
             },
+            GgmlType::Q5_K => {
+                // T175 P2 — Q5_K SGEMM batched via expert_major kernel en mode
+                // "single-expert" : tile_expert_ids = [0, ...] et expert_stride
+                // = 0. Le kernel calcule W = W_stacked + 0 × 0 = W_stacked
+                // (matrice unique). Élimine le fallback drain×M qui coûtait
+                // 128 × 250 µs = 32 ms / matmul sur prefill 35B-A3B.
+                if m >= 8 && m % 8 == 0 && self.n % 8 == 0 && self.k % 256 == 0 {
+                    let n_tiles = m / 8;
+                    let zeros = vec![0u32; n_tiles];
+                    let tile_buf = backend.alloc_shared(n_tiles * 4)?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            zeros.as_ptr(),
+                            tile_buf.contents() as *mut u32,
+                            n_tiles,
+                        );
+                    }
+                    sgemm_q5_k_f32_expert_major_8x8_into(
+                        backend,
+                        x_batched,
+                        &self.buffer,
+                        &tile_buf,
+                        out_batched,
+                        m,
+                        self.n,
+                        self.k,
+                        0, // expert_stride_bytes = 0 → single-expert mode
+                    )
+                } else {
+                    Err(MetalError::Unsupported(format!(
+                        "HybridMetalWeight::matmul_batched_into: Q5_K SGEMM requires M%8, N%8, K%256 (got M={m}, N={}, K={})",
+                        self.n, self.k
+                    )))
+                }
+            },
             other => Err(MetalError::Unsupported(format!(
                 "HybridMetalWeight::matmul_batched_into: dtype {:?} not yet supported for M > 1 batched path",
                 other
