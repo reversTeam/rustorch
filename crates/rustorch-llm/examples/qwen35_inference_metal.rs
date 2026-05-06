@@ -1659,7 +1659,15 @@ fn ffn_moe_forward_batch(
     let gate_em = matches!(gate_exps_stacked.dtype, GgmlType::Q4_K | GgmlType::Q5_K);
     let up_em = matches!(up_exps_stacked.dtype, GgmlType::Q4_K | GgmlType::Q5_K);
     let down_em = matches!(down_exps_stacked.dtype, GgmlType::Q4_K | GgmlType::Q5_K);
-    let all_em = gate_em && up_em && down_em && b_eff >= n_experts;
+    // T169 (Voie D) — guard threshold relaxable via env. Default keeps the
+    // T163 phase 9f-six behavior (b_eff >= n_experts). Setting RUSTORCH_EM_THRESHOLD
+    // to a smaller value (e.g. 8) enables expert_major at smaller batches to
+    // measure whether the BlockMMA gain offsets the padding waste at B<n_experts.
+    let em_threshold: usize = std::env::var("RUSTORCH_EM_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(n_experts);
+    let all_em = gate_em && up_em && down_em && b_eff >= em_threshold;
 
     let dispatch_em_sgemm = |stacked: &StackedQuantizedExperts,
                              a_buf: &Buffer,
