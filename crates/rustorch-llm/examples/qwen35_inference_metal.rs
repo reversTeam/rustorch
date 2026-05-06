@@ -3223,15 +3223,23 @@ fn forward_batch(
             (
                 LayerMetal::Attn {
                     attn,
-                    ffn: ffn @ FfnLayerMetal::Moe { .. },
+                    ffn:
+                        FfnLayerMetal::Moe {
+                            gate_inp,
+                            gate_inp_shexp,
+                            gate_shexp,
+                            up_shexp,
+                            down_shexp,
+                            gate_exps_stacked,
+                            up_exps_stacked,
+                            down_exps_stacked,
+                        },
                 },
                 LayerState::Attn(cache),
             ) => {
-                // T162 phase 9f-hybrid : Attn block batched, MoE FFN per-token.
-                // Le gather_sgemv MoE est fast à n_used=8 rows/dispatch ; batcher
-                // ce kernel introduirait soit memcpy 128MB (replication) soit
-                // saturation GPU (256 rows × 256 N/4 TG = 65K TG > occupancy).
-                // Per-token reste la voie optimale en attendant gather_sgemm_q4_k.
+                // T170 — Attn batched + MoE FFN BATCHED (was per-token loop with
+                // drain × B that ate 1.28s for B=128 on 35B-A3B prefill).
+                // Replaces dead-code ffn_moe_forward_batch entry into the path.
                 attn_block_forward_batch(
                     backend,
                     attn,
@@ -3246,33 +3254,24 @@ fn forward_batch(
                     state.max_seq,
                 )
                 .map_err(|e| format!("L{li} attn batched: {e:?}"))?;
-                // MoE FFN per-token : copy xd_batched[bi] → scratch.xd, run
-                // post-norm + ffn_moe (per-token gather), copy back.
-                backend.drain();
-                for bi in 0..b {
-                    unsafe {
-                        let src = (batch_scratch.xd.contents() as *const f32).add(bi * d);
-                        let dst = state.scratch.xd.contents() as *mut f32;
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                    rms_norm_f32(
-                        backend,
-                        &state.scratch.xd,
-                        &attn.attn_post_norm,
-                        &state.scratch.h,
-                        d,
-                        cfg.rms_eps,
-                    )
-                    .map_err(|e| format!("L{li}/{bi} post norm: {e:?}"))?;
-                    ffn_dense_forward(backend, ffn, &state.scratch, cfg)
-                        .map_err(|e| format!("L{li}/{bi} moe: {e:?}"))?;
-                    backend.drain();
-                    unsafe {
-                        let src = state.scratch.xd.contents() as *const f32;
-                        let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                }
+                ffn_moe_forward_batch(
+                    backend,
+                    &attn.attn_post_norm,
+                    gate_inp,
+                    gate_inp_shexp,
+                    gate_shexp,
+                    up_shexp,
+                    down_shexp,
+                    gate_exps_stacked,
+                    up_exps_stacked,
+                    down_exps_stacked,
+                    &batch_scratch.xd,
+                    &state.scratch,
+                    &batch_scratch.moe,
+                    cfg,
+                    b,
+                )
+                .map_err(|e| format!("L{li} moe batched: {e:?}"))?;
             },
             (
                 LayerMetal::Ssm {
@@ -3320,11 +3319,24 @@ fn forward_batch(
             (
                 LayerMetal::Ssm {
                     ssm,
-                    ffn: ffn @ FfnLayerMetal::Moe { .. },
+                    ffn:
+                        FfnLayerMetal::Moe {
+                            gate_inp,
+                            gate_inp_shexp,
+                            gate_shexp,
+                            up_shexp,
+                            down_shexp,
+                            gate_exps_stacked,
+                            up_exps_stacked,
+                            down_exps_stacked,
+                        },
                 },
                 LayerState::Ssm(s),
             ) => {
-                // T162 phase 9f-hybrid : SSM batched, MoE FFN per-token.
+                // T170 — SSM batched + MoE FFN BATCHED. Identical fix to the
+                // Attn+MoE branch above: removes per-token drain loop that ate
+                // most of the prefill time on 35B-A3B (30 SSM+MoE layers × B
+                // drains = 38400 drains for B=128).
                 ssm_block_forward_batch(
                     backend,
                     ssm,
@@ -3336,31 +3348,24 @@ fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("L{li} ssm batched: {e:?}"))?;
-                backend.drain();
-                for bi in 0..b {
-                    unsafe {
-                        let src = (batch_scratch.xd.contents() as *const f32).add(bi * d);
-                        let dst = state.scratch.xd.contents() as *mut f32;
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                    rms_norm_f32(
-                        backend,
-                        &state.scratch.xd,
-                        &ssm.attn_post_norm,
-                        &state.scratch.h,
-                        d,
-                        cfg.rms_eps,
-                    )
-                    .map_err(|e| format!("L{li}/{bi} post norm: {e:?}"))?;
-                    ffn_dense_forward(backend, ffn, &state.scratch, cfg)
-                        .map_err(|e| format!("L{li}/{bi} moe: {e:?}"))?;
-                    backend.drain();
-                    unsafe {
-                        let src = state.scratch.xd.contents() as *const f32;
-                        let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
-                        std::ptr::copy_nonoverlapping(src, dst, d);
-                    }
-                }
+                ffn_moe_forward_batch(
+                    backend,
+                    &ssm.attn_post_norm,
+                    gate_inp,
+                    gate_inp_shexp,
+                    gate_shexp,
+                    up_shexp,
+                    down_shexp,
+                    gate_exps_stacked,
+                    up_exps_stacked,
+                    down_exps_stacked,
+                    &batch_scratch.xd,
+                    &state.scratch,
+                    &batch_scratch.moe,
+                    cfg,
+                    b,
+                )
+                .map_err(|e| format!("L{li} ssm+moe batched: {e:?}"))?;
             },
             _ => return Err(format!("L{li}: kind/state mismatch")),
         }
