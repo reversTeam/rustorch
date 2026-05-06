@@ -2178,124 +2178,152 @@ impl GgufTokenizer {
     }
 }
 
-/// T162 — Benche `matmul_batched_into` sur une vraie weight Q4_K du modèle.
+/// T162 — Bench complet de tous les matmuls Q4_K d'une layer + projection prefill.
 ///
-/// Sélectionne la 1ère FFN gate Q4_K (= matrice [K=hidden, N=intermediate]) et
-/// mesure le speedup du path SGEMM simdgroup_matrix vs sgemv-loop M fois sur
-/// les exact mêmes bytes que ceux utilisés en inférence. C'est le bench le plus
-/// fidèle à l'usage réel : aucune génération synthétique de bytes Q4_K.
+/// Mesure le speedup `matmul_batched_into` (SGEMM phase 2/3-bis) vs
+/// `matmul_into` × M (sgemv loop) sur les 7 matmuls d'une layer transformer
+/// dense (Q/K/V/O attn + gate/up/down FFN), sur les bytes Q4_K RÉELS
+/// du modèle chargé. Calcule ensuite la projection prefill end-to-end.
 fn bench_batched_matmul_on_loaded_weights(backend: &MetalBackend, model: &Qwen35MetalModel) {
-    // Sélection : 1ère couche avec FFN dense Q4_K (Qwen3-14B = qwen3 dense).
-    let mut target: Option<&HybridMetalWeight> = None;
+    // Sélection : 1ère couche Attn dense Q4_K (= Qwen3-14B style).
+    let mut found: Option<(&AttnLayerMetal, &FfnLayerMetal)> = None;
     for layer in &model.layers {
-        let ffn = match layer {
-            LayerMetal::Attn { ffn, .. } => ffn,
-            LayerMetal::Ssm { ffn, .. } => ffn,
-        };
-        if let FfnLayerMetal::Dense { w_gate, .. } = ffn {
-            if w_gate.dtype == GgmlType::Q4_K {
-                target = Some(w_gate);
+        if let LayerMetal::Attn { attn, ffn } = layer {
+            if matches!(ffn, FfnLayerMetal::Dense { .. }) {
+                found = Some((attn, ffn));
                 break;
             }
         }
     }
-    let w = match target {
-        Some(w) => w,
+    let (attn, ffn) = match found {
+        Some(x) => x,
         None => {
-            eprintln!("bench-batched: pas de FFN Q4_K dans ce modèle (model variant non-dense ?)");
+            eprintln!("bench-batched: pas de layer Attn+Dense (modèle non-dense ?)");
             return;
         },
     };
-    println!(
-        "\n=== T162 bench-batched sur FFN gate Q4_K [{} (K=in) × {} (N=out)] ===",
-        w.k, w.n
-    );
+    let (w_gate, w_up, w_down) = match ffn {
+        FfnLayerMetal::Dense {
+            w_gate,
+            w_up,
+            w_down,
+        } => (w_gate, w_up, w_down),
+        _ => return,
+    };
 
-    // Test 4 valeurs de M représentatives :
-    //   M=1   : decode autoregressive (référence sgemv pure)
-    //   M=8   : prefill alignement minimum SGEMM phase 2
-    //   M=24  : prefill 19 tokens rounded up (cas réel court prompt)
-    //   M=64  : prefill batch SGEMM phase 3 (multi-warp)
-    //   M=128 : prefill long prompt
+    let weights: Vec<(&str, &HybridMetalWeight)> = vec![
+        ("Q proj    ", &attn.w_q),
+        ("K proj    ", &attn.w_k),
+        ("V proj    ", &attn.w_v),
+        ("O proj    ", &attn.w_o),
+        ("FFN gate  ", w_gate),
+        ("FFN up    ", w_up),
+        ("FFN down  ", w_down),
+    ];
+
     let m_values = [1usize, 8, 24, 64, 128];
 
     for &m in &m_values {
-        // Allocation : x [M, K], out [M, N]
-        let x_buf = match backend.alloc_shared(m * w.k * 4) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("alloc x failed: {e:?}");
-                continue;
-            },
-        };
-        let out_buf = match backend.alloc_shared(m * w.n * 4) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("alloc out failed: {e:?}");
-                continue;
-            },
-        };
-        // Init x avec valeurs déterministes (sin-seed).
-        unsafe {
-            let x_ptr = x_buf.contents() as *mut f32;
-            for i in 0..(m * w.k) {
-                *x_ptr.add(i) = ((i as f32 + 1.0) * 0.001).sin();
-            }
-        }
+        println!("\n=== T162 bench-batched layer 0 attn+ffn (M={m}) ===");
+        let mut total_batched_ms = 0.0_f64;
+        let mut total_loop_ms = 0.0_f64;
 
-        // Path A : matmul_batched_into (SGEMM si possible, sinon erreur).
-        let warmups = 3;
-        let iters = 30;
-        let batched_ms = {
-            let mut errored = false;
+        for (label, w) in &weights {
+            if w.dtype != GgmlType::Q4_K {
+                println!(
+                    "  {label} [K={}, N={}] dtype={:?} : skipped (non-Q4_K)",
+                    w.k, w.n, w.dtype
+                );
+                continue;
+            }
+            let x_buf = backend.alloc_shared(m * w.k * 4).unwrap();
+            let out_buf = backend.alloc_shared(m * w.n * 4).unwrap();
+            unsafe {
+                let x_ptr = x_buf.contents() as *mut f32;
+                for i in 0..(m * w.k) {
+                    *x_ptr.add(i) = ((i as f32 + 1.0) * 0.001).sin();
+                }
+            }
+
+            let warmups = 3;
+            let iters = 20;
+
+            let batched_ms = {
+                let mut errored = false;
+                for _ in 0..warmups {
+                    if w.matmul_batched_into(backend, m, &x_buf, &out_buf).is_err() {
+                        errored = true;
+                        break;
+                    }
+                }
+                backend.drain();
+                if errored {
+                    f64::NAN
+                } else {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        let _ = w.matmul_batched_into(backend, m, &x_buf, &out_buf);
+                    }
+                    backend.drain();
+                    t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+                }
+            };
+
             for _ in 0..warmups {
-                if w.matmul_batched_into(backend, m, &x_buf, &out_buf).is_err() {
-                    errored = true;
-                    break;
+                for _row in 0..m {
+                    let _ = w.matmul_into(backend, &x_buf, &out_buf);
                 }
             }
             backend.drain();
-            if errored {
-                f64::NAN
-            } else {
-                let t0 = std::time::Instant::now();
-                for _ in 0..iters {
-                    let _ = w.matmul_batched_into(backend, m, &x_buf, &out_buf);
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                for _row in 0..m {
+                    let _ = w.matmul_into(backend, &x_buf, &out_buf);
                 }
-                backend.drain();
-                t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
             }
-        };
+            backend.drain();
+            let loop_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-        // Path B : matmul_into M fois (= sgemv loop).
-        // Note : matmul_into prend x_buf entier (suppose M=1 = K floats).
-        // Pour simuler la loop M=1, on utilise le même buffer (les valeurs
-        // varient peu entre rows pour un bench). Réaliste car sgemv ignore
-        // le M-stride.
-        for _ in 0..warmups {
-            for _row in 0..m {
-                let _ = w.matmul_into(backend, &x_buf, &out_buf);
+            let speedup = if batched_ms.is_finite() && loop_ms > 0.0 {
+                loop_ms / batched_ms
+            } else {
+                f64::NAN
+            };
+            println!(
+                "  {label} [{:>5} → {:>5}] : batched={:7.3}ms  loop={:7.3}ms  ×{:5.2}",
+                w.k, w.n, batched_ms, loop_ms, speedup
+            );
+            if batched_ms.is_finite() {
+                total_batched_ms += batched_ms;
+            } else {
+                total_batched_ms += loop_ms;
             }
+            total_loop_ms += loop_ms;
         }
-        backend.drain();
-        let t0 = std::time::Instant::now();
-        for _ in 0..iters {
-            for _row in 0..m {
-                let _ = w.matmul_into(backend, &x_buf, &out_buf);
-            }
-        }
-        backend.drain();
-        let loop_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-        let speedup = if batched_ms.is_finite() {
-            loop_ms / batched_ms
-        } else {
-            f64::NAN
-        };
+        let total_speedup = total_loop_ms / total_batched_ms;
+        let n_layers = model.cfg.n_layers;
+        let full_loop_ms = total_loop_ms * n_layers as f64;
+        let full_batched_ms = total_batched_ms * n_layers as f64;
         println!(
-            "  M={m:4}: batched={:7.3}ms  loop={:7.3}ms  speedup={:5.2}×",
-            batched_ms, loop_ms, speedup
+            "  TOTAL/layer (matmul only): batched={:7.3}ms  loop={:7.3}ms  ×{:5.2}",
+            total_batched_ms, total_loop_ms, total_speedup
         );
+        println!(
+            "  × {} layers : batched={:.1}ms  loop={:.1}ms",
+            n_layers, full_batched_ms, full_loop_ms
+        );
+
+        if total_speedup.is_finite() && total_speedup > 1.0 {
+            // Approximation Amdahl : si matmul = 60% du forward time, gain
+            // total = 1 / (0.4 + 0.6/×_matmul).
+            let matmul_frac = 0.60_f64;
+            let projected_speedup = 1.0 / (1.0 - matmul_frac + matmul_frac / total_speedup);
+            println!(
+                "  PROJECTED prefill speedup (matmul ≈ 60% forward) : ×{:5.2}",
+                projected_speedup
+            );
+        }
     }
 }
 
