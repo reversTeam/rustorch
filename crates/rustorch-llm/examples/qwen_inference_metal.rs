@@ -32,12 +32,14 @@ use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, gqa_decode_batched_f32, gqa_decode_f32,
     kv_append_batched_f32, kv_append_f32, rms_norm_batched_f32, rms_norm_f32,
     rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rope_half_split_batched_f32,
-    rope_half_split_f32, sgemm_q4_k_f32_simdgroup_matrix_64_into,
+    rope_half_split_f32, sgemm_q3_k_f32_simdgroup_matrix_64_into,
+    sgemm_q3_k_f32_simdgroup_matrix_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
     sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
-    sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_q4_k_f32_into, sgemv_q4_k_f32_lcpp_nr2_batch_into,
-    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_pair_into, sgemv_q4_k_f32_pair_quadcoop_into,
-    sgemv_q4_k_f32_triple_quadcoop_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_lcpp_nr2_batch_into,
-    sgemv_q6_k_f32_lcpp_nsg2_into, swiglu_batched_f32, swiglu_f32,
+    sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_into,
+    sgemv_q4_k_f32_lcpp_nr2_batch_into, sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_pair_into,
+    sgemv_q4_k_f32_pair_quadcoop_into, sgemv_q4_k_f32_triple_quadcoop_into,
+    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_into, sgemv_q6_k_f32_lcpp_nr2_batch_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, swiglu_batched_f32, swiglu_f32,
 };
 
 /// T162 phase 4-bis : dispatcher SGEMM batched. Choisit le kernel optimal
@@ -87,6 +89,93 @@ fn dispatch_batched_matmul(
                     .map_err(|e| format!("sgemv_q6_k_batch: {e:?}"))
             }
         },
+        GgmlType::Q3_K => {
+            // T162 phase 7/7-bis — Q3_K SGEMM tile 8×8 ou 64×64.
+            // Pour M ∈ [2,7] : fallback per-token sgemv loop M×.
+            if aligned_64 {
+                sgemm_q3_k_f32_simdgroup_matrix_64_into(backend, h_buf, w_buf, out_buf, m, n, k)
+                    .map_err(|e| format!("sgemm_q3_k_64: {e:?}"))
+            } else if aligned_8 {
+                sgemm_q3_k_f32_simdgroup_matrix_into(backend, h_buf, w_buf, out_buf, m, n, k)
+                    .map_err(|e| format!("sgemm_q3_k_8: {e:?}"))
+            } else {
+                // Pas de Q3_K batched sgemv — boucle per-token avec offsets.
+                let bytes_per_row = (k / 256) * 110; // Q3_K super-block = 110 bytes
+                for i in 0..m {
+                    let h_view = backend.alloc_shared(k * 4).unwrap();
+                    let out_view = backend.alloc_shared(n * 4).unwrap();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (h_buf.contents() as *const u8).add(i * k * 4),
+                            h_view.contents() as *mut u8,
+                            k * 4,
+                        );
+                    }
+                    sgemv_q3_k_f32_lcpp_nsg2_into(backend, &h_view, w_buf, &out_view, k, n)
+                        .map_err(|e| format!("sgemv_q3_k loop[{i}]: {e:?}"))?;
+                    backend.drain();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            out_view.contents() as *const u8,
+                            (out_buf.contents() as *mut u8).add(i * n * 4),
+                            n * 4,
+                        );
+                    }
+                    let _ = bytes_per_row;
+                }
+                Ok(())
+            }
+        },
+        // T162 phase 9d-extra : fallback per-token loop pour les dtypes sans
+        // SGEMM batched (Q5_K, Q8_0). M itérations × matmul_into avec drain.
+        GgmlType::Q5_K => {
+            for i in 0..m {
+                let h_view = backend.alloc_shared(k * 4).unwrap();
+                let out_view = backend.alloc_shared(n * 4).unwrap();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (h_buf.contents() as *const u8).add(i * k * 4),
+                        h_view.contents() as *mut u8,
+                        k * 4,
+                    );
+                }
+                sgemv_q5_k_f32_lcpp_nsg2_into(backend, &h_view, w_buf, &out_view, k, n)
+                    .map_err(|e| format!("sgemv_q5_k loop[{i}]: {e:?}"))?;
+                backend.drain();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        out_view.contents() as *const u8,
+                        (out_buf.contents() as *mut u8).add(i * n * 4),
+                        n * 4,
+                    );
+                }
+            }
+            Ok(())
+        },
+        GgmlType::Q8_0 => {
+            for i in 0..m {
+                let h_view = backend.alloc_shared(k * 4).unwrap();
+                let out_view = backend.alloc_shared(n * 4).unwrap();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (h_buf.contents() as *const u8).add(i * k * 4),
+                        h_view.contents() as *mut u8,
+                        k * 4,
+                    );
+                }
+                sgemv_q8_0_f32_lcpp_nsg2_into(backend, &h_view, w_buf, &out_view, k, n)
+                    .map_err(|e| format!("sgemv_q8_0 loop[{i}]: {e:?}"))?;
+                backend.drain();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        out_view.contents() as *const u8,
+                        (out_buf.contents() as *mut u8).add(i * n * 4),
+                        n * 4,
+                    );
+                }
+            }
+            Ok(())
+        },
         other => Err(format!(
             "dispatch_batched_matmul: dtype {other:?} not supported"
         )),
@@ -134,6 +223,18 @@ impl MetalWeight {
             },
             (GgmlType::Q6_K, _, _) => {
                 sgemv_q6_k_f32_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n).unwrap()
+            },
+            (GgmlType::Q3_K, _, _) => {
+                sgemv_q3_k_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                    .unwrap()
+            },
+            (GgmlType::Q5_K, _, _) => {
+                sgemv_q5_k_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                    .unwrap()
+            },
+            (GgmlType::Q8_0, _, _) => {
+                sgemv_q8_0_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
+                    .unwrap()
             },
             _ => panic!("unsupported dtype: {:?}", self.dtype),
         }
