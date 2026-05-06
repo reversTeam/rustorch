@@ -64,8 +64,8 @@ use rustorch_metal::kernels::{
     sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
     split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
     ssm_conv1d_step_f32, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
-    topk_softmax_norm_f32, weighted_add_inplace_f32, weighted_reduce_add_batched_f32,
-    weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
+    topk_softmax_norm_f32, unpermute_rows_f32, weighted_add_inplace_f32,
+    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
 };
 
 /// One quantised weight tensor resident in a Metal buffer, tagged with
@@ -1637,14 +1637,19 @@ fn ffn_moe_forward_batch(
         b,
     )?;
 
-    // 4-7. T163 phase 9f-quater : EXPERT-MAJOR si tous les MoE weights sont Q4_K
-    //      (sort + pad mult-8 + SGEMM expert_major + scatter atomic). Sinon
-    //      fallback gather_per_token (T162 phase 9f-bis).
-    let all_q4k_moe = matches!(gate_exps_stacked.dtype, GgmlType::Q4_K)
-        && matches!(up_exps_stacked.dtype, GgmlType::Q4_K)
-        && matches!(down_exps_stacked.dtype, GgmlType::Q4_K);
+    // 4-7. T163 phase 9f-quater : EXPERT-MAJOR pipeline.
+    //      - Si TOUS Q4_K → full expert-major (gate, up, down via SGEMM 8×8).
+    //      - Si gate+up Q4_K mais down ≠ Q4_K (35B-A3B Q5_K down) → HYBRID :
+    //        gate/up via expert_major SGEMM, unpermute em_fd → fd_gather, puis
+    //        down via gather_sgemv standard.
+    //      - Sinon fallback complet gather_per_token.
+    let gate_q4k = matches!(gate_exps_stacked.dtype, GgmlType::Q4_K);
+    let up_q4k = matches!(up_exps_stacked.dtype, GgmlType::Q4_K);
+    let down_q4k = matches!(down_exps_stacked.dtype, GgmlType::Q4_K);
+    let all_q4k_moe = gate_q4k && up_q4k && down_q4k;
+    let hybrid_q4k_gate_up = gate_q4k && up_q4k && !down_q4k;
 
-    if all_q4k_moe {
+    if all_q4k_moe || hybrid_q4k_gate_up {
         // CPU sort indices.
         backend.drain();
         let mut src_indices_vec: Vec<u32> = Vec::with_capacity(b_eff + 7 * n_experts);
@@ -1720,27 +1725,62 @@ fn ffn_moe_forward_batch(
             &batch_scratch.em_fd,
             m_padded * ef,
         )?;
-        sgemm_q4_k_f32_expert_major_8x8_into(
-            backend,
-            &batch_scratch.em_fd,
-            &down_exps_stacked.buffer,
-            &batch_scratch.em_tile_expert_ids,
-            &batch_scratch.em_out_d,
-            m_padded,
-            d,
-            ef,
-            down_exps_stacked.bytes_per_expert,
-        )?;
-        weighted_scatter_add_f32(
-            backend,
-            &batch_scratch.em_out_d,
-            &batch_scratch.em_src_indices,
-            &batch_scratch.topw,
-            &batch_scratch.moe_acc,
-            d,
-            m_padded,
-            n_used,
-        )?;
+        if all_q4k_moe {
+            // Down also Q4_K → expert_major SGEMM end-to-end + atomic scatter.
+            sgemm_q4_k_f32_expert_major_8x8_into(
+                backend,
+                &batch_scratch.em_fd,
+                &down_exps_stacked.buffer,
+                &batch_scratch.em_tile_expert_ids,
+                &batch_scratch.em_out_d,
+                m_padded,
+                d,
+                ef,
+                down_exps_stacked.bytes_per_expert,
+            )?;
+            weighted_scatter_add_f32(
+                backend,
+                &batch_scratch.em_out_d,
+                &batch_scratch.em_src_indices,
+                &batch_scratch.topw,
+                &batch_scratch.moe_acc,
+                d,
+                m_padded,
+                n_used,
+            )?;
+        } else {
+            // HYBRID : gate/up via expert_major (Q4_K), unpermute em_fd →
+            // fd_gather (original [b_eff, ef] layout), puis down via gather_sgemv
+            // standard (compatible Q5_K, Q6_K, Q8_0).
+            unpermute_rows_f32(
+                backend,
+                &batch_scratch.em_fd,
+                &batch_scratch.em_src_indices,
+                &batch_scratch.fd_gather,
+                ef,
+                m_padded,
+            )?;
+            dispatch_gather_sgemv(
+                backend,
+                down_exps_stacked,
+                &batch_scratch.fd_gather,
+                &batch_scratch.down_gather,
+                &batch_scratch.indices,
+                b_eff,
+                ef,
+                d,
+                ef,
+            )?;
+            weighted_reduce_add_batched_f32(
+                backend,
+                &batch_scratch.down_gather,
+                &batch_scratch.topw,
+                &batch_scratch.moe_acc,
+                n_used,
+                d,
+                b,
+            )?;
+        }
     } else {
         // Fallback : gather_per_token (T162 phase 9f-bis) pour les modèles
         // mixed-dtype (e.g., 35B-A3B Q4_K gate/up + Q5_K down).

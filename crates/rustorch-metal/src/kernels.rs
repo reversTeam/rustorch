@@ -2902,6 +2902,74 @@ pub fn gather_pack_rows_f32(
 }
 
 // =============================================================================
+// T163 phase 9f-quater — unpermute rows pour hybrid expert-major.
+//
+// Inverse de gather_pack_rows : projette les rows en layout sorted-by-expert
+// vers le layout flat [B*n_used, D] dans l'ordre original (b*n_used+k_slot).
+//
+// Pour chaque row i ∈ [0, M_padded), si src_indices[i] != SENTINEL_PAD :
+//   dst[src_indices[i], :] = src[i, :]
+const UNPERMUTE_ROWS_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint UNPERM_SENTINEL = 0xFFFFFFFFu;
+
+kernel void unpermute_rows_f32(
+    device const float* src           [[buffer(0)]],   // [M_padded, D]
+    device const uint*  src_indices   [[buffer(1)]],   // [M_padded] flat indices
+    device float*       dst           [[buffer(2)]],   // [B*n_used, D]
+    constant uint2&     dims          [[buffer(3)]],   // (D, M_padded)
+    uint2               gid           [[thread_position_in_grid]]
+) {
+    uint D = dims.x;
+    uint M_padded = dims.y;
+    uint d = gid.x;
+    uint i = gid.y;
+    if (d >= D || i >= M_padded) return;
+
+    uint dst_idx = src_indices[i];
+    if (dst_idx == UNPERM_SENTINEL) return;
+    dst[dst_idx * D + d] = src[i * D + d];
+}
+"#;
+
+/// T163 phase 9f-quater — Inverse de `gather_pack_rows_f32`.
+/// Projette `src[M_padded, D]` (sorted by expert) vers `dst[B*n_used, D]` dans
+/// l'ordre original `b*n_used+k_slot`. Padded rows (sentinel) sont ignorées.
+pub fn unpermute_rows_f32(
+    backend: &MetalBackend,
+    src_buf: &Buffer,
+    src_indices_buf: &Buffer,
+    dst_buf: &Buffer,
+    d: usize,
+    m_padded: usize,
+) -> Result<(), MetalError> {
+    if d == 0 || m_padded == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "unpermute_rows_f32: D={d}, M_padded={m_padded}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "unpermute_rows_f32",
+        UNPERMUTE_ROWS_F32_SHADER,
+        "unpermute_rows_f32",
+    )?;
+    let dims = [d as u32, m_padded as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src_buf), 0);
+        encoder.set_buffer(1, Some(src_indices_buf), 0);
+        encoder.set_buffer(2, Some(dst_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(d as u64, m_padded as u64, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
+// =============================================================================
 // T163 phase 9f-quater — weighted scatter add pour expert-major MoE.
 //
 // Inverse de gather_pack_rows. Pour chaque row i ∈ [0, M_padded) qui est valide
