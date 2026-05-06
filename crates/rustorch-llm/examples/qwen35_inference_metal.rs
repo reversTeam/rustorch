@@ -1574,79 +1574,84 @@ fn ffn_moe_forward_batch(
         b,
     )?;
 
-    // 4. Replicate h_post for gather x_stride=K. h_repl[bi * n_used + k] = h_post[bi].
-    //    All replicated rows for token bi share the same h. CPU memcpy in shared mem.
-    unsafe {
-        let h_src = batch_scratch.h_post.contents() as *const f32;
-        let h_dst = batch_scratch.h_repl.contents() as *mut f32;
-        for bi in 0..b {
-            for k in 0..n_used {
-                let src = h_src.add(bi * d);
-                let dst = h_dst.add((bi * n_used + k) * d);
-                std::ptr::copy_nonoverlapping(src, dst, d);
-            }
+    // 4-7. Hybrid : per-token gather (proven fast at n_used=8 rows/dispatch),
+    //      batched zero. Avoids the 128MB memcpy h_repl + gather saturation issue.
+    zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
+    backend.drain();
+    let _ = b_eff; // unused in hybrid path
+    for bi in 0..b {
+        // Per-token views (sub-buffer offsets via memcpy of small chunks).
+        let h_view = backend.alloc_shared(d * 4).unwrap();
+        let idx_view = backend.alloc_shared(n_used * 4).unwrap();
+        let topw_view = backend.alloc_shared(n_used * 4).unwrap();
+        let gate_view = backend.alloc_shared(n_used * ef * 4).unwrap();
+        let up_view = backend.alloc_shared(n_used * ef * 4).unwrap();
+        let fd_view = backend.alloc_shared(n_used * ef * 4).unwrap();
+        let down_view = backend.alloc_shared(n_used * d * 4).unwrap();
+        let acc_view = backend.alloc_shared(d * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (batch_scratch.h_post.contents() as *const f32).add(bi * d),
+                h_view.contents() as *mut f32,
+                d,
+            );
+            std::ptr::copy_nonoverlapping(
+                (batch_scratch.indices.contents() as *const u32).add(bi * n_used),
+                idx_view.contents() as *mut u32,
+                n_used,
+            );
+            std::ptr::copy_nonoverlapping(
+                (batch_scratch.topw.contents() as *const f32).add(bi * n_used),
+                topw_view.contents() as *mut f32,
+                n_used,
+            );
+        }
+        // Gather gate + up (broadcast h, n_used experts each).
+        dispatch_gather_sgemv(
+            backend,
+            gate_exps_stacked,
+            &h_view,
+            &gate_view,
+            &idx_view,
+            n_used,
+            d,
+            ef,
+            0, // x_stride=0 → broadcast
+        )?;
+        dispatch_gather_sgemv(
+            backend,
+            up_exps_stacked,
+            &h_view,
+            &up_view,
+            &idx_view,
+            n_used,
+            d,
+            ef,
+            0,
+        )?;
+        swiglu_f32(backend, &gate_view, &up_view, &fd_view, n_used * ef)?;
+        dispatch_gather_sgemv(
+            backend,
+            down_exps_stacked,
+            &fd_view,
+            &down_view,
+            &idx_view,
+            n_used,
+            ef,
+            d,
+            ef, // x_stride=ef per-row
+        )?;
+        zero_f32(backend, &acc_view, d)?;
+        weighted_reduce_add_f32(backend, &down_view, &topw_view, &acc_view, n_used, d)?;
+        backend.drain();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                acc_view.contents() as *const f32,
+                (batch_scratch.moe_acc.contents() as *mut f32).add(bi * d),
+                d,
+            );
         }
     }
-
-    // 5. Gather gate + up : 1 dispatch each over B*n_used rows.
-    dispatch_gather_sgemv(
-        backend,
-        gate_exps_stacked,
-        &batch_scratch.h_repl,
-        &batch_scratch.gate_gather,
-        &batch_scratch.indices,
-        b_eff,
-        d,
-        ef,
-        d, // x_stride=d (per-row from replication)
-    )?;
-    dispatch_gather_sgemv(
-        backend,
-        up_exps_stacked,
-        &batch_scratch.h_repl,
-        &batch_scratch.up_gather,
-        &batch_scratch.indices,
-        b_eff,
-        d,
-        ef,
-        d,
-    )?;
-
-    // 6. Element-wise SwiGLU on B*n_used*ef floats (treated as 1D).
-    swiglu_f32(
-        backend,
-        &batch_scratch.gate_gather,
-        &batch_scratch.up_gather,
-        &batch_scratch.fd_gather,
-        b_eff * ef,
-    )?;
-
-    // 7. Gather down : output [B*n_used, d] per-row.
-    dispatch_gather_sgemv(
-        backend,
-        down_exps_stacked,
-        &batch_scratch.fd_gather,
-        &batch_scratch.down_gather,
-        &batch_scratch.indices,
-        b_eff,
-        ef,
-        d,
-        ef, // x_stride=ef (per-row)
-    )?;
-    backend.drain();
-
-    // 8. Batched weighted reduce : moe_acc[t, d] += sum_k topw[t, k] * down_gather[t, k, d].
-    //    Zero the accumulator first (one batched dispatch sized [B, d]).
-    zero_f32(backend, &batch_scratch.moe_acc, b * d)?;
-    weighted_reduce_add_batched_f32(
-        backend,
-        &batch_scratch.down_gather,
-        &batch_scratch.topw,
-        &batch_scratch.moe_acc,
-        n_used,
-        d,
-        b,
-    )?;
 
     // 9. Shared expert pipeline (BATCHED dense FFN).
     dispatch_batched_attn_matmul(
@@ -2967,21 +2972,15 @@ fn forward_batch(
             (
                 LayerMetal::Attn {
                     attn,
-                    ffn:
-                        FfnLayerMetal::Moe {
-                            gate_inp,
-                            gate_inp_shexp,
-                            gate_shexp,
-                            up_shexp,
-                            down_shexp,
-                            gate_exps_stacked,
-                            up_exps_stacked,
-                            down_exps_stacked,
-                        },
+                    ffn: ffn @ FfnLayerMetal::Moe { .. },
                 },
                 LayerState::Attn(cache),
             ) => {
-                // T162 phase 9f — Attn batched + MoE batched (gather x_replicate).
+                // T162 phase 9f-hybrid : Attn block batched, MoE FFN per-token.
+                // Le gather_sgemv MoE est fast à n_used=8 rows/dispatch ; batcher
+                // ce kernel introduirait soit memcpy 128MB (replication) soit
+                // saturation GPU (256 rows × 256 N/4 TG = 65K TG > occupancy).
+                // Per-token reste la voie optimale en attendant gather_sgemm_q4_k.
                 attn_block_forward_batch(
                     backend,
                     attn,
@@ -2996,24 +2995,33 @@ fn forward_batch(
                     state.max_seq,
                 )
                 .map_err(|e| format!("L{li} attn batched: {e:?}"))?;
-                ffn_moe_forward_batch(
-                    backend,
-                    &attn.attn_post_norm,
-                    gate_inp,
-                    gate_inp_shexp,
-                    gate_shexp,
-                    up_shexp,
-                    down_shexp,
-                    gate_exps_stacked,
-                    up_exps_stacked,
-                    down_exps_stacked,
-                    &batch_scratch.xd,
-                    &state.scratch,
-                    &batch_scratch.moe,
-                    cfg,
-                    b,
-                )
-                .map_err(|e| format!("L{li} attn-moe batched: {e:?}"))?;
+                // MoE FFN per-token : copy xd_batched[bi] → scratch.xd, run
+                // post-norm + ffn_moe (per-token gather), copy back.
+                backend.drain();
+                for bi in 0..b {
+                    unsafe {
+                        let src = (batch_scratch.xd.contents() as *const f32).add(bi * d);
+                        let dst = state.scratch.xd.contents() as *mut f32;
+                        std::ptr::copy_nonoverlapping(src, dst, d);
+                    }
+                    rms_norm_f32(
+                        backend,
+                        &state.scratch.xd,
+                        &attn.attn_post_norm,
+                        &state.scratch.h,
+                        d,
+                        cfg.rms_eps,
+                    )
+                    .map_err(|e| format!("L{li}/{bi} post norm: {e:?}"))?;
+                    ffn_dense_forward(backend, ffn, &state.scratch, cfg)
+                        .map_err(|e| format!("L{li}/{bi} moe: {e:?}"))?;
+                    backend.drain();
+                    unsafe {
+                        let src = state.scratch.xd.contents() as *const f32;
+                        let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
+                        std::ptr::copy_nonoverlapping(src, dst, d);
+                    }
+                }
             },
             (
                 LayerMetal::Ssm {
@@ -3057,21 +3065,11 @@ fn forward_batch(
             (
                 LayerMetal::Ssm {
                     ssm,
-                    ffn:
-                        FfnLayerMetal::Moe {
-                            gate_inp,
-                            gate_inp_shexp,
-                            gate_shexp,
-                            up_shexp,
-                            down_shexp,
-                            gate_exps_stacked,
-                            up_exps_stacked,
-                            down_exps_stacked,
-                        },
+                    ffn: ffn @ FfnLayerMetal::Moe { .. },
                 },
                 LayerState::Ssm(s),
             ) => {
-                // T162 phase 9f — SSM batched + MoE batched.
+                // T162 phase 9f-hybrid : SSM batched, MoE FFN per-token.
                 ssm_block_forward_batch(
                     backend,
                     ssm,
@@ -3083,24 +3081,31 @@ fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("L{li} ssm batched: {e:?}"))?;
-                ffn_moe_forward_batch(
-                    backend,
-                    &ssm.attn_post_norm,
-                    gate_inp,
-                    gate_inp_shexp,
-                    gate_shexp,
-                    up_shexp,
-                    down_shexp,
-                    gate_exps_stacked,
-                    up_exps_stacked,
-                    down_exps_stacked,
-                    &batch_scratch.xd,
-                    &state.scratch,
-                    &batch_scratch.moe,
-                    cfg,
-                    b,
-                )
-                .map_err(|e| format!("L{li} ssm-moe batched: {e:?}"))?;
+                backend.drain();
+                for bi in 0..b {
+                    unsafe {
+                        let src = (batch_scratch.xd.contents() as *const f32).add(bi * d);
+                        let dst = state.scratch.xd.contents() as *mut f32;
+                        std::ptr::copy_nonoverlapping(src, dst, d);
+                    }
+                    rms_norm_f32(
+                        backend,
+                        &state.scratch.xd,
+                        &ssm.attn_post_norm,
+                        &state.scratch.h,
+                        d,
+                        cfg.rms_eps,
+                    )
+                    .map_err(|e| format!("L{li}/{bi} post norm: {e:?}"))?;
+                    ffn_dense_forward(backend, ffn, &state.scratch, cfg)
+                        .map_err(|e| format!("L{li}/{bi} moe: {e:?}"))?;
+                    backend.drain();
+                    unsafe {
+                        let src = state.scratch.xd.contents() as *const f32;
+                        let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
+                        std::ptr::copy_nonoverlapping(src, dst, d);
+                    }
+                }
             },
             _ => return Err(format!("L{li}: kind/state mismatch")),
         }
@@ -4212,61 +4217,79 @@ fn main() -> ExitCode {
                     }
                 )
             });
-            println!("  T162 phase 9d : prefill batched (B={prefill_batch}, B_MAX={B_MAX_BATCH})");
-            if any_moe && !any_dense {
+            // T162 phase 9f-route : MoE-only models (35B-A3B style) regress
+            // -50% en batched mode (gather_sgemv saturation + per-token loop
+            // overhead). On force le path per-token forward_token jusqu'à la
+            // phase 9f-bis (gather_sgemm_q4_k_simdgroup_matrix).
+            let force_pertoken = any_moe && !any_dense;
+            if force_pertoken {
                 println!(
-                    "  WARNING : modèle MoE-only (35B-A3B style) — phase 9f-foundation \
-                     batched mais REGRESSION (gather_sgemv satur. + 128MB memcpy/layer). \
-                     Phase 9f-bis (gather_sgemm_q4_k simdgroup_matrix) requise pour gain."
+                    "  NOTE : modèle MoE-only — auto-route per-token forward_token \
+                     (--prefill-batch ignoré jusqu'à phase 9f-bis avec gather_sgemm_q4_k)."
                 );
-            } else if any_moe {
+            } else {
                 println!(
-                    "  NOTE : modèle hybride avec layers MoE — gain partiel sur layers Dense."
+                    "  T162 phase 9d : prefill batched (B={prefill_batch}, B_MAX={B_MAX_BATCH})"
                 );
-            }
-            let batch_scratch = BatchScratch::new(backend, &cfg);
-            let mut idx = 0;
-            while idx < prompt_ids.len() {
-                let remaining = prompt_ids.len() - idx;
-                // T162 phase 9d : préférer chunks multiples de 8 pour SGEMM path.
-                // Si remaining < B mais ≥ 8 : round-down à 8. Si < 8 : tail
-                // per-token forward_token (le fallback CPU-copy ×M est ~100×
-                // plus lent que sgemv direct).
-                let chunk_size = if remaining >= prefill_batch {
-                    prefill_batch
-                } else if remaining >= 8 {
-                    (remaining / 8) * 8
-                } else {
-                    for &t in &prompt_ids[idx..] {
-                        match forward_token(backend, &file, &model, &mut state, t, cur_pos) {
-                            Ok(out) => last = out,
-                            Err(e) => {
-                                eprintln!("forward error at prefill tail: {e}");
-                                return ExitCode::FAILURE;
-                            },
-                        }
-                        cur_pos += 1;
-                    }
-                    break;
-                };
-                let chunk = &prompt_ids[idx..idx + chunk_size];
-                match forward_batch(
-                    backend,
-                    &file,
-                    &model,
-                    &mut state,
-                    &batch_scratch,
-                    chunk,
-                    cur_pos,
-                ) {
-                    Ok(out) => last = out,
-                    Err(e) => {
-                        eprintln!("forward_batch error at prefill: {e}");
-                        return ExitCode::FAILURE;
-                    },
+                if any_moe {
+                    println!(
+                        "  NOTE : modèle hybride avec layers MoE — gain partiel sur layers Dense."
+                    );
                 }
-                cur_pos += chunk_size;
-                idx += chunk_size;
+            }
+            if force_pertoken {
+                // MoE-only auto-route per-token forward.
+                for &t in &prompt_ids {
+                    match forward_token(backend, &file, &model, &mut state, t, cur_pos) {
+                        Ok(out) => last = out,
+                        Err(e) => {
+                            eprintln!("forward error at prefill (per-token): {e}");
+                            return ExitCode::FAILURE;
+                        },
+                    }
+                    cur_pos += 1;
+                }
+            } else {
+                let batch_scratch = BatchScratch::new(backend, &cfg);
+                let mut idx = 0;
+                while idx < prompt_ids.len() {
+                    let remaining = prompt_ids.len() - idx;
+                    let chunk_size = if remaining >= prefill_batch {
+                        prefill_batch
+                    } else if remaining >= 8 {
+                        (remaining / 8) * 8
+                    } else {
+                        for &t in &prompt_ids[idx..] {
+                            match forward_token(backend, &file, &model, &mut state, t, cur_pos) {
+                                Ok(out) => last = out,
+                                Err(e) => {
+                                    eprintln!("forward error at prefill tail: {e}");
+                                    return ExitCode::FAILURE;
+                                },
+                            }
+                            cur_pos += 1;
+                        }
+                        break;
+                    };
+                    let chunk = &prompt_ids[idx..idx + chunk_size];
+                    match forward_batch(
+                        backend,
+                        &file,
+                        &model,
+                        &mut state,
+                        &batch_scratch,
+                        chunk,
+                        cur_pos,
+                    ) {
+                        Ok(out) => last = out,
+                        Err(e) => {
+                            eprintln!("forward_batch error at prefill: {e}");
+                            return ExitCode::FAILURE;
+                        },
+                    }
+                    cur_pos += chunk_size;
+                    idx += chunk_size;
+                }
             }
         } else {
             for &t in &prompt_ids {
