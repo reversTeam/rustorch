@@ -54,20 +54,21 @@ use rustorch_metal::kernels::{
     rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
     rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
-    sgemm_q4_k_f32_expert_major_8x8_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
-    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q5_k_f32_expert_major_8x8_into,
-    sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
-    sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into,
-    sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-    sgemv_q5_k_gather_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-    sgemv_q6_k_gather_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
-    sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32,
-    sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
-    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
-    ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
-    topk_softmax_norm_f32, unpermute_rows_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
+    sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
+    sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
+    sgemm_q5_k_f32_expert_major_8x8_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
+    sgemm_q6_k_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
+    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+    sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into,
+    sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32,
+    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
+    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
+    ssm_conv1d_step_f32, ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32,
+    topk_softmax_norm_batched_f32, topk_softmax_norm_f32, unpermute_rows_f32,
+    weighted_add_inplace_f32, weighted_reduce_add_batched_f32, weighted_reduce_add_f32,
+    weighted_scatter_add_f32, zero_f32,
 };
 
 /// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
@@ -1709,17 +1710,36 @@ fn ffn_moe_forward_batch(
                              k: usize|
      -> Result<(), MetalError> {
         match stacked.dtype {
-            GgmlType::Q4_K => sgemm_q4_k_f32_expert_major_8x8_into(
-                backend,
-                a_buf,
-                &stacked.buffer,
-                &batch_scratch.em_tile_expert_ids,
-                c_buf,
-                m,
-                n,
-                k,
-                stacked.bytes_per_expert,
-            ),
+            GgmlType::Q4_K => {
+                // T175 Day 5 wire-up : préfère le tile 8×64 half MMA quand
+                // N est aligné sur 64 (1.25× speedup vs 8×8 sur 35B-A3B).
+                // Fallback 8×8 sinon (e.g. shared expert avec N petit).
+                if n % 64 == 0 {
+                    sgemm_q4_k_f32_expert_major_8x64_half_into(
+                        backend,
+                        a_buf,
+                        &stacked.buffer,
+                        &batch_scratch.em_tile_expert_ids,
+                        c_buf,
+                        m,
+                        n,
+                        k,
+                        stacked.bytes_per_expert,
+                    )
+                } else {
+                    sgemm_q4_k_f32_expert_major_8x8_into(
+                        backend,
+                        a_buf,
+                        &stacked.buffer,
+                        &batch_scratch.em_tile_expert_ids,
+                        c_buf,
+                        m,
+                        n,
+                        k,
+                        stacked.bytes_per_expert,
+                    )
+                }
+            },
             GgmlType::Q5_K => sgemm_q5_k_f32_expert_major_8x8_into(
                 backend,
                 a_buf,
