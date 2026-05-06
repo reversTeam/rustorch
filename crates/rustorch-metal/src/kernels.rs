@@ -9555,6 +9555,109 @@ kernel void rope_half_split_batched_f32(
 }
 "#;
 
+// T162 phase 9a — Batched RoPE half-split with partial `rope_dim`. Only the
+// first `rope_dim` dims of each head are rotated; the remaining
+// `head_dim - rope_dim` dims are untouched. Used by Qwen3.5 / 3.6 which apply
+// RoPE to a prefix of head_dim only (`cfg.rope_dim < cfg.head_dim`).
+const ROPE_HALF_SPLIT_PARTIAL_BATCHED_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rope_half_split_partial_batched_f32(
+    device float* x              [[buffer(0)]],   // [B, n_heads * head_dim]
+    device const float* cos_tab  [[buffer(1)]],   // [max_seq, rope_dim/2]
+    device const float* sin_tab  [[buffer(2)]],
+    constant uint4& dims_a       [[buffer(3)]],   // (n_heads, head_dim, rope_dim, position_base)
+    constant uint&  B_arg        [[buffer(4)]],
+    uint2 gid                    [[thread_position_in_grid]]
+) {
+    uint n_heads  = dims_a.x;
+    uint head_dim = dims_a.y;
+    uint rope_dim = dims_a.z;
+    uint pos_base = dims_a.w;
+    uint B        = B_arg;
+
+    uint b = gid.y;
+    if (b >= B) return;
+
+    uint half_rope = rope_dim / 2u;
+    uint flat = gid.x;
+    uint total = n_heads * half_rope;
+    if (flat >= total) return;
+
+    uint h = flat / half_rope;
+    uint k = flat % half_rope;
+    // head_dim is the stride between heads; we never touch dims [rope_dim..head_dim].
+    uint row_off = b * (n_heads * head_dim);
+    uint i0 = row_off + h * head_dim + k;
+    uint i1 = row_off + h * head_dim + k + half_rope;
+
+    uint position = pos_base + b;
+    uint tab_off = position * half_rope + k;
+    float c = cos_tab[tab_off];
+    float s = sin_tab[tab_off];
+    float x0 = x[i0];
+    float x1 = x[i1];
+    x[i0] = x0 * c - x1 * s;
+    x[i1] = x1 * c + x0 * s;
+}
+"#;
+
+/// T162 phase 9a — Batched partial RoPE. Apply half-split RoPE in place to B
+/// rows of [n_heads * head_dim], each at sequence position `position_base + b`,
+/// rotating only the first `rope_dim` dims of each head (the remaining
+/// `head_dim - rope_dim` dims are untouched). Equivalent to B sequential
+/// `rope_half_split_f32` calls.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_half_split_partial_batched_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    cos_buf: &Buffer,
+    sin_buf: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position_base: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if rope_dim == 0 || rope_dim > head_dim || rope_dim % 2 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "rope_half_split_partial_batched_f32: rope_dim={rope_dim} must be even \
+             and within (0, head_dim={head_dim}]"
+        )));
+    }
+    if b == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "rope_half_split_partial_batched_f32: B must be > 0".to_string(),
+        ));
+    }
+    let pipeline = backend.pipeline(
+        "rope_half_split_partial_batched_f32",
+        ROPE_HALF_SPLIT_PARTIAL_BATCHED_SHADER,
+        "rope_half_split_partial_batched_f32",
+    )?;
+    let dims_a = [
+        n_heads as u32,
+        head_dim as u32,
+        rope_dim as u32,
+        position_base as u32,
+    ];
+    let b_arg = b as u32;
+    let total = n_heads * (rope_dim / 2);
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(cos_buf), 0);
+        encoder.set_buffer(2, Some(sin_buf), 0);
+        encoder.set_bytes(3, 16, dims_a.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(4, 4, &b_arg as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(total as u64, b as u64, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 /// T107 — Batched RoPE. Apply half-split RoPE in place to B rows of
 /// [n_heads * head_dim], each at sequence position `position_base + b`.
 pub fn rope_half_split_batched_f32(
@@ -14201,6 +14304,135 @@ mod tests {
                     r < 1e-3,
                     "batch={batch} i={i} mismatch: seq={a} batch={bv} (rel {r:.3e})"
                 );
+            }
+        }
+    }
+
+    /// T162 phase 9a — batched partial-RoPE must match B sequential calls
+    /// at consecutive positions, leaving the [rope_dim..head_dim] tail untouched.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn rope_half_split_partial_batched_f32_matches_singles() {
+        let backend = metal_backend();
+        let n_heads = 4usize;
+        let head_dim = 128usize;
+        let rope_dim = 64usize; // partial — tail [64..128] untouched
+        let max_seq = 32usize;
+        let pos_base = 7usize;
+        let b = 4usize;
+        let row_size = n_heads * head_dim;
+        let half_rope = rope_dim / 2;
+
+        // Build B different rows.
+        let mut x_all = vec![0.0f32; b * row_size];
+        for batch in 0..b {
+            for i in 0..row_size {
+                x_all[batch * row_size + i] = ((i as f32 + 1.0 + batch as f32) * 0.013).sin();
+            }
+        }
+        // Build cos/sin tables [max_seq, rope_dim/2].
+        let mut cos_tab = vec![0.0f32; max_seq * half_rope];
+        let mut sin_tab = vec![0.0f32; max_seq * half_rope];
+        for p in 0..max_seq {
+            for k in 0..half_rope {
+                let theta = (p as f32) * 0.001 * ((k + 1) as f32);
+                cos_tab[p * half_rope + k] = theta.cos();
+                sin_tab[p * half_rope + k] = theta.sin();
+            }
+        }
+        let cos_buf = backend.alloc_shared(max_seq * half_rope * 4).unwrap();
+        let sin_buf = backend.alloc_shared(max_seq * half_rope * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cos_tab.as_ptr(),
+                cos_buf.contents() as *mut f32,
+                max_seq * half_rope,
+            );
+            std::ptr::copy_nonoverlapping(
+                sin_tab.as_ptr(),
+                sin_buf.contents() as *mut f32,
+                max_seq * half_rope,
+            );
+        }
+
+        // Reference: B sequential rope_half_split_f32 calls (with rope_dim).
+        let mut x_seq = vec![0.0f32; b * row_size];
+        for batch in 0..b {
+            let xb_buf = backend.alloc_shared(row_size * 4).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    x_all[batch * row_size..(batch + 1) * row_size].as_ptr(),
+                    xb_buf.contents() as *mut f32,
+                    row_size,
+                );
+            }
+            rope_half_split_f32(
+                backend,
+                &xb_buf,
+                &cos_buf,
+                &sin_buf,
+                n_heads,
+                head_dim,
+                rope_dim,
+                pos_base + batch,
+            )
+            .unwrap();
+            backend.drain();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    xb_buf.contents() as *const f32,
+                    x_seq[batch * row_size..(batch + 1) * row_size].as_mut_ptr(),
+                    row_size,
+                );
+            }
+        }
+
+        // Batched call.
+        let x_batch_buf = backend.alloc_shared(b * row_size * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                x_all.as_ptr(),
+                x_batch_buf.contents() as *mut f32,
+                b * row_size,
+            );
+        }
+        rope_half_split_partial_batched_f32(
+            backend,
+            &x_batch_buf,
+            &cos_buf,
+            &sin_buf,
+            n_heads,
+            head_dim,
+            rope_dim,
+            pos_base,
+            b,
+        )
+        .unwrap();
+        backend.drain();
+
+        let x_bat = unsafe {
+            std::slice::from_raw_parts(x_batch_buf.contents() as *const f32, b * row_size).to_vec()
+        };
+        for batch in 0..b {
+            for h in 0..n_heads {
+                for i in 0..head_dim {
+                    let off = batch * row_size + h * head_dim + i;
+                    let a = x_seq[off];
+                    let bv = x_bat[off];
+                    let r = (a - bv).abs() / a.abs().max(1e-4);
+                    assert!(
+                        r < 1e-3,
+                        "batch={batch} h={h} i={i} mismatch: seq={a} bat={bv} (rel {r:.3e})"
+                    );
+                    if i >= rope_dim {
+                        // Tail must be unchanged from the input.
+                        let orig = x_all[off];
+                        assert!(
+                            (orig - bv).abs() < 1e-6,
+                            "tail dim {i} should be unchanged: orig={orig} bat={bv}"
+                        );
+                    }
+                }
             }
         }
     }
