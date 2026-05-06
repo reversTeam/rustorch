@@ -4494,7 +4494,8 @@ kernel void sgemm_q6_k_f32_simdgroup_matrix_64(
     uint sgi = (uint)sgitg / WN_Q6K_64;
     uint sgj = (uint)sgitg % WN_Q6K_64;
 
-    // Q6_K reste en float (half precision accumule >5% rel error sur K=512).
+    // Q6_K reste en float (half précision donne >1% rel err sur K=512 et 10%
+    // sur K=17408 — testé en T163 phase 10b, parité cassée à seuil 1%).
     threadgroup float Xs[64 * 32];
     threadgroup float Ws[64 * 32];
 
