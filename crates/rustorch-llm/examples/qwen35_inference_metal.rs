@@ -3562,7 +3562,28 @@ fn main() -> ExitCode {
             let batch_scratch = BatchScratch::new(backend, &cfg);
             let mut idx = 0;
             while idx < prompt_ids.len() {
-                let chunk_size = prefill_batch.min(prompt_ids.len() - idx);
+                let remaining = prompt_ids.len() - idx;
+                // T162 phase 9d : préférer chunks multiples de 8 pour SGEMM path.
+                // Si remaining < B mais ≥ 8 : round-down à 8. Si < 8 : tail
+                // per-token forward_token (le fallback CPU-copy ×M est ~100×
+                // plus lent que sgemv direct).
+                let chunk_size = if remaining >= prefill_batch {
+                    prefill_batch
+                } else if remaining >= 8 {
+                    (remaining / 8) * 8
+                } else {
+                    for &t in &prompt_ids[idx..] {
+                        match forward_token(backend, &file, &model, &mut state, t, cur_pos) {
+                            Ok(out) => last = out,
+                            Err(e) => {
+                                eprintln!("forward error at prefill tail: {e}");
+                                return ExitCode::FAILURE;
+                            },
+                        }
+                        cur_pos += 1;
+                    }
+                    break;
+                };
                 let chunk = &prompt_ids[idx..idx + chunk_size];
                 match forward_batch(
                     backend,
