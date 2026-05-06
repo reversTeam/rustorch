@@ -1625,7 +1625,10 @@ fn ffn_moe_forward_batch(
         &batch_scratch.h_post,
         &batch_scratch.logits,
     )?;
-    backend.drain();
+    // T175 P1 — drain supprimé : `topk_softmax_norm_batched_f32` lit
+    // `batch_scratch.logits` qui vient d'être écrit par le dispatch précédent.
+    // Metal sérialise via memory hazards intra-CB ; le drain de 250 µs était
+    // pur gaspillage. (Coût total éliminé : 30 layers × 250 µs = 7.5 ms/chunk.)
 
     // 3. Batched top-K + softmax + renormalize : 1 dispatch (B threadgroups)
     //    au lieu de B per-token loops + drains.
@@ -1886,7 +1889,10 @@ fn ffn_moe_forward_batch(
         &batch_scratch.shexp_fd,
         &batch_scratch.shexp_out,
     )?;
-    backend.drain();
+    // T175 P1 — drain supprimé : `sigmoid_add_moe_batched_f32` lit
+    // `batch_scratch.shexp_out` et `batch_scratch.moe_acc` qui viennent d'être
+    // écrits ; Metal hazard tracking sérialise correctement intra-CB.
+    // (7.5 ms/chunk éliminé sur 30 layers MoE.)
 
     // 10. Batched fused gate-scalar + sigmoid_add_moe (final residual).
     //     1 dispatch (B threadgroups, 4 simdgroups each) au lieu de B per-token
@@ -3269,15 +3275,33 @@ fn forward_batch(
     let d = cfg.d;
     let max_seq = state.max_seq;
 
-    // 1. Embed B tokens into xd_batched [B, d]. Reuse embed_token by
-    //    creating a per-token view (allocates a small temp f32 row).
-    for (bi, &tok) in tokens.iter().enumerate() {
-        let row_buf = backend.alloc_shared(d * 4).unwrap();
-        embed_token(file, tok, &row_buf, cfg)?;
-        unsafe {
-            let src = row_buf.contents() as *const f32;
-            let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
-            std::ptr::copy_nonoverlapping(src, dst, d);
+    // 1. Embed B tokens into xd_batched [B, d]. T175 P3 — write directly into
+    //    batch_scratch.xd[bi*d..] via dequant + raw ptr, eliminating
+    //    `backend.alloc_shared(d*4)` per token (was ~6 ms/chunk at B=128).
+    {
+        let info = file
+            .tensor("token_embd.weight")
+            .ok_or_else(|| "missing token_embd.weight".to_string())?;
+        let row_bytes = info.byte_size() as usize / cfg.vocab;
+        let bytes = file.tensor_bytes(info);
+        let mut row_info = info.clone();
+        row_info.shape = vec![cfg.d as u64];
+        for (bi, &tok) in tokens.iter().enumerate() {
+            let row_start = (tok as usize) * row_bytes;
+            let row_end = row_start + row_bytes;
+            let f32_row = dequant_to_f32(&row_info, &bytes[row_start..row_end])
+                .map_err(|e| format!("token_embd dequant: {e:?}"))?;
+            if f32_row.len() != cfg.d {
+                return Err(format!(
+                    "token_embd: expected {} f32, got {}",
+                    cfg.d,
+                    f32_row.len()
+                ));
+            }
+            unsafe {
+                let dst = (batch_scratch.xd.contents() as *mut f32).add(bi * d);
+                std::ptr::copy_nonoverlapping(f32_row.as_ptr(), dst, d);
+            }
         }
     }
 
