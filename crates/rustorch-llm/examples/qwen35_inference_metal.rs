@@ -4951,6 +4951,240 @@ fn main() -> ExitCode {
         .nth(1)
         .unwrap_or_default();
     let no_chat_template = env::args().any(|a| a == "--no-chat-template");
+    let chat_mode = env::args().any(|a| a == "--chat");
+
+    // T185 — Interactive chat mode with persistent KV cache across turns.
+    // Each new user message is prefilled as a delta on top of the existing
+    // KV state, so multi-turn conversations don't pay the full prefill cost
+    // again. /exit, /clear, /stats commands. Streams tokens by default.
+    if chat_mode {
+        use std::io::{BufRead, Write};
+
+        println!("\n=== Interactive chat mode (Qwen3.6-35B-A3B) ===");
+        println!(
+            "  max_seq={max_seq}, decode budget per turn={} tokens",
+            forward_n.unwrap_or(2048)
+        );
+        if !system_text.is_empty() {
+            println!("  system: {system_text}");
+        }
+        println!("  Commands: /exit  /clear  /stats  /system <text>");
+        println!("  KV cache persists across turns (multi-turn conversation).");
+
+        let file = match GgufFile::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("reopen gguf: {e:?}");
+                return ExitCode::FAILURE;
+            },
+        };
+        let tok = match GgufTokenizer::from_gguf(&file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("tokenizer init: {e}");
+                return ExitCode::FAILURE;
+            },
+        };
+        let im_end_id = tok.special_id("<|im_end|>").unwrap_or(tok.eos_id);
+        let stops = [tok.eos_id, im_end_id];
+        let max_decode = forward_n.unwrap_or(2048);
+
+        let mut state = DecodeState::new(backend, &cfg, max_seq);
+        let mut cur_pos = 0_usize;
+        let mut last: u32 = 0;
+        let mut turn = 0_usize;
+        let mut current_system = system_text.clone();
+
+        let stdin = std::io::stdin();
+        let mut stdin_lock = stdin.lock();
+
+        loop {
+            print!("\n[user] ");
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            match stdin_lock.read_line(&mut line) {
+                Ok(0) => break, // EOF (Ctrl-D)
+                Ok(_) => {},
+                Err(_) => break,
+            }
+            let input = line.trim();
+            if input.is_empty() {
+                continue;
+            }
+            // Slash commands.
+            if let Some(rest) = input.strip_prefix("/system ") {
+                current_system = rest.to_string();
+                println!("(system prompt updated; will apply on /clear or next turn)");
+                continue;
+            }
+            match input {
+                "/exit" | "/quit" => {
+                    println!("Bye.");
+                    break;
+                },
+                "/clear" => {
+                    state = DecodeState::new(backend, &cfg, max_seq);
+                    cur_pos = 0;
+                    turn = 0;
+                    println!("(history cleared, KV cache reset)");
+                    continue;
+                },
+                "/stats" => {
+                    println!(
+                        "  turn={turn}  kv_pos={cur_pos}  max_seq={max_seq}  remaining={}",
+                        max_seq.saturating_sub(cur_pos)
+                    );
+                    continue;
+                },
+                _ => {},
+            }
+
+            // Build the chunk to prefill for this turn.
+            // Turn 0: full ChatML wrapper (system + user + assistant header).
+            // Turn ≥1: only the new user→assistant delta. The previous
+            // assistant turn's <|im_end|> was already decoded into the KV
+            // cache, so we just append a newline + new user block.
+            let chunk_text = if turn == 0 {
+                tok.chatml_prompt(&current_system, input)
+            } else {
+                format!(
+                    "\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                    input
+                )
+            };
+            let chunk_ids = tok.encode(&chunk_text);
+
+            // Capacity check: prefill + decode budget must fit in KV cache.
+            let needed = cur_pos + chunk_ids.len() + 16; // 16 = small margin for first decode steps
+            if needed >= max_seq {
+                eprintln!(
+                    "KV cache nearly full (pos={cur_pos}, +chunk={}, max_seq={max_seq}). Use /clear to reset history.",
+                    chunk_ids.len()
+                );
+                continue;
+            }
+
+            // Prefill the chunk (per-token; chat mode is short bursts so
+            // this is fine without batched prefill).
+            let t_prefill = Instant::now();
+            for &t in &chunk_ids {
+                match forward_token(backend, &file, &model, &mut state, t, cur_pos) {
+                    Ok(out) => last = out,
+                    Err(e) => {
+                        eprintln!("forward error at chat prefill: {e}");
+                        return ExitCode::FAILURE;
+                    },
+                }
+                cur_pos += 1;
+            }
+            let dt_prefill = t_prefill.elapsed();
+
+            // Decode + stream.
+            print!("[assistant] ");
+            std::io::stdout().flush().ok();
+            let mut generated: Vec<u32> = vec![last];
+            // Helper : safely emit the new char-boundary-aligned suffix of
+            // `cur_clean` versus `emitted`. Avoids slicing in the middle of
+            // multi-byte UTF-8 chars (e.g. emoji 🇫🇷). Trailing partial
+            // characters wait for the next iteration.
+            let emit_safe = |cur_clean: &str, emitted: &mut String| {
+                // Tokenizer decode can change the byte-level structure of
+                // earlier output as new tokens complete a multi-byte UTF-8
+                // char (typically: `�` placeholder → actual emoji). When
+                // that happens, `emitted` is no longer a prefix of cur_clean;
+                // walk back to the largest common prefix on a boundary.
+                if !cur_clean.starts_with(emitted.as_str()) {
+                    let mut common = emitted
+                        .as_bytes()
+                        .iter()
+                        .zip(cur_clean.as_bytes().iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    while common > 0 && !cur_clean.is_char_boundary(common) {
+                        common -= 1;
+                    }
+                    emitted.clear();
+                    emitted.push_str(&cur_clean[..common]);
+                }
+                if cur_clean.len() <= emitted.len() {
+                    return;
+                }
+                let mut safe_end = cur_clean.len();
+                while safe_end > emitted.len() && !cur_clean.is_char_boundary(safe_end) {
+                    safe_end -= 1;
+                }
+                if safe_end > emitted.len() {
+                    use std::io::Write;
+                    print!("{}", &cur_clean[emitted.len()..safe_end]);
+                    std::io::stdout().flush().ok();
+                    emitted.clear();
+                    emitted.push_str(&cur_clean[..safe_end]);
+                }
+            };
+            // Emit the first generated token (predicted right after prefill).
+            let initial = tok.decode(&generated);
+            let initial_clean = initial
+                .replace("<|im_end|>", "")
+                .replace("<|im_start|>", "")
+                .replace("<|endoftext|>", "");
+            let mut emitted = String::new();
+            emit_safe(&initial_clean, &mut emitted);
+
+            let t_decode = Instant::now();
+            let mut hit_stop = stops.contains(&last);
+            let mut n_decoded = 1_usize;
+            while n_decoded < max_decode && !hit_stop {
+                if cur_pos + 1 >= max_seq {
+                    println!("\n[hit max_seq during decode]");
+                    break;
+                }
+                match forward_token(backend, &file, &model, &mut state, last, cur_pos) {
+                    Ok(out) => {
+                        last = out;
+                        generated.push(last);
+                        cur_pos += 1;
+                        n_decoded += 1;
+                        // Emit incremental delta (UTF-8 safe).
+                        let cur = tok.decode(&generated);
+                        let cur_clean = cur
+                            .replace("<|im_end|>", "")
+                            .replace("<|im_start|>", "")
+                            .replace("<|endoftext|>", "");
+                        emit_safe(&cur_clean, &mut emitted);
+                        if stops.contains(&last) {
+                            hit_stop = true;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("\nforward error at chat decode: {e}");
+                        return ExitCode::FAILURE;
+                    },
+                }
+            }
+            // Final flush in case the last partial char now has its full
+            // bytes available.
+            let final_cur = tok.decode(&generated);
+            let final_clean = final_cur
+                .replace("<|im_end|>", "")
+                .replace("<|im_start|>", "")
+                .replace("<|endoftext|>", "");
+            emit_safe(&final_clean, &mut emitted);
+            let dt_decode = t_decode.elapsed();
+            println!(); // newline after streamed answer
+            println!(
+                "  [prefill {} tok in {:.2}s ({:.1} t/s) | decode {} tok in {:.2}s ({:.1} t/s){}]",
+                chunk_ids.len(),
+                dt_prefill.as_secs_f64(),
+                chunk_ids.len() as f64 / dt_prefill.as_secs_f64().max(1e-9),
+                n_decoded,
+                dt_decode.as_secs_f64(),
+                n_decoded as f64 / dt_decode.as_secs_f64().max(1e-9),
+                if hit_stop { " stop" } else { "" }
+            );
+            turn += 1;
+        }
+        return ExitCode::SUCCESS;
+    }
 
     if let Some(prompt_str) = prompt_text {
         println!("\n=== Chat mode (Rust tokenizer + ChatML) ===");
@@ -5143,15 +5377,14 @@ fn main() -> ExitCode {
             std::io::stdout().flush().ok();
         }
         // Helper closure: print new tokens incrementally when streaming.
-        // Strips ChatML special tokens so they don't appear in user-visible output.
+        // Strips ChatML special tokens and slices on UTF-8 char boundaries
+        // so we don't split multi-byte chars (e.g. emoji) mid-byte.
         let emit_stream = |stream_emitted: &mut String, generated: &[u32]| {
             if !stream {
                 return;
             }
             use std::io::Write;
             let mut cur = tok.decode(generated);
-            // Strip ChatML special tokens (they would otherwise leak into output
-            // when streaming, since they're emitted as literal text by the tokenizer).
             for special in [
                 "<|im_end|>",
                 "<|im_start|>",
@@ -5160,11 +5393,35 @@ fn main() -> ExitCode {
             ] {
                 cur = cur.replace(special, "");
             }
-            if cur.len() > stream_emitted.len() {
-                let suffix = &cur[stream_emitted.len()..];
-                print!("{}", suffix);
+            // Defensive: when stream_emitted no longer matches cur prefix
+            // (e.g. tokenizer's `�` placeholder got replaced by a complete
+            // emoji as more tokens arrived), walk back to the largest
+            // common boundary.
+            if !cur.starts_with(stream_emitted.as_str()) {
+                let mut common = stream_emitted
+                    .as_bytes()
+                    .iter()
+                    .zip(cur.as_bytes().iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                while common > 0 && !cur.is_char_boundary(common) {
+                    common -= 1;
+                }
+                stream_emitted.clear();
+                stream_emitted.push_str(&cur[..common]);
+            }
+            if cur.len() <= stream_emitted.len() {
+                return;
+            }
+            let mut safe_end = cur.len();
+            while safe_end > stream_emitted.len() && !cur.is_char_boundary(safe_end) {
+                safe_end -= 1;
+            }
+            if safe_end > stream_emitted.len() {
+                print!("{}", &cur[stream_emitted.len()..safe_end]);
                 std::io::stdout().flush().ok();
-                *stream_emitted = cur;
+                stream_emitted.clear();
+                stream_emitted.push_str(&cur[..safe_end]);
             }
         };
         if (2..=32).contains(&speculative_b) && speculative_b % 8 == 0 {
