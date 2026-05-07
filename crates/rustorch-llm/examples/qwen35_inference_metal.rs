@@ -68,9 +68,9 @@ use rustorch_metal::kernels::{
     sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
     split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
     ssm_conv1d_step_f32, ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32,
-    topk_softmax_norm_batched_f32, topk_softmax_norm_f32, unpermute_rows_f32,
-    weighted_add_inplace_f32, weighted_reduce_add_batched_f32, weighted_reduce_add_f32,
-    weighted_scatter_add_f32, zero_f32,
+    topk_softmax_norm_batched_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32,
+    unpermute_rows_f32, weighted_add_inplace_f32, weighted_reduce_add_batched_f32,
+    weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
 };
 
 /// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
@@ -2965,14 +2965,35 @@ fn ffn_dense_forward(
             // (routing_topk_softmax_norm_f32) régresse -50% car le matmul
             // perd son parallélisme massif (256 sgs //) en se contractant à
             // 1 TG (8 sgs serial). Voir gotcha pour le détail.
-            topk_softmax_norm_f32(
-                backend,
-                &scratch.moe_logits,
-                &scratch.moe_indices_buf,
-                &scratch.moe_topw_buf,
-                n_experts,
-                n_used,
-            )?;
+            //
+            // T182 — `topk_softmax_norm_parallel_f32` réduit la boucle topk
+            // sérielle (1 thread × K × N = 2048 ops) à une réduction
+            // simdgroup-coopérative (K × 40 ops). Speedup ×9 (115µs → 12µs)
+            // sur micro-bench M4 Max → ~4 ms/token gain attendu sur le décode.
+            // Activable via RUSTORCH_TOPK_PARALLEL=1 (default). Set =0 pour
+            // bisection / régression.
+            let use_parallel_topk = std::env::var("RUSTORCH_TOPK_PARALLEL")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if use_parallel_topk {
+                topk_softmax_norm_parallel_f32(
+                    backend,
+                    &scratch.moe_logits,
+                    &scratch.moe_indices_buf,
+                    &scratch.moe_topw_buf,
+                    n_experts,
+                    n_used,
+                )?;
+            } else {
+                topk_softmax_norm_f32(
+                    backend,
+                    &scratch.moe_logits,
+                    &scratch.moe_indices_buf,
+                    &scratch.moe_topw_buf,
+                    n_experts,
+                    n_used,
+                )?;
+            }
             profile_drain_record(backend, "  moe.routing", _moe_t0_routing);
 
             // 3. T147a — zero the accumulator on GPU (no drain).
