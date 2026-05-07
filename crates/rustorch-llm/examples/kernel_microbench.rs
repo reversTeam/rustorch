@@ -36,12 +36,12 @@ fn main() {
         gqa_decode_f32_nsg2, gqa_decode_f32_splitk, gqa_decode_kv4_f32, kv_append_f32,
         rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
         sgemv_f32_cached_x_into, sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
-        sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-        sgemv_q5_k_f32_lcpp_nsg4_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-        sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_dot_fused_f32, sigmoid_add_moe_f32,
-        sigmoid_mul_inplace_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
-        swiglu_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32, weighted_reduce_add_f32,
-        zero_f32,
+        sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2_into,
+        sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg4_into,
+        sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
+        sigmoid_add_moe_dot_fused_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_f32, split_qkv_f32,
+        ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32, topk_softmax_norm_f32,
+        topk_softmax_norm_parallel_f32, weighted_reduce_add_f32, zero_f32,
     };
     use std::time::Instant;
 
@@ -266,6 +266,128 @@ fn main() {
             dt.as_secs_f64() * 1e6 / ITERS as f64,
             format!("K={k} N={n} Q4_K b={n_used}"),
             120, // 40 layers × 3 projections (gate/up/down)
+        ));
+
+        // T191 — Fused gather + SwiGLU benchmark + parity vs (gather + swiglu_f32)
+        let gate_buf = backend.alloc_shared(n_used * n * 4).unwrap();
+        let fd_buf = backend.alloc_shared(n_used * n * 4).unwrap();
+        // Reference path : write matmul to y_buf, write gate_proj to gate_buf,
+        // then swiglu_f32(gate_buf, y_buf, fd_ref).
+        sgemv_q4_k_gather_f32_lcpp_nsg2_into(
+            backend,
+            &x_buf,
+            &w_buf,
+            &idx_buf,
+            n_used,
+            &gate_buf,
+            k,
+            n,
+            bytes_per_expert,
+            0,
+        )
+        .unwrap();
+        sgemv_q4_k_gather_f32_lcpp_nsg2_into(
+            backend,
+            &x_buf,
+            &w_buf,
+            &idx_buf,
+            n_used,
+            &y_buf,
+            k,
+            n,
+            bytes_per_expert,
+            0,
+        )
+        .unwrap();
+        rustorch_metal::kernels::swiglu_f32(backend, &gate_buf, &y_buf, &fd_buf, n_used * n)
+            .unwrap();
+        backend.drain();
+        let mut fd_ref = vec![0.0_f32; n_used * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                fd_buf.contents() as *const f32,
+                fd_ref.as_mut_ptr(),
+                n_used * n,
+            );
+        }
+        // Fused path : sgemv + swiglu in one dispatch.
+        sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2_into(
+            backend,
+            &x_buf,
+            &w_buf,
+            &idx_buf,
+            n_used,
+            &fd_buf,
+            &gate_buf,
+            k,
+            n,
+            bytes_per_expert,
+            0,
+        )
+        .unwrap();
+        backend.drain();
+        let mut fd_fused = vec![0.0_f32; n_used * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                fd_buf.contents() as *const f32,
+                fd_fused.as_mut_ptr(),
+                n_used * n,
+            );
+        }
+        let mut max_rel = 0.0_f32;
+        for (a, b) in fd_ref.iter().zip(fd_fused.iter()) {
+            let denom = a.abs().max(1e-4);
+            let rel = (a - b).abs() / denom;
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+        println!(
+            "Parity T191 q4k_gather_swiglu (K={k} N={n} b={n_used}): max_rel_err = {max_rel:.3e}  ({})",
+            if max_rel < 1e-3 { "PASS ✓" } else { "FAIL ✗" }
+        );
+
+        // Bench the fused kernel.
+        sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2_into(
+            backend,
+            &x_buf,
+            &w_buf,
+            &idx_buf,
+            n_used,
+            &fd_buf,
+            &gate_buf,
+            k,
+            n,
+            bytes_per_expert,
+            0,
+        )
+        .unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2_into(
+                backend,
+                &x_buf,
+                &w_buf,
+                &idx_buf,
+                n_used,
+                &fd_buf,
+                &gate_buf,
+                k,
+                n,
+                bytes_per_expert,
+                0,
+            )
+            .unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "T191 sgemv_q4k_gather_SWIGLU (fused)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={k} N={n} Q4_K b={n_used} (gate+up+swiglu fused)"),
+            40, // 1 fused call replaces (up + swiglu) per layer × 40 layers
         ));
     }
 
@@ -974,7 +1096,7 @@ fn main() {
             ));
         }
         // T186 NSG=2 variant
-        for &kv_len in &[64usize, 256, 1024, 2048, 4096] {
+        for &kv_len in &[64usize, 256, 512, 1024, 2048, 4096] {
             gqa_decode_f32_nsg2(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
                 .unwrap();
             backend.drain();
@@ -1110,7 +1232,7 @@ fn main() {
             );
         }
         // T190 v2 split-K (f32 K) at multiple kv_len.
-        for &kv_len in &[64usize, 256, 1024, 2048, 4096] {
+        for &kv_len in &[64usize, 256, 512, 1024, 2048, 4096] {
             gqa_decode_f32_splitk(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
                 .unwrap();
             backend.drain();

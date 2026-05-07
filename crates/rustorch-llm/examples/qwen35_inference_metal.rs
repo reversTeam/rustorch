@@ -3124,29 +3124,57 @@ fn ffn_dense_forward(
             profile_drain_record(backend, "  moe.gather_gate", _moe_t0_gate);
 
             // up_proj : [n_used, ef] = stacked_up[indices, :, :] @ h (broadcast)
+            //
+            // T191 — when up_exps is Q4_K, fuse the SwiGLU into the up_proj
+            // kernel output. Saves 1 dispatch/layer × 40 = 40 dispatches/token,
+            // ~200-400 µs decode wall-clock saved (CPU encoder overhead).
+            // Activable via RUSTORCH_GATHER_SWIGLU_FUSED (default ON).
+            // Microbench parity : byte-identique avec gather + swiglu_f32.
+            let use_gather_swiglu_fused = std::env::var("RUSTORCH_GATHER_SWIGLU_FUSED")
+                .map(|v| v != "0")
+                .unwrap_or(true);
             let _moe_t0_up = std::time::Instant::now();
-            gather_dispatch(
-                up_exps_stacked,
-                &scratch.h,
-                &scratch.moe_up_gather,
-                d,
-                ef,
-                0,
-            )
-            .map_err(|e| MetalError::Unsupported(format!("moe up gather: {e:?}")))?;
-            profile_drain_record(backend, "  moe.gather_up", _moe_t0_up);
+            if use_gather_swiglu_fused && up_exps_stacked.dtype == GgmlType::Q4_K {
+                use rustorch_metal::kernels::sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2_into;
+                sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2_into(
+                    backend,
+                    &scratch.h,
+                    &up_exps_stacked.buffer,
+                    &scratch.moe_indices_buf,
+                    n_used,
+                    &scratch.moe_fd_gather,
+                    &scratch.moe_gate_gather,
+                    d,
+                    ef,
+                    up_exps_stacked.bytes_per_expert,
+                    0,
+                )
+                .map_err(|e| MetalError::Unsupported(format!("moe up+swiglu fused: {e:?}")))?;
+                profile_drain_record(backend, "  moe.gather_up_swiglu", _moe_t0_up);
+            } else {
+                gather_dispatch(
+                    up_exps_stacked,
+                    &scratch.h,
+                    &scratch.moe_up_gather,
+                    d,
+                    ef,
+                    0,
+                )
+                .map_err(|e| MetalError::Unsupported(format!("moe up gather: {e:?}")))?;
+                profile_drain_record(backend, "  moe.gather_up", _moe_t0_up);
 
-            // swiglu : fd_gather[b, i] = silu(gate[b, i]) * up[b, i] sur n_used*ef
-            // éléments traités comme un tableau 1D (kernel élément-wise pur).
-            let _moe_t0_swiglu = std::time::Instant::now();
-            swiglu_f32(
-                backend,
-                &scratch.moe_gate_gather,
-                &scratch.moe_up_gather,
-                &scratch.moe_fd_gather,
-                n_used * ef,
-            )?;
-            profile_drain_record(backend, "  moe.swiglu_top", _moe_t0_swiglu);
+                // swiglu : fd_gather[b, i] = silu(gate[b, i]) * up[b, i] sur n_used*ef
+                // éléments traités comme un tableau 1D (kernel élément-wise pur).
+                let _moe_t0_swiglu = std::time::Instant::now();
+                swiglu_f32(
+                    backend,
+                    &scratch.moe_gate_gather,
+                    &scratch.moe_up_gather,
+                    &scratch.moe_fd_gather,
+                    n_used * ef,
+                )?;
+                profile_drain_record(backend, "  moe.swiglu_top", _moe_t0_swiglu);
+            }
 
             // down_proj : [n_used, d] = stacked_down[indices, :, :] @ fd_gather (per-row)
             let _moe_t0_down = std::time::Instant::now();

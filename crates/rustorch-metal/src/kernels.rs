@@ -7881,6 +7881,215 @@ pub fn sgemv_q4_k_gather_f32_lcpp_nsg2_into(
     Ok(())
 }
 
+// ============================================================================
+// T191 — Q4_K gather sgemv FUSED with SwiGLU output activation.
+//
+// Variante de `sgemv_q4_k_gather_f32_lcpp_nsg2` qui, juste avant d'écrire
+// la sortie `y_base[nrow] = sum_all`, multiplie par `silu(gate[b, nrow])` :
+//   y[b, n] = silu(gate[b, n]) * (W[indices[b], n, :] @ x[b * x_stride .. + K])
+//
+// Profil RUSTORCH_PROFILE=1 35B-A3B :
+//   moe.gather_up   : 154.36 µs/call (× 40 layers/token)
+//   moe.swiglu_top  :  96.56 µs/call (× 40 layers/token)
+//   → total non fusé ≈ 250 µs/call ; fused ≈ 154 µs/call → 96 µs économisés/layer
+//   → 96 × 40 = 3.86 ms économisés/token (theorical, drain-amplified).
+// En décodage réel (sans drain), le gain attendu est plus modeste : la
+// fusion économise ~5-10 µs CPU dispatch/layer = 200-400 µs/token = ~1-2%
+// du décode wall-clock. Le bonus tangible est la réduction du nombre de
+// commandes côté CPU (moins de pression GIL `with_encoder`).
+//
+// Numerical parity : la fusion préserve l'ordre des opérations (matmul +
+// silu(gate) * out) → byte-identique avec swiglu_f32 séparé.
+// ============================================================================
+
+const SGEMV_Q4_K_GATHER_SWIGLU_F32_LCPP_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint BLOCK_BYTES_SG = 144u;
+constant uint BLOCK_WEIGHTS_SG = 256u;
+constant short NR0_SG = 2;
+constant short NSG_SG = 2;
+constant ushort KMASK1_SG = 0x3f3f;
+constant ushort KMASK2_SG = 0x0f0f;
+constant ushort KMASK3_SG = 0xc0c0;
+
+kernel void sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2(
+    device const float*  x         [[buffer(0)]],
+    device const uchar*  w_q4k     [[buffer(1)]],
+    device const uint*   indices   [[buffer(2)]],
+    device float*        y         [[buffer(3)]],
+    constant uint4&      dims      [[buffer(4)]],
+    constant uint&       x_stride  [[buffer(5)]],
+    device const float*  gate      [[buffer(6)]],
+    uint2                tg_id     [[threadgroup_position_in_grid]],
+    ushort               tiisg     [[thread_index_in_simdgroup]],
+    ushort               sgitg     [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint B = dims.z;
+    uint expert_stride = dims.w;
+    uint b = tg_id.y;
+    if (b >= B) return;
+
+    uint expert = indices[b];
+
+    device const uchar* w_base = w_q4k + (uint64_t)expert * (uint64_t)expert_stride;
+    device const float* x_base = x + (uint64_t)b * (uint64_t)x_stride;
+    device       float* y_base = y + (uint64_t)b * (uint64_t)N;
+    device const float* gate_base = gate + (uint64_t)b * (uint64_t)N;
+
+    uint blocks_per_row = K / BLOCK_WEIGHTS_SG;
+    uint first_row = (tg_id.x * (uint)NSG_SG + (uint)sgitg) * (uint)NR0_SG;
+    if (first_row >= N) return;
+
+    short ix = (short)(tiisg / 8u);
+    short it = (short)(tiisg % 8u);
+    short iq = it / 4;
+    short ir = it % 4;
+
+    int nb = (int)blocks_per_row;
+
+    device const float* y4 = x_base + ix * 256 + 64 * iq + 8 * ir;
+
+    float yl[16];
+    float yh[16];
+    float sumf[2] = {0.0, 0.0};
+
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    uint row_stride = blocks_per_row * BLOCK_BYTES_SG;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.0, 0.0, 0.0, 0.0};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        for (short row = 0; row < NR0_SG; ++row) {
+            uint nrow = first_row + (uint)row;
+            if (nrow >= N) continue;
+
+            device const uchar* block = w_base + (uint64_t)nrow * row_stride + (uint)ib * BLOCK_BYTES_SG;
+            device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+            float d    = float(as_type<half>(dh_ptr[0]));
+            float dmin = float(as_type<half>(dh_ptr[1]));
+
+            device const uint16_t* sc = (device const uint16_t*)(block + 4) + iq;
+            device const uint16_t* q1 = (device const uint16_t*)(block + 16) + 16 * iq + 4 * ir;
+            device const uint16_t* q2 = q1 + 32;
+
+            sc16[0] = sc[0] & KMASK1_SG;
+            sc16[1] = sc[2] & KMASK1_SG;
+            sc16[2] = ((sc[4] >> 0) & KMASK2_SG) | ((sc[0] & KMASK3_SG) >> 2);
+            sc16[3] = ((sc[4] >> 4) & KMASK2_SG) | ((sc[2] & KMASK3_SG) >> 2);
+
+            float4 acc1 = {0.0, 0.0, 0.0, 0.0};
+            float4 acc2 = {0.0, 0.0, 0.0, 0.0};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[row] += d * ((acc1[0] + 1.0f/256.0f * acc1[1]) * float(sc8[0]) +
+                              (acc1[2] + 1.0f/256.0f * acc1[3]) * float(sc8[1]) * 1.0f/16.0f +
+                              (acc2[0] + 1.0f/256.0f * acc2[1]) * float(sc8[4]) +
+                              (acc2[2] + 1.0f/256.0f * acc2[3]) * float(sc8[5]) * 1.0f/16.0f) -
+                       dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                               sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        y4 += 4 * (int)BLOCK_WEIGHTS_SG;
+    }
+
+    for (short row = 0; row < NR0_SG; ++row) {
+        uint nrow = first_row + (uint)row;
+        if (nrow >= N) break;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            // T191 — fused SwiGLU : silu(gate[nrow]) * matmul_result
+            float g = gate_base[nrow];
+            float s = g / (1.0 + exp(-g));
+            y_base[nrow] = s * sum_all;
+        }
+    }
+}
+"#;
+
+/// T191 — `y[b, n] = silu(gate[b, n]) * (W[indices[b], n, :] @ x[b * x_stride .. + K])`
+/// en un seul dispatch. Drop-in replacement pour `sgemv_q4_k_gather_f32_lcpp_nsg2_into`
+/// suivi de `swiglu_f32`. Élimine 1 dispatch + 2 traversées mémoire/layer.
+///
+/// Parité numérique : préserve l'ordre des opérations → byte-identique
+/// avec la chaîne séparée (matmul puis swiglu).
+#[allow(clippy::too_many_arguments)]
+pub fn sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q4k_stacked_buf: &Buffer,
+    indices_buf: &Buffer,
+    b: usize,
+    out_buf: &Buffer,
+    gate_buf: &Buffer,
+    k: usize,
+    n: usize,
+    expert_stride_bytes: usize,
+    x_stride_floats: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 || n % 4 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_gather_swiglu: K%256==0 && N%4==0 required (K={k}, N={n})"
+        )));
+    }
+    if b == 0 {
+        return Ok(());
+    }
+    if x_stride_floats != 0 && x_stride_floats != k {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q4_k_gather_swiglu: x_stride_floats must be 0 or K={k}, got {x_stride_floats}"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2",
+        SGEMV_Q4_K_GATHER_SWIGLU_F32_LCPP_NSG2_SHADER,
+        "sgemv_q4_k_gather_swiglu_f32_lcpp_nsg2",
+    )?;
+    let dims = [k as u32, n as u32, b as u32, expert_stride_bytes as u32];
+    let x_stride_u32 = x_stride_floats as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q4k_stacked_buf), 0);
+        encoder.set_buffer(2, Some(indices_buf), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &x_stride_u32 as *const u32 as *const std::ffi::c_void);
+        encoder.set_buffer(6, Some(gate_buf), 0);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let n_tg = (n as u64).div_ceil(4);
+        let groups = MTLSize::new(n_tg, b as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T168 — Q4_K gather sgemv with qmv_fast pattern (port MLX `affine_gather_qmv_fast`).
 //
 // Combines T152 gather pattern (per-row expert lookup via indices[b]) with
@@ -13353,6 +13562,10 @@ pub fn gqa_decode_f32_splitk(
     //   kv ≤ 1024  → n_chunks=1 (NSG=2 fallback, phase 2 overhead not worth it)
     //   1024 < kv ≤ 2048 → n_chunks=4 (×1.85 win)
     //   kv > 2048  → n_chunks=8 (×3.67 win at 4096)
+    //
+    // T191 — chunks=2 at kv 384-1024 tested but regresses -3% vs NSG=2:
+    // single-TG NSG=2 (64 threads) already saturates SMs ; doubling TGs
+    // costs Phase 2 overhead without compute parallelism gain.
     let n_chunks: usize = if kv_len <= 1024 {
         1
     } else if kv_len <= 2048 {
