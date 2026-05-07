@@ -37,10 +37,11 @@ fn main() {
         rms_norm_per_head_gated_f32, rope_half_split_f32, sgemv_f32_cached_x_into,
         sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
         sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-        sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
-        sigmoid_add_moe_dot_fused_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_f32, split_qkv_f32,
-        ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32, topk_softmax_norm_f32,
-        topk_softmax_norm_parallel_f32, weighted_reduce_add_f32, zero_f32,
+        sgemv_q5_k_f32_lcpp_nsg4_into, sgemv_q6_k_f32_lcpp_nsg2_into,
+        sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_dot_fused_f32, sigmoid_add_moe_f32,
+        sigmoid_mul_inplace_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
+        swiglu_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32, weighted_reduce_add_f32,
+        zero_f32,
     };
     use std::time::Instant;
 
@@ -268,7 +269,7 @@ fn main() {
         ));
     }
 
-    // -------- Kernel 3: Q5_K SSM w_qkv, K=2048 N=8192 --------
+    // -------- Kernel 3: Q5_K SSM w_qkv, K=2048 N=8192 (CURRENT NSG=2) --------
     {
         let k = 2048usize;
         let n = 8192usize;
@@ -290,12 +291,52 @@ fn main() {
         backend.drain();
         let dt = t0.elapsed();
         results.push((
-            "sgemv_q5_k (SSM w_qkv)".to_string(),
+            "sgemv_q5_k NSG=2 (SSM w_qkv)".to_string(),
             dt.as_secs_f64() * 1000.0,
             dt.as_secs_f64() * 1e6 / ITERS as f64,
             format!("K={k} N={n} Q5_K"),
-            30, // 30 SSM layers
+            30,
         ));
+        // T189 NSG=4 variant
+        let mut y_nsg2 = vec![0.0_f32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y_nsg2.as_mut_ptr(), n);
+        }
+        sgemv_q5_k_f32_lcpp_nsg4_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_q5_k_f32_lcpp_nsg4_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sgemv_q5_k NSG=4 (T189 w_qkv)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={k} N={n} Q5_K"),
+            30,
+        ));
+        let mut y_nsg4 = vec![0.0_f32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y_nsg4.as_mut_ptr(), n);
+        }
+        let mut max_rel = 0.0_f32;
+        for (a, b) in y_nsg2.iter().zip(y_nsg4.iter()) {
+            let denom = a.abs().max(1e-4);
+            let rel = (a - b).abs() / denom;
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+        println!(
+            "Parity T189 sgemv_q5_k NSG=4 (K={k} N={n}): max_rel_err = {max_rel:.3e}  ({})",
+            if max_rel < 1e-3 {
+                "PASS ✓"
+            } else {
+                "FAIL ✗"
+            }
+        );
     }
 
     // -------- Kernel 4: Q5_K SSM w_gate, K=2048 N=4096 --------

@@ -8855,6 +8855,195 @@ pub fn sgemv_q3_k_f32_lcpp_nsg2_into(
 //   - Each threadgroup processes NSG_Q5K * NR0_Q5K = 2 rows
 //   - first_row = (tg_id * NSG + sgitg) * NR0_Q5K
 //
+// ============================================================================
+// T189 — Q5_K sgemv with NSG=4 (drop-in replacement of NSG=2 variant).
+//
+// SSM w_qkv (K=2048 N=8192) is the largest single Q5_K kernel call,
+// at 31.5 µs × 30 SSM layers = 0.95 ms/token (5% decode). NSG=2 dispatches
+// 4096 TGs of 64 threads each. NSG=4 = 2048 TGs of 128 threads, halving
+// TG launch overhead while keeping per-simdgroup state (NR0=1) identical.
+//
+// Same shader source as NSG=2 but the NSG_Q5K constant is 4. Each TG now
+// has 4 simdgroups, each producing NR0=1 row → 4 outputs per TG.
+//
+// Kept NR0=1 to avoid register spilling (Q5_K already uses ~50 float regs/thread).
+// ============================================================================
+
+const SGEMV_Q5_K_F32_LCPP_NSG4_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint Q5K_BYTES_NSG4 = 176u;
+constant uint Q5K_WEIGHTS_NSG4 = 256u;
+constant short NR0_Q5K_NSG4 = 1;
+constant short NSG_Q5K_NSG4 = 4;
+constant ushort KMASK1_NSG4 = 0x3f3f;
+constant ushort KMASK2_NSG4 = 0x0f0f;
+constant ushort KMASK3_NSG4 = 0xc0c0;
+
+kernel void sgemv_q5_k_f32_lcpp_nsg4(
+    device const float*  x      [[buffer(0)]],
+    device const uchar*  w_q5k  [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint2&      dims   [[buffer(3)]],
+    uint                 tg_id  [[threadgroup_position_in_grid]],
+    ushort               tiisg  [[thread_index_in_simdgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+    uint blocks_per_row = K / Q5K_WEIGHTS_NSG4;
+    uint first_row = (tg_id * (uint)NSG_Q5K_NSG4 + (uint)sgitg) * (uint)NR0_Q5K_NSG4;
+    if (first_row >= N) return;
+
+    short tid = (short)(tiisg / 4u);
+    short ix  = (short)(tiisg % 4u);
+    short iq  = tid / 4;
+    short ir  = tid % 4;
+
+    short l0 = 8 * ir;
+    short q_offset = 32 * iq + l0;
+    short y_offset = 64 * iq + l0;
+
+    uchar hm1 = 1u << (2*iq);
+    uchar hm2 = hm1 << 1;
+    uchar hm3 = hm1 << 4;
+    uchar hm4 = hm2 << 4;
+
+    int nb = (int)blocks_per_row;
+    uint row_stride = blocks_per_row * Q5K_BYTES_NSG4;
+
+    float sumf = 0.0;
+    float yl[16];
+    float yh[16];
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    device const float* y1 = x + (uint)ix * Q5K_WEIGHTS_NSG4 + (uint)y_offset;
+
+    for (int i = ix; i < nb; i += 4) {
+        device const float* y2 = y1 + 128;
+        float4 sumy = {0.0, 0.0, 0.0, 0.0};
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l + 0];   sumy[0] += yl[l + 0];
+            yl[l + 8] = y1[l + 32];  sumy[1] += yl[l + 8];
+            yh[l + 0] = y2[l + 0];   sumy[2] += yh[l + 0];
+            yh[l + 8] = y2[l + 32];  sumy[3] += yh[l + 8];
+        }
+
+        device const uchar* block = w_q5k + (uint64_t)first_row * row_stride + (uint)i * Q5K_BYTES_NSG4;
+        device const uint16_t* dh_ptr = (device const uint16_t*)(block);
+        float d    = float(as_type<half>(dh_ptr[0]));
+        float dmin = float(as_type<half>(dh_ptr[1]));
+
+        device const uint16_t* a = (device const uint16_t*)(block + 4) + iq;
+        sc16[0] = a[0] & KMASK1_NSG4;
+        sc16[1] = a[2] & KMASK1_NSG4;
+        sc16[2] = ((a[4] >> 0) & KMASK2_NSG4) | ((a[0] & KMASK3_NSG4) >> 2);
+        sc16[3] = ((a[4] >> 4) & KMASK2_NSG4) | ((a[2] & KMASK3_NSG4) >> 2);
+
+        device const uchar* qh = (device const uchar*)(block + 16) + (uint)l0;
+        device const uchar* q1 = (device const uchar*)(block + 48) + (uint)q_offset;
+        device const uchar* q2 = q1 + 64;
+
+        float4 acc1 = {0.0, 0.0, 0.0, 0.0};
+        float4 acc2 = {0.0, 0.0, 0.0, 0.0};
+        for (short l = 0; l < 8; ++l) {
+            uchar h = qh[l];
+            acc1[0] += yl[l + 0] * (float)(q1[l] & 0x0F);
+            acc1[1] += yl[l + 8] * (float)(q1[l] & 0xF0);
+            acc1[2] += yh[l + 0] * (float)(q2[l] & 0x0F);
+            acc1[3] += yh[l + 8] * (float)(q2[l] & 0xF0);
+            acc2[0] += (h & hm1) ? yl[l + 0] : 0.0;
+            acc2[1] += (h & hm2) ? yl[l + 8] : 0.0;
+            acc2[2] += (h & hm3) ? yh[l + 0] : 0.0;
+            acc2[3] += (h & hm4) ? yh[l + 8] : 0.0;
+        }
+
+        sumf += d * (
+            float(sc8[0]) * (acc1[0]        + 16.0 * acc2[0]) +
+            float(sc8[1]) * (acc1[1]/16.0   + 16.0 * acc2[1]) +
+            float(sc8[4]) * (acc1[2]        + 16.0 * acc2[2]) +
+            float(sc8[5]) * (acc1[3]/16.0   + 16.0 * acc2[3])
+        ) - dmin * (
+            sumy[0] * float(sc8[2]) +
+            sumy[1] * float(sc8[3]) +
+            sumy[2] * float(sc8[6]) +
+            sumy[3] * float(sc8[7])
+        );
+
+        y1 += 4 * (int)Q5K_WEIGHTS_NSG4;
+    }
+
+    if (first_row < N) {
+        float row_sum = simd_sum(sumf);
+        if (tiisg == 0) {
+            y[first_row] = row_sum;
+        }
+    }
+}
+"#;
+
+/// T189 — **REJECTED, kept dead-code for reference**.
+///
+/// Q5_K sgemv with NSG=4 (4 simdgroups per TG, 4 outputs per TG).
+/// Drop-in replacement for `sgemv_q5_k_f32_lcpp_nsg2_into` — halves the
+/// number of dispatched threadgroups by widening each one.
+///
+/// Microbench (M4 Max, K=2048 N=8192 Q5_K, 1000 iters):
+///   NSG=2 (current production): 32.5 µs/call
+///   NSG=4 (this T189 variant):  34.5 µs/call  — **−6% regression**
+///   Parity: byte-identical (max_rel_err = 0)
+///
+/// Cause: original NSG=2 is already at ~1.5× theoretical BW peak. Reducing
+/// TG count by widening (8192/4 = 2048 TGs vs 4096 TGs) loses parallelism
+/// without saving meaningful overhead. Same lesson as T183 (cached_x):
+/// kernel near peak BW has no room for dispatch-pattern improvements.
+///
+/// Kept available for future workloads (e.g. very wide N where TG launch
+/// overhead becomes dominant).
+///
+/// Pre-conditions: same as NSG=2 (Metal3, K%256==0).
+#[allow(dead_code)]
+pub fn sgemv_q5_k_f32_lcpp_nsg4_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_q5k_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "sgemv_q5_k_f32_lcpp_nsg4 needs Metal3".to_string(),
+        ));
+    }
+    if k == 0 || n == 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_q5_k_f32_lcpp_nsg4: K%256==0 required (K={k}, N={n})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_q5_k_f32_lcpp_nsg4",
+        SGEMV_Q5_K_F32_LCPP_NSG4_SHADER,
+        "sgemv_q5_k_f32_lcpp_nsg4",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_q5k_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        // 128 threads/tg = 4 simdgroups × 32. Each tg processes NSG*NR0 = 4 rows.
+        let tg_size = MTLSize::new(128, 1, 1);
+        let n_tg = (n as u64).div_ceil(4);
+        let groups = MTLSize::new(n_tg, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // We use NR0=1 (vs Q4_K's NR0=2) because Q5_K has more per-block state
 // (qh + qs split + 8 sub-block scales) which raises register pressure.
 const SGEMV_Q5_K_F32_LCPP_NSG2_SHADER: &str = r#"
