@@ -1482,6 +1482,7 @@ fn ssm_block_forward_batch(
     let conv_dim = 2 * key_dim + value_dim;
 
     // 1. Batched pre-mixer norm.
+    let _t_norm = std::time::Instant::now();
     rms_norm_batched_f32(
         backend,
         xd_batched,
@@ -1491,8 +1492,10 @@ fn ssm_block_forward_batch(
         b,
         eps,
     )?;
+    profile_drain_record(backend, "  fbs.norm", _t_norm);
 
     // 2. Batched 4 input projections (Q+K+V mixed, gate-z, alpha, beta).
+    let _t_proj = std::time::Instant::now();
     dispatch_batched_attn_matmul(
         backend,
         &ssm.w_qkv,
@@ -1515,8 +1518,10 @@ fn ssm_block_forward_batch(
         &batch_scratch.h,
         &batch_scratch.beta,
     )?;
+    profile_drain_record(backend, "  fbs.in_proj4", _t_proj);
 
     // 3. Batched ssm_apply_gate.
+    let _t_gate = std::time::Instant::now();
     ssm_apply_gate_batched_f32(
         backend,
         &batch_scratch.alpha,
@@ -1528,6 +1533,7 @@ fn ssm_block_forward_batch(
         n_v,
         b,
     )?;
+    profile_drain_record(backend, "  fbs.apply_gate", _t_gate);
 
     // 4. Per-token scan (recurrent). T175 P0 — drain-free path : on bind les
     //    inputs `qkv_mixed` / `gate_h` / `beta_sig` / `z` directement à
@@ -1542,6 +1548,7 @@ fn ssm_block_forward_batch(
     let conv_off_stride = conv_dim * 4;
     let value_off_stride = value_dim * 4;
     let n_v_off_stride = n_v * 4;
+    let _t_scan = std::time::Instant::now();
     for bi in 0..b {
         // Conv1d step lit batch_scratch.qkv_mixed[bi*conv_dim..] directement.
         ssm_conv1d_step_f32_with_offset(
@@ -1598,8 +1605,10 @@ fn ssm_block_forward_batch(
             eps,
         )?;
     }
+    profile_drain_record(backend, "  fbs.scan_loop", _t_scan);
 
     // 5. Batched output projection ssm_out_buf → o.
+    let _t_out = std::time::Instant::now();
     dispatch_batched_attn_matmul(
         backend,
         &ssm.ssm_out,
@@ -1609,6 +1618,7 @@ fn ssm_block_forward_batch(
     )?;
     // 6. Batched residual add.
     add_inplace_batched_f32(backend, xd_batched, &batch_scratch.o, d, b)?;
+    profile_drain_record(backend, "  fbs.out_residual", _t_out);
     Ok(())
 }
 
