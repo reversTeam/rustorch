@@ -33,9 +33,9 @@ fn main() {
     use rustorch_metal::backend_singleton::metal_backend;
     use rustorch_metal::kernels::{
         add_inplace_f32, argmax_batched_f32, delta_net_step_with_l2_f32, gqa_decode_f32,
-        gqa_decode_f32_nsg2, kv_append_f32, rms_norm_f32, rms_norm_per_head_f32,
-        rms_norm_per_head_gated_f32, rope_half_split_f32, sgemv_f32_cached_x_into,
-        sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+        gqa_decode_f32_nsg2, gqa_decode_kv4_f32, kv_append_f32, rms_norm_f32,
+        rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
+        sgemv_f32_cached_x_into, sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
         sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
         sgemv_q5_k_f32_lcpp_nsg4_into, sgemv_q6_k_f32_lcpp_nsg2_into,
         sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_dot_fused_f32, sigmoid_add_moe_f32,
@@ -994,6 +994,58 @@ fn main() {
                 format!("n_q={n_q} n_kv={n_kv} hd={hd} kv_len={kv_len}"),
                 10,
             ));
+        }
+        // T190 KV4 variant : K cached as int4 packed + scales + zeros, V f32.
+        {
+            let groups_per_row = hd / 32;
+            let k_packed_bytes = n_kv * max_seq * (hd / 2);
+            let k_scales_bytes = n_kv * max_seq * groups_per_row * 2; // f16
+            let k_zeros_bytes = n_kv * max_seq * groups_per_row;
+            let kp = backend.alloc_shared(k_packed_bytes).unwrap();
+            let ks = backend.alloc_shared(k_scales_bytes).unwrap();
+            let kz = backend.alloc_shared(k_zeros_bytes).unwrap();
+            // Synthetic data : packed nibbles random, scales fp16 = 0.01,
+            // zeros = 8 (mid-range). Just for timing — not parity.
+            unsafe {
+                let p_ptr = kp.contents() as *mut u8;
+                for i in 0..k_packed_bytes {
+                    *p_ptr.add(i) = ((i * 7 + 1) & 0xFF) as u8;
+                }
+                let s_ptr = ks.contents() as *mut u16;
+                let one_h = half::f16::from_f32(0.01).to_bits();
+                for i in 0..(k_scales_bytes / 2) {
+                    *s_ptr.add(i) = one_h;
+                }
+                let z_ptr = kz.contents() as *mut i8;
+                for i in 0..k_zeros_bytes {
+                    *z_ptr.add(i) = 8;
+                }
+            }
+            for &kv_len in &[64usize, 256, 1024, 2048, 4096] {
+                gqa_decode_kv4_f32(
+                    backend, &q, &kp, &ks, &kz, &vc, &out, n_q, n_kv, hd, kv_len, max_seq,
+                )
+                .unwrap();
+                backend.drain();
+                let t0 = Instant::now();
+                for _ in 0..ITERS {
+                    gqa_decode_kv4_f32(
+                        backend, &q, &kp, &ks, &kz, &vc, &out, n_q, n_kv, hd, kv_len, max_seq,
+                    )
+                    .unwrap();
+                }
+                backend.drain();
+                let dt = t0.elapsed();
+                let label: String = format!("gqa_decode_KV4 (T190) kv={kv_len}");
+                let leaked: &'static str = Box::leak(label.into_boxed_str());
+                results.push((
+                    leaked.to_string(),
+                    dt.as_secs_f64() * 1000.0,
+                    dt.as_secs_f64() * 1e6 / ITERS as f64,
+                    format!("n_q={n_q} n_kv={n_kv} hd={hd} kv_len={kv_len} (K int4)"),
+                    10,
+                ));
+            }
         }
         // Parity: NSG=2 vs original on kv_len=256
         {

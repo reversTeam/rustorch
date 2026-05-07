@@ -12972,6 +12972,252 @@ pub fn gqa_decode_f32_nsg2(
     Ok(())
 }
 
+// ============================================================================
+// T190 — Open-TQ-Metal port: fused int4-K dequant attention.
+//
+// References paper arXiv:2604.16957 (Vegasena, Apr 2026). Algorithm 1
+// (online softmax) + Eq. 4 (qdot vectorized nibble extraction).
+//
+// Format: int4 asymmetric K cache, group_size=32 along head_dim
+//   - k_packed : [n_kv, max_seq, head_dim/2] u8 (2 nibbles per byte)
+//   - k_scales : [n_kv, max_seq, head_dim/32] f16
+//   - k_zeros  : [n_kv, max_seq, head_dim/32] i8
+//   - V stays f32 (paper: V quant impacts quality more than K quant)
+//
+// Compression on K: 8 MB → 1.2 MB at max_seq=4096 (6.7×). Total KV cache
+// for our 10 attn layers: 160 MB f32 → 92 MB (-43%).
+//
+// Per-token attention bandwidth saved: K reads go from
+//   n_kv × kv_len × head_dim × 4 = 2KB × kv_len f32
+// to
+//   n_kv × kv_len × (head_dim/2 + head_dim/16) ≈ 304B × kv_len int4+meta
+// — ×6.7 less bandwidth on K reads.
+//
+// Pre-conditions: head_dim % 32 == 0 (group alignment). For Qwen3.6 hd=256 ✓.
+// ============================================================================
+
+const GQA_DECODE_KV4_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint GROUP_SIZE_KV4 = 32u;
+constant uint NSG_KV4 = 2u;
+constant uint THREADS_PER_TG_KV4 = 64u; // 2 simdgroups × 32
+
+kernel void gqa_decode_kv4_f32(
+    device const float*    q           [[buffer(0)]],   // [n_q, head_dim]
+    device const uchar*    k_packed    [[buffer(1)]],   // [n_kv, max_seq, head_dim/2]
+    device const half*     k_scales    [[buffer(2)]],   // [n_kv, max_seq, head_dim/32]
+    device const char*     k_zeros     [[buffer(3)]],   // [n_kv, max_seq, head_dim/32]
+    device const float*    v_cache     [[buffer(4)]],   // [n_kv, max_seq, head_dim]
+    device float*          out         [[buffer(5)]],   // [n_q, head_dim]
+    constant uint4&        dims        [[buffer(6)]],   // (n_q, n_kv, head_dim, kv_len)
+    constant uint&         max_seq     [[buffer(7)]],
+    constant float&        inv_sqrt_d  [[buffer(8)]],
+    threadgroup float*     shm         [[threadgroup(0)]],
+    uint                   q_h         [[threadgroup_position_in_grid]],
+    uint                   tid         [[thread_position_in_threadgroup]],
+    ushort                 sgitg       [[simdgroup_index_in_threadgroup]],
+    ushort                 tiisg       [[thread_index_in_simdgroup]]
+) {
+    uint n_q     = dims.x;
+    uint n_kv    = dims.y;
+    uint hd      = dims.z;
+    uint kv_len  = dims.w;
+    if (q_h >= n_q) return;
+
+    uint group_size = n_q / n_kv;
+    uint kv_h = q_h / group_size;
+    uint groups_per_row = hd / GROUP_SIZE_KV4;
+
+    // Layout of `shm` (sized at dispatch):
+    //   [0 .. hd)                : pre-scaled q[q_h] in TG memory (shared by both simdgroups)
+    //   [hd .. hd + 2*4)         : cross-simdgroup (m, ℓ) scratch
+    //   [hd + 8 .. hd + 8 + hd)  : cross-simdgroup output accumulator scratch
+    threadgroup float* q_shm = shm;
+    threadgroup float* m_scratch = shm + hd;       // 2 floats
+    threadgroup float* l_scratch = shm + hd + 2;   // 2 floats
+    threadgroup float* o_scratch = shm + hd + 4;   // hd floats (per-sg output)
+
+    // Phase A: load + pre-scale q into shm. Each thread handles hd/64 elements.
+    device const float* q_h_ptr = q + q_h * hd;
+    for (uint i = tid; i < hd; i += THREADS_PER_TG_KV4) {
+        q_shm[i] = q_h_ptr[i] * inv_sqrt_d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each simdgroup handles a CHUNK of kv_len positions (NSG=2 split).
+    // Online softmax state per-thread (lane-local accumulator, reduced at end).
+    // For head_dim=256 and 32-thread simdgroup, each thread handles 8 hd elements.
+    // We accumulate o[8 hd-stride] per thread, reduced via simdgroup_max/sum then
+    // cross-simdgroup TG-memory.
+    //
+    // Per-simdgroup loop : positions p = sgitg, sgitg + NSG, sgitg + 2*NSG, ...
+    // The simdgroup processes 1 position at a time, all 32 threads cooperating
+    // on Q · dequant(K[p]) reduction.
+
+    // Per-thread output accumulator for hd elements assigned to this thread.
+    // Each thread handles hd/32 = 8 elements (for hd=256).
+    uint elems_per_thread = hd / 32u;  // 8 for hd=256, 4 for hd=128
+    float o_acc[16]; // upper bound for hd <= 512
+    for (uint i = 0; i < elems_per_thread; i++) o_acc[i] = 0.0;
+    float m_local = -INFINITY;
+    float l_local = 0.0;
+
+    uint base_packed_kv  = kv_h * max_seq * (hd / 2u);
+    uint base_scales_kv  = kv_h * max_seq * groups_per_row;
+    uint base_v_kv       = kv_h * max_seq * hd;
+
+    for (uint p = sgitg; p < kv_len; p += NSG_KV4) {
+        // Phase B: cooperative Q · K[p] with fused dequant.
+        device const uchar* kp_packed = k_packed + base_packed_kv + p * (hd / 2u);
+        device const half*  kp_scales = k_scales + base_scales_kv + p * groups_per_row;
+        device const char*  kp_zeros  = k_zeros  + base_scales_kv + p * groups_per_row;
+
+        // Each thread reads its hd/32 elements (e.g. 8 for hd=256).
+        // Element `t * elems_per_thread + e` belongs to lane t = tiisg.
+        float partial = 0.0;
+        for (uint e = 0; e < elems_per_thread; e++) {
+            uint hd_idx = tiisg * elems_per_thread + e;
+            uint group_idx = hd_idx / GROUP_SIZE_KV4;
+            float scale = float(kp_scales[group_idx]);
+            float zero  = float(kp_zeros[group_idx]);
+            // packed byte index: each byte holds 2 nibbles (low: even hd_idx, high: odd)
+            uint byte_idx = hd_idx >> 1;
+            uint nib_high = hd_idx & 1u;
+            uchar packed_byte = kp_packed[byte_idx];
+            uint q4 = nib_high ? ((packed_byte >> 4) & 0xFu) : (packed_byte & 0xFu);
+            float k_val = (float(q4) - zero) * scale;
+            partial += q_shm[hd_idx] * k_val;
+        }
+        float a_p = simd_sum(partial);
+
+        // Phase C: online softmax update.
+        float m_new = max(m_local, a_p);
+        float exp_diff = exp(m_local - m_new);
+        float exp_a = exp(a_p - m_new);
+        l_local = l_local * exp_diff + exp_a;
+
+        // Phase D: V[p] is f32; accumulate o_acc[e] = o_acc[e] * exp_diff + exp_a * V[p][hd_idx].
+        device const float* vp = v_cache + base_v_kv + p * hd;
+        for (uint e = 0; e < elems_per_thread; e++) {
+            uint hd_idx = tiisg * elems_per_thread + e;
+            o_acc[e] = o_acc[e] * exp_diff + exp_a * vp[hd_idx];
+        }
+        m_local = m_new;
+    }
+
+    // Phase E: cross-simdgroup reduction of (m, ℓ, o).
+    // Lane 0 of each simdgroup writes (m, ℓ) to scratch.
+    if (tiisg == 0) {
+        m_scratch[sgitg] = m_local;
+        l_scratch[sgitg] = l_local;
+    }
+    // Each thread writes its o_acc[] partial to scratch :
+    //   o_scratch[sgitg * hd + tiisg * elems_per_thread + e] = o_acc[e]
+    for (uint e = 0; e < elems_per_thread; e++) {
+        uint dst = sgitg * hd + tiisg * elems_per_thread + e;
+        o_scratch[dst] = o_acc[e];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce across simdgroups : compute final m = max(m_0, m_1), then
+    // o_final = (o_0 * exp(m_0 - m) + o_1 * exp(m_1 - m)) / (l_0 * exp(m_0 - m) + l_1 * exp(m_1 - m))
+    if (sgitg == 0) {
+        float m0 = m_scratch[0];
+        float m1 = m_scratch[1];
+        float l0 = l_scratch[0];
+        float l1 = l_scratch[1];
+        float m_final = max(m0, m1);
+        float c0 = exp(m0 - m_final);
+        float c1 = exp(m1 - m_final);
+        float l_final = l0 * c0 + l1 * c1;
+        float inv_l = 1.0 / max(l_final, 1e-30);
+        device float* out_h = out + q_h * hd;
+        for (uint e = 0; e < elems_per_thread; e++) {
+            uint hd_idx = tiisg * elems_per_thread + e;
+            float o0 = o_scratch[0 * hd + hd_idx];
+            float o1 = o_scratch[1 * hd + hd_idx];
+            out_h[hd_idx] = (o0 * c0 + o1 * c1) * inv_l;
+        }
+    }
+}
+"#;
+
+/// T190 v1 — **REJECTED, dead-code conservé pour référence**.
+///
+/// GQA decode with int4 K cache (V f32). Online softmax + fused dequant.
+///
+/// Microbench (M4 Max, n_q=16 n_kv=2 hd=256, 1000 iters):
+///
+///   kv_len  | T186 NSG=2 | T190 v1 KV4 | Δ
+///   --------|-----------:|------------:|---:
+///   64      |    18.5 µs |      49 µs  | +165% slower
+///   256     |    62 µs   |     180 µs  | +190% slower
+///   1024    |    238 µs  |     712 µs  | +200% slower
+///   4096    |    1474 µs |    3445 µs  | +134% slower
+///
+/// Cause: implementation lacks **split-K tiling** (Open-TQ-Metal paper Sec 3.2).
+/// Without split-K, the online-softmax loop over kv_len is sequential per-thread,
+/// negating parallelism gains. Per-thread work jumps 4× vs T186 NSG=2.
+///
+/// To actually win this needs Phase 1 (N TGs/head × chunk=512 positions, partial
+/// (o, m, ℓ)) + Phase 2 (1 TG reduces chunks). 1-2 additional days of work.
+///
+/// Plus: paper's own end-to-end was -18% vs mlx-lm even WITH split-K, due to
+/// KV cache management overhead. Risk that even a fixed T190 wouldn't ship.
+///
+/// Kept available as starting point if/when split-K is implemented.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn gqa_decode_kv4_f32(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    k_packed_buf: &Buffer,
+    k_scales_buf: &Buffer,
+    k_zeros_buf: &Buffer,
+    v_cache_buf: &Buffer,
+    out_buf: &Buffer,
+    n_q: usize,
+    n_kv: usize,
+    head_dim: usize,
+    kv_len: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    if head_dim == 0 || head_dim % 32 != 0 || head_dim > 512 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "gqa_decode_kv4_f32: head_dim={head_dim} must be multiple of 32, ≤ 512"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "gqa_decode_kv4_f32",
+        GQA_DECODE_KV4_F32_SHADER,
+        "gqa_decode_kv4_f32",
+    )?;
+    let dims = [n_q as u32, n_kv as u32, head_dim as u32, kv_len as u32];
+    let ms = max_seq as u32;
+    let inv_sqrt_d: f32 = 1.0 / (head_dim as f32).sqrt();
+    // shm layout : hd (q) + 4 (m+l) + 2*hd (o per-sg). All f32.
+    let shm_floats = head_dim + 4 + 2 * head_dim;
+    let shared_bytes = (shm_floats * 4) as u64;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_packed_buf), 0);
+        encoder.set_buffer(2, Some(k_scales_buf), 0);
+        encoder.set_buffer(3, Some(k_zeros_buf), 0);
+        encoder.set_buffer(4, Some(v_cache_buf), 0);
+        encoder.set_buffer(5, Some(out_buf), 0);
+        encoder.set_bytes(6, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(7, 4, &ms as *const u32 as *const std::ffi::c_void);
+        encoder.set_bytes(8, 4, &inv_sqrt_d as *const f32 as *const std::ffi::c_void);
+        encoder.set_threadgroup_memory_length(0, shared_bytes);
+        let tg_size = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(64 * n_q as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 /// GQA attention for a single decode-step query (`q_seq = 1`) against
 /// the cached `kv_len` K/V positions. One threadgroup per query head;
 /// 32 threads inside cooperate on the kv-length reduction.
