@@ -16785,13 +16785,16 @@ pub fn mul_mm_id_map0_into(
         )));
     }
     // Standard top-K routing returns distinct experts per token, so each expert
-    // is selected at most once per token => max(tpe[e]) <= B. Caller should pass
-    // `max_per_expert >= B`. (Previous check `>= B*n_used` was over-conservative
-    // and balloons the `mul_mm_id_q4_k_f32` dst buffer to E*B*n_used*N.)
-    if max_per_expert < b {
-        return Err(MetalError::ShapeMismatch(format!(
-            "mul_mm_id_map0: max_per_expert ({max_per_expert}) must be >= B ({b})"
-        )));
+    // is selected at most once per token => max(tpe[e]) <= B. The shader handles
+    // tpe[e] > max_per_expert by silently capping (`count < max_per_expert`
+    // guard), which corrupts output if it triggers. Caller is responsible for
+    // ensuring max_per_expert ≥ realistic max(tpe). For absolute safety pass
+    // `max_per_expert >= B`. For perf experimentation with smaller values
+    // (T197.1c — fewer dispatched TGs in mm_id), only reject `max_per_expert == 0`.
+    if max_per_expert == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "mul_mm_id_map0: max_per_expert must be > 0".to_string(),
+        ));
     }
     let pipeline = backend.pipeline("mul_mm_id_map0", MUL_MM_ID_MAP0_SHADER, "mul_mm_id_map0")?;
     let dims = [
