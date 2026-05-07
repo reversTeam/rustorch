@@ -33,8 +33,8 @@ fn main() {
     use rustorch_metal::backend_singleton::metal_backend;
     use rustorch_metal::kernels::{
         add_inplace_f32, argmax_batched_f32, delta_net_step_with_l2_f32, gqa_decode_f32,
-        gqa_decode_f32_nsg2, gqa_decode_kv4_f32, kv_append_f32, rms_norm_f32,
-        rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
+        gqa_decode_f32_nsg2, gqa_decode_f32_splitk, gqa_decode_kv4_f32, kv_append_f32,
+        rms_norm_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
         sgemv_f32_cached_x_into, sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
         sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
         sgemv_q5_k_f32_lcpp_nsg4_into, sgemv_q6_k_f32_lcpp_nsg2_into,
@@ -1046,6 +1046,90 @@ fn main() {
                     10,
                 ));
             }
+        }
+        // Parity: split-K vs NSG=2 at kv_len=2048 (where split-K activates with n_chunks=4).
+        {
+            let q_test = fake_f32(n_q * hd, 4.4);
+            let k_test = fake_f32(n_kv * hd * max_seq, 5.5);
+            let v_test = fake_f32(n_kv * hd * max_seq, 6.6);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    q_test.as_ptr(),
+                    q.contents() as *mut f32,
+                    q_test.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    k_test.as_ptr(),
+                    kc.contents() as *mut f32,
+                    k_test.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    v_test.as_ptr(),
+                    vc.contents() as *mut f32,
+                    v_test.len(),
+                );
+            }
+            let kv_len = 2048usize;
+            gqa_decode_f32_nsg2(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let mut out_nsg2 = vec![0.0_f32; n_q * hd];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out.contents() as *const f32,
+                    out_nsg2.as_mut_ptr(),
+                    n_q * hd,
+                );
+            }
+            gqa_decode_f32_splitk(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let mut out_sk = vec![0.0_f32; n_q * hd];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out.contents() as *const f32,
+                    out_sk.as_mut_ptr(),
+                    n_q * hd,
+                );
+            }
+            let mut max_rel = 0.0_f32;
+            for (a, b) in out_nsg2.iter().zip(out_sk.iter()) {
+                let denom = a.abs().max(1e-4);
+                let rel = (a - b).abs() / denom;
+                if rel > max_rel {
+                    max_rel = rel;
+                }
+            }
+            println!(
+                "Parity T190v2 split-K (kv_len={kv_len}): max_rel_err = {max_rel:.3e}  ({})",
+                if max_rel < 1e-3 {
+                    "PASS ✓"
+                } else {
+                    "FAIL ✗"
+                }
+            );
+        }
+        // T190 v2 split-K (f32 K) at multiple kv_len.
+        for &kv_len in &[64usize, 256, 1024, 2048, 4096] {
+            gqa_decode_f32_splitk(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                gqa_decode_f32_splitk(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                    .unwrap();
+            }
+            backend.drain();
+            let dt = t0.elapsed();
+            let label: String = format!("gqa_decode_SPLITK (T190v2) kv={kv_len}");
+            let leaked: &'static str = Box::leak(label.into_boxed_str());
+            results.push((
+                leaked.to_string(),
+                dt.as_secs_f64() * 1000.0,
+                dt.as_secs_f64() * 1e6 / ITERS as f64,
+                format!("n_q={n_q} n_kv={n_kv} hd={hd} kv_len={kv_len} f32 splitK"),
+                10,
+            ));
         }
         // Parity: NSG=2 vs original on kv_len=256
         {

@@ -13144,6 +13144,286 @@ kernel void gqa_decode_kv4_f32(
 }
 "#;
 
+// ============================================================================
+// T190 v2 — GQA decode with split-K reduction (FlashDecoding-style, f32 K).
+//
+// Phase 1 : N TGs per Q head, each handling chunk_size = kv_len/N positions
+//   cooperatively. Writes (o_chunk[hd], m_chunk, ℓ_chunk) to scratch.
+//
+// Phase 2 : 1 TG per Q head reduces N partial results via online-softmax
+//   merge formula:
+//     m_final = max(m_0, ..., m_{N-1})
+//     ℓ_final = Σ_i ℓ_i * exp(m_i - m_final)
+//     o_final = (Σ_i o_i * exp(m_i - m_final)) / ℓ_final
+//
+// Goal: better SM utilization at long kv_len (n_q × N TGs vs n_q × 1).
+// At kv=4096 with n_q=16, N=8 → 128 TGs > 40 SMs M4 Max = full saturation.
+// ============================================================================
+
+const GQA_DECODE_F32_SPLITK_PHASE1_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_decode_f32_splitk_phase1(
+    device const float* q              [[buffer(0)]],
+    device const float* k_cache        [[buffer(1)]],
+    device const float* v_cache        [[buffer(2)]],
+    device float*       o_partial      [[buffer(3)]],
+    device float*       m_partial      [[buffer(4)]],
+    device float*       l_partial      [[buffer(5)]],
+    constant uint4&     dims           [[buffer(6)]],
+    constant uint2&     chunk_dims     [[buffer(7)]],
+    constant float&     inv_sqrt_d     [[buffer(8)]],
+    threadgroup float*  shared         [[threadgroup(0)]],
+    uint2               tg_id          [[threadgroup_position_in_grid]],
+    ushort              tiisg          [[thread_index_in_simdgroup]]
+) {
+    uint n_q     = dims.x;
+    uint n_kv    = dims.y;
+    uint hd      = dims.z;
+    uint kv_len  = dims.w;
+    uint n_chunks = chunk_dims.x;
+    uint max_seq = chunk_dims.y;
+
+    uint q_h = tg_id.x;
+    uint chunk = tg_id.y;
+    if (q_h >= n_q || chunk >= n_chunks) return;
+
+    uint group_size = n_q / n_kv;
+    uint kv_h = q_h / group_size;
+
+    uint chunk_size = (kv_len + n_chunks - 1u) / n_chunks;
+    uint start = chunk * chunk_size;
+    uint end_p = min(start + chunk_size, kv_len);
+    if (start >= end_p) {
+        if (tiisg == 0) {
+            m_partial[q_h * n_chunks + chunk] = -INFINITY;
+            l_partial[q_h * n_chunks + chunk] = 0.0;
+        }
+        device float* o_chunk = o_partial + (q_h * n_chunks + chunk) * hd;
+        for (uint i = tiisg; i < hd; i += 32u) {
+            o_chunk[i] = 0.0;
+        }
+        return;
+    }
+
+    device const float* q_h_ptr = q + q_h * hd;
+    device const float* k_h_base = k_cache + kv_h * max_seq * hd;
+    device const float* v_h_base = v_cache + kv_h * max_seq * hd;
+
+    uint hd4 = hd / 4u;
+    device const float4* q_h_ptr4 = (device const float4*)q_h_ptr;
+
+    // Phase A : compute scores into shared[0..chunk_size).
+    for (uint p = start + tiisg; p < end_p; p += 32u) {
+        device const float4* k_p4 = (device const float4*)(k_h_base + p * hd);
+        float4 acc4 = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint d4 = 0; d4 < hd4; ++d4) {
+            acc4 += q_h_ptr4[d4] * k_p4[d4];
+        }
+        float dot = acc4.x + acc4.y + acc4.z + acc4.w;
+        for (uint d = hd4 * 4u; d < hd; ++d) {
+            dot += q_h_ptr[d] * k_h_base[p * hd + d];
+        }
+        shared[p - start] = dot * inv_sqrt_d;
+    }
+
+    // Phase B : max within chunk.
+    float local_max = -INFINITY;
+    for (uint i = tiisg; i < (end_p - start); i += 32u) {
+        local_max = max(local_max, shared[i]);
+    }
+    float chunk_max = simd_max(local_max);
+
+    // Phase C : exp + sum within chunk, store back as exp values.
+    float local_sum = 0.0;
+    for (uint i = tiisg; i < (end_p - start); i += 32u) {
+        float e = exp(shared[i] - chunk_max);
+        shared[i] = e;
+        local_sum += e;
+    }
+    float chunk_sum = simd_sum(local_sum);
+
+    // Phase D : V-weighted sum over chunk → o_chunk[hd].
+    device float* o_chunk = o_partial + (q_h * n_chunks + chunk) * hd;
+    uint hd4_d = hd / 4u;
+    device float4* o_chunk4 = (device float4*)o_chunk;
+    for (uint d4 = tiisg; d4 < hd4_d; d4 += 32u) {
+        float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint p = 0; p < (end_p - start); ++p) {
+            device const float4* v_p4 = (device const float4*)(v_h_base + (start + p) * hd);
+            acc += shared[p] * v_p4[d4];
+        }
+        o_chunk4[d4] = acc;
+    }
+    uint tail_start = hd4_d * 4u;
+    for (uint d = tail_start + tiisg; d < hd; d += 32u) {
+        float acc = 0.0;
+        for (uint p = 0; p < (end_p - start); ++p) {
+            acc += shared[p] * v_h_base[(start + p) * hd + d];
+        }
+        o_chunk[d] = acc;
+    }
+
+    if (tiisg == 0) {
+        m_partial[q_h * n_chunks + chunk] = chunk_max;
+        l_partial[q_h * n_chunks + chunk] = chunk_sum;
+    }
+}
+"#;
+
+const GQA_DECODE_F32_SPLITK_PHASE2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MAX_CHUNKS_P2 = 16u;
+
+kernel void gqa_decode_f32_splitk_phase2(
+    device const float* o_partial   [[buffer(0)]],
+    device const float* m_partial   [[buffer(1)]],
+    device const float* l_partial   [[buffer(2)]],
+    device float*       out         [[buffer(3)]],
+    constant uint3&     dims        [[buffer(4)]],
+    uint                q_h         [[threadgroup_position_in_grid]],
+    ushort              tiisg       [[thread_index_in_simdgroup]]
+) {
+    uint n_q      = dims.x;
+    uint hd       = dims.y;
+    uint n_chunks = dims.z;
+    if (q_h >= n_q) return;
+
+    threadgroup float m_arr[MAX_CHUNKS_P2];
+    threadgroup float l_arr[MAX_CHUNKS_P2];
+    threadgroup float c_arr[MAX_CHUNKS_P2];
+    threadgroup float l_final;
+    if (tiisg < n_chunks) {
+        m_arr[tiisg] = m_partial[q_h * n_chunks + tiisg];
+        l_arr[tiisg] = l_partial[q_h * n_chunks + tiisg];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        float m_final = -INFINITY;
+        for (uint i = 0; i < n_chunks; i++) {
+            m_final = max(m_final, m_arr[i]);
+        }
+        float l_acc = 0.0;
+        for (uint i = 0; i < n_chunks; i++) {
+            float c = exp(m_arr[i] - m_final);
+            c_arr[i] = c;
+            l_acc += l_arr[i] * c;
+        }
+        l_final = max(l_acc, 1e-30);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_l = 1.0 / l_final;
+    device float* out_h = out + q_h * hd;
+    for (uint d = tiisg; d < hd; d += 32u) {
+        float acc = 0.0;
+        for (uint i = 0; i < n_chunks; i++) {
+            acc += o_partial[(q_h * n_chunks + i) * hd + d] * c_arr[i];
+        }
+        out_h[d] = acc * inv_l;
+    }
+}
+"#;
+
+/// T190 v2 — split-K GQA decode (f32 K). Drop-in replacement for `gqa_decode_f32_nsg2`.
+/// Auto-selects n_chunks based on kv_len ; falls back to NSG=2 for kv ≤ 256.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_decode_f32_splitk(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    k_cache: &Buffer,
+    v_cache: &Buffer,
+    out_buf: &Buffer,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    kv_len: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    if head_dim == 0 || head_dim % 4 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "gqa_decode_f32_splitk: head_dim={head_dim} must be > 0 and %4==0"
+        )));
+    }
+    // Auto-select n_chunks based on kv_len. Empirically tuned on M4 Max:
+    //   kv ≤ 1024  → n_chunks=1 (NSG=2 fallback, phase 2 overhead not worth it)
+    //   1024 < kv ≤ 2048 → n_chunks=4 (×1.85 win)
+    //   kv > 2048  → n_chunks=8 (×3.67 win at 4096)
+    let n_chunks: usize = if kv_len <= 1024 {
+        1
+    } else if kv_len <= 2048 {
+        4
+    } else {
+        8
+    };
+    if n_chunks == 1 {
+        return gqa_decode_f32_nsg2(
+            backend, q_buf, k_cache, v_cache, out_buf, n_heads, n_kv, head_dim, kv_len, max_seq,
+        );
+    }
+    let o_partial_bytes = n_heads * n_chunks * head_dim * 4;
+    let ml_bytes = n_heads * n_chunks * 4;
+    let o_partial = backend.pool_get(o_partial_bytes)?;
+    let m_partial = backend.pool_get(ml_bytes)?;
+    let l_partial = backend.pool_get(ml_bytes)?;
+
+    let chunk_size = kv_len.div_ceil(n_chunks);
+    let pipeline_p1 = backend.pipeline(
+        "gqa_decode_f32_splitk_phase1",
+        GQA_DECODE_F32_SPLITK_PHASE1_SHADER,
+        "gqa_decode_f32_splitk_phase1",
+    )?;
+    let dims = [n_heads as u32, n_kv as u32, head_dim as u32, kv_len as u32];
+    let chunk_dims = [n_chunks as u32, max_seq as u32];
+    let inv_sqrt_d: f32 = 1.0 / (head_dim as f32).sqrt();
+    let shared_bytes_p1 = (chunk_size * 4) as u64;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline_p1);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache), 0);
+        encoder.set_buffer(2, Some(v_cache), 0);
+        encoder.set_buffer(3, Some(&o_partial), 0);
+        encoder.set_buffer(4, Some(&m_partial), 0);
+        encoder.set_buffer(5, Some(&l_partial), 0);
+        encoder.set_bytes(6, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(7, 8, chunk_dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(8, 4, &inv_sqrt_d as *const f32 as *const std::ffi::c_void);
+        encoder.set_threadgroup_memory_length(0, shared_bytes_p1);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let groups = MTLSize::new(n_heads as u64, n_chunks as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+
+    let pipeline_p2 = backend.pipeline(
+        "gqa_decode_f32_splitk_phase2",
+        GQA_DECODE_F32_SPLITK_PHASE2_SHADER,
+        "gqa_decode_f32_splitk_phase2",
+    )?;
+    let dims_p2 = [n_heads as u32, head_dim as u32, n_chunks as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline_p2);
+        encoder.set_buffer(0, Some(&o_partial), 0);
+        encoder.set_buffer(1, Some(&m_partial), 0);
+        encoder.set_buffer(2, Some(&l_partial), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 12, dims_p2.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let groups = MTLSize::new(n_heads as u64, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    // Return scratch buffers to pool for reuse on next call. Critical for
+    // repeated decode steps : without this, every call allocates fresh
+    // (~10 µs each × 30 ops/token = 300 µs overhead).
+    backend.pool_return(o_partial, o_partial_bytes);
+    backend.pool_return(m_partial, ml_bytes);
+    backend.pool_return(l_partial, ml_bytes);
+    Ok(())
+}
+
 /// T190 v1 — **REJECTED, dead-code conservé pour référence**.
 ///
 /// GQA decode with int4 K cache (V f32). Online softmax + fused dequant.
