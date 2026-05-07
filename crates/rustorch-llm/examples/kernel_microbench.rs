@@ -32,11 +32,13 @@ fn main() {
     use half::f16;
     use rustorch_metal::backend_singleton::metal_backend;
     use rustorch_metal::kernels::{
-        delta_net_step_with_l2_f32, rms_norm_f32, sgemv_f32_lcpp_simd_into,
-        sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
-        sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-        sgemv_q8_0_f32_lcpp_nsg2_into, ssm_apply_gate_f32, topk_softmax_norm_f32,
-        topk_softmax_norm_parallel_f32,
+        add_inplace_f32, argmax_batched_f32, delta_net_step_with_l2_f32, gqa_decode_f32,
+        kv_append_f32, rms_norm_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
+        sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+        sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
+        sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
+        sigmoid_mul_inplace_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
+        swiglu_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32, weighted_reduce_add_f32,
     };
     use std::time::Instant;
 
@@ -630,6 +632,308 @@ fn main() {
                 "FAIL ✗"
             }
         );
+    }
+
+    // -------- Kernel 12: swiglu_f32, f=512 (MoE expert FFN dim) --------
+    {
+        let f = 512usize;
+        let g_buf = backend.alloc_shared(f * 4).unwrap();
+        let u_buf = backend.alloc_shared(f * 4).unwrap();
+        let y_buf = backend.alloc_shared(f * 4).unwrap();
+        swiglu_f32(backend, &g_buf, &u_buf, &y_buf, f).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            swiglu_f32(backend, &g_buf, &u_buf, &y_buf, f).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "swiglu_f32 (MoE expert)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("f={f}"),
+            320, // 40 layers × 8 experts (n_used)
+        ));
+    }
+
+    // -------- Kernel 13: ssm_conv1d_step_f32, conv_dim=8192, kernel=4 --------
+    {
+        let conv_dim = 8192usize;
+        let kernel = 4usize;
+        let x_buf = backend.alloc_shared(conv_dim * 4).unwrap();
+        let w_buf = backend.alloc_shared(conv_dim * kernel * 4).unwrap();
+        let state_buf = backend.alloc_shared(conv_dim * kernel * 4).unwrap();
+        let y_buf = backend.alloc_shared(conv_dim * 4).unwrap();
+        ssm_conv1d_step_f32(
+            backend, &x_buf, &w_buf, &state_buf, &y_buf, kernel, conv_dim,
+        )
+        .unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            ssm_conv1d_step_f32(
+                backend, &x_buf, &w_buf, &state_buf, &y_buf, kernel, conv_dim,
+            )
+            .unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "ssm_conv1d_step_f32".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("conv_dim={conv_dim} k={kernel}"),
+            30,
+        ));
+    }
+
+    // -------- Kernel 14: rms_norm_per_head_gated_f32, n=32, hd=128 --------
+    {
+        let n = 32usize;
+        let hd = 128usize;
+        let x_buf = backend.alloc_shared(n * hd * 4).unwrap();
+        let g_buf = backend.alloc_shared(hd * 4).unwrap();
+        let z_buf = backend.alloc_shared(n * hd * 4).unwrap();
+        rms_norm_per_head_gated_f32(backend, &x_buf, &g_buf, &z_buf, n, hd, 1e-6).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            rms_norm_per_head_gated_f32(backend, &x_buf, &g_buf, &z_buf, n, hd, 1e-6).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "rms_norm_per_head_gated_f32".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("n={n} hd={hd}"),
+            30,
+        ));
+    }
+
+    // -------- Kernel 15: split_qkv_f32, conv_dim=8192 split (2k+2k+4k) --------
+    {
+        let q_len = 2048usize;
+        let k_len = 2048usize;
+        let v_len = 4096usize;
+        let total = q_len + k_len + v_len;
+        let src_buf = backend.alloc_shared(total * 4).unwrap();
+        let q_buf = backend.alloc_shared(q_len * 4).unwrap();
+        let k_buf = backend.alloc_shared(k_len * 4).unwrap();
+        let v_buf = backend.alloc_shared(v_len * 4).unwrap();
+        split_qkv_f32(
+            backend, &src_buf, &q_buf, &k_buf, &v_buf, q_len, k_len, v_len,
+        )
+        .unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            split_qkv_f32(
+                backend, &src_buf, &q_buf, &k_buf, &v_buf, q_len, k_len, v_len,
+            )
+            .unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "split_qkv_f32".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("q={q_len} k={k_len} v={v_len}"),
+            30,
+        ));
+    }
+
+    // -------- Kernel 16: sigmoid_add_moe_f32, d=2048 --------
+    {
+        let d = 2048usize;
+        let acc = backend.alloc_shared(d * 4).unwrap();
+        let sh = backend.alloc_shared(d * 4).unwrap();
+        let sc = backend.alloc_shared(4).unwrap();
+        let xd = backend.alloc_shared(d * 4).unwrap();
+        sigmoid_add_moe_f32(backend, &acc, &sh, &sc, &xd, d).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sigmoid_add_moe_f32(backend, &acc, &sh, &sc, &xd, d).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sigmoid_add_moe_f32".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("d={d}"),
+            40,
+        ));
+    }
+
+    // -------- Kernel 17: weighted_reduce_add_f32, b=8 d=2048 --------
+    {
+        let b = 8usize;
+        let d = 2048usize;
+        let src = backend.alloc_shared(b * d * 4).unwrap();
+        let w = backend.alloc_shared(b * 4).unwrap();
+        let acc = backend.alloc_shared(d * 4).unwrap();
+        weighted_reduce_add_f32(backend, &src, &w, &acc, b, d).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            weighted_reduce_add_f32(backend, &src, &w, &acc, b, d).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "weighted_reduce_add_f32".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("b={b} d={d}"),
+            40,
+        ));
+    }
+
+    // -------- Kernel 18: kv_append_f32, n_kv=2 head_dim=256 --------
+    {
+        let n_kv = 2usize;
+        let hd = 256usize;
+        let max_seq = 256usize;
+        let src = backend.alloc_shared(n_kv * hd * 4).unwrap();
+        let dst = backend.alloc_shared(n_kv * hd * max_seq * 4).unwrap();
+        kv_append_f32(backend, &src, &dst, n_kv, hd, 0, max_seq).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for pos in 0..ITERS {
+            kv_append_f32(backend, &src, &dst, n_kv, hd, pos % max_seq, max_seq).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "kv_append_f32".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("n_kv={n_kv} hd={hd}"),
+            20, // 10 attn × 2 (k + v)
+        ));
+    }
+
+    // -------- Kernel 19: rope_half_split_f32, n_heads=16 hd=256 rope_dim=64 --------
+    {
+        let n_heads = 16usize;
+        let hd = 256usize;
+        let rope_dim = 64usize;
+        let x = backend.alloc_shared(n_heads * hd * 4).unwrap();
+        let cos = backend.alloc_shared(rope_dim / 2 * 4).unwrap();
+        let sin = backend.alloc_shared(rope_dim / 2 * 4).unwrap();
+        rope_half_split_f32(backend, &x, &cos, &sin, n_heads, hd, rope_dim, 0).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for pos in 0..ITERS {
+            rope_half_split_f32(backend, &x, &cos, &sin, n_heads, hd, rope_dim, pos).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "rope_half_split_f32".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("h={n_heads} hd={hd} rd={rope_dim}"),
+            20, // 10 attn × 2 (q + k)
+        ));
+    }
+
+    // -------- Kernel 20: gqa_decode_f32, n_q=16 n_kv=2 hd=256 kv_len=64 --------
+    {
+        let n_q = 16usize;
+        let n_kv = 2usize;
+        let hd = 256usize;
+        let kv_len = 64usize;
+        let max_seq = 256usize;
+        let q = backend.alloc_shared(n_q * hd * 4).unwrap();
+        let kc = backend.alloc_shared(n_kv * hd * max_seq * 4).unwrap();
+        let vc = backend.alloc_shared(n_kv * hd * max_seq * 4).unwrap();
+        let out = backend.alloc_shared(n_q * hd * 4).unwrap();
+        gqa_decode_f32(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            gqa_decode_f32(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "gqa_decode_f32".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("n_q={n_q} n_kv={n_kv} hd={hd} kv_len={kv_len}"),
+            10,
+        ));
+    }
+
+    // -------- Kernel 21: argmax_batched_f32, b=1 vocab=248320 --------
+    {
+        let vocab = 248320usize;
+        let logits = backend.alloc_shared(vocab * 4).unwrap();
+        let idx = backend.alloc_shared(4).unwrap();
+        argmax_batched_f32(backend, &logits, &idx, 1, vocab).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            argmax_batched_f32(backend, &logits, &idx, 1, vocab).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "argmax_batched_f32 (sample)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("vocab={vocab}"),
+            1,
+        ));
+    }
+
+    // -------- Kernel 22: sigmoid_mul_inplace_f32, n=4096 (SSM gated) --------
+    {
+        let n = 4096usize;
+        let x = backend.alloc_shared(n * 4).unwrap();
+        let g = backend.alloc_shared(n * 4).unwrap();
+        sigmoid_mul_inplace_f32(backend, &x, &g, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sigmoid_mul_inplace_f32(backend, &x, &g, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sigmoid_mul_inplace_f32".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("n={n}"),
+            40,
+        ));
+    }
+
+    // -------- Kernel 23: add_inplace_f32, d=2048 (residual) --------
+    {
+        let d = 2048usize;
+        let x = backend.alloc_shared(d * 4).unwrap();
+        let y = backend.alloc_shared(d * 4).unwrap();
+        add_inplace_f32(backend, &x, &y, d).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            add_inplace_f32(backend, &x, &y, d).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "add_inplace_f32 (residual)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("d={d}"),
+            80, // 40 layers × 2 residuals
+        ));
     }
 
     // -------- Print results --------
