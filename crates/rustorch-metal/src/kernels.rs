@@ -15087,6 +15087,137 @@ pub fn ssm_conv1d_step_f32_with_io_offsets(
     Ok(())
 }
 
+// ============================================================================
+// T202 — Persistent batched ssm_conv1d_step. B timesteps in 1 dispatch.
+//
+// Same SiLU-fused conv1d as ssm_conv1d_step_f32, but loops over B timesteps
+// internally with per-thread state in registers (kernel_size-1 floats per
+// channel = 3 floats for kernel=4). Eliminates B-1 dispatches per layer.
+//
+// Per-channel work per call : ~8-12 µs. Below the dispatch overhead
+// threshold (~5-10 µs validated by T201 pattern note 5c193de5), so
+// batching should pay.
+//
+// Constraints :
+//   - kernel_size <= 8 (register array bound)
+//   - one thread per channel, conv_dim threads total
+// ============================================================================
+
+const SSM_CONV1D_STEP_PERSISTENT_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MAX_KERNEL_SIZE = 8u;
+
+kernel void ssm_conv1d_step_persistent_f32(
+    device const float*  x_in_batched [[buffer(0)]],   // [B, conv_dim]
+    device const float*  conv1d_w     [[buffer(1)]],   // [conv_dim, kernel_size]
+    device float*        conv_state   [[buffer(2)]],   // [(K-1), conv_dim] read+write
+    device float*        y_out_batched [[buffer(3)]],  // [B, conv_dim]
+    constant uint3&      dims         [[buffer(4)]],   // (kernel_size, conv_dim, B)
+    uint                 gid          [[thread_position_in_grid]]
+) {
+    uint kernel_size = dims.x;
+    uint conv_dim    = dims.y;
+    uint B           = dims.z;
+    if (gid >= conv_dim) return;
+    if (kernel_size == 0u || kernel_size > MAX_KERNEL_SIZE) return;
+
+    uint w_base = gid * kernel_size;
+
+    // Load weights into registers (small — kernel_size <= 8).
+    float w_local[MAX_KERNEL_SIZE];
+    for (uint t = 0u; t < kernel_size; ++t) {
+        w_local[t] = conv1d_w[w_base + t];
+    }
+
+    // Load conv state into registers.
+    // State buffer layout: conv_state[t * conv_dim + gid] for t in 0..(kernel_size-1).
+    // After per-step shift, position 0 is oldest, position (K-2) is most recent.
+    float state[MAX_KERNEL_SIZE - 1u];
+    for (uint t = 0u; t + 1u < kernel_size; ++t) {
+        state[t] = conv_state[t * conv_dim + gid];
+    }
+
+    // Loop over B timesteps. State stays in registers.
+    for (uint bi = 0u; bi < B; ++bi) {
+        float xv = x_in_batched[bi * conv_dim + gid];
+
+        // Conv: sum over kernel positions.
+        // Position t in 0..(K-2) uses state[t]; position K-1 uses xv.
+        float acc = 0.0;
+        for (uint t = 0u; t + 1u < kernel_size; ++t) {
+            acc += w_local[t] * state[t];
+        }
+        acc += w_local[kernel_size - 1u] * xv;
+
+        // SiLU fused.
+        float sig = 1.0 / (1.0 + exp(-acc));
+        y_out_batched[bi * conv_dim + gid] = acc * sig;
+
+        // Shift state left by 1 and append xv at last slot.
+        // After this : state[0] = old state[1], ..., state[K-3] = old state[K-2],
+        //              state[K-2] = xv.
+        for (uint t = 0u; t + 2u < kernel_size; ++t) {
+            state[t] = state[t + 1u];
+        }
+        if (kernel_size >= 2u) {
+            state[kernel_size - 2u] = xv;
+        }
+    }
+
+    // Write final state back to device memory.
+    for (uint t = 0u; t + 1u < kernel_size; ++t) {
+        conv_state[t * conv_dim + gid] = state[t];
+    }
+}
+"#;
+
+/// T202 — Persistent batched conv1d step. Same SiLU-fused conv as
+/// `ssm_conv1d_step_f32` but processes B timesteps in one kernel dispatch
+/// (per-thread state in registers, no DRAM round-trips per step).
+///
+/// Pre-conditions :
+/// - `kernel_size <= 8` (register bound)
+/// - `x_in_batched` shape [B, conv_dim], `y_out_batched` shape [B, conv_dim]
+pub fn ssm_conv1d_step_persistent_f32_into(
+    backend: &MetalBackend,
+    x_in_batched_buf: &Buffer,
+    conv1d_w_buf: &Buffer,
+    conv_state_buf: &Buffer,
+    y_out_batched_buf: &Buffer,
+    b: usize,
+    kernel_size: usize,
+    conv_dim: usize,
+) -> Result<(), MetalError> {
+    if kernel_size == 0 || kernel_size > 8 || conv_dim == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ssm_conv1d_step_persistent_f32: kernel_size in 1..=8, conv_dim>0 (got K={kernel_size}, conv_dim={conv_dim})"
+        )));
+    }
+    if b == 0 {
+        return Ok(());
+    }
+    let pipeline = backend.pipeline(
+        "ssm_conv1d_step_persistent_f32",
+        SSM_CONV1D_STEP_PERSISTENT_F32_SHADER,
+        "ssm_conv1d_step_persistent_f32",
+    )?;
+    let dims = [kernel_size as u32, conv_dim as u32, b as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_in_batched_buf), 0);
+        encoder.set_buffer(1, Some(conv1d_w_buf), 0);
+        encoder.set_buffer(2, Some(conv_state_buf), 0);
+        encoder.set_buffer(3, Some(y_out_batched_buf), 0);
+        encoder.set_bytes(4, 12, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(conv_dim as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
+
 // ----------------------------------------------------------------------------
 // 2. Per-head L2 normalization (no gamma). Used on Q and K after conv.
 //

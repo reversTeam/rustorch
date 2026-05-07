@@ -72,10 +72,11 @@ use rustorch_metal::kernels::{
     sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32,
     split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
     ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
-    ssm_conv1d_step_f32_with_io_offsets, ssm_conv1d_step_f32_with_offset, swiglu_batched_f32,
-    swiglu_f32, topk_softmax_norm_batched_f32, topk_softmax_norm_f32,
-    topk_softmax_norm_parallel_f32, unpermute_rows_f32, weighted_add_inplace_f32,
-    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
+    ssm_conv1d_step_f32_with_io_offsets, ssm_conv1d_step_f32_with_offset,
+    ssm_conv1d_step_persistent_f32_into, swiglu_batched_f32, swiglu_f32,
+    topk_softmax_norm_batched_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32,
+    unpermute_rows_f32, weighted_add_inplace_f32, weighted_reduce_add_batched_f32,
+    weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
 };
 
 /// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
@@ -1611,39 +1612,81 @@ fn ssm_block_forward_batch(
             eps,
         )?;
     } else {
-        for bi in 0..b {
-            // Conv1d step lit batch_scratch.qkv_mixed[bi*conv_dim..] directement.
-            ssm_conv1d_step_f32_with_offset(
+        // T202 — Batched persistent conv1d (1 dispatch over all B timesteps,
+        // per-channel state in registers). Replaces B per-step conv1d_step calls.
+        // Output goes to batched conv_out_batched [B, conv_dim].
+        // Opt-out via RUSTORCH_T202=0 (falls back to per-step).
+        let env_t202 = std::env::var("RUSTORCH_T202")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if env_t202 {
+            ssm_conv1d_step_persistent_f32_into(
                 backend,
                 &batch_scratch.qkv_mixed,
-                bi * conv_off_stride,
                 &ssm.conv1d,
                 &s.conv_state,
-                &scratch.conv_out,
+                &batch_scratch.conv_out_batched,
+                b,
                 cfg.ssm_conv_kernel,
                 conv_dim,
             )?;
-            // T199b — split_qkv_f32 ELIMINATED via Metal buffer offsets.
-            delta_net_step_with_l2_f32_with_qkv_offsets(
-                backend,
-                &scratch.conv_out,
-                0,
-                &scratch.conv_out,
-                key_dim * 4,
-                &scratch.conv_out,
-                2 * key_dim * 4,
-                &batch_scratch.gate_h,
-                bi * n_v_off_stride,
-                &batch_scratch.beta_sig,
-                bi * n_v_off_stride,
-                &s.state,
-                &batch_scratch.ssm_out_buf,
-                bi * value_off_stride,
-                n_v,
-                head_v_dim,
-                n_k,
-                eps,
-            )?;
+            // delta_net per-step reads from conv_out_batched with bi*conv_off_stride offset.
+            for bi in 0..b {
+                delta_net_step_with_l2_f32_with_qkv_offsets(
+                    backend,
+                    &batch_scratch.conv_out_batched,
+                    bi * conv_off_stride,
+                    &batch_scratch.conv_out_batched,
+                    bi * conv_off_stride + key_dim * 4,
+                    &batch_scratch.conv_out_batched,
+                    bi * conv_off_stride + 2 * key_dim * 4,
+                    &batch_scratch.gate_h,
+                    bi * n_v_off_stride,
+                    &batch_scratch.beta_sig,
+                    bi * n_v_off_stride,
+                    &s.state,
+                    &batch_scratch.ssm_out_buf,
+                    bi * value_off_stride,
+                    n_v,
+                    head_v_dim,
+                    n_k,
+                    eps,
+                )?;
+            }
+        } else {
+            for bi in 0..b {
+                ssm_conv1d_step_f32_with_offset(
+                    backend,
+                    &batch_scratch.qkv_mixed,
+                    bi * conv_off_stride,
+                    &ssm.conv1d,
+                    &s.conv_state,
+                    &scratch.conv_out,
+                    cfg.ssm_conv_kernel,
+                    conv_dim,
+                )?;
+                delta_net_step_with_l2_f32_with_qkv_offsets(
+                    backend,
+                    &scratch.conv_out,
+                    0,
+                    &scratch.conv_out,
+                    key_dim * 4,
+                    &scratch.conv_out,
+                    2 * key_dim * 4,
+                    &batch_scratch.gate_h,
+                    bi * n_v_off_stride,
+                    &batch_scratch.beta_sig,
+                    bi * n_v_off_stride,
+                    &s.state,
+                    &batch_scratch.ssm_out_buf,
+                    bi * value_off_stride,
+                    n_v,
+                    head_v_dim,
+                    n_k,
+                    eps,
+                )?;
+            }
         }
         // T201 — batched gated RMS norm AFTER the scan loop (no recurrent state).
         rms_norm_per_head_gated_batched_f32(
