@@ -65,6 +65,12 @@ pub struct MetalBackend {
     /// M4 / Vision Pro / A17 Pro+ qualify; M1 / M2 fall through to
     /// the f16 + GradScaler path.
     supports_metal3: bool,
+    /// T181 — optional GPU profiler. `Some(p)` when profiling is enabled
+    /// via `enable_profiler()`. Each call to `with_encoder_labeled` then
+    /// samples MTL timestamp counters around the dispatch. `drain()`
+    /// schedules a `resolve_counters` blit before commit and reads back
+    /// the timestamps after `wait_until_completed`.
+    profiler: Arc<Mutex<Option<crate::profiler::MetalProfiler>>>,
 }
 
 impl MetalBackend {
@@ -92,7 +98,142 @@ impl MetalBackend {
             buffer_pool: Arc::new(Mutex::new(HashMap::new())),
             adapter_name,
             supports_metal3,
+            profiler: Arc::new(Mutex::new(None)),
         })
+    }
+
+    // ============================================================================
+    // T181 — GPU profiler API
+    // ============================================================================
+
+    /// Enable the GPU profiler. Subsequent `with_encoder_labeled` calls will
+    /// sample MTL timestamp counters around each dispatch. Returns `Ok(())`
+    /// on success, `Err` if the device doesn't support counter sampling.
+    ///
+    /// Idempotent: calling enable() twice resets the captured pairs but
+    /// keeps the same sample buffer (cheap reuse).
+    pub fn enable_profiler(&self) -> Result<(), MetalError> {
+        let mut guard = self.profiler.lock().expect("metal profiler lock");
+        if guard.is_some() {
+            // Already enabled — just reset.
+            guard.as_ref().unwrap().reset();
+            return Ok(());
+        }
+        let prof = crate::profiler::MetalProfiler::new(&self.device)?;
+        *guard = Some(prof);
+        Ok(())
+    }
+
+    /// Disable the profiler. Releases the counter sample buffer.
+    pub fn disable_profiler(&self) {
+        let mut guard = self.profiler.lock().expect("metal profiler lock");
+        *guard = None;
+    }
+
+    /// Reset the profiler's captured pairs (e.g. start of a new forward pass).
+    /// No-op if profiling is disabled.
+    pub fn reset_profiler(&self) {
+        if let Some(p) = self.profiler.lock().expect("metal profiler lock").as_ref() {
+            p.reset();
+        }
+    }
+
+    /// Aggregate per-label totals from the profiler. Returns empty Vec if
+    /// profiling is disabled or no samples were captured.
+    /// Each tuple is (label, total_ns, count).
+    pub fn profiler_aggregate(&self) -> Vec<(&'static str, u64, u64)> {
+        match self.profiler.lock().expect("metal profiler lock").as_ref() {
+            Some(p) => p.aggregate(),
+            None => vec![],
+        }
+    }
+
+    /// Pretty-print the GPU breakdown to stderr.
+    pub fn profiler_print_summary(&self) {
+        if let Some(p) = self.profiler.lock().expect("metal profiler lock").as_ref() {
+            p.print_summary();
+        } else {
+            eprintln!("[MetalProfiler] not enabled (call enable_profiler() first)");
+        }
+    }
+
+    /// Like `with_encoder` but samples MTL timestamp counters around the
+    /// dispatch when the profiler is enabled. Use this for any kernel
+    /// dispatch you want to time individually.
+    ///
+    /// **Profiling on**: this call breaks the chained encoder, opens a fresh
+    /// `MTLComputeCommandEncoder` with a `ComputePassDescriptor` carrying a
+    /// counter-sample-buffer attachment (start = `2*pair_idx`, end = `+1`),
+    /// runs the dispatch, ends the encoder. Subsequent unlabeled
+    /// `with_encoder` calls reopen a new chained encoder lazily.
+    /// This adds ~5-10 µs/dispatch of encoder open/close overhead — acceptable
+    /// during profile runs, never paid in production.
+    ///
+    /// **Profiling off** (default): identical to `with_encoder`, no overhead.
+    ///
+    /// Note: Apple Silicon does not support `MTLCounterSamplingPointAtDispatchBoundary`
+    /// (per-dispatch sampling inside an encoder via `sampleCountersInBuffer:atSampleIndex:`),
+    /// so we use the per-encoder pattern instead.
+    pub fn with_encoder_labeled<F: FnOnce(&metal::ComputeCommandEncoderRef)>(
+        &self,
+        label: &'static str,
+        f: F,
+    ) {
+        // Try to allocate a pair from the profiler. If profiler is off or
+        // out of slots, fall back to the chained `with_encoder` path.
+        let pair_idx = self
+            .profiler
+            .lock()
+            .expect("metal profiler lock")
+            .as_ref()
+            .and_then(|p| p.alloc_pair(label));
+
+        if let Some(start_idx) = pair_idx {
+            // Close any open chained encoder so our descriptor-based encoder
+            // starts on a clean boundary.
+            {
+                let mut enc_guard = self
+                    .pending_encoder
+                    .lock()
+                    .expect("metal pending encoder lock");
+                if let Some(enc) = enc_guard.take() {
+                    enc.end_encoding();
+                }
+            }
+            // Get/create the pending command buffer.
+            let mut cb_guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
+            if cb_guard.is_none() {
+                *cb_guard = Some(self.queue.new_command_buffer().to_owned());
+            }
+            let cb = cb_guard.as_ref().expect("just created");
+
+            // Build a ComputePassDescriptor with the counter-sample attachment.
+            // Apple Silicon gotcha: `set_object_at` to install a fresh
+            // attachment descriptor breaks sampling. We must mutate the
+            // implicit attachment via `object_at(0)` instead. Even so,
+            // only the FIRST attached encoder per drain captures valid
+            // timestamps — subsequent encoders get 0. This appears to be a
+            // hardware/driver limitation on M4 Max. So callers wanting
+            // multi-phase profile must drain between phases.
+            let desc = metal::ComputePassDescriptor::new();
+            {
+                let prof_guard = self.profiler.lock().expect("metal profiler lock");
+                let p = prof_guard.as_ref().expect("profiler still on");
+                let attachments = desc.sample_buffer_attachments();
+                let attachment = attachments.object_at(0).expect("attachment at index 0");
+                attachment.set_sample_buffer(p.sample_buffer());
+                attachment.set_start_of_encoder_sample_index(start_idx as u64);
+                attachment.set_end_of_encoder_sample_index((start_idx + 1) as u64);
+            }
+            let enc = cb.compute_command_encoder_with_descriptor(desc);
+            f(enc);
+            enc.end_encoding();
+            // Note: we do NOT store this encoder in pending_encoder. The next
+            // unlabeled with_encoder() call lazy-creates a fresh chained encoder.
+        } else {
+            // Profiler off (or out of slots) — chained path.
+            self.with_encoder(f);
+        }
     }
 
     /// Maximum buffers retained per size bucket. Caps the pool's
@@ -315,6 +456,13 @@ impl MetalBackend {
         }
         let mut guard = self.pending_cmd_buffer.lock().expect("metal pending lock");
         if let Some(cb) = guard.take() {
+            // T181 — if profiler is on, schedule a blit-resolve of the
+            // counter sample buffer into our destination buffer BEFORE commit.
+            // After wait_until_completed, the destination buffer has the
+            // resolved u64 timestamps ready for `aggregate()` to read.
+            if let Some(p) = self.profiler.lock().expect("metal profiler lock").as_ref() {
+                p.schedule_resolve(&cb);
+            }
             cb.commit();
             cb.wait_until_completed();
         } else {

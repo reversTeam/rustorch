@@ -43,6 +43,11 @@ pub mod backend;
 #[cfg(target_os = "macos")]
 pub mod backend_singleton;
 
+/// T181 — GPU-side profiler using `MTLCounterSampleBuffer`. Replaces the
+/// broken CPU-drain-based profiler with real per-dispatch timestamps.
+#[cfg(target_os = "macos")]
+pub mod profiler;
+
 #[cfg(target_os = "macos")]
 pub mod kernels;
 

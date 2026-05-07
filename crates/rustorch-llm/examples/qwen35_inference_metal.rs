@@ -49,8 +49,8 @@ use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, argmax_batched_f32, build_em_perm_f32_into,
     delta_net_step_f32, delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets,
-    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32,
-    kv_append_f32, l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32,
+    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, gqa_decode_f32_nsg2,
+    kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32,
     rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
     rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
     rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
@@ -68,9 +68,9 @@ use rustorch_metal::kernels::{
     sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
     split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
     ssm_conv1d_step_f32, ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32,
-    topk_softmax_norm_batched_f32, topk_softmax_norm_f32, unpermute_rows_f32,
-    weighted_add_inplace_f32, weighted_reduce_add_batched_f32, weighted_reduce_add_f32,
-    weighted_scatter_add_f32, zero_f32,
+    topk_softmax_norm_batched_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32,
+    unpermute_rows_f32, weighted_add_inplace_f32, weighted_reduce_add_batched_f32,
+    weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
 };
 
 /// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
@@ -171,14 +171,15 @@ impl HybridMetalWeight {
                 sgemv_q8_0_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
             },
             GgmlType::F32 => {
-                // T151 — Small F32 projections (e.g. ssm_alpha, ssm_beta) now
-                // run on GPU via `sgemv_f32_lcpp_simd_into` (1 simdgroup per
-                // output column). The previous path was CPU naive matmul +
-                // `backend.drain()`, costing ~250 µs/call × 64 calls/token
-                // (= 32 SSM layers × 2 F32 projections) = ~16 ms/token =
-                // ~23% of the 27B decode budget. The new path keeps the
-                // matmul on the same Metal command buffer, no host-side
-                // synchronisation needed.
+                // T151 — Small F32 projections on GPU via `sgemv_f32_lcpp_simd_into`.
+                //
+                // T183 (rejected end-to-end) — wrote `sgemv_f32_cached_x_into`
+                // that caches x[K] in threadgroup memory. Microbench: ×2 speedup
+                // (22µs → 11µs, parity byte-identical). End-to-end on natural
+                // prompts: WASH (-1% to -2%). Likely cause: in production the
+                // L2 cache already absorbs x reads, so our explicit TG-mem
+                // caching is pure overhead. Lesson: microbench gains require
+                // end-to-end confirmation. Kernel kept dead-code in kernels.rs.
                 sgemv_f32_lcpp_simd_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
             },
             other => Err(MetalError::Unsupported(format!(
@@ -436,6 +437,118 @@ fn load_quant_2d(
     })
 }
 
+/// T180 — Quantize a f32 weight slice to Q8_0 format.
+///
+/// Q8_0 super-block: 32 weights → (fp16 scale, [int8; 32]) = 34 bytes.
+/// Output layout: contiguous blocks, total size = `(n_weights / 32) * 34` bytes.
+///
+/// Used at load-time to convert F32 routing matrices (`ffn_gate_inp.weight`,
+/// 2 MB/layer × 40 layers = 80 MB/token of F32 bandwidth) to Q8_0 (4× compression,
+/// faster `sgemv_q8_0_f32_lcpp_nsg2` dispatch path).
+///
+/// Pre-conditions: `weights.len() % 32 == 0`.
+fn quantize_f32_to_q8_0(weights: &[f32]) -> Vec<u8> {
+    use half::f16;
+    assert_eq!(
+        weights.len() % 32,
+        0,
+        "Q8_0 requires multiple of 32 weights"
+    );
+    let n_blocks = weights.len() / 32;
+    let mut out = vec![0u8; n_blocks * 34];
+    for b in 0..n_blocks {
+        let block = &weights[b * 32..(b + 1) * 32];
+        let amax = block.iter().fold(0.0_f32, |acc, &x| acc.max(x.abs()));
+        let d = amax / 127.0;
+        let inv_d = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let off = b * 34;
+        let d_h = f16::from_f32(d).to_le_bytes();
+        out[off] = d_h[0];
+        out[off + 1] = d_h[1];
+        for i in 0..32 {
+            let q = (block[i] * inv_d).round().clamp(-127.0, 127.0) as i8;
+            out[off + 2 + i] = q as u8;
+        }
+    }
+    out
+}
+
+/// T180 — Load a 2D tensor from GGUF, optionally re-quantizing F32 weights to Q8_0.
+///
+/// If `requantize_f32_to_q8_0` is true AND the source tensor is F32, the f32 bytes
+/// are read, quantized to Q8_0 in-place, and uploaded as Q8_0. The returned
+/// `HybridMetalWeight` has `dtype = Q8_0` so `matmul_into` automatically routes
+/// to the Q8_0 sgemv kernel (4× less bandwidth, faster dispatch).
+fn load_quant_2d_maybe_requantize(
+    backend: &MetalBackend,
+    file: &GgufFile,
+    info: &TensorInfo,
+    requantize_f32_to_q8_0: bool,
+) -> Result<HybridMetalWeight, String> {
+    if info.shape.len() != 2 {
+        return Err(format!(
+            "{}: expected 2-D tensor, got shape {:?}",
+            info.name, info.shape
+        ));
+    }
+    let k = info.shape[0] as usize;
+    let n = info.shape[1] as usize;
+    if requantize_f32_to_q8_0 && info.dtype == GgmlType::F32 {
+        // Read F32 bytes, reinterpret as f32 slice, quantize to Q8_0.
+        let bytes = file.tensor_bytes(info);
+        let n_floats = bytes.len() / 4;
+        if k * n != n_floats {
+            return Err(format!(
+                "{}: F32 byte count {} != k*n {}",
+                info.name,
+                n_floats,
+                k * n
+            ));
+        }
+        if k % 32 != 0 {
+            return Err(format!(
+                "{}: F32 K={k} not multiple of 32, cannot quantize to Q8_0",
+                info.name
+            ));
+        }
+        let weights: &[f32] =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_floats) };
+        let q8_bytes = quantize_f32_to_q8_0(weights);
+        let buffer = backend
+            .alloc_shared(q8_bytes.len())
+            .map_err(|e| format!("alloc {}: {:?}", info.name, e))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                q8_bytes.as_ptr(),
+                buffer.contents() as *mut u8,
+                q8_bytes.len(),
+            );
+        }
+        return Ok(HybridMetalWeight {
+            buffer,
+            dtype: GgmlType::Q8_0,
+            k,
+            n,
+            name: info.name.clone(),
+        });
+    }
+    // Normal path: copy raw bytes.
+    let bytes = file.tensor_bytes(info);
+    let buffer = backend
+        .alloc_shared(bytes.len())
+        .map_err(|e| format!("alloc {}: {:?}", info.name, e))?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.contents() as *mut u8, bytes.len());
+    }
+    Ok(HybridMetalWeight {
+        buffer,
+        dtype: info.dtype,
+        k,
+        n,
+        name: info.name.clone(),
+    })
+}
+
 /// Load an F32 1-D vector (norm gamma, dt bias, ssm_a, etc.) into a
 /// Metal buffer. We keep these as f32 since they're tiny and the kernels
 /// (RMSNorm, residual add, etc.) operate on f32.
@@ -606,6 +719,13 @@ pub fn load_metal_model(
         stats.n_tensors += 1;
     };
 
+    // T180 — env flag to opt-in re-quantize F32 routing matrices to Q8_0 at
+    // load time. When set, `load_2d_routing` (used only for `ffn_gate_inp`)
+    // converts F32 weights → Q8_0 (4× compression, faster dispatch path).
+    let routing_quant_q8 = std::env::var("RUSTORCH_ROUTING_QUANT")
+        .map(|v| v.eq_ignore_ascii_case("q8_0"))
+        .unwrap_or(false);
+
     let load_2d = |name: &str, stats: &mut LoadStats| -> Result<HybridMetalWeight, String> {
         let info = file
             .tensor(name)
@@ -613,6 +733,19 @@ pub fn load_metal_model(
         visit_tensor(info, stats);
         load_quant_2d(backend, &file, info)
     };
+    // T180 — variant that re-quantizes F32 → Q8_0 for routing matrices when
+    // RUSTORCH_ROUTING_QUANT=q8_0. Currently unused after T180 rejection;
+    // kept available for future re-test on models where routing is the actual
+    // bottleneck (e.g. larger n_experts where bandwidth dominates).
+    #[allow(dead_code)]
+    let _load_2d_routing =
+        |name: &str, stats: &mut LoadStats| -> Result<HybridMetalWeight, String> {
+            let info = file
+                .tensor(name)
+                .ok_or_else(|| format!("missing tensor: {name}"))?;
+            visit_tensor(info, stats);
+            load_quant_2d_maybe_requantize(backend, &file, info, routing_quant_q8)
+        };
     let load_stacked_one_buffer =
         |name: &str, stats: &mut LoadStats| -> Result<StackedQuantizedExperts, String> {
             // T152 — Stacked expert tensors: GGUF shape `[k, n, n_experts]`
@@ -693,6 +826,13 @@ pub fn load_metal_model(
                 }
             },
             Qwen35Variant::Moe => {
+                // T180 (rejected) — tried routing F32 → Q8_0 quant via load_2d_routing.
+                // Result: wash -1% on 5 prompts × 3 runs (within ±2% noise).
+                // Root cause: profile drain artifact made moe.routing look like 5.5ms
+                // (23% of decode), but real per-call cost is ~1-2 µs in chained mode.
+                // The F32 sgemv was already efficient; quant compression saved
+                // bandwidth on a non-bottleneck. `load_2d_routing` kept available
+                // for re-test on different models (e.g. larger n_experts).
                 let gate_inp = load_2d(&format!("blk.{li}.ffn_gate_inp.weight"), &mut stats)?;
                 let gate_inp_shexp =
                     load_1d_f32(&format!("blk.{li}.ffn_gate_inp_shexp.weight"), &mut stats)?;
@@ -2379,18 +2519,46 @@ fn attn_block_forward(
     )?;
 
     // 8. GQA decode → attn_out (q_dim).
-    gqa_decode_f32(
-        backend,
-        &scratch.q,
-        &cache.k_cache,
-        &cache.v_cache,
-        &scratch.attn_out,
-        n_q,
-        n_kv,
-        head_dim,
-        position + 1,
-        max_seq,
-    )?;
+    //
+    // T186 — `gqa_decode_f32_nsg2` uses 2 simdgroups per TG (64 threads),
+    // halving the per-thread sequential work over kv_len. Microbench on
+    // M4 Max shows ×1.13 to ×2.21 speedup growing with kv_len:
+    //   kv=64    : 33 → 29 µs (×1.13)
+    //   kv=256   : 117 → 62 µs (×1.88)
+    //   kv=1024  : 462 → 231 µs (×2.00)
+    //   kv=4096  : 3050 → 1377 µs (×2.21)
+    // Parity byte-near-identical (max_rel_err 1.85e-6 vs original).
+    // Activable via RUSTORCH_GQA_NSG2 (default ON, set =0 for bisect).
+    let use_gqa_nsg2 = std::env::var("RUSTORCH_GQA_NSG2")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if use_gqa_nsg2 {
+        gqa_decode_f32_nsg2(
+            backend,
+            &scratch.q,
+            &cache.k_cache,
+            &cache.v_cache,
+            &scratch.attn_out,
+            n_q,
+            n_kv,
+            head_dim,
+            position + 1,
+            max_seq,
+        )?;
+    } else {
+        gqa_decode_f32(
+            backend,
+            &scratch.q,
+            &cache.k_cache,
+            &cache.v_cache,
+            &scratch.attn_out,
+            n_q,
+            n_kv,
+            head_dim,
+            position + 1,
+            max_seq,
+        )?;
+    }
 
     // 9. Apply sigmoid(gate) on attention output (Qwen3Next-only). Pure
     //    qwen3 has no per-head gate so this is skipped.
@@ -2476,6 +2644,12 @@ fn ssm_block_forward(
 
     // 3. T146a — fused GPU kernel: gate_h = softplus(alpha + dt_bias) * ssm_a,
     //    beta_sig = sigmoid(beta). No drain needed.
+    //
+    // T178 (rejected) — tried to fuse this gate_apply + delta_net + gated_norm
+    // into a single mega-kernel `ssm_block_mega_f32`. Result: −5% regression
+    // because per-head TG (32 TGs) underutilizes M4 Max SMs vs original per-row
+    // TG (4096 TGs). 5th occurrence of the chained-encoder fusion trap (cf. T86,
+    // T164, T165, T177). Mega-kernel kept dead-code in kernels.rs for reference.
     let _ssm_t0_gate = std::time::Instant::now();
     ssm_apply_gate_f32(
         backend,
@@ -2563,15 +2737,13 @@ fn ssm_block_forward(
 
     // 7+9. T154-fast — Fuse L2 norm de q,k DANS delta_net_step.
     //
-    // Avant : 2 dispatches l2_norm_per_head_f32 (q, k) + 1 dispatch
-    // delta_net_step_f32 = 3 dispatches/SSM-layer.
-    //
-    // Maintenant : 1 dispatch delta_net_step_with_l2_f32 qui calcule inv_q
-    // et inv_k via simd_sum en début, puis applique en scalaires multiplicatifs
-    // sur les simd_sums internes (proj_r *= inv_k, delta_eff = delta * inv_k,
-    // final out *= inv_q). State SSM identique numériquement.
-    //
     // Switch RUSTORCH_SSM_FORCE_LEGACY_L2=1 pour bisection / régression check.
+    //
+    // T178 mega-kernel (per-head TG, 32 TGs) rejected -5% (kept dead-code).
+    // T179 V2 MLX-style dispatch (1024 TGs × 128 threads, state in registers)
+    //   wash -1% (kept dead-code + parity test in kernels.rs).
+    // 3 SSM optimization attempts → SSM is NOT the bottleneck.
+    // Real hot path = MoE (50%) + LM head sgemv (25%).
     let force_legacy_l2 = std::env::var("RUSTORCH_SSM_FORCE_LEGACY_L2").is_ok();
     if force_legacy_l2 {
         // Legacy path : 2 L2 dispatches + delta_net legacy.
@@ -2822,14 +2994,35 @@ fn ffn_dense_forward(
             // (routing_topk_softmax_norm_f32) régresse -50% car le matmul
             // perd son parallélisme massif (256 sgs //) en se contractant à
             // 1 TG (8 sgs serial). Voir gotcha pour le détail.
-            topk_softmax_norm_f32(
-                backend,
-                &scratch.moe_logits,
-                &scratch.moe_indices_buf,
-                &scratch.moe_topw_buf,
-                n_experts,
-                n_used,
-            )?;
+            //
+            // T182 — `topk_softmax_norm_parallel_f32` réduit la boucle topk
+            // sérielle (1 thread × K × N = 2048 ops) à une réduction
+            // simdgroup-coopérative (K × 40 ops). Speedup ×9 (115µs → 12µs)
+            // sur micro-bench M4 Max → ~4 ms/token gain attendu sur le décode.
+            // Activable via RUSTORCH_TOPK_PARALLEL=1 (default). Set =0 pour
+            // bisection / régression.
+            let use_parallel_topk = std::env::var("RUSTORCH_TOPK_PARALLEL")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if use_parallel_topk {
+                topk_softmax_norm_parallel_f32(
+                    backend,
+                    &scratch.moe_logits,
+                    &scratch.moe_indices_buf,
+                    &scratch.moe_topw_buf,
+                    n_experts,
+                    n_used,
+                )?;
+            } else {
+                topk_softmax_norm_f32(
+                    backend,
+                    &scratch.moe_logits,
+                    &scratch.moe_indices_buf,
+                    &scratch.moe_topw_buf,
+                    n_experts,
+                    n_used,
+                )?;
+            }
             profile_drain_record(backend, "  moe.routing", _moe_t0_routing);
 
             // 3. T147a — zero the accumulator on GPU (no drain).
@@ -4786,6 +4979,257 @@ fn main() -> ExitCode {
         .nth(1)
         .unwrap_or_default();
     let no_chat_template = env::args().any(|a| a == "--no-chat-template");
+    let chat_mode = env::args().any(|a| a == "--chat");
+
+    // T185 — Interactive chat mode with persistent KV cache across turns.
+    // Each new user message is prefilled as a delta on top of the existing
+    // KV state, so multi-turn conversations don't pay the full prefill cost
+    // again. /exit, /clear, /stats commands. Streams tokens by default.
+    if chat_mode {
+        use std::io::{BufRead, Write};
+
+        println!("\n=== Interactive chat mode (Qwen3.6-35B-A3B) ===");
+        println!(
+            "  max_seq={max_seq}, decode budget per turn={} tokens",
+            forward_n.unwrap_or(2048)
+        );
+        if !system_text.is_empty() {
+            println!("  system: {system_text}");
+        }
+        println!("  Commands: /exit  /clear  /stats  /system <text>");
+        println!("  KV cache persists across turns (multi-turn conversation).");
+
+        let file = match GgufFile::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("reopen gguf: {e:?}");
+                return ExitCode::FAILURE;
+            },
+        };
+        let tok = match GgufTokenizer::from_gguf(&file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("tokenizer init: {e}");
+                return ExitCode::FAILURE;
+            },
+        };
+        let im_end_id = tok.special_id("<|im_end|>").unwrap_or(tok.eos_id);
+        let im_start_id = tok.special_id("<|im_start|>").unwrap_or(tok.eos_id);
+        // Stop on EOS, <|im_end|> (turn end), or <|im_start|> (model started a
+        // NEXT turn header — happens when the model "forgets" to emit im_end).
+        let stops = [tok.eos_id, im_end_id, im_start_id];
+        let max_decode = forward_n.unwrap_or(2048);
+
+        let mut state = DecodeState::new(backend, &cfg, max_seq);
+        let mut cur_pos = 0_usize;
+        let mut last: u32 = 0;
+        let mut turn = 0_usize;
+        let mut current_system = system_text.clone();
+
+        let stdin = std::io::stdin();
+        let mut stdin_lock = stdin.lock();
+
+        loop {
+            print!("\n[user] ");
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            match stdin_lock.read_line(&mut line) {
+                Ok(0) => break, // EOF (Ctrl-D)
+                Ok(_) => {},
+                Err(_) => break,
+            }
+            let input = line.trim();
+            if input.is_empty() {
+                continue;
+            }
+            // Slash commands.
+            if let Some(rest) = input.strip_prefix("/system ") {
+                current_system = rest.to_string();
+                println!("(system prompt updated; will apply on /clear or next turn)");
+                continue;
+            }
+            match input {
+                "/exit" | "/quit" => {
+                    println!("Bye.");
+                    break;
+                },
+                "/clear" => {
+                    state = DecodeState::new(backend, &cfg, max_seq);
+                    cur_pos = 0;
+                    turn = 0;
+                    println!("(history cleared, KV cache reset)");
+                    continue;
+                },
+                "/stats" => {
+                    println!(
+                        "  turn={turn}  kv_pos={cur_pos}  max_seq={max_seq}  remaining={}",
+                        max_seq.saturating_sub(cur_pos)
+                    );
+                    continue;
+                },
+                _ => {},
+            }
+
+            // Build the chunk to prefill for this turn.
+            // Turn 0: full ChatML wrapper (system + user + assistant header).
+            // Turn ≥1: only the new user→assistant delta. The previous
+            // assistant turn's <|im_end|> was already decoded into the KV
+            // cache, so we just append a newline + new user block.
+            let chunk_text = if turn == 0 {
+                tok.chatml_prompt(&current_system, input)
+            } else {
+                format!(
+                    "\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                    input
+                )
+            };
+            let chunk_ids = tok.encode(&chunk_text);
+
+            // Capacity check: prefill + decode budget must fit in KV cache.
+            let needed = cur_pos + chunk_ids.len() + 16; // 16 = small margin for first decode steps
+            if needed >= max_seq {
+                eprintln!(
+                    "KV cache nearly full (pos={cur_pos}, +chunk={}, max_seq={max_seq}). Use /clear to reset history.",
+                    chunk_ids.len()
+                );
+                continue;
+            }
+
+            // Prefill the chunk (per-token; chat mode is short bursts so
+            // this is fine without batched prefill).
+            let t_prefill = Instant::now();
+            for &t in &chunk_ids {
+                match forward_token(backend, &file, &model, &mut state, t, cur_pos) {
+                    Ok(out) => last = out,
+                    Err(e) => {
+                        eprintln!("forward error at chat prefill: {e}");
+                        return ExitCode::FAILURE;
+                    },
+                }
+                cur_pos += 1;
+            }
+            let dt_prefill = t_prefill.elapsed();
+
+            // Decode + stream.
+            print!("[assistant] ");
+            std::io::stdout().flush().ok();
+            let mut generated: Vec<u32> = vec![last];
+            // Helper : safely emit the new char-boundary-aligned suffix of
+            // `cur_clean` versus `emitted`. Avoids slicing in the middle of
+            // multi-byte UTF-8 chars (e.g. emoji 🇫🇷). Trailing partial
+            // characters wait for the next iteration.
+            let emit_safe = |cur_clean: &str, emitted: &mut String| {
+                // T185-fix : the tokenizer emits U+FFFD (`�`) as placeholder
+                // for incomplete multi-byte chars. When subsequent tokens
+                // complete the char, the placeholder gets replaced by the
+                // real char and earlier byte positions shift. To avoid
+                // printing transient placeholders that get overwritten,
+                // we trim trailing `�` runs from cur_clean before emitting.
+                // Three bytes per `�` (U+FFFD encoded as EF BF BD).
+                let mut effective_len = cur_clean.len();
+                let fffd_bytes: [u8; 3] = [0xEF, 0xBF, 0xBD];
+                while effective_len >= 3
+                    && cur_clean.as_bytes()[effective_len - 3..effective_len] == fffd_bytes
+                {
+                    effective_len -= 3;
+                }
+                // Tokenizer decode can also change the byte-level structure
+                // of earlier output as new tokens complete a multi-byte UTF-8
+                // char. When that happens, `emitted` is no longer a prefix
+                // of cur_clean; walk back to the largest common prefix on
+                // a boundary.
+                if !cur_clean.starts_with(emitted.as_str()) {
+                    let mut common = emitted
+                        .as_bytes()
+                        .iter()
+                        .zip(cur_clean.as_bytes().iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    while common > 0 && !cur_clean.is_char_boundary(common) {
+                        common -= 1;
+                    }
+                    emitted.clear();
+                    emitted.push_str(&cur_clean[..common]);
+                }
+                if effective_len <= emitted.len() {
+                    return;
+                }
+                let mut safe_end = effective_len;
+                while safe_end > emitted.len() && !cur_clean.is_char_boundary(safe_end) {
+                    safe_end -= 1;
+                }
+                if safe_end > emitted.len() {
+                    use std::io::Write;
+                    print!("{}", &cur_clean[emitted.len()..safe_end]);
+                    std::io::stdout().flush().ok();
+                    emitted.clear();
+                    emitted.push_str(&cur_clean[..safe_end]);
+                }
+            };
+            // Emit the first generated token (predicted right after prefill).
+            let initial = tok.decode(&generated);
+            let initial_clean = initial
+                .replace("<|im_end|>", "")
+                .replace("<|im_start|>", "")
+                .replace("<|endoftext|>", "");
+            let mut emitted = String::new();
+            emit_safe(&initial_clean, &mut emitted);
+
+            let t_decode = Instant::now();
+            let mut hit_stop = stops.contains(&last);
+            let mut n_decoded = 1_usize;
+            while n_decoded < max_decode && !hit_stop {
+                if cur_pos + 1 >= max_seq {
+                    println!("\n[hit max_seq during decode]");
+                    break;
+                }
+                match forward_token(backend, &file, &model, &mut state, last, cur_pos) {
+                    Ok(out) => {
+                        last = out;
+                        generated.push(last);
+                        cur_pos += 1;
+                        n_decoded += 1;
+                        // Emit incremental delta (UTF-8 safe).
+                        let cur = tok.decode(&generated);
+                        let cur_clean = cur
+                            .replace("<|im_end|>", "")
+                            .replace("<|im_start|>", "")
+                            .replace("<|endoftext|>", "");
+                        emit_safe(&cur_clean, &mut emitted);
+                        if stops.contains(&last) {
+                            hit_stop = true;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("\nforward error at chat decode: {e}");
+                        return ExitCode::FAILURE;
+                    },
+                }
+            }
+            // Final flush in case the last partial char now has its full
+            // bytes available.
+            let final_cur = tok.decode(&generated);
+            let final_clean = final_cur
+                .replace("<|im_end|>", "")
+                .replace("<|im_start|>", "")
+                .replace("<|endoftext|>", "");
+            emit_safe(&final_clean, &mut emitted);
+            let dt_decode = t_decode.elapsed();
+            println!(); // newline after streamed answer
+            println!(
+                "  [prefill {} tok in {:.2}s ({:.1} t/s) | decode {} tok in {:.2}s ({:.1} t/s){}]",
+                chunk_ids.len(),
+                dt_prefill.as_secs_f64(),
+                chunk_ids.len() as f64 / dt_prefill.as_secs_f64().max(1e-9),
+                n_decoded,
+                dt_decode.as_secs_f64(),
+                n_decoded as f64 / dt_decode.as_secs_f64().max(1e-9),
+                if hit_stop { " stop" } else { "" }
+            );
+            turn += 1;
+        }
+        return ExitCode::SUCCESS;
+    }
 
     if let Some(prompt_str) = prompt_text {
         println!("\n=== Chat mode (Rust tokenizer + ChatML) ===");
@@ -4812,7 +5256,12 @@ fn main() -> ExitCode {
         let prompt_ids = tok.encode(&wrapped);
         // Add im_end as an extra stop token alongside the EOS.
         let im_end_id = tok.special_id("<|im_end|>").unwrap_or(tok.eos_id);
-        let stops: [u32; 2] = [tok.eos_id, im_end_id];
+        let im_start_id = tok.special_id("<|im_start|>").unwrap_or(tok.eos_id);
+        // T185-fix: also stop on <|im_start|> (next-turn header). Without
+        // this, the model occasionally outputs `<|im_start|>user\n...` after
+        // its answer and the "user\n..." text leaks past the special-token
+        // strip into the displayed output.
+        let stops: [u32; 3] = [tok.eos_id, im_end_id, im_start_id];
         println!(
             "  prompt ({} tok): {}{}",
             prompt_ids.len(),
@@ -4964,6 +5413,75 @@ fn main() -> ExitCode {
         let mut spec_drafts = 0usize;
         let mut spec_accepted = 0usize;
         let mut spec_rounds = 0usize;
+        // T184 — when --stream is set, print tokens as they decode by re-decoding
+        // the whole generated[1..] sequence and emitting the new suffix. This
+        // handles BPE merges + special tokens cleanly (no partial UTF-8).
+        let mut stream_emitted = String::new();
+        if stream {
+            use std::io::Write;
+            print!("\n=== Streaming ===\n");
+            std::io::stdout().flush().ok();
+            // First-decoded token (the one returned at end of prefill).
+            stream_emitted = tok.decode(&generated);
+            print!("{}", stream_emitted);
+            std::io::stdout().flush().ok();
+        }
+        // Helper closure: print new tokens incrementally when streaming.
+        // Strips ChatML special tokens and slices on UTF-8 char boundaries
+        // so we don't split multi-byte chars (e.g. emoji) mid-byte.
+        let emit_stream = |stream_emitted: &mut String, generated: &[u32]| {
+            if !stream {
+                return;
+            }
+            use std::io::Write;
+            let mut cur = tok.decode(generated);
+            for special in [
+                "<|im_end|>",
+                "<|im_start|>",
+                "<|endoftext|>",
+                "<|startoftext|>",
+            ] {
+                cur = cur.replace(special, "");
+            }
+            // T185-fix: trim trailing U+FFFD (`�`) placeholders so we don't
+            // emit transient chars that will be replaced by real ones.
+            let mut effective_len = cur.len();
+            let fffd_bytes: [u8; 3] = [0xEF, 0xBF, 0xBD];
+            while effective_len >= 3
+                && cur.as_bytes()[effective_len - 3..effective_len] == fffd_bytes
+            {
+                effective_len -= 3;
+            }
+            // Defensive: when stream_emitted no longer matches cur prefix
+            // (tokenizer's `�` placeholder got replaced by a real char as
+            // more tokens arrived), walk back to the largest common boundary.
+            if !cur.starts_with(stream_emitted.as_str()) {
+                let mut common = stream_emitted
+                    .as_bytes()
+                    .iter()
+                    .zip(cur.as_bytes().iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                while common > 0 && !cur.is_char_boundary(common) {
+                    common -= 1;
+                }
+                stream_emitted.clear();
+                stream_emitted.push_str(&cur[..common]);
+            }
+            if effective_len <= stream_emitted.len() {
+                return;
+            }
+            let mut safe_end = effective_len;
+            while safe_end > stream_emitted.len() && !cur.is_char_boundary(safe_end) {
+                safe_end -= 1;
+            }
+            if safe_end > stream_emitted.len() {
+                print!("{}", &cur[stream_emitted.len()..safe_end]);
+                std::io::stdout().flush().ok();
+                stream_emitted.clear();
+                stream_emitted.push_str(&cur[..safe_end]);
+            }
+        };
         if (2..=32).contains(&speculative_b) && speculative_b % 8 == 0 {
             // T176 — Speculative decoding with 2-gram lookahead cache (port T167).
             //
@@ -5067,6 +5585,7 @@ fn main() -> ExitCode {
                             last = out;
                             generated.push(last);
                             cur_pos += 1;
+                            emit_stream(&mut stream_emitted, &generated);
                             // T176 fix : update caches from generated history even
                             // on fallback steps.
                             if generated.len() >= 3 {
@@ -5157,6 +5676,7 @@ fn main() -> ExitCode {
                 // Bonus token.
                 let bonus = outs[accepted];
                 generated.push(bonus);
+                emit_stream(&mut stream_emitted, &generated);
                 if generated.len() >= 3 {
                     prev_token2 = generated[generated.len() - 3];
                     prev_token = generated[generated.len() - 2];
@@ -5189,6 +5709,7 @@ fn main() -> ExitCode {
                         last = out;
                         generated.push(last);
                         cur_pos += 1;
+                        emit_stream(&mut stream_emitted, &generated);
                         if stops.contains(&last) {
                             hit_stop = true;
                             break;
@@ -5211,6 +5732,11 @@ fn main() -> ExitCode {
         } else {
             String::new()
         };
+        if stream {
+            // Newline so the `decode :` stat starts on its own line, not
+            // appended to the streamed text.
+            println!();
+        }
         println!(
             "  decode : {} tok in {:.3}s ({:.2} tok/s){}{}",
             n_decoded as usize,
@@ -5228,9 +5754,16 @@ fn main() -> ExitCode {
             }
         }
         let answer = tok.decode(&answer_ids);
-        println!("\n=== Answer ===");
-        println!("{}", answer);
-        println!("===");
+        if stream {
+            // Already printed incrementally — just close the streaming block
+            // and avoid re-dumping the full answer. Print a newline + marker
+            // for clarity.
+            println!("\n=== End ===");
+        } else {
+            println!("\n=== Answer ===");
+            println!("{}", answer);
+            println!("===");
+        }
         profile_print_summary();
         return ExitCode::SUCCESS;
     }
