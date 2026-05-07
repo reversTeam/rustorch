@@ -51,10 +51,11 @@ use rustorch_metal::kernels::{
     delta_net_step_f32, delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets,
     gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, gqa_decode_f32_nsg2,
     gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2, gqa_decode_f32_splitk_nsg4,
-    kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32,
+    kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, mul_mm_id_map0_into,
+    mul_mm_id_q4_k_f32_into, mul_mm_id_q5_k_f32_into, rms_norm_batched_f32, rms_norm_f32,
     rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
     rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
-    rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
+    rope_half_split_partial_batched_f32, scatter_moe_acc_f32_into, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
     sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
     sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
@@ -1984,7 +1985,122 @@ fn ffn_moe_forward_batch(
         }
     };
 
-    if all_em {
+    // T197.1 — opt-in mm_id pipeline (×2-3 expected vs EM expert-major).
+    // Replaces the [drain + CPU sort + upload + gather_pack + em_*×3 + unpermute
+    // + reduce] chain by [GPU map0 + mm_id_q4_k×2 + swiglu + mm_id_q5_k + scatter].
+    // Eliminates: 1 CPU drain, 1 CPU sort+upload, 1 zero_f32, 1 gather_pack_rows,
+    // 1 unpermute_rows, 1 weighted_reduce_add. Keeps: 6 GPU dispatches total.
+    let env_mmid = std::env::var("RUSTORCH_MMID")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let mmid_supported = env_mmid
+        && all_em
+        && matches!(gate_exps_stacked.dtype, GgmlType::Q4_K)
+        && matches!(up_exps_stacked.dtype, GgmlType::Q4_K)
+        && matches!(down_exps_stacked.dtype, GgmlType::Q5_K)
+        && b % 32 == 0; // mm_id requires M_max % 32 == 0
+
+    if mmid_supported {
+        // M_max = b is the safe upper bound (top-K with distinct experts per
+        // token guarantees tpe[e] ≤ b for all e). See mul_mm_id_map0_into doc.
+        let m_max = b;
+
+        // Stage 1 : GPU sort routing — no CPU drain, no upload.
+        let _t_map0 = std::time::Instant::now();
+        mul_mm_id_map0_into(
+            backend,
+            &batch_scratch.indices,
+            &batch_scratch.mmid_tpe,
+            &batch_scratch.mmid_ids,
+            &batch_scratch.mmid_pos,
+            b,
+            n_used,
+            n_experts,
+            m_max,
+        )?;
+        profile_drain_record(backend, "  fbm.mmid_map0", _t_map0);
+
+        // Stage 2a : Q4_K mm_id gate.
+        let _t_gate = std::time::Instant::now();
+        mul_mm_id_q4_k_f32_into(
+            backend,
+            &batch_scratch.h_post,
+            &gate_exps_stacked.buffer,
+            &batch_scratch.mmid_ids,
+            &batch_scratch.mmid_tpe,
+            &batch_scratch.mmid_gate_out,
+            n_experts,
+            m_max,
+            ef,
+            d,
+            n_used,
+        )?;
+        profile_drain_record(backend, "  fbm.mmid_gate", _t_gate);
+
+        // Stage 2b : Q4_K mm_id up.
+        let _t_up = std::time::Instant::now();
+        mul_mm_id_q4_k_f32_into(
+            backend,
+            &batch_scratch.h_post,
+            &up_exps_stacked.buffer,
+            &batch_scratch.mmid_ids,
+            &batch_scratch.mmid_tpe,
+            &batch_scratch.mmid_up_out,
+            n_experts,
+            m_max,
+            ef,
+            d,
+            n_used,
+        )?;
+        profile_drain_record(backend, "  fbm.mmid_up", _t_up);
+
+        // Stage 3 : SwiGLU on flat [E*M_max*ef] buffer.
+        // Tail rows (m >= tpe[e]) compute waste output but scatter ignores them.
+        let _t_silu = std::time::Instant::now();
+        swiglu_f32(
+            backend,
+            &batch_scratch.mmid_gate_out,
+            &batch_scratch.mmid_up_out,
+            &batch_scratch.mmid_silu,
+            n_experts * m_max * ef,
+        )?;
+        profile_drain_record(backend, "  fbm.mmid_swiglu", _t_silu);
+
+        // Stage 4 : Q5_K mm_id down.
+        // Note : N=d, K=ef (the reverse of gate/up which had N=ef, K=d).
+        let _t_down = std::time::Instant::now();
+        mul_mm_id_q5_k_f32_into(
+            backend,
+            &batch_scratch.mmid_silu,
+            &down_exps_stacked.buffer,
+            &batch_scratch.mmid_ids,
+            &batch_scratch.mmid_tpe,
+            &batch_scratch.mmid_down_out,
+            n_experts,
+            m_max,
+            d,
+            ef,
+            n_used,
+        )?;
+        profile_drain_record(backend, "  fbm.mmid_down", _t_down);
+
+        // Stage 5 : weighted scatter back to moe_acc[B, d]. OVERWRITES (no zero needed).
+        let _t_scatter = std::time::Instant::now();
+        scatter_moe_acc_f32_into(
+            backend,
+            &batch_scratch.mmid_down_out,
+            &batch_scratch.indices,
+            &batch_scratch.topw,
+            &batch_scratch.mmid_pos,
+            &batch_scratch.moe_acc,
+            b,
+            n_used,
+            m_max,
+            d,
+        )?;
+        profile_drain_record(backend, "  fbm.mmid_scatter", _t_scatter);
+    } else if all_em {
         // CPU sort indices.
         let _t_drain = std::time::Instant::now();
         backend.drain();
