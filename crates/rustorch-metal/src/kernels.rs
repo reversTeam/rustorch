@@ -15924,6 +15924,94 @@ pub fn rms_norm_per_head_gated_f32_with_offsets(
 }
 
 // ============================================================================
+// T201 — Batched per-head RMS norm gated by silu(z), B timesteps in 1 dispatch.
+//
+// Replaces the per-step `rms_norm_per_head_gated_f32_with_offsets` loop in
+// the SSM scan path. Each (b, head) pair is one threadgroup; both axes
+// dispatched in 2D grid. No cross-token state, so trivially parallel.
+//
+// Data layout per buffer (B major):
+//   x: [B, n_heads, head_dim]   (in place)
+//   z: [B, n_heads, head_dim]
+//   gamma: [head_dim] (shared across all B and heads)
+// ============================================================================
+
+const RMS_NORM_PER_HEAD_GATED_BATCHED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rms_norm_per_head_gated_batched_f32(
+    device float*        x       [[buffer(0)]],   // [B, n_heads, head_dim]
+    device const float*  gamma   [[buffer(1)]],   // [head_dim]
+    device const float*  z       [[buffer(2)]],   // [B, n_heads, head_dim]
+    constant uint3&      dims    [[buffer(3)]],   // (B, n_heads, head_dim)
+    constant float&      eps     [[buffer(4)]],
+    uint2                tg_id   [[threadgroup_position_in_grid]],
+    ushort               tiisg   [[thread_index_in_simdgroup]]
+) {
+    uint B = dims.x;
+    uint n_heads = dims.y;
+    uint head_dim = dims.z;
+    uint head = tg_id.x;
+    uint b = tg_id.y;
+    if (head >= n_heads || b >= B) return;
+
+    uint base = b * n_heads * head_dim + head * head_dim;
+    float sumsq = 0.0;
+    for (uint i = tiisg; i < head_dim; i += 32u) {
+        float v = x[base + i];
+        sumsq += v * v;
+    }
+    sumsq = simd_sum(sumsq);
+    float inv = 1.0 / sqrt(sumsq / float(head_dim) + eps);
+
+    for (uint i = tiisg; i < head_dim; i += 32u) {
+        float zv = z[base + i];
+        float silu = zv / (1.0 + exp(-zv));
+        x[base + i] = x[base + i] * inv * gamma[i] * silu;
+    }
+}
+"#;
+
+/// T201 — Batched gated RMS norm (B timesteps in 1 dispatch).
+/// Replaces the per-step `rms_norm_per_head_gated_f32_with_offsets` loop
+/// inside SSM scan, eliminating B-1 dispatches per layer.
+pub fn rms_norm_per_head_gated_batched_f32(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    gamma_buf: &Buffer,
+    z_buf: &Buffer,
+    b: usize,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    if b == 0 || n_heads == 0 || head_dim == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "rms_norm_per_head_gated_batched_f32: all dims > 0 (got B={b}, n_heads={n_heads}, head_dim={head_dim})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "rms_norm_per_head_gated_batched_f32",
+        RMS_NORM_PER_HEAD_GATED_BATCHED_F32_SHADER,
+        "rms_norm_per_head_gated_batched_f32",
+    )?;
+    let dims = [b as u32, n_heads as u32, head_dim as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(gamma_buf), 0);
+        encoder.set_buffer(2, Some(z_buf), 0);
+        encoder.set_bytes(3, 12, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg = MTLSize::new(32, 1, 1);
+        let groups = MTLSize::new(n_heads as u64, b as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg);
+    });
+    Ok(())
+}
+
+// ============================================================================
 // T179 (Phase 1.1 V2) — `delta_net_step_with_l2_v2_f32` : SSM scan delta_net
 // avec pattern MLX `gated_delta_update`.
 //
