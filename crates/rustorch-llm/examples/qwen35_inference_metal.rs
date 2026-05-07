@@ -52,9 +52,9 @@ use rustorch_metal::kernels::{
     gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, gqa_decode_f32_nsg2,
     gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2, gqa_decode_f32_splitk_nsg4,
     kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, mul_mm_id_map0_into,
-    mul_mm_id_q4_k_f32_into, mul_mm_id_q5_k_f32_into, rms_norm_batched_f32, rms_norm_f32,
-    rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
-    rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
+    mul_mm_id_q4_k_f32_into, mul_mm_id_q4_k_q4_k_swiglu_f32_into, mul_mm_id_q5_k_f32_into,
+    rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32, rms_norm_per_head_f32,
+    rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
     rope_half_split_partial_batched_f32, scatter_moe_acc_f32_into, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
     sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
@@ -2058,51 +2058,77 @@ fn ffn_moe_forward_batch(
         )?;
         profile_drain_record(backend, "  fbm.mmid_map0", _t_map0);
 
-        // Stage 2a : Q4_K mm_id gate.
-        let _t_gate = std::time::Instant::now();
-        mul_mm_id_q4_k_f32_into(
-            backend,
-            &batch_scratch.h_post,
-            &gate_exps_stacked.buffer,
-            &batch_scratch.mmid_ids,
-            &batch_scratch.mmid_tpe,
-            &batch_scratch.mmid_gate_out,
-            n_experts,
-            m_max,
-            ef,
-            d,
-            n_used,
-        )?;
-        profile_drain_record(backend, "  fbm.mmid_gate", _t_gate);
+        // T198 — Fused gate + up + swiglu in single kernel (default ON, opt-out RUSTORCH_T198=0).
+        // Eliminates intermediate gate_out/up_out DRAM round-trips.
+        // Measured (35B-A3B B=128): 345 → 357 t/s prefill (+3.5%), parity bit-exact.
+        let env_t198 = std::env::var("RUSTORCH_T198")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
-        // Stage 2b : Q4_K mm_id up.
-        let _t_up = std::time::Instant::now();
-        mul_mm_id_q4_k_f32_into(
-            backend,
-            &batch_scratch.h_post,
-            &up_exps_stacked.buffer,
-            &batch_scratch.mmid_ids,
-            &batch_scratch.mmid_tpe,
-            &batch_scratch.mmid_up_out,
-            n_experts,
-            m_max,
-            ef,
-            d,
-            n_used,
-        )?;
-        profile_drain_record(backend, "  fbm.mmid_up", _t_up);
+        if env_t198 {
+            let _t_fused = std::time::Instant::now();
+            mul_mm_id_q4_k_q4_k_swiglu_f32_into(
+                backend,
+                &batch_scratch.h_post,
+                &gate_exps_stacked.buffer,
+                &up_exps_stacked.buffer,
+                &batch_scratch.mmid_ids,
+                &batch_scratch.mmid_tpe,
+                &batch_scratch.mmid_silu,
+                n_experts,
+                m_max,
+                ef,
+                d,
+                n_used,
+            )?;
+            profile_drain_record(backend, "  fbm.mmid_fused_gateupswiglu", _t_fused);
+        } else {
+            // Stage 2a : Q4_K mm_id gate.
+            let _t_gate = std::time::Instant::now();
+            mul_mm_id_q4_k_f32_into(
+                backend,
+                &batch_scratch.h_post,
+                &gate_exps_stacked.buffer,
+                &batch_scratch.mmid_ids,
+                &batch_scratch.mmid_tpe,
+                &batch_scratch.mmid_gate_out,
+                n_experts,
+                m_max,
+                ef,
+                d,
+                n_used,
+            )?;
+            profile_drain_record(backend, "  fbm.mmid_gate", _t_gate);
 
-        // Stage 3 : SwiGLU on flat [E*M_max*ef] buffer.
-        // Tail rows (m >= tpe[e]) compute waste output but scatter ignores them.
-        let _t_silu = std::time::Instant::now();
-        swiglu_f32(
-            backend,
-            &batch_scratch.mmid_gate_out,
-            &batch_scratch.mmid_up_out,
-            &batch_scratch.mmid_silu,
-            n_experts * m_max * ef,
-        )?;
-        profile_drain_record(backend, "  fbm.mmid_swiglu", _t_silu);
+            // Stage 2b : Q4_K mm_id up.
+            let _t_up = std::time::Instant::now();
+            mul_mm_id_q4_k_f32_into(
+                backend,
+                &batch_scratch.h_post,
+                &up_exps_stacked.buffer,
+                &batch_scratch.mmid_ids,
+                &batch_scratch.mmid_tpe,
+                &batch_scratch.mmid_up_out,
+                n_experts,
+                m_max,
+                ef,
+                d,
+                n_used,
+            )?;
+            profile_drain_record(backend, "  fbm.mmid_up", _t_up);
+
+            // Stage 3 : SwiGLU on flat [E*M_max*ef] buffer.
+            let _t_silu = std::time::Instant::now();
+            swiglu_f32(
+                backend,
+                &batch_scratch.mmid_gate_out,
+                &batch_scratch.mmid_up_out,
+                &batch_scratch.mmid_silu,
+                n_experts * m_max * ef,
+            )?;
+            profile_drain_record(backend, "  fbm.mmid_swiglu", _t_silu);
+        }
 
         // Stage 4 : Q5_K mm_id down.
         // Note : N=d, K=ef (the reverse of gate/up which had N=ef, K=d).
