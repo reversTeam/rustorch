@@ -1985,15 +1985,19 @@ fn ffn_moe_forward_batch(
         }
     };
 
-    // T197.1 — opt-in mm_id pipeline (×2-3 expected vs EM expert-major).
+    // T197.1b — mm_id pipeline DEFAULT ON when shapes match, opt-out via RUSTORCH_MMID=0.
     // Replaces the [drain + CPU sort + upload + gather_pack + em_*×3 + unpermute
     // + reduce] chain by [GPU map0 + mm_id_q4_k×2 + swiglu + mm_id_q5_k + scatter].
     // Eliminates: 1 CPU drain, 1 CPU sort+upload, 1 zero_f32, 1 gather_pack_rows,
     // 1 unpermute_rows, 1 weighted_reduce_add. Keeps: 6 GPU dispatches total.
+    //
+    // Measured (M4 Max, 35B-A3B Q4_K_M, B=128, 5 runs each):
+    //   EM    : mean 108 t/s, range 82-131 (std 21)
+    //   mm_id : mean 131 t/s, range 126-140 (std 5)  → +21% mean, ×4 stability
     let env_mmid = std::env::var("RUSTORCH_MMID")
         .ok()
-        .map(|v| v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let mmid_supported = env_mmid
         && all_em
         && matches!(gate_exps_stacked.dtype, GgmlType::Q4_K)
