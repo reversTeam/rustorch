@@ -17304,6 +17304,283 @@ pub fn mul_mm_id_q4_k_f32_into(
     Ok(())
 }
 
+// ============================================================================
+// T197.2 — mul_mm_id Q5_K SGEMM (port of Q4_K mm_id with Q5_K dequant inline).
+//
+// Same dispatch shape and grid as Q4_K (NR_W=64, NR_A=32, NK=32, 4 SG × 32),
+// indirected gather via ids[E, M_max] / n_used = act_row.
+//
+// Q5_K format (176 bytes/super-block, 256 weights, 5.5 bits/weight):
+//   [ 2B d | 2B dmin | 12B sc6_packed | 32B qh | 128B qs ]
+// Per weight :
+//   sc, m  ← unpack from sc6_packed[sb_in_super]
+//   nibble ← qs[byte_pos] >> (4 if is_high else 0) & 0x0F
+//   high   ← (qh[byte_pos % 16 + 16*chunk] >> sb_in_super) & 1
+//   q5     ← nibble + (high << 4)                  // [0, 32)
+//   w      ← d * sc * q5 - dmin * m
+// ============================================================================
+
+const MUL_MM_ID_Q5_K_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q5K_BYTES = 176u;
+constant uint Q5K_WEIGHTS = 256u;
+
+constant uint NR_W = 64u;     // BN
+constant uint NR_A = 32u;     // BM
+constant uint NK   = 32u;     // K-tile per loop
+constant uint NL0  = NK / 16u;
+constant uint NL1  = NK / 8u;
+
+kernel void mul_mm_id_q5_k_f32(
+    device const float*  act    [[buffer(0)]],
+    device const uchar*  W_q5k  [[buffer(1)]],
+    device const uint*   ids    [[buffer(2)]],
+    device const uint*   tpe    [[buffer(3)]],
+    device float*        dst    [[buffer(4)]],
+    constant uint4&      dims   [[buffer(5)]],
+    uint3                tgpig  [[threadgroup_position_in_grid]],
+    ushort               tiitg  [[thread_index_in_threadgroup]],
+    ushort               sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    uint M_max = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+    uint n_used = dims.w;
+
+    uint expert = tgpig.z;
+    uint m_tile = tgpig.y * NR_A;
+    uint n_tile = tgpig.x * NR_W;
+
+    uint expert_tpe = tpe[expert];
+    if (m_tile >= expert_tpe) return;
+
+    threadgroup half sa[64 * 32];
+    threadgroup half sb[32 * 32];
+
+    uint blocks_per_row_q5k = K / Q5K_WEIGHTS;
+    uint w_row_stride_bytes = blocks_per_row_q5k * Q5K_BYTES;
+    uint w_expert_byte_offset = expert * N * w_row_stride_bytes;
+
+    uint sa_row = tiitg / NL0;
+    uint sa_chunk = tiitg % NL0;
+    uint sb_row = tiitg / NL1;
+    uint sb_chunk = tiitg % NL1;
+
+    uint m_global = m_tile + sb_row;
+    bool m_valid = (m_global < expert_tpe);
+    uint act_row = 0u;
+    if (m_valid) {
+        uint id = ids[expert * M_max + m_global];
+        act_row = id / n_used;
+    }
+
+    simdgroup_matrix<float, 8, 8> mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = simdgroup_matrix<float, 8, 8>(0.0);
+    }
+
+    uint nr_w_eff = NR_W;
+
+    for (uint k_offset = 0; k_offset < K; k_offset += NK) {
+        // ============ Phase 1 : load+dequant W (Q5_K) → sa swizzled ============
+        if (sa_row < nr_w_eff) {
+            uint w_row_global = n_tile + sa_row;
+            uint k_pos_base = k_offset + sa_chunk * 16u;
+
+            uint super_block_idx = k_pos_base / Q5K_WEIGHTS;
+            uint sb_in_super = (k_pos_base % Q5K_WEIGHTS) / 32u;  // 0..7
+            uint pair_idx = sb_in_super / 2u;                      // 0..3
+            bool is_high = (sb_in_super & 1u) != 0u;
+
+            device const uchar* row_block = W_q5k
+                + (uint64_t)w_expert_byte_offset
+                + (uint64_t)w_row_global * w_row_stride_bytes
+                + (uint64_t)super_block_idx * Q5K_BYTES;
+            device const half* d_ptr = (device const half*)(row_block);
+            float d    = float(d_ptr[0]);
+            float dmin = float(d_ptr[1]);
+
+            // sc6 packing identical to Q4_K (12 bytes at offset 4).
+            device const uchar* sc_raw = row_block + 4;
+            uchar sc6, m6;
+            if (sb_in_super < 4u) {
+                sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+                m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+            } else {
+                uint i = sb_in_super - 4u;
+                sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+                m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+            }
+            float scale   = d    * float(sc6);
+            float min_val = dmin * float(m6);
+
+            // Q5_K-specific: qh at offset 16 (32 bytes), qs at offset 48 (128 bytes).
+            device const uchar* qh_ptr = row_block + 16u;
+            device const uchar* qs_ptr = row_block + 48u + pair_idx * 32u;
+            uint sy = sa_row / 8u;
+            uint lx = sa_row % 8u;
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < 16u; ++c) {
+                uint k_in_tile = sa_chunk * 16u + c;
+                uint sx = k_in_tile / 8u;
+                uint ly = k_in_tile % 8u;
+                uint ib = 8u * sx + sy;
+
+                uchar qs_byte = qs_ptr[k_in_tile];
+                uchar low_4 = is_high ? (qs_byte >> 4u) : (qs_byte & 0x0Fu);
+
+                uint load_chunk_q5k = k_in_tile / 16u;
+                uint l_in_qh = k_in_tile % 16u;
+                uchar qh_byte = qh_ptr[load_chunk_q5k * 16u + l_in_qh];
+                uint high_bit = ((uint)qh_byte >> sb_in_super) & 1u;
+
+                uint q5 = (uint)low_4 + (high_bit << 4u);
+                sa[ib * 64u + ly * 8u + lx] = scale * float(q5) - min_val;
+            }
+        }
+
+        // ============ Phase 2 : load A → sb swizzled (id indirection) ============
+        {
+            uint sx = sb_chunk;
+            uint sy = sb_row / 8u;
+            uint ly = sb_row % 8u;
+            uint ib = 4u * sx + sy;
+            if (m_valid) {
+                uint k_pos = k_offset + sb_chunk * 8u;
+                #pragma clang loop unroll(full)
+                for (uint lx = 0; lx < 8u; ++lx) {
+                    if (k_pos + lx < K) {
+                        sb[ib * 64u + ly * 8u + lx] = (half)act[(uint64_t)act_row * K + k_pos + lx];
+                    } else {
+                        sb[ib * 64u + ly * 8u + lx] = (half)0.0;
+                    }
+                }
+            } else {
+                #pragma clang loop unroll(full)
+                for (uint lx = 0; lx < 8u; ++lx) {
+                    sb[ib * 64u + ly * 8u + lx] = (half)0.0;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ============ Phase 3 : MMAs (8 C-frags per SG) ============
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+
+        #pragma clang loop unroll(full)
+        for (uint ik = 0; ik < NK / 8u; ++ik) {
+            simdgroup_matrix<half, 8, 8> ma[4];
+            simdgroup_matrix<half, 8, 8> mb[2];
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4u; ++i) {
+                simdgroup_load(ma[i], lsma + 64u * i, 8);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2u; ++i) {
+                simdgroup_load(mb[i], lsmb + 64u * i, 8);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8u; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4u], ma[i % 4u], mc[i]);
+            }
+
+            lsma += 8u * 64u;
+            lsmb += 4u * 64u;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ============ Store mc to dst[E, M_max, N] ============
+    uint64_t expert_dst_offset = (uint64_t)expert * (uint64_t)M_max * (uint64_t)N;
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8u; ++i) {
+        uint c_row = m_tile + (uint)(sgitg / 2u) * 16u + (i / 4u) * 8u;
+        uint c_col = n_tile + (uint)(sgitg % 2u) * 32u + (i % 4u) * 8u;
+        if (c_row + 7u < M_max && c_col + 7u < N) {
+            device float* dst_ptr = dst + expert_dst_offset + (uint64_t)c_row * (uint64_t)N + (uint64_t)c_col;
+            simdgroup_store(mc[i], dst_ptr, N);
+        }
+    }
+}
+"#;
+
+/// T197.2 — Per-expert MoE BlockMMA SGEMM Q5_K (Stage 2 of mm_id pipeline).
+///
+/// Same contract as `mul_mm_id_q4_k_f32_into` but for Q5_K weights.
+/// Used for the `down_proj` of MoE FFN in Qwen3.5/3.6 hybrid models
+/// (~33% of MoE compute).
+///
+/// Pre-conditions :
+/// - Metal3 (Apple7+).
+/// - `M_max % 32 == 0`, `N % 64 == 0`, `K % 256 == 0`.
+/// - `ids_buf` and `tpe_buf` produced by `mul_mm_id_map0_into`.
+/// - `act_buf` is [B, K] f32 (or [B*n_used, K] for indirect via ids/n_used).
+/// - `dst_buf` is [E, M_max, N] f32.
+#[allow(clippy::too_many_arguments)]
+pub fn mul_mm_id_q5_k_f32_into(
+    backend: &MetalBackend,
+    act_buf: &Buffer,
+    w_q5k_buf: &Buffer,
+    ids_buf: &Buffer,
+    tpe_buf: &Buffer,
+    dst_buf: &Buffer,
+    n_experts: usize,
+    m_max: usize,
+    n: usize,
+    k: usize,
+    n_used: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "mul_mm_id_q5_k_f32 needs Metal3".to_string(),
+        ));
+    }
+    if n_experts == 0 || m_max == 0 || n == 0 || k == 0 || n_used == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "mul_mm_id_q5_k_f32: all dims > 0 (got E={n_experts}, M_max={m_max}, N={n}, K={k}, n_used={n_used})"
+        )));
+    }
+    if m_max % 32 != 0 || n % 64 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "mul_mm_id_q5_k_f32: M_max%32==0, N%64==0, K%256==0 required (got M_max={m_max}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "mul_mm_id_q5_k_f32",
+        MUL_MM_ID_Q5_K_F32_SHADER,
+        "mul_mm_id_q5_k_f32",
+    )?;
+    let dims = [m_max as u32, n as u32, k as u32, n_used as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(act_buf), 0);
+        encoder.set_buffer(1, Some(w_q5k_buf), 0);
+        encoder.set_buffer(2, Some(ids_buf), 0);
+        encoder.set_buffer(3, Some(tpe_buf), 0);
+        encoder.set_buffer(4, Some(dst_buf), 0);
+        encoder.set_bytes(5, 16, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1);
+        let n_tg_x = (n / 64) as u64;
+        let n_tg_y = (m_max / 32) as u64;
+        let n_tg_z = n_experts as u64;
+        let groups = MTLSize::new(n_tg_x, n_tg_y, n_tg_z);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T174 Day 4 — Scatter per-expert MoE outputs back to moe_acc[B, K] weighted.
 //
 // Stage 3 of the M-major MoE pipeline. Folds `down_out[E, M_max, K]` (the
