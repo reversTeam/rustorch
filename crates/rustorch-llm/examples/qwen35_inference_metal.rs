@@ -50,10 +50,11 @@ use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, argmax_batched_f32, build_em_perm_f32_into,
     delta_net_step_f32, delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets,
     gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, gqa_decode_f32_nsg2,
-    gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2, kv_append_batched_f32, kv_append_f32,
-    l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
-    rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets,
-    rope_half_split_f32, rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
+    gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2, gqa_decode_f32_splitk_nsg4,
+    kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32,
+    rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
+    rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
+    rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
     sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
     sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
@@ -2534,7 +2535,12 @@ fn attn_block_forward(
     //     kv=2048  : 333 → 171 µs  (×1.95 vs T190v2)
     //     kv=4096  : 345 → 194 µs  (×1.78 vs T190v2)
     //   Parity max_rel_err 2.4e-7 (essentially identical).
-    // Activable via RUSTORCH_GQA_SPLITK_NSG2 (default ON, set =0 to bisect).
+    // T195 — `gqa_decode_f32_splitk_nsg4` widens further to 128 threads/TG (4 SGs).
+    //   ~×1.15-1.21 vs T194 NSG=2 at long kv. Same parity (rel_err 2.3e-7).
+    // Activable via RUSTORCH_GQA_SPLITK_NSG4 (default ON), RUSTORCH_GQA_SPLITK_NSG2 (=0 to bisect to NSG=2).
+    let use_gqa_splitk_nsg4 = std::env::var("RUSTORCH_GQA_SPLITK_NSG4")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let use_gqa_splitk_nsg2 = std::env::var("RUSTORCH_GQA_SPLITK_NSG2")
         .map(|v| v != "0")
         .unwrap_or(true);
@@ -2544,7 +2550,20 @@ fn attn_block_forward(
     let use_gqa_nsg2 = std::env::var("RUSTORCH_GQA_NSG2")
         .map(|v| v != "0")
         .unwrap_or(true);
-    if use_gqa_splitk_nsg2 {
+    if use_gqa_splitk_nsg4 {
+        gqa_decode_f32_splitk_nsg4(
+            backend,
+            &scratch.q,
+            &cache.k_cache,
+            &cache.v_cache,
+            &scratch.attn_out,
+            n_q,
+            n_kv,
+            head_dim,
+            position + 1,
+            max_seq,
+        )?;
+    } else if use_gqa_splitk_nsg2 {
         gqa_decode_f32_splitk_nsg2(
             backend,
             &scratch.q,
@@ -5437,20 +5456,22 @@ fn main() -> ExitCode {
                     }
                 )
             });
-            // T162 phase 9f-bis bench : nouveau gather_per_token kernel évite le
-            // memcpy h_repl 128MB MAIS la saturation GPU à B_eff=B*n_used élevé
-            // (65K TGs > 1280 simdgroups concurrents M4 Max) reste limitante.
-            // 35B-A3B B=16 : 23 t/s (-45% vs baseline 42 t/s per-token).
-            // Conclusion : MLX 1276 t/s n'utilise pas un gather sgemv per-eval mais
-            // un kernel SGEMM-style avec sort tokens par expert (M-major dispatch).
-            // Auto-route reste actif sur MoE-only ; opt-in batched via env var.
-            let force_batched_moe =
-                (any_moe && !any_dense) && std::env::var("RUSTORCH_MOE_BATCHED").is_ok();
-            let force_pertoken = (any_moe && !any_dense) && !force_batched_moe;
+            // T196 — Inverse du défaut. Le commit `6496bbd` (T162 phase 9f-route)
+            // avait ajouté `force_pertoken = any_moe && !any_dense` parce que le
+            // batched MoE régressait à 23 t/s sur 35B-A3B B=16.
+            // **T175 (commits `bc1dae2` Q8_0 SGEMM batched + `f1ef15d` SSM scan
+            // drain elimination) a corrigé ce path** : le batched fait maintenant
+            // 232 t/s à B=32, 305 t/s à B=64, **347 t/s à B=128** sur 35B-A3B
+            // (Q4_K_M, M4 Max), soit ×8.2 vs le path per-token (42 t/s).
+            //
+            // Auto-route batched par défaut sur MoE-only post-T175. Opt-out via
+            // `RUSTORCH_MOE_BATCHED=0` si une régression future émerge.
+            let env_moe_batched = std::env::var("RUSTORCH_MOE_BATCHED").ok();
+            let force_pertoken = (any_moe && !any_dense) && env_moe_batched.as_deref() == Some("0");
             if force_pertoken {
                 println!(
-                    "  NOTE : modèle MoE-only — auto-route per-token (gather kernel sat. à \
-                     B_eff > 64). Force batched : env RUSTORCH_MOE_BATCHED=1."
+                    "  NOTE : modèle MoE-only — opt-out per-token forcé via \
+                     RUSTORCH_MOE_BATCHED=0 (slow ~42 t/s ; default batched ~347 t/s)."
                 );
             } else {
                 println!(

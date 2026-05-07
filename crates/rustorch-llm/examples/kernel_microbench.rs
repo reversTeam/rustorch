@@ -1343,6 +1343,76 @@ fn main() {
                 10,
             ));
         }
+        // T195 — bench split-K NSG=4 across kv_len + parity at kv=4096.
+        {
+            use rustorch_metal::kernels::{gqa_decode_f32_splitk_nsg2, gqa_decode_f32_splitk_nsg4};
+            // Parity vs T194 at kv=4096
+            let kv_len = 4096usize;
+            gqa_decode_f32_splitk_nsg2(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let mut out_v2 = vec![0.0_f32; n_q * hd];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out.contents() as *const f32,
+                    out_v2.as_mut_ptr(),
+                    n_q * hd,
+                );
+            }
+            gqa_decode_f32_splitk_nsg4(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let mut out_v4 = vec![0.0_f32; n_q * hd];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out.contents() as *const f32,
+                    out_v4.as_mut_ptr(),
+                    n_q * hd,
+                );
+            }
+            let mut max_rel = 0.0_f32;
+            for (a, b) in out_v2.iter().zip(out_v4.iter()) {
+                let denom = a.abs().max(1e-4);
+                let rel = (a - b).abs() / denom;
+                if rel > max_rel {
+                    max_rel = rel;
+                }
+            }
+            println!(
+                "Parity T195 split-K NSG=4 (kv_len={kv_len}): max_rel_err = {max_rel:.3e}  ({})",
+                if max_rel < 1e-3 {
+                    "PASS ✓"
+                } else {
+                    "FAIL ✗"
+                }
+            );
+
+            for &kv_len in &[1024usize, 2048, 4096] {
+                gqa_decode_f32_splitk_nsg4(
+                    backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq,
+                )
+                .unwrap();
+                backend.drain();
+                let t0 = Instant::now();
+                for _ in 0..ITERS {
+                    gqa_decode_f32_splitk_nsg4(
+                        backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq,
+                    )
+                    .unwrap();
+                }
+                backend.drain();
+                let dt = t0.elapsed();
+                let label: String = format!("T195 splitK_NSG4 kv={kv_len}");
+                let leaked: &'static str = Box::leak(label.into_boxed_str());
+                results.push((
+                    leaked.to_string(),
+                    dt.as_secs_f64() * 1000.0,
+                    dt.as_secs_f64() * 1e6 / ITERS as f64,
+                    format!("n_q={n_q} n_kv={n_kv} hd={hd} kv_len={kv_len} splitK NSG=4"),
+                    10,
+                ));
+            }
+        }
         // Parity: NSG=2 vs original on kv_len=256
         {
             let q_test = fake_f32(n_q * hd, 1.1);
