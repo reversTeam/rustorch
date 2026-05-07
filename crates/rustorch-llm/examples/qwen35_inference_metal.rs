@@ -55,7 +55,8 @@ use rustorch_metal::kernels::{
     kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, mul_mm_id_map0_into,
     mul_mm_id_q4_k_f32_into, mul_mm_id_q4_k_q4_k_swiglu_f32_into, mul_mm_id_q5_k_f32_into,
     rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32, rms_norm_per_head_f32,
-    rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
+    rms_norm_per_head_gated_batched_f32, rms_norm_per_head_gated_f32,
+    rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
     rope_half_split_partial_batched_f32, scatter_moe_acc_f32_into, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
     sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
@@ -1596,21 +1597,19 @@ fn ssm_block_forward_batch(
             conv_dim,
             eps,
         )?;
-        // Phase C : per-step gated norm (no recurrent state, just element-wise
-        // per head, but kept per-step until a batched variant is added).
-        for bi in 0..b {
-            rms_norm_per_head_gated_f32_with_offsets(
-                backend,
-                &batch_scratch.ssm_out_buf,
-                bi * value_off_stride,
-                &ssm.ssm_norm,
-                &batch_scratch.z,
-                bi * value_off_stride,
-                n_v,
-                head_v_dim,
-                eps,
-            )?;
-        }
+        // Phase C : T201 — batched gated RMS norm in 1 dispatch.
+        // No recurrent state (per-step independent), so trivially parallel.
+        // Replaces B per-step calls with 1 call per layer.
+        rms_norm_per_head_gated_batched_f32(
+            backend,
+            &batch_scratch.ssm_out_buf,
+            &ssm.ssm_norm,
+            &batch_scratch.z,
+            b,
+            n_v,
+            head_v_dim,
+            eps,
+        )?;
     } else {
         for bi in 0..b {
             // Conv1d step lit batch_scratch.qkv_mixed[bi*conv_dim..] directement.
@@ -1645,18 +1644,18 @@ fn ssm_block_forward_batch(
                 n_k,
                 eps,
             )?;
-            rms_norm_per_head_gated_f32_with_offsets(
-                backend,
-                &batch_scratch.ssm_out_buf,
-                bi * value_off_stride,
-                &ssm.ssm_norm,
-                &batch_scratch.z,
-                bi * value_off_stride,
-                n_v,
-                head_v_dim,
-                eps,
-            )?;
         }
+        // T201 — batched gated RMS norm AFTER the scan loop (no recurrent state).
+        rms_norm_per_head_gated_batched_f32(
+            backend,
+            &batch_scratch.ssm_out_buf,
+            &ssm.ssm_norm,
+            &batch_scratch.z,
+            b,
+            n_v,
+            head_v_dim,
+            eps,
+        )?;
     }
     profile_drain_record(backend, "  fbs.scan_loop", _t_scan);
 
