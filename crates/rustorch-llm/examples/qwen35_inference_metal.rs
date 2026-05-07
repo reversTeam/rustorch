@@ -3210,17 +3210,36 @@ fn ffn_dense_forward(
             //    ffn_gate_inp_shexp of shape [d] would imply a 1×d matrix → output
             //    is a scalar per token. So a dot product.
             // T173 : skip if async path already ran shared expert during AMX overlap.
+            // T192 — fuse swiglu into up_shexp matmul output when up_shexp is Q4_K.
+            // Eliminates 1 dispatch/layer × 40 = 40 dispatches/token. Activable
+            // via RUSTORCH_SHEXP_SWIGLU_FUSED (default ON). Parity verified.
+            let use_shexp_swiglu_fused = std::env::var("RUSTORCH_SHEXP_SWIGLU_FUSED")
+                .map(|v| v != "0")
+                .unwrap_or(true);
             let _moe_t0_shared = std::time::Instant::now();
             if !use_amx_async {
                 gate_shexp.matmul_into(backend, &scratch.h, &scratch.moe_gate)?;
-                up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
-                swiglu_f32(
-                    backend,
-                    &scratch.moe_gate,
-                    &scratch.moe_up,
-                    &scratch.moe_fd,
-                    ef,
-                )?;
+                if use_shexp_swiglu_fused && up_shexp.dtype == GgmlType::Q4_K {
+                    use rustorch_metal::kernels::sgemv_q4_k_swiglu_f32_lcpp_nsg2_into;
+                    sgemv_q4_k_swiglu_f32_lcpp_nsg2_into(
+                        backend,
+                        &scratch.h,
+                        &up_shexp.buffer,
+                        &scratch.moe_fd,
+                        &scratch.moe_gate,
+                        up_shexp.k,
+                        up_shexp.n,
+                    )?;
+                } else {
+                    up_shexp.matmul_into(backend, &scratch.h, &scratch.moe_up)?;
+                    swiglu_f32(
+                        backend,
+                        &scratch.moe_gate,
+                        &scratch.moe_up,
+                        &scratch.moe_fd,
+                        ef,
+                    )?;
+                }
                 down_shexp.matmul_into(backend, &scratch.moe_fd, &scratch.moe_expert_out)?;
             }
             profile_drain_record(backend, "  moe.shared", _moe_t0_shared);
