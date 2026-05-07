@@ -1947,7 +1947,15 @@ fn ffn_moe_forward_batch(
     let d = cfg.d;
     let ef = cfg.expert_f;
     let n_experts = cfg.n_experts;
-    let n_used = cfg.n_experts_used;
+    // T211 — Expert pruning innovation: override n_used via env var.
+    // Mathematically prunes the top-K to a smaller K (e.g. 4 instead of 8).
+    // Risk: quality degradation. Only set if model tolerates fewer experts.
+    let cfg_n_used = cfg.n_experts_used;
+    let n_used = std::env::var("RUSTORCH_NUSED")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0 && v <= cfg_n_used)
+        .unwrap_or(cfg_n_used);
     let eps = cfg.rms_eps;
     let b_eff = b * n_used; // total expert evaluations across all tokens
 
