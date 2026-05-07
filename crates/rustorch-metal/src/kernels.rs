@@ -15412,9 +15412,58 @@ pub fn delta_net_step_with_l2_f32_with_offsets(
     n_k_heads: usize,
     eps: f32,
 ) -> Result<(), MetalError> {
+    delta_net_step_with_l2_f32_with_qkv_offsets(
+        backend,
+        q_buf,
+        0,
+        k_buf,
+        0,
+        v_buf,
+        0,
+        gate_h_buf,
+        gate_h_offset_bytes,
+        beta_buf,
+        beta_offset_bytes,
+        state_buf,
+        out_buf,
+        out_offset_bytes,
+        n_v_heads,
+        head_dim,
+        n_k_heads,
+        eps,
+    )
+}
+
+/// T199b — `delta_net_step_with_l2_f32` with explicit Q/K/V byte offsets.
+///
+/// Allows passing the same underlying buffer (e.g. `conv_out`) for q/k/v
+/// with different offsets, eliminating the need for a separate
+/// `split_qkv_f32` dispatch. Metal `set_buffer(idx, buf, offset)` adjusts
+/// the device pointer the shader sees, no shader change needed.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net_step_with_l2_f32_with_qkv_offsets(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    q_offset_bytes: usize,
+    k_buf: &Buffer,
+    k_offset_bytes: usize,
+    v_buf: &Buffer,
+    v_offset_bytes: usize,
+    gate_h_buf: &Buffer,
+    gate_h_offset_bytes: usize,
+    beta_buf: &Buffer,
+    beta_offset_bytes: usize,
+    state_buf: &Buffer,
+    out_buf: &Buffer,
+    out_offset_bytes: usize,
+    n_v_heads: usize,
+    head_dim: usize,
+    n_k_heads: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
     if n_v_heads == 0 || head_dim == 0 || n_k_heads == 0 || n_v_heads % n_k_heads != 0 {
         return Err(MetalError::ShapeMismatch(format!(
-            "delta_net_step_with_l2_f32_with_offsets: n_v_heads={n_v_heads} must be a multiple of n_k_heads={n_k_heads}"
+            "delta_net_step_with_l2_f32_with_qkv_offsets: n_v_heads={n_v_heads} must be a multiple of n_k_heads={n_k_heads}"
         )));
     }
     let pipeline = backend.pipeline(
@@ -15426,9 +15475,9 @@ pub fn delta_net_step_with_l2_f32_with_offsets(
     let dims = [n_v_heads as u32, head_dim as u32, n_k_heads as u32, repeat];
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(q_buf), 0);
-        encoder.set_buffer(1, Some(k_buf), 0);
-        encoder.set_buffer(2, Some(v_buf), 0);
+        encoder.set_buffer(0, Some(q_buf), q_offset_bytes as u64);
+        encoder.set_buffer(1, Some(k_buf), k_offset_bytes as u64);
+        encoder.set_buffer(2, Some(v_buf), v_offset_bytes as u64);
         encoder.set_buffer(3, Some(gate_h_buf), gate_h_offset_bytes as u64);
         encoder.set_buffer(4, Some(beta_buf), beta_offset_bytes as u64);
         encoder.set_buffer(5, Some(state_buf), 0);
