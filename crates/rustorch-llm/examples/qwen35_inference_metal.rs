@@ -5129,6 +5129,44 @@ fn main() -> ExitCode {
         let mut spec_drafts = 0usize;
         let mut spec_accepted = 0usize;
         let mut spec_rounds = 0usize;
+        // T184 — when --stream is set, print tokens as they decode by re-decoding
+        // the whole generated[1..] sequence and emitting the new suffix. This
+        // handles BPE merges + special tokens cleanly (no partial UTF-8).
+        let mut stream_emitted = String::new();
+        if stream {
+            use std::io::Write;
+            print!("\n=== Streaming ===\n");
+            std::io::stdout().flush().ok();
+            // First-decoded token (the one returned at end of prefill).
+            stream_emitted = tok.decode(&generated);
+            print!("{}", stream_emitted);
+            std::io::stdout().flush().ok();
+        }
+        // Helper closure: print new tokens incrementally when streaming.
+        // Strips ChatML special tokens so they don't appear in user-visible output.
+        let emit_stream = |stream_emitted: &mut String, generated: &[u32]| {
+            if !stream {
+                return;
+            }
+            use std::io::Write;
+            let mut cur = tok.decode(generated);
+            // Strip ChatML special tokens (they would otherwise leak into output
+            // when streaming, since they're emitted as literal text by the tokenizer).
+            for special in [
+                "<|im_end|>",
+                "<|im_start|>",
+                "<|endoftext|>",
+                "<|startoftext|>",
+            ] {
+                cur = cur.replace(special, "");
+            }
+            if cur.len() > stream_emitted.len() {
+                let suffix = &cur[stream_emitted.len()..];
+                print!("{}", suffix);
+                std::io::stdout().flush().ok();
+                *stream_emitted = cur;
+            }
+        };
         if (2..=32).contains(&speculative_b) && speculative_b % 8 == 0 {
             // T176 — Speculative decoding with 2-gram lookahead cache (port T167).
             //
@@ -5232,6 +5270,7 @@ fn main() -> ExitCode {
                             last = out;
                             generated.push(last);
                             cur_pos += 1;
+                            emit_stream(&mut stream_emitted, &generated);
                             // T176 fix : update caches from generated history even
                             // on fallback steps.
                             if generated.len() >= 3 {
@@ -5322,6 +5361,7 @@ fn main() -> ExitCode {
                 // Bonus token.
                 let bonus = outs[accepted];
                 generated.push(bonus);
+                emit_stream(&mut stream_emitted, &generated);
                 if generated.len() >= 3 {
                     prev_token2 = generated[generated.len() - 3];
                     prev_token = generated[generated.len() - 2];
@@ -5354,6 +5394,7 @@ fn main() -> ExitCode {
                         last = out;
                         generated.push(last);
                         cur_pos += 1;
+                        emit_stream(&mut stream_emitted, &generated);
                         if stops.contains(&last) {
                             hit_stop = true;
                             break;
@@ -5376,6 +5417,11 @@ fn main() -> ExitCode {
         } else {
             String::new()
         };
+        if stream {
+            // Newline so the `decode :` stat starts on its own line, not
+            // appended to the streamed text.
+            println!();
+        }
         println!(
             "  decode : {} tok in {:.3}s ({:.2} tok/s){}{}",
             n_decoded as usize,
@@ -5393,9 +5439,16 @@ fn main() -> ExitCode {
             }
         }
         let answer = tok.decode(&answer_ids);
-        println!("\n=== Answer ===");
-        println!("{}", answer);
-        println!("===");
+        if stream {
+            // Already printed incrementally — just close the streaming block
+            // and avoid re-dumping the full answer. Print a newline + marker
+            // for clarity.
+            println!("\n=== End ===");
+        } else {
+            println!("\n=== Answer ===");
+            println!("{}", answer);
+            println!("===");
+        }
         profile_print_summary();
         return ExitCode::SUCCESS;
     }
