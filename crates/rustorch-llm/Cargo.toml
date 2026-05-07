@@ -27,6 +27,7 @@ serde_json         = { version = "1" }
 rustorch-metal = { workspace = true }
 rustorch-cpu   = { workspace = true } # T171 — AMX (Accelerate) path for F32 small matmul
 metal          = "0.29"
+half           = { workspace = true } # T180 — F32 → Q8_0 routing requantization
 
 [[example]]
 name = "qwen_inference"

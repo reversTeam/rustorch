@@ -436,6 +436,118 @@ fn load_quant_2d(
     })
 }
 
+/// T180 — Quantize a f32 weight slice to Q8_0 format.
+///
+/// Q8_0 super-block: 32 weights → (fp16 scale, [int8; 32]) = 34 bytes.
+/// Output layout: contiguous blocks, total size = `(n_weights / 32) * 34` bytes.
+///
+/// Used at load-time to convert F32 routing matrices (`ffn_gate_inp.weight`,
+/// 2 MB/layer × 40 layers = 80 MB/token of F32 bandwidth) to Q8_0 (4× compression,
+/// faster `sgemv_q8_0_f32_lcpp_nsg2` dispatch path).
+///
+/// Pre-conditions: `weights.len() % 32 == 0`.
+fn quantize_f32_to_q8_0(weights: &[f32]) -> Vec<u8> {
+    use half::f16;
+    assert_eq!(
+        weights.len() % 32,
+        0,
+        "Q8_0 requires multiple of 32 weights"
+    );
+    let n_blocks = weights.len() / 32;
+    let mut out = vec![0u8; n_blocks * 34];
+    for b in 0..n_blocks {
+        let block = &weights[b * 32..(b + 1) * 32];
+        let amax = block.iter().fold(0.0_f32, |acc, &x| acc.max(x.abs()));
+        let d = amax / 127.0;
+        let inv_d = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let off = b * 34;
+        let d_h = f16::from_f32(d).to_le_bytes();
+        out[off] = d_h[0];
+        out[off + 1] = d_h[1];
+        for i in 0..32 {
+            let q = (block[i] * inv_d).round().clamp(-127.0, 127.0) as i8;
+            out[off + 2 + i] = q as u8;
+        }
+    }
+    out
+}
+
+/// T180 — Load a 2D tensor from GGUF, optionally re-quantizing F32 weights to Q8_0.
+///
+/// If `requantize_f32_to_q8_0` is true AND the source tensor is F32, the f32 bytes
+/// are read, quantized to Q8_0 in-place, and uploaded as Q8_0. The returned
+/// `HybridMetalWeight` has `dtype = Q8_0` so `matmul_into` automatically routes
+/// to the Q8_0 sgemv kernel (4× less bandwidth, faster dispatch).
+fn load_quant_2d_maybe_requantize(
+    backend: &MetalBackend,
+    file: &GgufFile,
+    info: &TensorInfo,
+    requantize_f32_to_q8_0: bool,
+) -> Result<HybridMetalWeight, String> {
+    if info.shape.len() != 2 {
+        return Err(format!(
+            "{}: expected 2-D tensor, got shape {:?}",
+            info.name, info.shape
+        ));
+    }
+    let k = info.shape[0] as usize;
+    let n = info.shape[1] as usize;
+    if requantize_f32_to_q8_0 && info.dtype == GgmlType::F32 {
+        // Read F32 bytes, reinterpret as f32 slice, quantize to Q8_0.
+        let bytes = file.tensor_bytes(info);
+        let n_floats = bytes.len() / 4;
+        if k * n != n_floats {
+            return Err(format!(
+                "{}: F32 byte count {} != k*n {}",
+                info.name,
+                n_floats,
+                k * n
+            ));
+        }
+        if k % 32 != 0 {
+            return Err(format!(
+                "{}: F32 K={k} not multiple of 32, cannot quantize to Q8_0",
+                info.name
+            ));
+        }
+        let weights: &[f32] =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_floats) };
+        let q8_bytes = quantize_f32_to_q8_0(weights);
+        let buffer = backend
+            .alloc_shared(q8_bytes.len())
+            .map_err(|e| format!("alloc {}: {:?}", info.name, e))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                q8_bytes.as_ptr(),
+                buffer.contents() as *mut u8,
+                q8_bytes.len(),
+            );
+        }
+        return Ok(HybridMetalWeight {
+            buffer,
+            dtype: GgmlType::Q8_0,
+            k,
+            n,
+            name: info.name.clone(),
+        });
+    }
+    // Normal path: copy raw bytes.
+    let bytes = file.tensor_bytes(info);
+    let buffer = backend
+        .alloc_shared(bytes.len())
+        .map_err(|e| format!("alloc {}: {:?}", info.name, e))?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.contents() as *mut u8, bytes.len());
+    }
+    Ok(HybridMetalWeight {
+        buffer,
+        dtype: info.dtype,
+        k,
+        n,
+        name: info.name.clone(),
+    })
+}
+
 /// Load an F32 1-D vector (norm gamma, dt bias, ssm_a, etc.) into a
 /// Metal buffer. We keep these as f32 since they're tiny and the kernels
 /// (RMSNorm, residual add, etc.) operate on f32.
@@ -606,6 +718,13 @@ pub fn load_metal_model(
         stats.n_tensors += 1;
     };
 
+    // T180 — env flag to opt-in re-quantize F32 routing matrices to Q8_0 at
+    // load time. When set, `load_2d_routing` (used only for `ffn_gate_inp`)
+    // converts F32 weights → Q8_0 (4× compression, faster dispatch path).
+    let routing_quant_q8 = std::env::var("RUSTORCH_ROUTING_QUANT")
+        .map(|v| v.eq_ignore_ascii_case("q8_0"))
+        .unwrap_or(false);
+
     let load_2d = |name: &str, stats: &mut LoadStats| -> Result<HybridMetalWeight, String> {
         let info = file
             .tensor(name)
@@ -613,6 +732,19 @@ pub fn load_metal_model(
         visit_tensor(info, stats);
         load_quant_2d(backend, &file, info)
     };
+    // T180 — variant that re-quantizes F32 → Q8_0 for routing matrices when
+    // RUSTORCH_ROUTING_QUANT=q8_0. Currently unused after T180 rejection;
+    // kept available for future re-test on models where routing is the actual
+    // bottleneck (e.g. larger n_experts where bandwidth dominates).
+    #[allow(dead_code)]
+    let _load_2d_routing =
+        |name: &str, stats: &mut LoadStats| -> Result<HybridMetalWeight, String> {
+            let info = file
+                .tensor(name)
+                .ok_or_else(|| format!("missing tensor: {name}"))?;
+            visit_tensor(info, stats);
+            load_quant_2d_maybe_requantize(backend, &file, info, routing_quant_q8)
+        };
     let load_stacked_one_buffer =
         |name: &str, stats: &mut LoadStats| -> Result<StackedQuantizedExperts, String> {
             // T152 — Stacked expert tensors: GGUF shape `[k, n, n_experts]`
@@ -693,6 +825,13 @@ pub fn load_metal_model(
                 }
             },
             Qwen35Variant::Moe => {
+                // T180 (rejected) — tried routing F32 → Q8_0 quant via load_2d_routing.
+                // Result: wash -1% on 5 prompts × 3 runs (within ±2% noise).
+                // Root cause: profile drain artifact made moe.routing look like 5.5ms
+                // (23% of decode), but real per-call cost is ~1-2 µs in chained mode.
+                // The F32 sgemv was already efficient; quant compression saved
+                // bandwidth on a non-bottleneck. `load_2d_routing` kept available
+                // for re-test on different models (e.g. larger n_experts).
                 let gate_inp = load_2d(&format!("blk.{li}.ffn_gate_inp.weight"), &mut stats)?;
                 let gate_inp_shexp =
                     load_1d_f32(&format!("blk.{li}.ffn_gate_inp_shexp.weight"), &mut stats)?;
