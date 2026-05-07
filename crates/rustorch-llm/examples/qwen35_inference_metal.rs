@@ -49,8 +49,8 @@ use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, argmax_batched_f32, build_em_perm_f32_into,
     delta_net_step_f32, delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets,
-    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, kv_append_batched_f32,
-    kv_append_f32, l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32,
+    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, gqa_decode_f32_nsg2,
+    kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32,
     rms_norm_per_head_batched_f32, rms_norm_per_head_f32, rms_norm_per_head_gated_f32,
     rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
     rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
@@ -2519,18 +2519,46 @@ fn attn_block_forward(
     )?;
 
     // 8. GQA decode → attn_out (q_dim).
-    gqa_decode_f32(
-        backend,
-        &scratch.q,
-        &cache.k_cache,
-        &cache.v_cache,
-        &scratch.attn_out,
-        n_q,
-        n_kv,
-        head_dim,
-        position + 1,
-        max_seq,
-    )?;
+    //
+    // T186 — `gqa_decode_f32_nsg2` uses 2 simdgroups per TG (64 threads),
+    // halving the per-thread sequential work over kv_len. Microbench on
+    // M4 Max shows ×1.13 to ×2.21 speedup growing with kv_len:
+    //   kv=64    : 33 → 29 µs (×1.13)
+    //   kv=256   : 117 → 62 µs (×1.88)
+    //   kv=1024  : 462 → 231 µs (×2.00)
+    //   kv=4096  : 3050 → 1377 µs (×2.21)
+    // Parity byte-near-identical (max_rel_err 1.85e-6 vs original).
+    // Activable via RUSTORCH_GQA_NSG2 (default ON, set =0 for bisect).
+    let use_gqa_nsg2 = std::env::var("RUSTORCH_GQA_NSG2")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if use_gqa_nsg2 {
+        gqa_decode_f32_nsg2(
+            backend,
+            &scratch.q,
+            &cache.k_cache,
+            &cache.v_cache,
+            &scratch.attn_out,
+            n_q,
+            n_kv,
+            head_dim,
+            position + 1,
+            max_seq,
+        )?;
+    } else {
+        gqa_decode_f32(
+            backend,
+            &scratch.q,
+            &cache.k_cache,
+            &cache.v_cache,
+            &scratch.attn_out,
+            n_q,
+            n_kv,
+            head_dim,
+            position + 1,
+            max_seq,
+        )?;
+    }
 
     // 9. Apply sigmoid(gate) on attention output (Qwen3Next-only). Pure
     //    qwen3 has no per-head gate so this is skipped.

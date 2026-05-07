@@ -33,12 +33,13 @@ fn main() {
     use rustorch_metal::backend_singleton::metal_backend;
     use rustorch_metal::kernels::{
         add_inplace_f32, argmax_batched_f32, delta_net_step_with_l2_f32, gqa_decode_f32,
-        kv_append_f32, rms_norm_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
-        sgemv_f32_cached_x_into, sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
-        sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-        sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
-        sigmoid_mul_inplace_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
-        swiglu_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32, weighted_reduce_add_f32,
+        gqa_decode_f32_nsg2, kv_append_f32, rms_norm_f32, rms_norm_per_head_gated_f32,
+        rope_half_split_f32, sgemv_f32_cached_x_into, sgemv_f32_lcpp_simd_into,
+        sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
+        sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
+        sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32, sigmoid_mul_inplace_f32, split_qkv_f32,
+        ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32, topk_softmax_norm_f32,
+        topk_softmax_norm_parallel_f32, weighted_reduce_add_f32,
     };
     use std::time::Instant;
 
@@ -898,32 +899,117 @@ fn main() {
         ));
     }
 
-    // -------- Kernel 20: gqa_decode_f32, n_q=16 n_kv=2 hd=256 kv_len=64 --------
+    // -------- Kernel 20: gqa_decode_f32 at multiple kv_len values --------
+    // Long-context decode is bottlenecked by gqa_decode (linear in kv_len).
+    // Tesla 800-token output : 53→44 t/s (-17%). Quantify the scaling.
     {
         let n_q = 16usize;
         let n_kv = 2usize;
         let hd = 256usize;
-        let kv_len = 64usize;
-        let max_seq = 256usize;
+        let max_seq = 4096usize;
         let q = backend.alloc_shared(n_q * hd * 4).unwrap();
         let kc = backend.alloc_shared(n_kv * hd * max_seq * 4).unwrap();
         let vc = backend.alloc_shared(n_kv * hd * max_seq * 4).unwrap();
         let out = backend.alloc_shared(n_q * hd * 4).unwrap();
-        gqa_decode_f32(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq).unwrap();
-        backend.drain();
-        let t0 = Instant::now();
-        for _ in 0..ITERS {
+        for &kv_len in &[64usize, 256, 1024, 2048, 4096] {
             gqa_decode_f32(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq).unwrap();
+            backend.drain();
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                gqa_decode_f32(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                    .unwrap();
+            }
+            backend.drain();
+            let dt = t0.elapsed();
+            let label: String = format!("gqa_decode_f32 kv={kv_len}");
+            let leaked: &'static str = Box::leak(label.into_boxed_str());
+            results.push((
+                leaked.to_string(),
+                dt.as_secs_f64() * 1000.0,
+                dt.as_secs_f64() * 1e6 / ITERS as f64,
+                format!("n_q={n_q} n_kv={n_kv} hd={hd} kv_len={kv_len}"),
+                10,
+            ));
         }
-        backend.drain();
-        let dt = t0.elapsed();
-        results.push((
-            "gqa_decode_f32".to_string(),
-            dt.as_secs_f64() * 1000.0,
-            dt.as_secs_f64() * 1e6 / ITERS as f64,
-            format!("n_q={n_q} n_kv={n_kv} hd={hd} kv_len={kv_len}"),
-            10,
-        ));
+        // T186 NSG=2 variant
+        for &kv_len in &[64usize, 256, 1024, 2048, 4096] {
+            gqa_decode_f32_nsg2(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                gqa_decode_f32_nsg2(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                    .unwrap();
+            }
+            backend.drain();
+            let dt = t0.elapsed();
+            let label: String = format!("gqa_decode_NSG2 kv={kv_len}");
+            let leaked: &'static str = Box::leak(label.into_boxed_str());
+            results.push((
+                leaked.to_string(),
+                dt.as_secs_f64() * 1000.0,
+                dt.as_secs_f64() * 1e6 / ITERS as f64,
+                format!("n_q={n_q} n_kv={n_kv} hd={hd} kv_len={kv_len}"),
+                10,
+            ));
+        }
+        // Parity: NSG=2 vs original on kv_len=256
+        {
+            let q_test = fake_f32(n_q * hd, 1.1);
+            let k_test = fake_f32(n_kv * hd * max_seq, 2.2);
+            let v_test = fake_f32(n_kv * hd * max_seq, 3.3);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    q_test.as_ptr(),
+                    q.contents() as *mut f32,
+                    q_test.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    k_test.as_ptr(),
+                    kc.contents() as *mut f32,
+                    k_test.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    v_test.as_ptr(),
+                    vc.contents() as *mut f32,
+                    v_test.len(),
+                );
+            }
+            let kv_len = 256usize;
+            gqa_decode_f32(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq).unwrap();
+            backend.drain();
+            let mut out_orig = vec![0.0_f32; n_q * hd];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out.contents() as *const f32,
+                    out_orig.as_mut_ptr(),
+                    n_q * hd,
+                );
+            }
+            gqa_decode_f32_nsg2(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let mut out_nsg2 = vec![0.0_f32; n_q * hd];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out.contents() as *const f32,
+                    out_nsg2.as_mut_ptr(),
+                    n_q * hd,
+                );
+            }
+            let mut max_rel = 0.0_f32;
+            for (a, b) in out_orig.iter().zip(out_nsg2.iter()) {
+                let denom = a.abs().max(1e-4);
+                let rel = (a - b).abs() / denom;
+                if rel > max_rel {
+                    max_rel = rel;
+                }
+            }
+            println!(
+                "\nParity T186 gqa_decode_NSG2 (kv_len={kv_len}): max_rel_err = {max_rel:.3e}  ({})",
+                if max_rel < 1e-3 { "PASS ✓" } else { "FAIL ✗" }
+            );
+        }
     }
 
     // -------- Kernel 21: argmax_batched_f32, b=1 vocab=248320 --------

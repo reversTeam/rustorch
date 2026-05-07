@@ -12600,6 +12600,189 @@ kernel void gqa_decode_f32(
 }
 "#;
 
+// ============================================================================
+// T186 — GQA decode with 2 simdgroups per TG (parallel kv_len split).
+//
+// The original `gqa_decode_f32` uses 1 simdgroup (32 threads) per query head
+// and parallelizes over kv_len with stride 32. At kv_len=4096 each thread
+// does 128 sequential dot products of 256 elements → super-linear slowdown.
+//
+// Microbench scaling (n_q=16 n_kv=2 hd=256, M4 Max):
+//   kv_len=64    : 32 µs
+//   kv_len=4096  : 3553 µs (109× — super-linear)
+//
+// This NSG=2 variant uses 64 threads per TG (2 simdgroups). Each simdgroup
+// handles a chunk of kv_len positions (first half + second half). Phase
+// boundaries (max, sum) reduce across both simdgroups via threadgroup memory.
+//
+// Pre-conditions: head_dim % 4 == 0 (float4 path). Same as original.
+// ============================================================================
+
+const GQA_DECODE_F32_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint NSG_GQA = 2u;
+
+kernel void gqa_decode_f32_nsg2(
+    device const float* q       [[buffer(0)]],
+    device const float* k_cache [[buffer(1)]],
+    device const float* v_cache [[buffer(2)]],
+    device float* out           [[buffer(3)]],
+    constant uint4& dims        [[buffer(4)]],   // (n_heads, n_kv, head_dim, kv_len)
+    constant uint& max_seq      [[buffer(5)]],
+    constant float& inv_sqrt_d  [[buffer(6)]],
+    threadgroup float* shared   [[threadgroup(0)]],   // scores [kv_len] + cross-sg slots [4]
+    uint q_h                    [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]],
+    ushort sgitg                [[simdgroup_index_in_threadgroup]],
+    ushort tiisg                [[thread_index_in_simdgroup]]
+) {
+    uint n_heads  = dims.x;
+    uint n_kv     = dims.y;
+    uint head_dim = dims.z;
+    uint kv_len   = dims.w;
+    if (q_h >= n_heads) return;
+    uint group_size = n_heads / n_kv;
+    uint kv_h = q_h / group_size;
+
+    // Layout of `shared`:
+    //   [0 .. kv_len)             : score buffer
+    //   [kv_len .. kv_len+2)      : cross-sg max scratch
+    //   [kv_len+2 .. kv_len+4)    : cross-sg sum scratch
+    threadgroup float* sg_max = shared + kv_len;
+    threadgroup float* sg_sum = shared + kv_len + 2u;
+
+    device const float* q_h_ptr = q + q_h * head_dim;
+    device const float* k_h_base = k_cache + kv_h * max_seq * head_dim;
+
+    uint hd4 = head_dim / 4u;
+    device const float4* q_h_ptr4 = (device const float4*)q_h_ptr;
+
+    // Phase A: compute scores. 64 threads (2 simdgroups), each thread
+    // handles positions [tid, tid + 64, tid + 128, ...]. Doubles the
+    // parallelism vs original (32 threads, stride 32).
+    for (uint p = tid; p < kv_len; p += 64u) {
+        device const float4* k_p4 = (device const float4*)(k_h_base + p * head_dim);
+        float4 acc4 = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint d4 = 0; d4 < hd4; ++d4) {
+            acc4 += q_h_ptr4[d4] * k_p4[d4];
+        }
+        float dot = acc4.x + acc4.y + acc4.z + acc4.w;
+        for (uint d = hd4 * 4u; d < head_dim; ++d) {
+            dot += q_h_ptr[d] * k_h_base[p * head_dim + d];
+        }
+        shared[p] = dot * inv_sqrt_d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase B: max for stable softmax. Each simdgroup reduces its half,
+    // then thread 0 of each simdgroup writes to sg_max[]. Final reduction
+    // in simdgroup 0.
+    float local_max = -INFINITY;
+    for (uint p = tid; p < kv_len; p += 64u) {
+        local_max = max(local_max, shared[p]);
+    }
+    float sg_max_val = simd_max(local_max);
+    if (tiisg == 0) {
+        sg_max[sgitg] = sg_max_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_score = max(sg_max[0], sg_max[1]);
+
+    // Phase C: exp + accumulate sum (in shared[p]).
+    float local_sum = 0.0;
+    for (uint p = tid; p < kv_len; p += 64u) {
+        float e = exp(shared[p] - max_score);
+        shared[p] = e;
+        local_sum += e;
+    }
+    float sg_sum_val = simd_sum(local_sum);
+    if (tiisg == 0) {
+        sg_sum[sgitg] = sg_sum_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = sg_sum[0] + sg_sum[1];
+    float inv_sum = 1.0 / sum;
+
+    // Pre-multiply shared[p] by inv_sum cooperatively.
+    for (uint p = tid; p < kv_len; p += 64u) {
+        shared[p] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase D: V-weighted sum, output head_dim values. 64 threads cover
+    // head_dim with stride 64 (each thread writes head_dim/64 outputs).
+    device const float* v_h_base = v_cache + kv_h * max_seq * head_dim;
+    device float* out_h = out + q_h * head_dim;
+    uint hd4_d = head_dim / 4u;
+    device float4* out_h4 = (device float4*)out_h;
+    for (uint d4 = tid; d4 < hd4_d; d4 += 64u) {
+        float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint p = 0; p < kv_len; ++p) {
+            device const float4* v_p4 = (device const float4*)(v_h_base + p * head_dim);
+            acc += shared[p] * v_p4[d4];
+        }
+        out_h4[d4] = acc;
+    }
+    uint tail_start = hd4_d * 4u;
+    for (uint d = tail_start + tid; d < head_dim; d += 64u) {
+        float acc = 0.0;
+        for (uint p = 0; p < kv_len; ++p) {
+            acc += shared[p] * v_h_base[p * head_dim + d];
+        }
+        out_h[d] = acc;
+    }
+}
+"#;
+
+/// T186 — GQA decode with 2 simdgroups per TG (NSG=2). Drop-in replacement
+/// for `gqa_decode_f32` with same signature. Halves the per-thread sequential
+/// work over kv_len, addresses super-linear scaling at long context.
+///
+/// Microbench expected gain: ~2× at kv_len ≥ 1024 (where current is sequential
+/// bound). Possibly slight regression at kv_len < 64 (more cross-sg sync overhead
+/// than work saved).
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_decode_f32_nsg2(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    k_cache: &Buffer,
+    v_cache: &Buffer,
+    out_buf: &Buffer,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    kv_len: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    let pipeline = backend.pipeline(
+        "gqa_decode_f32_nsg2",
+        GQA_DECODE_F32_NSG2_SHADER,
+        "gqa_decode_f32_nsg2",
+    )?;
+    let dims = [n_heads as u32, n_kv as u32, head_dim as u32, kv_len as u32];
+    let ms = max_seq as u32;
+    let inv_sqrt_d: f32 = 1.0 / (head_dim as f32).sqrt();
+    // Layout : kv_len score floats + 4 cross-sg scratch floats.
+    let shared_bytes = ((kv_len + 4) * 4) as u64;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache), 0);
+        encoder.set_buffer(2, Some(v_cache), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(5, 4, &ms as *const u32 as *const std::ffi::c_void);
+        encoder.set_bytes(6, 4, &inv_sqrt_d as *const f32 as *const std::ffi::c_void);
+        encoder.set_threadgroup_memory_length(0, shared_bytes);
+        let tg_size = MTLSize::new(64, 1, 1); // 2 simdgroups × 32
+        let grid = MTLSize::new(64 * n_heads as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg_size);
+    });
+    Ok(())
+}
+
 /// GQA attention for a single decode-step query (`q_seq = 1`) against
 /// the cached `kv_len` K/V positions. One threadgroup per query head;
 /// 32 threads inside cooperate on the kv-length reduction.
