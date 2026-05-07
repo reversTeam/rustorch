@@ -4986,7 +4986,10 @@ fn main() -> ExitCode {
             },
         };
         let im_end_id = tok.special_id("<|im_end|>").unwrap_or(tok.eos_id);
-        let stops = [tok.eos_id, im_end_id];
+        let im_start_id = tok.special_id("<|im_start|>").unwrap_or(tok.eos_id);
+        // Stop on EOS, <|im_end|> (turn end), or <|im_start|> (model started a
+        // NEXT turn header — happens when the model "forgets" to emit im_end).
+        let stops = [tok.eos_id, im_end_id, im_start_id];
         let max_decode = forward_n.unwrap_or(2048);
 
         let mut state = DecodeState::new(backend, &cfg, max_seq);
@@ -5088,11 +5091,25 @@ fn main() -> ExitCode {
             // multi-byte UTF-8 chars (e.g. emoji 🇫🇷). Trailing partial
             // characters wait for the next iteration.
             let emit_safe = |cur_clean: &str, emitted: &mut String| {
-                // Tokenizer decode can change the byte-level structure of
-                // earlier output as new tokens complete a multi-byte UTF-8
-                // char (typically: `�` placeholder → actual emoji). When
-                // that happens, `emitted` is no longer a prefix of cur_clean;
-                // walk back to the largest common prefix on a boundary.
+                // T185-fix : the tokenizer emits U+FFFD (`�`) as placeholder
+                // for incomplete multi-byte chars. When subsequent tokens
+                // complete the char, the placeholder gets replaced by the
+                // real char and earlier byte positions shift. To avoid
+                // printing transient placeholders that get overwritten,
+                // we trim trailing `�` runs from cur_clean before emitting.
+                // Three bytes per `�` (U+FFFD encoded as EF BF BD).
+                let mut effective_len = cur_clean.len();
+                let fffd_bytes: [u8; 3] = [0xEF, 0xBF, 0xBD];
+                while effective_len >= 3
+                    && cur_clean.as_bytes()[effective_len - 3..effective_len] == fffd_bytes
+                {
+                    effective_len -= 3;
+                }
+                // Tokenizer decode can also change the byte-level structure
+                // of earlier output as new tokens complete a multi-byte UTF-8
+                // char. When that happens, `emitted` is no longer a prefix
+                // of cur_clean; walk back to the largest common prefix on
+                // a boundary.
                 if !cur_clean.starts_with(emitted.as_str()) {
                     let mut common = emitted
                         .as_bytes()
@@ -5106,10 +5123,10 @@ fn main() -> ExitCode {
                     emitted.clear();
                     emitted.push_str(&cur_clean[..common]);
                 }
-                if cur_clean.len() <= emitted.len() {
+                if effective_len <= emitted.len() {
                     return;
                 }
-                let mut safe_end = cur_clean.len();
+                let mut safe_end = effective_len;
                 while safe_end > emitted.len() && !cur_clean.is_char_boundary(safe_end) {
                     safe_end -= 1;
                 }
@@ -5211,7 +5228,12 @@ fn main() -> ExitCode {
         let prompt_ids = tok.encode(&wrapped);
         // Add im_end as an extra stop token alongside the EOS.
         let im_end_id = tok.special_id("<|im_end|>").unwrap_or(tok.eos_id);
-        let stops: [u32; 2] = [tok.eos_id, im_end_id];
+        let im_start_id = tok.special_id("<|im_start|>").unwrap_or(tok.eos_id);
+        // T185-fix: also stop on <|im_start|> (next-turn header). Without
+        // this, the model occasionally outputs `<|im_start|>user\n...` after
+        // its answer and the "user\n..." text leaks past the special-token
+        // strip into the displayed output.
+        let stops: [u32; 3] = [tok.eos_id, im_end_id, im_start_id];
         println!(
             "  prompt ({} tok): {}{}",
             prompt_ids.len(),
@@ -5393,10 +5415,18 @@ fn main() -> ExitCode {
             ] {
                 cur = cur.replace(special, "");
             }
+            // T185-fix: trim trailing U+FFFD (`�`) placeholders so we don't
+            // emit transient chars that will be replaced by real ones.
+            let mut effective_len = cur.len();
+            let fffd_bytes: [u8; 3] = [0xEF, 0xBF, 0xBD];
+            while effective_len >= 3
+                && cur.as_bytes()[effective_len - 3..effective_len] == fffd_bytes
+            {
+                effective_len -= 3;
+            }
             // Defensive: when stream_emitted no longer matches cur prefix
-            // (e.g. tokenizer's `�` placeholder got replaced by a complete
-            // emoji as more tokens arrived), walk back to the largest
-            // common boundary.
+            // (tokenizer's `�` placeholder got replaced by a real char as
+            // more tokens arrived), walk back to the largest common boundary.
             if !cur.starts_with(stream_emitted.as_str()) {
                 let mut common = stream_emitted
                     .as_bytes()
@@ -5410,10 +5440,10 @@ fn main() -> ExitCode {
                 stream_emitted.clear();
                 stream_emitted.push_str(&cur[..common]);
             }
-            if cur.len() <= stream_emitted.len() {
+            if effective_len <= stream_emitted.len() {
                 return;
             }
-            let mut safe_end = cur.len();
+            let mut safe_end = effective_len;
             while safe_end > stream_emitted.len() && !cur.is_char_boundary(safe_end) {
                 safe_end -= 1;
             }
