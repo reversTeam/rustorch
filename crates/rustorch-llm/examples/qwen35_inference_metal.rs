@@ -4120,6 +4120,7 @@ fn forward_batch(
     batch_scratch: &BatchScratch,
     tokens: &[u32],
     pos_base: usize,
+    hooks: Option<&InferenceHooks>,
 ) -> Result<u32, String> {
     let outs = forward_batch_argmax(
         backend,
@@ -4130,7 +4131,7 @@ fn forward_batch(
         tokens,
         pos_base,
         false,
-        None,
+        hooks,
     )?;
     Ok(*outs.last().unwrap())
 }
@@ -5889,6 +5890,31 @@ fn main() -> ExitCode {
                 }
             } else {
                 let batch_scratch = BatchScratch::new(backend, &cfg);
+
+                // T220.2 test hook : when RUSTORCH_HOOKS_TEST=1 set, allocate
+                // a zero-filled hidden_offsets buffer of correct shape and pass
+                // it to forward_batch. Output should be bit-exact identical to
+                // baseline (xd += 0 = xd). Validates the consumption path E2E.
+                let hooks_test = std::env::var("RUSTORCH_HOOKS_TEST")
+                    .ok()
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                let hooks_zero_buf = if hooks_test {
+                    let bytes = cfg.n_layers * B_MAX_BATCH * cfg.d * 4;
+                    let buf = backend
+                        .alloc_shared(bytes)
+                        .expect("alloc zero hooks buffer");
+                    unsafe {
+                        std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+                    }
+                    eprintln!(
+                        "  RUSTORCH_HOOKS_TEST=1 : injecting zero hidden_offsets ({} MB)",
+                        bytes / (1024 * 1024)
+                    );
+                    Some(buf)
+                } else {
+                    None
+                };
                 let mut idx = 0;
                 while idx < prompt_ids.len() {
                     let remaining = prompt_ids.len() - idx;
@@ -5910,6 +5936,11 @@ fn main() -> ExitCode {
                         break;
                     };
                     let chunk = &prompt_ids[idx..idx + chunk_size];
+                    let hooks_struct = hooks_zero_buf.as_ref().map(|b| InferenceHooks {
+                        hidden_offsets: Some(b),
+                        attn_bias: None,
+                        routing_bias: None,
+                    });
                     match forward_batch(
                         backend,
                         &file,
@@ -5918,6 +5949,7 @@ fn main() -> ExitCode {
                         &batch_scratch,
                         chunk,
                         cur_pos,
+                        hooks_struct.as_ref(),
                     ) {
                         Ok(out) => last = out,
                         Err(e) => {
