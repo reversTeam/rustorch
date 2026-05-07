@@ -2476,6 +2476,12 @@ fn ssm_block_forward(
 
     // 3. T146a — fused GPU kernel: gate_h = softplus(alpha + dt_bias) * ssm_a,
     //    beta_sig = sigmoid(beta). No drain needed.
+    //
+    // T178 (rejected) — tried to fuse this gate_apply + delta_net + gated_norm
+    // into a single mega-kernel `ssm_block_mega_f32`. Result: −5% regression
+    // because per-head TG (32 TGs) underutilizes M4 Max SMs vs original per-row
+    // TG (4096 TGs). 5th occurrence of the chained-encoder fusion trap (cf. T86,
+    // T164, T165, T177). Mega-kernel kept dead-code in kernels.rs for reference.
     let _ssm_t0_gate = std::time::Instant::now();
     ssm_apply_gate_f32(
         backend,
@@ -2567,11 +2573,10 @@ fn ssm_block_forward(
     // delta_net_step_f32 = 3 dispatches/SSM-layer.
     //
     // Maintenant : 1 dispatch delta_net_step_with_l2_f32 qui calcule inv_q
-    // et inv_k via simd_sum en début, puis applique en scalaires multiplicatifs
-    // sur les simd_sums internes (proj_r *= inv_k, delta_eff = delta * inv_k,
-    // final out *= inv_q). State SSM identique numériquement.
+    // et inv_k via simd_sum en début, puis applique en scalaires multiplicatifs.
     //
     // Switch RUSTORCH_SSM_FORCE_LEGACY_L2=1 pour bisection / régression check.
+    // T178 mega-kernel rejected — kept in kernels.rs as dead-code reference.
     let force_legacy_l2 = std::env::var("RUSTORCH_SSM_FORCE_LEGACY_L2").is_ok();
     if force_legacy_l2 {
         // Legacy path : 2 L2 dispatches + delta_net legacy.

@@ -13739,6 +13739,296 @@ pub fn rms_norm_per_head_gated_f32_with_offsets(
     Ok(())
 }
 
+// ============================================================================
+// T178 (Phase 1.1) — SSM block mega-kernel : fusion de
+// `ssm_apply_gate_f32` + `delta_net_step_with_l2_f32` + `rms_norm_per_head_gated_f32`
+// dans 1 dispatch unique.
+//
+// Ce kernel est inspiré de la stratégie MLX `gated_delta_update` :
+// - 1 threadgroup par v-head (n_v_heads TGs)
+// - 128 threads (4 simdgroups) par TG
+// - 128 rows traitées en 4 rounds × 4 simdgroups en parallèle
+// - L2 norm de q/k computée 1 fois par TG (broadcast via TG memory)
+// - RMSNorm cross-row computée en TG memory à la fin
+// - silu(z) appliqué inline
+//
+// Inputs :
+//   - alpha [n_v_heads], beta [n_v_heads] (post-projection activations)
+//   - dt_bias [n_v_heads], ssm_a [n_v_heads] (model parameters)
+//   - q [n_k_heads, head_dim], k [n_k_heads, head_dim] (post-conv1d)
+//   - v [n_v_heads, head_dim] (post-conv1d)
+//   - state [n_v_heads, head_dim, head_dim] (R/W)
+//   - ssm_norm_gamma [head_dim], z [n_v_heads, head_dim]
+// Output :
+//   - out [n_v_heads, head_dim] = post-gated-RMS-norm SSM output
+//
+// Dispatch :
+//   threadgroups = (n_v_heads, 1, 1)
+//   threads/TG  = (128, 1, 1)  // 4 simdgroups × 32 threads
+//
+// Pre-conditions :
+//   - head_dim multiple of 32 (uses 32-thread simdgroup reduction)
+//   - n_v_heads % n_k_heads == 0 (broadcast pattern)
+//   - head_dim <= 256 (TG memory budget for row_outputs accumulator)
+// ============================================================================
+
+const SSM_BLOCK_MEGA_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MAX_HEAD_DIM_MEGA = 256u;
+
+kernel void ssm_block_mega_f32(
+    device const float*  alpha           [[buffer(0)]],   // [n_v_heads]
+    device const float*  beta            [[buffer(1)]],   // [n_v_heads]
+    device const float*  dt_bias         [[buffer(2)]],   // [n_v_heads]
+    device const float*  ssm_a           [[buffer(3)]],   // [n_v_heads]
+    device const float*  q               [[buffer(4)]],   // [n_k_heads, head_dim]
+    device const float*  k               [[buffer(5)]],   // [n_k_heads, head_dim]
+    device const float*  v               [[buffer(6)]],   // [n_v_heads, head_dim]
+    device float*        state           [[buffer(7)]],   // [n_v_heads, head_dim, head_dim] R/W
+    device const float*  ssm_norm_gamma  [[buffer(8)]],   // [head_dim]
+    device const float*  z               [[buffer(9)]],   // [n_v_heads, head_dim]
+    device float*        out             [[buffer(10)]],  // [n_v_heads, head_dim]
+    constant uint4&      dims            [[buffer(11)]],  // (n_v_heads, head_dim, n_k_heads, _)
+    constant float&      eps             [[buffer(12)]],
+    uint                 tg_id           [[threadgroup_position_in_grid]],
+    uint                 tid             [[thread_position_in_threadgroup]],
+    ushort               sgitg           [[simdgroup_index_in_threadgroup]],
+    ushort               tiisg           [[thread_index_in_simdgroup]]
+) {
+    uint n_v_heads = dims.x;
+    uint head_dim  = dims.y;
+    uint n_k_heads = dims.z;
+    uint head_v = tg_id;
+    if (head_v >= n_v_heads) return;
+
+    uint head_k = head_v % n_k_heads;
+    uint qk_off = head_k * head_dim;
+    uint v_off  = head_v * head_dim;
+
+    // -------------------------------------------------------------------------
+    // Phase A : ssm_apply_gate inline. Broadcast gate_h[head_v], beta_sig[head_v]
+    // via TG memory (only 1 thread computes, all threads read).
+    // -------------------------------------------------------------------------
+    threadgroup float gate_h_tg;
+    threadgroup float beta_sig_tg;
+    threadgroup float q_ss_tg;
+    threadgroup float k_ss_tg;
+
+    if (tid == 0) {
+        float a = alpha[head_v] + dt_bias[head_v];
+        // Stable softplus
+        float sp;
+        if (a > 20.0)       sp = a;
+        else if (a < -20.0) sp = exp(a);
+        else                sp = log(1.0 + exp(a));
+        gate_h_tg = sp * ssm_a[head_v];
+        beta_sig_tg = 1.0 / (1.0 + exp(-beta[head_v]));
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase B : L2 norm of q[head_k], k[head_k]. Computed by simdgroup 0 only,
+    // broadcast via TG memory. Stride-32 over head_dim.
+    // -------------------------------------------------------------------------
+    if (sgitg == 0) {
+        float qss = 0.0;
+        float kss = 0.0;
+        for (uint c = tiisg; c < head_dim; c += 32u) {
+            float qc = q[qk_off + c];
+            float kc = k[qk_off + c];
+            qss += qc * qc;
+            kss += kc * kc;
+        }
+        qss = simd_sum(qss);
+        kss = simd_sum(kss);
+        if (tiisg == 0) {
+            q_ss_tg = qss;
+            k_ss_tg = kss;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float gamma   = exp(gate_h_tg);
+    float beta_v  = beta_sig_tg;
+    float inv_q   = rsqrt(q_ss_tg + eps);
+    float inv_k   = rsqrt(k_ss_tg + eps);
+    float q_scale = 1.0 / sqrt((float)head_dim);
+
+    // -------------------------------------------------------------------------
+    // Phase C : delta-net per row. 4 simdgroups × 4 rounds = 16 rows per round...
+    // wait, head_dim = 128, sgitg = 0..3, so we have 4 simdgroups in flight.
+    // Each round does 4 rows in parallel. 128/4 = 32 rounds.
+    // Each row uses 32-thread cooperative simdgroup reduction (same as original
+    // delta_net_step_with_l2).
+    // -------------------------------------------------------------------------
+    threadgroup float row_outputs[MAX_HEAD_DIM_MEGA];
+
+    uint n_simdgroups = 4u;  // 128 threads / 32 lanes
+    uint rounds = head_dim / n_simdgroups; // typ. 32 for head_dim=128
+
+    for (uint round = 0u; round < rounds; round++) {
+        uint row = round * n_simdgroups + sgitg;
+        if (row >= head_dim) continue;
+
+        uint state_off = head_v * head_dim * head_dim + row * head_dim;
+        float v_r = v[v_off + row];
+
+        // Steps 1+2 : decay + proj_raw (lit raw k).
+        float proj_partial = 0.0;
+        for (uint c = tiisg; c < head_dim; c += 32u) {
+            float decayed = gamma * state[state_off + c];
+            state[state_off + c] = decayed;
+            proj_partial += decayed * k[qk_off + c];
+        }
+        float proj_r = simd_sum(proj_partial) * inv_k;
+
+        // Step 3+4 : delta-rule + readout.
+        float delta_r   = beta_v * (v_r - proj_r);
+        float delta_eff = delta_r * inv_k;
+        float out_partial = 0.0;
+        for (uint c = tiisg; c < head_dim; c += 32u) {
+            float k_c = k[qk_off + c];
+            float q_c = q[qk_off + c];
+            float updated = state[state_off + c] + delta_eff * k_c;
+            state[state_off + c] = updated;
+            out_partial += updated * q_c * q_scale;
+        }
+        float row_val = simd_sum(out_partial) * inv_q;
+
+        if (tiisg == 0) {
+            row_outputs[row] = row_val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // -------------------------------------------------------------------------
+    // Phase D : RMSNorm sumsq across rows of this head.
+    // Use 4 simdgroups (= all 128 threads) to compute partial sums then aggregate.
+    // -------------------------------------------------------------------------
+    float rsq_partial = 0.0;
+    for (uint i = tid; i < head_dim; i += 128u) {
+        float rv = row_outputs[i];
+        rsq_partial += rv * rv;
+    }
+    rsq_partial = simd_sum(rsq_partial);
+
+    threadgroup float rsq_per_sg[4];
+    if (tiisg == 0) {
+        rsq_per_sg[sgitg] = rsq_partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float inv_norm_tg;
+    if (tid == 0) {
+        float total = rsq_per_sg[0] + rsq_per_sg[1] + rsq_per_sg[2] + rsq_per_sg[3];
+        inv_norm_tg = rsqrt(total / float(head_dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // -------------------------------------------------------------------------
+    // Phase E : apply gamma_norm * silu(z) per element, write output.
+    // Each thread writes 1 element (head_dim=128 elements, 128 threads available).
+    // -------------------------------------------------------------------------
+    if (tid < head_dim) {
+        float zv = z[v_off + tid];
+        float silu = zv / (1.0 + exp(-zv));
+        out[v_off + tid] = row_outputs[tid] * inv_norm_tg * ssm_norm_gamma[tid] * silu;
+    }
+}
+"#;
+
+/// T178 — **REJECTED, dead-code conservé pour référence**.
+///
+/// SSM block mega-kernel : fusion `ssm_apply_gate` + `delta_net_step_with_l2`
+/// + `rms_norm_per_head_gated` en 1 dispatch (style MLX `gated_delta_update`).
+///
+/// **Test parité PASS** vs eager pipeline (rel_err < 1e-3 sur out + state).
+///
+/// **Bench réel sur 35B-A3B Q4_K_M decode : −5.1% régression** (40.15 vs 42.32 t/s
+/// médian sur 5 prompts naturels). Pattern per-head TG (32 TGs de 128 threads) sous-utilise
+/// les 40+ SMs M4 Max vs original per-row TG (4096 TGs de 32 threads).
+///
+/// **Méta-leçon** : 5e occurrence du piège chained-encoder fusion
+/// (T86, T164, T165, T177, T178). Toute fusion qui réduit les TGs en flight
+/// régresse sur Apple Metal3.
+///
+/// Voir gotcha `2f408a4f-ca90-4561-a303-48f6f714dfe5` pour bench détaillé.
+///
+/// Pré-conditions :
+///   - `head_dim % 32 == 0` (simdgroup reduction)
+///   - `head_dim <= 256` (TG memory budget)
+///   - `n_v_heads % n_k_heads == 0` (broadcast Q/K pattern)
+///
+/// Conservé au cas où on rencontrerait un workload où n_v_heads >> 32 (auquel
+/// cas la perte de TG parallélisme deviendrait négligeable).
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn ssm_block_mega_f32(
+    backend: &MetalBackend,
+    alpha_buf: &Buffer,
+    beta_buf: &Buffer,
+    dt_bias_buf: &Buffer,
+    ssm_a_buf: &Buffer,
+    q_buf: &Buffer,
+    k_buf: &Buffer,
+    v_buf: &Buffer,
+    state_buf: &Buffer,
+    ssm_norm_gamma_buf: &Buffer,
+    z_buf: &Buffer,
+    out_buf: &Buffer,
+    n_v_heads: usize,
+    head_dim: usize,
+    n_k_heads: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    if n_v_heads == 0 || head_dim == 0 || n_k_heads == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "ssm_block_mega_f32: zero dimension".to_string(),
+        ));
+    }
+    if n_v_heads % n_k_heads != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ssm_block_mega_f32: n_v_heads={n_v_heads} must be a multiple of n_k_heads={n_k_heads}"
+        )));
+    }
+    if head_dim % 32 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ssm_block_mega_f32: head_dim={head_dim} must be a multiple of 32"
+        )));
+    }
+    if head_dim > 256 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "ssm_block_mega_f32: head_dim={head_dim} exceeds 256 (TG memory budget)"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "ssm_block_mega_f32",
+        SSM_BLOCK_MEGA_F32_SHADER,
+        "ssm_block_mega_f32",
+    )?;
+    let dims = [n_v_heads as u32, head_dim as u32, n_k_heads as u32, 0u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(alpha_buf), 0);
+        encoder.set_buffer(1, Some(beta_buf), 0);
+        encoder.set_buffer(2, Some(dt_bias_buf), 0);
+        encoder.set_buffer(3, Some(ssm_a_buf), 0);
+        encoder.set_buffer(4, Some(q_buf), 0);
+        encoder.set_buffer(5, Some(k_buf), 0);
+        encoder.set_buffer(6, Some(v_buf), 0);
+        encoder.set_buffer(7, Some(state_buf), 0);
+        encoder.set_buffer(8, Some(ssm_norm_gamma_buf), 0);
+        encoder.set_buffer(9, Some(z_buf), 0);
+        encoder.set_buffer(10, Some(out_buf), 0);
+        encoder.set_bytes(11, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(12, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1); // 4 simdgroups
+        let groups = MTLSize::new(n_v_heads as u64, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T152.1b — Top-K softmax + normalize 100% GPU. Élimine le drain qui
 // précédait la sélection d'experts dans le path MoE.
 //
@@ -21774,5 +22064,302 @@ mod tests {
             let _ = scatter_ms;
             let _ = mm_id_ms;
         }
+    }
+
+    /// T178 (Phase 1.1) — parité ssm_block_mega_f32 vs eager pipeline
+    /// (ssm_apply_gate + delta_net_step_with_l2 + rms_norm_per_head_gated).
+    ///
+    /// Vérifie :
+    /// 1. `out` byte-near-identical (rel_err < 1e-3)
+    /// 2. `state` byte-near-identical (rel_err < 1e-3)
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn ssm_block_mega_parity_vs_eager() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[ssm_block_mega] skipping: no Metal3");
+            return;
+        }
+
+        // Dimensions matching Qwen3.6-35B-A3B SSM
+        let n_v_heads = 8_usize; // small for fast test (real model: 32)
+        let head_dim = 128_usize;
+        let n_k_heads = 4_usize; // n_v / n_k = 2 (broadcast)
+        let eps = 1e-6_f32;
+
+        // Build deterministic synthetic inputs
+        let alpha = det_vec(n_v_heads, 1.1);
+        let beta = det_vec(n_v_heads, 2.3);
+        let dt_bias = det_vec(n_v_heads, 3.7);
+        let ssm_a = det_vec(n_v_heads, 4.1);
+        let q = det_vec(n_k_heads * head_dim, 5.9);
+        let k = det_vec(n_k_heads * head_dim, 6.7);
+        let v = det_vec(n_v_heads * head_dim, 7.3);
+        let z = det_vec(n_v_heads * head_dim, 8.9);
+        let ssm_norm_gamma = det_vec(head_dim, 9.7);
+        let state = det_vec(n_v_heads * head_dim * head_dim, 10.3);
+
+        // === Path 1 : eager (existing kernels) ===
+        let alpha_buf_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let beta_buf_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let dt_bias_buf_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let ssm_a_buf_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let gate_h_buf_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let beta_sig_buf_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let q_buf_a = backend.alloc_shared(n_k_heads * head_dim * 4).unwrap();
+        let k_buf_a = backend.alloc_shared(n_k_heads * head_dim * 4).unwrap();
+        let v_buf_a = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+        let z_buf_a = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+        let gamma_buf_a = backend.alloc_shared(head_dim * 4).unwrap();
+        let state_buf_a = backend
+            .alloc_shared(n_v_heads * head_dim * head_dim * 4)
+            .unwrap();
+        let inter_buf_a = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                alpha.as_ptr(),
+                alpha_buf_a.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                beta.as_ptr(),
+                beta_buf_a.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                dt_bias.as_ptr(),
+                dt_bias_buf_a.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                ssm_a.as_ptr(),
+                ssm_a_buf_a.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                q.as_ptr(),
+                q_buf_a.contents() as *mut f32,
+                n_k_heads * head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                k.as_ptr(),
+                k_buf_a.contents() as *mut f32,
+                n_k_heads * head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                v.as_ptr(),
+                v_buf_a.contents() as *mut f32,
+                n_v_heads * head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                z.as_ptr(),
+                z_buf_a.contents() as *mut f32,
+                n_v_heads * head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                ssm_norm_gamma.as_ptr(),
+                gamma_buf_a.contents() as *mut f32,
+                head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                state.as_ptr(),
+                state_buf_a.contents() as *mut f32,
+                state.len(),
+            );
+        }
+
+        // Eager pipeline
+        ssm_apply_gate_f32(
+            backend,
+            &alpha_buf_a,
+            &beta_buf_a,
+            &dt_bias_buf_a,
+            &ssm_a_buf_a,
+            &gate_h_buf_a,
+            &beta_sig_buf_a,
+            n_v_heads,
+        )
+        .unwrap();
+        delta_net_step_with_l2_f32(
+            backend,
+            &q_buf_a,
+            &k_buf_a,
+            &v_buf_a,
+            &gate_h_buf_a,
+            &beta_sig_buf_a,
+            &state_buf_a,
+            &inter_buf_a,
+            n_v_heads,
+            head_dim,
+            n_k_heads,
+            eps,
+        )
+        .unwrap();
+        // gated_norm writes in-place to inter_buf_a, but the wired path in
+        // qwen35_inference_metal.rs writes out → ssm_out_buf which is the same
+        // location. Replicate that : in-place gated_norm on inter_buf, then
+        // copy to out_buf_a.
+        rms_norm_per_head_gated_f32(
+            backend,
+            &inter_buf_a,
+            &gamma_buf_a,
+            &z_buf_a,
+            n_v_heads,
+            head_dim,
+            eps,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut out_ref = vec![0.0_f32; n_v_heads * head_dim];
+        let mut state_ref = vec![0.0_f32; state.len()];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                inter_buf_a.contents() as *const f32,
+                out_ref.as_mut_ptr(),
+                out_ref.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                state_buf_a.contents() as *const f32,
+                state_ref.as_mut_ptr(),
+                state_ref.len(),
+            );
+        }
+
+        // === Path 2 : mega-kernel ===
+        let alpha_buf_b = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let beta_buf_b = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let dt_bias_buf_b = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let ssm_a_buf_b = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let q_buf_b = backend.alloc_shared(n_k_heads * head_dim * 4).unwrap();
+        let k_buf_b = backend.alloc_shared(n_k_heads * head_dim * 4).unwrap();
+        let v_buf_b = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+        let z_buf_b = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+        let gamma_buf_b = backend.alloc_shared(head_dim * 4).unwrap();
+        let state_buf_b = backend
+            .alloc_shared(n_v_heads * head_dim * head_dim * 4)
+            .unwrap();
+        let out_buf_b = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                alpha.as_ptr(),
+                alpha_buf_b.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                beta.as_ptr(),
+                beta_buf_b.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                dt_bias.as_ptr(),
+                dt_bias_buf_b.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                ssm_a.as_ptr(),
+                ssm_a_buf_b.contents() as *mut f32,
+                n_v_heads,
+            );
+            std::ptr::copy_nonoverlapping(
+                q.as_ptr(),
+                q_buf_b.contents() as *mut f32,
+                n_k_heads * head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                k.as_ptr(),
+                k_buf_b.contents() as *mut f32,
+                n_k_heads * head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                v.as_ptr(),
+                v_buf_b.contents() as *mut f32,
+                n_v_heads * head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                z.as_ptr(),
+                z_buf_b.contents() as *mut f32,
+                n_v_heads * head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                ssm_norm_gamma.as_ptr(),
+                gamma_buf_b.contents() as *mut f32,
+                head_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                state.as_ptr(),
+                state_buf_b.contents() as *mut f32,
+                state.len(),
+            );
+        }
+
+        ssm_block_mega_f32(
+            backend,
+            &alpha_buf_b,
+            &beta_buf_b,
+            &dt_bias_buf_b,
+            &ssm_a_buf_b,
+            &q_buf_b,
+            &k_buf_b,
+            &v_buf_b,
+            &state_buf_b,
+            &gamma_buf_b,
+            &z_buf_b,
+            &out_buf_b,
+            n_v_heads,
+            head_dim,
+            n_k_heads,
+            eps,
+        )
+        .unwrap();
+        backend.drain();
+
+        let mut out_mega = vec![0.0_f32; n_v_heads * head_dim];
+        let mut state_mega = vec![0.0_f32; state.len()];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_buf_b.contents() as *const f32,
+                out_mega.as_mut_ptr(),
+                out_mega.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                state_buf_b.contents() as *const f32,
+                state_mega.as_mut_ptr(),
+                state_mega.len(),
+            );
+        }
+
+        // Compare outputs
+        let mut max_rel_out = 0.0_f32;
+        for (i, (r, m)) in out_ref.iter().zip(out_mega.iter()).enumerate() {
+            let abs = (r - m).abs();
+            let denom = r.abs().max(1e-4);
+            let rel = abs / denom;
+            if rel > max_rel_out {
+                max_rel_out = rel;
+            }
+            assert!(
+                rel < 1e-3,
+                "out[{i}] mismatch: ref={r} mega={m} (rel={rel:.3e})"
+            );
+        }
+        let mut max_rel_state = 0.0_f32;
+        for (i, (r, m)) in state_ref.iter().zip(state_mega.iter()).enumerate() {
+            let abs = (r - m).abs();
+            let denom = r.abs().max(1e-4);
+            let rel = abs / denom;
+            if rel > max_rel_state {
+                max_rel_state = rel;
+            }
+            assert!(
+                rel < 1e-3,
+                "state[{i}] mismatch: ref={r} mega={m} (rel={rel:.3e})"
+            );
+        }
+        eprintln!(
+            "[ssm_block_mega] OK : max_rel_out={max_rel_out:.3e}, max_rel_state={max_rel_state:.3e}"
+        );
     }
 }
