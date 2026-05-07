@@ -47,15 +47,15 @@ use rustorch_metal::backend::MetalBackend;
 use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
-    add_inplace_batched_f32, add_inplace_f32, argmax_batched_f32, build_em_perm_f32_into,
-    delta_net_persistent_scan_f32_into, delta_net_step_f32, delta_net_step_with_l2_f32,
-    delta_net_step_with_l2_f32_with_offsets, delta_net_step_with_l2_f32_with_qkv_offsets,
-    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, gqa_decode_f32_nsg2,
-    gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2, gqa_decode_f32_splitk_nsg4,
-    kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, mul_mm_id_map0_into,
-    mul_mm_id_q4_k_f32_into, mul_mm_id_q4_k_q4_k_swiglu_f32_into, mul_mm_id_q5_k_f32_into,
-    rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32, rms_norm_per_head_f32,
-    rms_norm_per_head_gated_batched_f32, rms_norm_per_head_gated_f32,
+    add_inplace_batched_f32, add_inplace_batched_f32_with_y_offset, add_inplace_f32,
+    argmax_batched_f32, build_em_perm_f32_into, delta_net_persistent_scan_f32_into,
+    delta_net_step_f32, delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets,
+    delta_net_step_with_l2_f32_with_qkv_offsets, gather_pack_rows_f32, gqa_decode_batched_f32,
+    gqa_decode_f32, gqa_decode_f32_nsg2, gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2,
+    gqa_decode_f32_splitk_nsg4, kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32,
+    mul_mm_id_map0_into, mul_mm_id_q4_k_f32_into, mul_mm_id_q4_k_q4_k_swiglu_f32_into,
+    mul_mm_id_q5_k_f32_into, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
+    rms_norm_per_head_f32, rms_norm_per_head_gated_batched_f32, rms_norm_per_head_gated_f32,
     rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
     rope_half_split_partial_batched_f32, scatter_moe_acc_f32_into, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
@@ -4414,16 +4414,22 @@ fn forward_batch_argmax(
         // add_inplace_batched_f32 kernel with a buffer offset trick (Metal
         // set_buffer with offset). For simplicity in T220.1 we assume the
         // caller provides a buffer aligned for this access pattern.
+        // T220.2 — Apply per-layer hidden_offsets hook if provided.
+        // Buffer layout: [n_layers, B_MAX_BATCH, d] f32 contiguous.
+        // Per-layer slice for layer li starts at byte offset li * B_MAX * d * 4.
+        // The kernel reads the first b*d floats of that slice and adds to xd_batched.
         if let Some(h) = hooks {
             if let Some(hidden_off) = h.hidden_offsets {
                 let layer_off_bytes = li * B_MAX_BATCH * d * 4;
-                // Use add_inplace with a slice view via raw offset would require
-                // a kernel variant that takes byte offsets. For T220.1, we issue
-                // a guarded add with a tg-side bound check via the existing
-                // batched add. Future T220.2 will add proper offset support.
-                let _ = (hidden_off, layer_off_bytes);
-                // TODO(T220.2): wire add_inplace_batched_f32_with_offset(
-                //   backend, &batch_scratch.xd, hidden_off, layer_off_bytes, d, b)?;
+                add_inplace_batched_f32_with_y_offset(
+                    backend,
+                    &batch_scratch.xd,
+                    hidden_off,
+                    layer_off_bytes,
+                    d,
+                    b,
+                )
+                .map_err(|e| format!("L{li} hooks.hidden_offsets add: {e:?}"))?;
             }
         }
     }
