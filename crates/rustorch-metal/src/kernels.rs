@@ -13740,6 +13740,209 @@ pub fn rms_norm_per_head_gated_f32_with_offsets(
 }
 
 // ============================================================================
+// T179 (Phase 1.1 V2) — `delta_net_step_with_l2_v2_f32` : SSM scan delta_net
+// avec pattern MLX `gated_delta_update`.
+//
+// Diff vs `delta_net_step_with_l2_f32` (T154-fast) :
+//   - **State register-resident** : chaque thread garde head_dim/32 state values
+//     en registres au lieu de stride-loop sur DRAM
+//   - **Sub-head Dv splitting** via `tg.y=4` (4 dv rows par TG en parallèle au
+//     lieu de 1)
+//   - **Total threads identique** mais répartition différente : 1024 TGs × 128
+//     threads vs 4096 TGs × 32 threads. Densité TG ↑ 4× → moins d'overhead.
+//
+// Économie state DRAM : 50% (256 ops vs 512 ops par row, decay + update fused).
+//
+// Pré-conditions : head_dim ∈ {32, 64, 96, 128, ..., 512}, multiple de 32.
+// ============================================================================
+
+const DELTA_NET_STEP_WITH_L2_V2_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant int MAX_N_PER_T = 16;  // supports head_dim up to 512
+
+kernel void delta_net_step_with_l2_v2_f32(
+    device const float*  q          [[buffer(0)]],   // [n_k_heads, head_dim] RAW
+    device const float*  k          [[buffer(1)]],   // [n_k_heads, head_dim] RAW
+    device const float*  v          [[buffer(2)]],   // [n_v_heads, head_dim]
+    device const float*  gate_h     [[buffer(3)]],   // [n_v_heads]
+    device const float*  beta       [[buffer(4)]],   // [n_v_heads]
+    device float*        state      [[buffer(5)]],   // [n_v_heads, head_dim, head_dim]
+    device float*        out        [[buffer(6)]],   // [n_v_heads, head_dim]
+    constant uint4&      dims       [[buffer(7)]],   // (n_v_heads, head_dim, n_k_heads, _)
+    constant float&      eps        [[buffer(8)]],
+    uint3                tg_id      [[threadgroup_position_in_grid]],
+    uint3                tid_in_tg  [[thread_position_in_threadgroup]],
+    ushort               tiisg      [[thread_index_in_simdgroup]]
+) {
+    uint n_v_heads = dims.x;
+    uint head_dim  = dims.y;
+    uint n_k_heads = dims.z;
+
+    uint head_v   = tg_id.z;
+    uint dv_tile  = tg_id.y;
+    uint dv_in    = tid_in_tg.y;       // 0..3 (which dv within the 4-tile)
+    uint row      = dv_tile * 4u + dv_in;
+    uint dk_lane  = tid_in_tg.x;       // 0..31 (Dk position in simdgroup)
+
+    if (head_v >= n_v_heads || row >= head_dim) return;
+
+    uint head_k = head_v % n_k_heads;
+    uint qk_off = head_k * head_dim;
+    uint v_off  = head_v * head_dim;
+
+    uint n_per_t = head_dim / 32u;     // typ. 4 for head_dim=128
+
+    // ===== Phase A : L2 norm of q, k for this head_k =====
+    // Each thread loads n_per_t values via stride-32, then simd_sum.
+    // All 4 simdgroups in TG do this redundantly (cheap, cache-friendly).
+    float qss = 0.0;
+    float kss = 0.0;
+    for (uint i = 0u; i < n_per_t; i++) {
+        uint c = dk_lane + i * 32u;
+        float qc = q[qk_off + c];
+        float kc = k[qk_off + c];
+        qss += qc * qc;
+        kss += kc * kc;
+    }
+    float q_ss = simd_sum(qss);
+    float k_ss = simd_sum(kss);
+    float inv_q = rsqrt(q_ss + eps);
+    float inv_k = rsqrt(k_ss + eps);
+
+    // ===== Phase B : load state into registers =====
+    // Each thread holds n_per_t state values for (head_v, row, dk_lane + i*32).
+    uint state_off = head_v * head_dim * head_dim + row * head_dim;
+    float state_local[MAX_N_PER_T];
+    for (uint i = 0u; i < n_per_t; i++) {
+        state_local[i] = state[state_off + dk_lane + i * 32u];
+    }
+
+    float gamma   = exp(gate_h[head_v]);
+    float beta_v  = beta[head_v];
+    float v_r     = v[v_off + row];
+    float q_scale = 1.0 / sqrt((float)head_dim);
+
+    // ===== Phase C : decay + project (state in registers) =====
+    float kv_mem = 0.0;
+    for (uint i = 0u; i < n_per_t; i++) {
+        state_local[i] *= gamma;
+        float k_c = k[qk_off + dk_lane + i * 32u];
+        kv_mem += state_local[i] * k_c;
+    }
+    float proj_r = simd_sum(kv_mem) * inv_k;
+
+    // ===== Phase D : delta + update + readout (state in registers) =====
+    float delta_r   = beta_v * (v_r - proj_r);
+    float delta_eff = delta_r * inv_k;
+    float out_acc = 0.0;
+    for (uint i = 0u; i < n_per_t; i++) {
+        float k_c = k[qk_off + dk_lane + i * 32u];
+        float q_c = q[qk_off + dk_lane + i * 32u];
+        state_local[i] += delta_eff * k_c;
+        out_acc += state_local[i] * q_c * q_scale;
+    }
+    float row_val = simd_sum(out_acc) * inv_q;
+
+    // ===== Phase E : write state back + write output =====
+    for (uint i = 0u; i < n_per_t; i++) {
+        state[state_off + dk_lane + i * 32u] = state_local[i];
+    }
+    if (tiisg == 0u) {
+        out[v_off + row] = row_val;
+    }
+}
+"#;
+
+/// T179 — **REJECTED, dead-code conservé pour référence**.
+///
+/// `delta_net_step_with_l2_v2_f32` : drop-in replacement for
+/// `delta_net_step_with_l2_f32` using MLX `gated_delta_update` dispatch pattern.
+///
+/// Sub-head Dv splitting (1024 TGs × 128 threads vs T154-fast 4096 × 32) +
+/// state register-resident + simd_sum reductions + decay/update fusés (-50% state DRAM).
+///
+/// **Test parité PASS** vs T154-fast (rel_err < 1e-3 sur out + state).
+///
+/// **Bench réel sur 35B-A3B Q4_K_M decode : wash -0.95%** (médian sur 6 mesures,
+/// dans le bruit ±2%). Économies state DRAM théoriques (110µs/token = 0.5%) confirmées
+/// par mesure : conformes mais inobservables.
+///
+/// **Méta-leçon** : 3e dead-end SSM optimization consécutif (T177, T178, T179).
+/// `delta_net_step` est déjà ~14µs/layer (~2% du décode total). Le gain max
+/// atteignable est +0.4% global, donc inobservable. SSM n'est PAS le bottleneck.
+///
+/// Voir gotcha `f2582d9f-257f-4fbe-8d51-86033a64c03d` pour bench détaillé.
+///
+/// Conservé pour référence + au cas où on rencontre un workload où l'état SSM
+/// devient plus chaud (très long context, B>1 SSM batched, etc.).
+///
+/// Pré-conditions :
+///   - `head_dim % 32 == 0`, `head_dim <= 512`, multiple de 4
+///   - `n_v_heads % n_k_heads == 0`
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn delta_net_step_with_l2_v2_f32(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    k_buf: &Buffer,
+    v_buf: &Buffer,
+    gate_h_buf: &Buffer,
+    beta_buf: &Buffer,
+    state_buf: &Buffer,
+    out_buf: &Buffer,
+    n_v_heads: usize,
+    head_dim: usize,
+    n_k_heads: usize,
+    eps: f32,
+) -> Result<(), MetalError> {
+    if n_v_heads == 0 || head_dim == 0 || n_k_heads == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "delta_net_step_with_l2_v2_f32: zero dim".to_string(),
+        ));
+    }
+    if n_v_heads % n_k_heads != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "delta_net_step_with_l2_v2_f32: n_v_heads={n_v_heads} must be multiple of n_k_heads={n_k_heads}"
+        )));
+    }
+    if head_dim % 32 != 0 || head_dim > 512 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "delta_net_step_with_l2_v2_f32: head_dim={head_dim} must be multiple of 32, <= 512"
+        )));
+    }
+    if head_dim % 4 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "delta_net_step_with_l2_v2_f32: head_dim={head_dim} must be multiple of 4 (Dv tile)"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "delta_net_step_with_l2_v2_f32",
+        DELTA_NET_STEP_WITH_L2_V2_F32_SHADER,
+        "delta_net_step_with_l2_v2_f32",
+    )?;
+    let dims = [n_v_heads as u32, head_dim as u32, n_k_heads as u32, 0u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_buf), 0);
+        encoder.set_buffer(2, Some(v_buf), 0);
+        encoder.set_buffer(3, Some(gate_h_buf), 0);
+        encoder.set_buffer(4, Some(beta_buf), 0);
+        encoder.set_buffer(5, Some(state_buf), 0);
+        encoder.set_buffer(6, Some(out_buf), 0);
+        encoder.set_bytes(7, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(8, 4, &eps as *const f32 as *const std::ffi::c_void);
+        // tg_size : (32, 4, 1) = 128 threads per TG
+        let tg_size = MTLSize::new(32, 4, 1);
+        // tg_count : (1, head_dim/4, n_v_heads) — 1024 TGs for head_dim=128, n_v_heads=32
+        let groups = MTLSize::new(1, (head_dim / 4) as u64, n_v_heads as u64);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
+// ============================================================================
 // T178 (Phase 1.1) — SSM block mega-kernel : fusion de
 // `ssm_apply_gate_f32` + `delta_net_step_with_l2_f32` + `rms_norm_per_head_gated_f32`
 // dans 1 dispatch unique.
@@ -22360,6 +22563,165 @@ mod tests {
         }
         eprintln!(
             "[ssm_block_mega] OK : max_rel_out={max_rel_out:.3e}, max_rel_state={max_rel_state:.3e}"
+        );
+    }
+
+    /// T179 (Phase 1.1 V2) — parité delta_net_step_with_l2_v2_f32 vs T154-fast.
+    ///
+    /// Vérifie :
+    /// 1. `out` rel_err < 1e-3 vs `delta_net_step_with_l2_f32`
+    /// 2. `state` rel_err < 1e-3
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn delta_net_v2_parity_vs_t154() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[delta_net_v2] skipping: no Metal3");
+            return;
+        }
+
+        let n_v_heads = 8_usize;
+        let head_dim = 128_usize;
+        let n_k_heads = 4_usize;
+        let eps = 1e-6_f32;
+
+        let q = det_vec(n_k_heads * head_dim, 5.9);
+        let k = det_vec(n_k_heads * head_dim, 6.7);
+        let v = det_vec(n_v_heads * head_dim, 7.3);
+        let gate_h = det_vec(n_v_heads, 4.1);
+        let beta_sig = det_vec(n_v_heads, 2.3);
+        let state_init = det_vec(n_v_heads * head_dim * head_dim, 10.3);
+
+        // === T154 reference path ===
+        let q_a = backend.alloc_shared(n_k_heads * head_dim * 4).unwrap();
+        let k_a = backend.alloc_shared(n_k_heads * head_dim * 4).unwrap();
+        let v_a = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+        let gate_h_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let beta_a = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let state_a = backend
+            .alloc_shared(n_v_heads * head_dim * head_dim * 4)
+            .unwrap();
+        let out_a = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(q.as_ptr(), q_a.contents() as *mut f32, q.len());
+            std::ptr::copy_nonoverlapping(k.as_ptr(), k_a.contents() as *mut f32, k.len());
+            std::ptr::copy_nonoverlapping(v.as_ptr(), v_a.contents() as *mut f32, v.len());
+            std::ptr::copy_nonoverlapping(
+                gate_h.as_ptr(),
+                gate_h_a.contents() as *mut f32,
+                gate_h.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                beta_sig.as_ptr(),
+                beta_a.contents() as *mut f32,
+                beta_sig.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                state_init.as_ptr(),
+                state_a.contents() as *mut f32,
+                state_init.len(),
+            );
+        }
+        delta_net_step_with_l2_f32(
+            backend, &q_a, &k_a, &v_a, &gate_h_a, &beta_a, &state_a, &out_a, n_v_heads, head_dim,
+            n_k_heads, eps,
+        )
+        .unwrap();
+        backend.drain();
+        let mut out_ref = vec![0.0_f32; n_v_heads * head_dim];
+        let mut state_ref = vec![0.0_f32; state_init.len()];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_a.contents() as *const f32,
+                out_ref.as_mut_ptr(),
+                out_ref.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                state_a.contents() as *const f32,
+                state_ref.as_mut_ptr(),
+                state_ref.len(),
+            );
+        }
+
+        // === V2 path ===
+        let q_b = backend.alloc_shared(n_k_heads * head_dim * 4).unwrap();
+        let k_b = backend.alloc_shared(n_k_heads * head_dim * 4).unwrap();
+        let v_b = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+        let gate_h_b = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let beta_b = backend.alloc_shared(n_v_heads * 4).unwrap();
+        let state_b = backend
+            .alloc_shared(n_v_heads * head_dim * head_dim * 4)
+            .unwrap();
+        let out_b = backend.alloc_shared(n_v_heads * head_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(q.as_ptr(), q_b.contents() as *mut f32, q.len());
+            std::ptr::copy_nonoverlapping(k.as_ptr(), k_b.contents() as *mut f32, k.len());
+            std::ptr::copy_nonoverlapping(v.as_ptr(), v_b.contents() as *mut f32, v.len());
+            std::ptr::copy_nonoverlapping(
+                gate_h.as_ptr(),
+                gate_h_b.contents() as *mut f32,
+                gate_h.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                beta_sig.as_ptr(),
+                beta_b.contents() as *mut f32,
+                beta_sig.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                state_init.as_ptr(),
+                state_b.contents() as *mut f32,
+                state_init.len(),
+            );
+        }
+        delta_net_step_with_l2_v2_f32(
+            backend, &q_b, &k_b, &v_b, &gate_h_b, &beta_b, &state_b, &out_b, n_v_heads, head_dim,
+            n_k_heads, eps,
+        )
+        .unwrap();
+        backend.drain();
+        let mut out_v2 = vec![0.0_f32; n_v_heads * head_dim];
+        let mut state_v2 = vec![0.0_f32; state_init.len()];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_b.contents() as *const f32,
+                out_v2.as_mut_ptr(),
+                out_v2.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                state_b.contents() as *const f32,
+                state_v2.as_mut_ptr(),
+                state_v2.len(),
+            );
+        }
+
+        let mut max_rel_out = 0.0_f32;
+        for (i, (r, m)) in out_ref.iter().zip(out_v2.iter()).enumerate() {
+            let abs = (r - m).abs();
+            let denom = r.abs().max(1e-4);
+            let rel = abs / denom;
+            if rel > max_rel_out {
+                max_rel_out = rel;
+            }
+            assert!(
+                rel < 1e-3,
+                "out[{i}] mismatch: t154={r} v2={m} (rel={rel:.3e})"
+            );
+        }
+        let mut max_rel_state = 0.0_f32;
+        for (i, (r, m)) in state_ref.iter().zip(state_v2.iter()).enumerate() {
+            let abs = (r - m).abs();
+            let denom = r.abs().max(1e-4);
+            let rel = abs / denom;
+            if rel > max_rel_state {
+                max_rel_state = rel;
+            }
+            assert!(
+                rel < 1e-3,
+                "state[{i}] mismatch: t154={r} v2={m} (rel={rel:.3e})"
+            );
+        }
+        eprintln!(
+            "[delta_net_v2] OK: max_rel_out={max_rel_out:.3e}, max_rel_state={max_rel_state:.3e}"
         );
     }
 }

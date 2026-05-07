@@ -2569,14 +2569,13 @@ fn ssm_block_forward(
 
     // 7+9. T154-fast — Fuse L2 norm de q,k DANS delta_net_step.
     //
-    // Avant : 2 dispatches l2_norm_per_head_f32 (q, k) + 1 dispatch
-    // delta_net_step_f32 = 3 dispatches/SSM-layer.
-    //
-    // Maintenant : 1 dispatch delta_net_step_with_l2_f32 qui calcule inv_q
-    // et inv_k via simd_sum en début, puis applique en scalaires multiplicatifs.
-    //
     // Switch RUSTORCH_SSM_FORCE_LEGACY_L2=1 pour bisection / régression check.
-    // T178 mega-kernel rejected — kept in kernels.rs as dead-code reference.
+    //
+    // T178 mega-kernel (per-head TG, 32 TGs) rejected -5% (kept dead-code).
+    // T179 V2 MLX-style dispatch (1024 TGs × 128 threads, state in registers)
+    //   wash -1% (kept dead-code + parity test in kernels.rs).
+    // 3 SSM optimization attempts → SSM is NOT the bottleneck.
+    // Real hot path = MoE (50%) + LM head sgemv (25%).
     let force_legacy_l2 = std::env::var("RUSTORCH_SSM_FORCE_LEGACY_L2").is_ok();
     if force_legacy_l2 {
         // Legacy path : 2 L2 dispatches + delta_net legacy.

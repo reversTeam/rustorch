@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>rustorch — browser demo gallery</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: #0a0b09;
+      color: #e0e0e0;
+      padding: 24px;
+      max-width: 1080px;
+      margin: 0 auto;
+      line-height: 1.5;
+    }
+    h1 { color: #ce422b; margin-bottom: 4px; }
+    h2 { color: #d8d8d8; font-size: 1.1em; margin-top: 0; }
+    h3 { color: #aaa; font-size: 0.95em; margin: 8px 0 4px; }
+    .lead { color: #aaa; margin-top: 0; }
+    .badge {
+      display: inline-block;
+      background: #2a2a26;
+      color: #aaa;
+      padding: 1px 8px;
+      border-radius: 10px;
+      font-size: 0.75em;
+      margin-right: 4px;
+    }
+    .badge.gpu  { background: #243; color: #8fcf6f; }
+    .badge.cpu  { background: #322; color: #e6b04b; }
+    .badge.train { background: #233; color: #6fb0ce; }
+    .pill {
+      display: inline-block;
+      background: #1a1c18;
+      border: 1px solid #2a2a26;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 0.78em;
+      margin-right: 4px;
+      color: #bdbdbd;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+      gap: 14px;
+    }
+    .card {
+      background: #14140f;
+      border: 1px solid #2a2a26;
+      padding: 16px 18px;
+      margin: 0;
+      border-radius: 8px;
+    }
+    .card.featured {
+      border-color: #4a3a36;
+      background: #181412;
+    }
+    .ok    { color: #8fcf6f; }
+    .warn  { color: #e6b04b; }
+    .err   { color: #e87b6f; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 220px;
+      overflow-y: auto;
+      background: #0a0a08;
+      padding: 10px;
+      border-radius: 4px;
+      font-size: 0.82em;
+      margin: 8px 0 0;
+    }
+    code {
+      background: #1a1c18;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 0.92em;
+    }
+    pre code {
+      background: transparent;
+      padding: 0;
+    }
+    button {
+      background: #ce422b;
+      color: white;
+      border: none;
+      padding: 8px 14px;
+      border-radius: 4px;
+      font: inherit;
+      cursor: pointer;
+      margin-right: 6px;
+      margin-top: 4px;
+      font-size: 0.88em;
+    }
+    button:hover:not(:disabled) { background: #e25036; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    label { color: #aaa; margin-right: 6px; font-size: 0.85em; }
+    input[type="number"] {
+      background: #0a0a08;
+      color: #e0e0e0;
+      border: 1px solid #2a2a26;
+      padding: 3px 6px;
+      border-radius: 3px;
+      font: inherit;
+      width: 60px;
+      margin-right: 10px;
+      font-size: 0.85em;
+    }
+    input[type="checkbox"] { margin-right: 4px; }
+    table {
+      border-collapse: collapse;
+      margin-top: 10px;
+      width: 100%;
+      font-size: 0.85em;
+    }
+    th, td {
+      padding: 4px 10px;
+      border-bottom: 1px solid #2a2a26;
+      text-align: left;
+    }
+    th { color: #888; font-weight: normal; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .legend {
+      color: #888;
+      font-size: 0.85em;
+      margin-bottom: 16px;
+    }
+    .legend .badge { margin-right: 6px; }
+    a { color: #e6b04b; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>rustorch — browser demo gallery</h1>
+  <p class="lead">
+    Pure-Rust deep-learning library compiled to WebAssembly. Each card
+    below exercises a specific corner of the public API, from raw GPU
+    kernels (WebGPU) to autograd-aware training in the browser (CPU).
+  </p>
+  <p class="legend">
+    <span class="badge gpu">GPU</span> WebGPU compute path&nbsp;&nbsp;
+    <span class="badge cpu">CPU</span> autograd-aware path (no GPU required)&nbsp;&nbsp;
+    <span class="badge train">TRAIN</span> exercises forward + backward + grad processing
+  </p>
+
+  <p style="background:#2a1f0a;border:1px solid #6e5418;padding:10px 14px;border-radius:6px;font-size:0.88em;color:#e6b04b">
+    ⚠ The <strong>GPU</strong> demos exercise the raw WGSL kernel chain
+    via wgpu-22. On macOS Metal that path currently has stability issues
+    that can hang the tab — every GPU button below is wrapped in a
+    <strong>10 s hard timeout</strong> so a stuck kernel aborts cleanly
+    instead of crashing the page. The <strong>CPU</strong> demos run on
+    the autograd stack and are stable; for a real learning demo see
+    <a href="index.html" style="color:#8fcf6f">the live training page</a>.
+  </p>
+
+  <div class="card">
+    <h2>Runtime status</h2>
+    <p id="status">Checking…</p>
+  </div>
+
+  <div class="grid">
+
+    <!-- ============ Demo: GPU smoke test ============ -->
+    <div class="card">
+      <h2>GPU · Smoke test <span class="badge gpu">GPU</span></h2>
+      <p>
+        End-to-end <code>add → relu → softmax</code> on a <code>[B, K]</code>
+        tensor through the WGPU backend. Proves the WASM ↔ WebGPU bridge.
+      </p>
+      <p>
+        <span class="pill">rustorch-wgpu</span>
+        <span class="pill">add</span>
+        <span class="pill">relu</span>
+        <span class="pill">softmax</span>
+      </p>
+      <p>
+        <label>B <input id="smoke-b" type="number" value="2" min="1" max="64" /></label>
+        <label>K <input id="smoke-k" type="number" value="8" min="1" max="2048" /></label>
+        <button id="run-smoke">Run</button>
+      </p>
+      <pre id="smoke-output">(not run yet)</pre>
+    </div>
+
+    <!-- ============ Demo: GPU transformer block ============ -->
+    <div class="card">
+      <h2>GPU · Transformer block <span class="badge gpu">GPU</span></h2>
+      <p>
+        Self-attention block on the WGPU side: <code>matmul(Q, K, V)</code>
+        → naive attention → LayerNorm. All ops are raw GPU kernels.
+      </p>
+      <p>
+        <span class="pill">rustorch-wgpu</span>
+        <span class="pill">matmul</span>
+        <span class="pill">attention_naive</span>
+        <span class="pill">layernorm_rows</span>
+      </p>
+      <p>
+        <label>S <input id="block-s" type="number" value="32" min="1" max="512" /></label>
+        <label>D <input id="block-d" type="number" value="64" min="8" max="512" /></label>
+        <button id="run-block">Run</button>
+      </p>
+      <table id="block-table" style="display:none">
+        <thead><tr><th>phase</th><th class="num">ms</th></tr></thead>
+        <tbody>
+          <tr><td>upload</td><td class="num" id="t-up"></td></tr>
+          <tr><td>compute</td><td class="num" id="t-c"></td></tr>
+          <tr><td>readback</td><td class="num" id="t-r"></td></tr>
+          <tr><td><strong>total</strong></td><td class="num" id="t-tot"></td></tr>
+        </tbody>
+      </table>
+      <pre id="block-output">(not run yet)</pre>
+    </div>
+
+    <!-- ============ Demo: Autograd encoder ============ -->
+    <div class="card featured">
+      <h2>CPU · Transformer encoder <span class="badge cpu">CPU</span></h2>
+      <p>
+        Single-block encoder running <em>entirely</em> through the
+        autograd-aware <code>nn</code> stack — no GPU adapter needed. Combines:
+      </p>
+      <p>
+        <span class="pill">Linear (rank-N)</span>
+        <span class="pill">RMSNorm</span>
+        <span class="pill">SinusoidalPositionalEncoding</span>
+        <span class="pill">MultiHeadAttention</span>
+        <span class="pill">causal_mask</span>
+      </p>
+      <p>
+        <label>B <input id="enc-b" type="number" value="2" min="1" max="32" /></label>
+        <label>T <input id="enc-t" type="number" value="16" min="2" max="256" /></label>
+        <label>D <input id="enc-d" type="number" value="64" min="8" max="512" /></label>
+        <label>heads <input id="enc-h" type="number" value="4" min="1" max="32" /></label>
+        <label><input id="enc-causal" type="checkbox" checked /> causal mask</label>
+        <button id="run-encoder">Run</button>
+      </p>
+      <table id="enc-table" style="display:none">
+        <thead><tr><th>metric</th><th class="num">value</th></tr></thead>
+        <tbody>
+          <tr><td>parameters</td><td class="num" id="enc-pc"></td></tr>
+          <tr><td>compute</td><td class="num" id="enc-c"></td></tr>
+        </tbody>
+      </table>
+      <pre id="enc-output">(not run yet)</pre>
+    </div>
+
+    <!-- ============ Demo: CrossAttentionPool ============ -->
+    <div class="card featured">
+      <h2>CPU · CrossAttentionPool <span class="badge cpu">CPU</span></h2>
+      <p>
+        Pool a variable-length sequence <code>[B, T, D]</code> to a fixed-size
+        <code>[B, num_queries, D]</code> via cross-attention from a learnable
+        query bank — the pattern used by <strong>Perceiver, Q-Former (BLIP-2),
+        Set Transformer</strong>.
+      </p>
+      <p>
+        <span class="pill">CrossAttentionPool</span>
+        <span class="pill">RMSNorm</span>
+        <span class="pill">MultiHeadAttention</span>
+      </p>
+      <p>
+        <label>B <input id="pool-b" type="number" value="2" min="1" max="16" /></label>
+        <label>T <input id="pool-t" type="number" value="32" min="2" max="256" /></label>
+        <label>D <input id="pool-d" type="number" value="64" min="8" max="256" /></label>
+        <label>heads <input id="pool-h" type="number" value="4" min="1" max="16" /></label>
+        <label>queries <input id="pool-q" type="number" value="8" min="1" max="64" /></label>
+        <button id="run-pool">Run</button>
+      </p>
+      <table id="pool-table" style="display:none">
+        <thead><tr><th>metric</th><th class="num">value</th></tr></thead>
+        <tbody>
+          <tr><td>output shape</td><td class="num" id="pool-shape"></td></tr>
+          <tr><td>parameters</td><td class="num" id="pool-pc"></td></tr>
+          <tr><td>compute</td><td class="num" id="pool-c"></td></tr>
+        </tbody>
+      </table>
+      <pre id="pool-output">(not run yet)</pre>
+    </div>
+
+    <!-- ============ Demo: training step ============ -->
+    <div class="card featured">
+      <h2>Training · Forward + backward + clip <span class="badge train">TRAIN</span></h2>
+      <p>
+        One training step on a 2-layer MLP: forward through
+        <code>Linear → relu → Linear</code>, MSE loss, reverse-mode
+        autograd, then <code>clip_grad_norm_</code>. No optimizer step
+        is performed (smoke test of the gradient flow).
+      </p>
+      <p>
+        <span class="pill">Linear</span>
+        <span class="pill">relu</span>
+        <span class="pill">mse_loss</span>
+        <span class="pill">backward</span>
+        <span class="pill">clip_grad_norm_</span>
+      </p>
+      <p>
+        <label>batch <input id="tr-b" type="number" value="8" min="1" max="64" /></label>
+        <label>in <input id="tr-in" type="number" value="32" min="2" max="512" /></label>
+        <label>hidden <input id="tr-h" type="number" value="64" min="2" max="512" /></label>
+        <label>out <input id="tr-out" type="number" value="10" min="1" max="100" /></label>
+        <label>max_norm <input id="tr-mn" type="number" value="1.0" min="0.01" max="100" step="0.1" /></label>
+        <button id="run-train">Run</button>
+      </p>
+      <table id="tr-table" style="display:none">
+        <thead><tr><th>metric</th><th class="num">value</th></tr></thead>
+        <tbody>
+          <tr><td>parameters</td><td class="num" id="tr-pc"></td></tr>
+          <tr><td>loss (MSE)</td><td class="num" id="tr-loss"></td></tr>
+          <tr><td>grad norm (pre-clip)</td><td class="num" id="tr-gn"></td></tr>
+          <tr><td>clipped?</td><td class="num" id="tr-clipped"></td></tr>
+          <tr><td>forward</td><td class="num" id="tr-fwd"></td></tr>
+          <tr><td>backward</td><td class="num" id="tr-bwd"></td></tr>
+          <tr><td>clip</td><td class="num" id="tr-clip"></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>Build &amp; serve</h2>
+    <pre><code>./build.sh        # produces pkg/ next to web/
+python3 -m http.server 8080
+# open http://localhost:8080/web/ in Chrome 120+</code></pre>
+    <p style="color:#888; font-size:0.85em">
+      The CPU demos (encoder, pool, training) work in any browser with
+      WASM support — they don't depend on WebGPU.
+      The GPU demos require Chrome 120+ with WebGPU enabled.
+    </p>
+  </div>
+
+  <p style="color:#666; font-size:0.85em; margin-top:24px">
+    Pages liées :
+    <a href="index.html">Live training demo</a> ·
+    <a href="gpt.html">GPT block (raw WGPU)</a> ·
+    <a href="resnet.html">ResNet block (raw WGPU)</a>
+  </p>
+
+  <!-- wgpu 22 / Chrome 130+ compatibility shim. See wgpu-limits-shim.js. -->
+  <script src="wgpu-limits-shim.js"></script>
+  <script type="module">
+    import init, {
+      run_demo,
+      run_attention_block,
+      run_encoder_block,
+      run_cross_attention_pool,
+      run_training_step,
+    } from "../pkg/rustorch_wasm_demo.js";
+
+    const $ = (id) => document.getElementById(id);
+
+    function setStatus() {
+      const hasGpu = "gpu" in navigator;
+      if (!hasGpu) {
+        $("status").innerHTML =
+          '<span class="warn">⚠ WebGPU not available — GPU demos disabled. CPU demos still work.</span>';
+        $("run-smoke").disabled = true;
+        $("run-block").disabled = true;
+      } else {
+        $("status").innerHTML = '<span class="ok">✓ navigator.gpu present — all demos enabled.</span>';
+      }
+    }
+
+    let initialized = false;
+    async function ensureInit() {
+      if (!initialized) {
+        await init();
+        initialized = true;
+      }
+    }
+
+    async function withErr(outId, fn) {
+      const out = $(outId);
+      try { return await fn(out); }
+      catch (err) {
+        out.innerHTML = `<span class="err">Error: ${err?.message || err}</span>`;
+        throw err;
+      }
+    }
+
+    /// Race a promise against a hard timeout. Used to wrap GPU calls
+    /// so a runaway WGSL kernel can't OOM the tab — it surfaces a clean
+    /// error instead. Pass through unchanged for synchronous CPU paths.
+    function withTimeout(promise, ms, label) {
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error(
+            `${label} did not return within ${ms / 1000}s — aborted to ` +
+            `keep the tab alive. The WGSL kernel chain is known to be ` +
+            `unstable on macOS Metal in this wgpu-22 build. Try smaller ` +
+            `dimensions, or use the CPU demos below.`
+          )),
+          ms
+        )),
+      ]);
+    }
+    const GPU_TIMEOUT_MS = 10_000;
+
+    // Smoke test
+    $("run-smoke").addEventListener("click", () => withErr("smoke-output", async (out) => {
+      out.textContent = "Initializing…";
+      await ensureInit();
+      const b = parseInt($("smoke-b").value);
+      const k = parseInt($("smoke-k").value);
+      const buf = await withTimeout(run_demo(b, k), GPU_TIMEOUT_MS, "GPU smoke test");
+      out.textContent = `[${b}, ${k}] result, first 16:\n` +
+        Array.from(buf).slice(0, 16)
+          .map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
+    }));
+
+    // Transformer block (GPU)
+    $("run-block").addEventListener("click", () => withErr("block-output", async (out) => {
+      out.textContent = "Initializing…";
+      $("block-table").style.display = "none";
+      await ensureInit();
+      const s = parseInt($("block-s").value);
+      const d = parseInt($("block-d").value);
+      const stats = await withTimeout(run_attention_block(s, d), GPU_TIMEOUT_MS, "GPU attention block");
+      $("t-up").textContent  = stats.upload_ms.toFixed(2);
+      $("t-c").textContent   = stats.compute_ms.toFixed(2);
+      $("t-r").textContent   = stats.readback_ms.toFixed(2);
+      $("t-tot").innerHTML   = `<strong>${stats.total_ms.toFixed(2)}</strong>`;
+      $("block-table").style.display = "table";
+      out.textContent = "First 8 outputs:\n" +
+        Array.from(stats.first_eight)
+          .map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
+    }));
+
+    // Encoder block (CPU autograd)
+    $("run-encoder").addEventListener("click", () => withErr("enc-output", async (out) => {
+      out.textContent = "Running…";
+      $("enc-table").style.display = "none";
+      await ensureInit();
+      const b = parseInt($("enc-b").value);
+      const t = parseInt($("enc-t").value);
+      const d = parseInt($("enc-d").value);
+      const h = parseInt($("enc-h").value);
+      const causal = $("enc-causal").checked;
+      const stats = run_encoder_block(b, t, d, h, causal);
+      $("enc-pc").textContent = stats.param_count.toLocaleString();
+      $("enc-c").textContent = `${stats.compute_ms.toFixed(2)} ms`;
+      $("enc-table").style.display = "table";
+      out.textContent =
+        `Output [${b}, ${t}, ${d}], first 8 values:\n` +
+        Array.from(stats.first_eight)
+          .map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
+    }));
+
+    // CrossAttentionPool (CPU)
+    $("run-pool").addEventListener("click", () => withErr("pool-output", async (out) => {
+      out.textContent = "Running…";
+      $("pool-table").style.display = "none";
+      await ensureInit();
+      const b = parseInt($("pool-b").value);
+      const t = parseInt($("pool-t").value);
+      const d = parseInt($("pool-d").value);
+      const h = parseInt($("pool-h").value);
+      const q = parseInt($("pool-q").value);
+      const stats = run_cross_attention_pool(b, t, d, h, q);
+      const shape = Array.from(stats.out_shape).join(" × ");
+      $("pool-shape").textContent = shape;
+      $("pool-pc").textContent = stats.param_count.toLocaleString();
+      $("pool-c").textContent = `${stats.compute_ms.toFixed(2)} ms`;
+      $("pool-table").style.display = "table";
+      out.textContent =
+        `Pooled output, first 8 values:\n` +
+        Array.from(stats.first_eight)
+          .map((v, i) => `[${i}] ${v.toFixed(6)}`).join("\n");
+    }));
+
+    // Training step (CPU)
+    $("run-train").addEventListener("click", () => withErr("tr-table", async () => {
+      $("tr-table").style.display = "none";
+      await ensureInit();
+      const batch  = parseInt($("tr-b").value);
+      const inDim  = parseInt($("tr-in").value);
+      const hidden = parseInt($("tr-h").value);
+      const outDim = parseInt($("tr-out").value);
+      const maxN   = parseFloat($("tr-mn").value);
+      const stats = run_training_step(batch, inDim, hidden, outDim, maxN);
+      $("tr-pc").textContent = stats.param_count.toLocaleString();
+      $("tr-loss").textContent = stats.loss_before.toFixed(6);
+      $("tr-gn").textContent = stats.grad_norm_before_clip.toFixed(4);
+      $("tr-clipped").innerHTML = stats.clipped
+        ? '<span class="ok">yes</span>'
+        : '<span class="warn">no (under max)</span>';
+      $("tr-fwd").textContent = `${stats.forward_ms.toFixed(2)} ms`;
+      $("tr-bwd").textContent = `${stats.backward_ms.toFixed(2)} ms`;
+      $("tr-clip").textContent = `${stats.clip_ms.toFixed(2)} ms`;
+      $("tr-table").style.display = "table";
+    }));
+
+    setStatus();
+  </script>
+</body>
+</html>
