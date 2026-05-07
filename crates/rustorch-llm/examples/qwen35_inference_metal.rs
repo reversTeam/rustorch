@@ -50,10 +50,10 @@ use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, argmax_batched_f32, build_em_perm_f32_into,
     delta_net_step_f32, delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets,
     gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, gqa_decode_f32_nsg2,
-    gqa_decode_f32_splitk, kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32,
-    rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32, rms_norm_per_head_f32,
-    rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
-    rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
+    gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2, kv_append_batched_f32, kv_append_f32,
+    l2_norm_per_head_f32, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
+    rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets,
+    rope_half_split_f32, rope_half_split_partial_batched_f32, sgemm_f32_simdgroup_matrix_into,
     sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
     sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
     sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
@@ -2529,14 +2529,35 @@ fn attn_block_forward(
     //     kv=2048  : 611 → 336 µs  (×1.85)
     //     kv=4096  : 1393 → 358 µs (×3.89 !)
     //   Parity max_rel_err 8.4e-5 (numerical noise from reduction order).
-    // Activable via RUSTORCH_GQA_SPLITK (default ON), RUSTORCH_GQA_NSG2 (=0 to bisect).
+    // T194 — `gqa_decode_f32_splitk_nsg2` widens Phase 1 to 64 threads/TG (NSG=2)
+    //   instead of 32. Doubles SM occupancy at long kv:
+    //     kv=2048  : 333 → 171 µs  (×1.95 vs T190v2)
+    //     kv=4096  : 345 → 194 µs  (×1.78 vs T190v2)
+    //   Parity max_rel_err 2.4e-7 (essentially identical).
+    // Activable via RUSTORCH_GQA_SPLITK_NSG2 (default ON, set =0 to bisect).
+    let use_gqa_splitk_nsg2 = std::env::var("RUSTORCH_GQA_SPLITK_NSG2")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let use_gqa_splitk = std::env::var("RUSTORCH_GQA_SPLITK")
         .map(|v| v != "0")
         .unwrap_or(true);
     let use_gqa_nsg2 = std::env::var("RUSTORCH_GQA_NSG2")
         .map(|v| v != "0")
         .unwrap_or(true);
-    if use_gqa_splitk {
+    if use_gqa_splitk_nsg2 {
+        gqa_decode_f32_splitk_nsg2(
+            backend,
+            &scratch.q,
+            &cache.k_cache,
+            &cache.v_cache,
+            &scratch.attn_out,
+            n_q,
+            n_kv,
+            head_dim,
+            position + 1,
+            max_seq,
+        )?;
+    } else if use_gqa_splitk {
         gqa_decode_f32_splitk(
             backend,
             &scratch.q,
@@ -3044,7 +3065,18 @@ fn ffn_dense_forward(
 
             // 3. T147a — zero the accumulator on GPU (no drain).
             // T173 : skip if async path already zeroed it during AMX overlap.
-            if !use_amx_async {
+            // T193 (REJECTED, default OFF) : `weighted_reduce_store_f32`
+            // overwrites moe_acc in 1 dispatch instead of (zero + accumulate).
+            // Mesured WASH on 35B-A3B (-0.2%, within noise, 6 alternated runs).
+            // Cause : zero_f32 is only 1.5 µs (already cheap), and the store
+            // variant runs at the same kernel time as the accumulate. Encoder
+            // sharing already amortizes the dispatch overhead. Kernel kept in
+            // metal/kernels.rs and activable via RUSTORCH_REDUCE_STORE=1 for
+            // future combination experiments.
+            let use_reduce_store = std::env::var("RUSTORCH_REDUCE_STORE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if !use_amx_async && !use_reduce_store {
                 zero_f32(backend, &scratch.moe_acc, d)?;
             }
 
@@ -3189,16 +3221,30 @@ fn ffn_dense_forward(
             .map_err(|e| MetalError::Unsupported(format!("moe down gather: {e:?}")))?;
             profile_drain_record(backend, "  moe.gather_down", _moe_t0_down);
 
-            // T152 — somme pondérée multi-row : moe_acc += sum_b top_w[b] * down_gather[b, :]
+            // T152 — somme pondérée multi-row : moe_acc = sum_b top_w[b] * down_gather[b, :]
+            // T193 — store-only variant (=) au lieu d'accumulate (+=) : élimine
+            // le zero_f32(moe_acc) précédent. Saves 1 dispatch + 1 DRAM read/layer.
             let _moe_t0_reduce = std::time::Instant::now();
-            weighted_reduce_add_f32(
-                backend,
-                &scratch.moe_down_gather,
-                &scratch.moe_topw_buf,
-                &scratch.moe_acc,
-                n_used,
-                d,
-            )?;
+            if use_reduce_store && !use_amx_async {
+                use rustorch_metal::kernels::weighted_reduce_store_f32;
+                weighted_reduce_store_f32(
+                    backend,
+                    &scratch.moe_down_gather,
+                    &scratch.moe_topw_buf,
+                    &scratch.moe_acc,
+                    n_used,
+                    d,
+                )?;
+            } else {
+                weighted_reduce_add_f32(
+                    backend,
+                    &scratch.moe_down_gather,
+                    &scratch.moe_topw_buf,
+                    &scratch.moe_acc,
+                    n_used,
+                    d,
+                )?;
+            }
             profile_drain_record(backend, "  moe.reduce_top", _moe_t0_reduce);
 
             // 5. Shared expert: standard SwiGLU FFN with sigmoid gate scalar.

@@ -13657,6 +13657,155 @@ kernel void gqa_decode_f32_splitk_phase1(
 }
 "#;
 
+// ============================================================================
+// T194 — Split-K Phase 1 with NSG=2 widening (64 threads per chunk).
+//
+// Original Phase 1 uses 32 threads (1 simdgroup) per chunk.
+// At kv_len=4096 chunks=8 : 128 TGs × 32 threads = 4096 active threads
+// = ~10% saturation of M4 Max (40 SMs × ~1024 max threads = 40K).
+//
+// NSG=2 variant : 128 TGs × 64 threads = 8192 active = ~20% saturation.
+// Each thread does HALF the work (chunk_size/64 vs chunk_size/32 positions).
+// Adds cross-simdgroup reduction in Phase B (max) and C (sum) via threadgroup
+// memory — same pattern as T186 NSG=2 single-TG variant.
+//
+// Expected gain : sub-linear due to BW pressure (already 25% peak), but the
+// extra parallelism should reduce the per-chunk latency at long kv.
+// ============================================================================
+
+const GQA_DECODE_F32_SPLITK_PHASE1_NSG2_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_decode_f32_splitk_phase1_nsg2(
+    device const float* q              [[buffer(0)]],
+    device const float* k_cache        [[buffer(1)]],
+    device const float* v_cache        [[buffer(2)]],
+    device float*       o_partial      [[buffer(3)]],
+    device float*       m_partial      [[buffer(4)]],
+    device float*       l_partial      [[buffer(5)]],
+    constant uint4&     dims           [[buffer(6)]],
+    constant uint2&     chunk_dims     [[buffer(7)]],
+    constant float&     inv_sqrt_d     [[buffer(8)]],
+    threadgroup float*  shared         [[threadgroup(0)]],
+    uint2               tg_id          [[threadgroup_position_in_grid]],
+    ushort              sgitg          [[simdgroup_index_in_threadgroup]],
+    ushort              tiisg          [[thread_index_in_simdgroup]]
+) {
+    // Compute thread index in TG manually : 2 simdgroups × 32 lanes = 64 threads.
+    uint tid = (uint)sgitg * 32u + (uint)tiisg;
+    uint n_q     = dims.x;
+    uint n_kv    = dims.y;
+    uint hd      = dims.z;
+    uint kv_len  = dims.w;
+    uint n_chunks = chunk_dims.x;
+    uint max_seq = chunk_dims.y;
+
+    uint q_h = tg_id.x;
+    uint chunk = tg_id.y;
+    if (q_h >= n_q || chunk >= n_chunks) return;
+
+    uint group_size = n_q / n_kv;
+    uint kv_h = q_h / group_size;
+
+    uint chunk_size = (kv_len + n_chunks - 1u) / n_chunks;
+    uint start = chunk * chunk_size;
+    uint end_p = min(start + chunk_size, kv_len);
+    if (start >= end_p) {
+        if (tid == 0) {
+            m_partial[q_h * n_chunks + chunk] = -INFINITY;
+            l_partial[q_h * n_chunks + chunk] = 0.0;
+        }
+        device float* o_chunk = o_partial + (q_h * n_chunks + chunk) * hd;
+        for (uint i = tid; i < hd; i += 64u) {
+            o_chunk[i] = 0.0;
+        }
+        return;
+    }
+
+    // Layout of `shared` :
+    //   [0 .. chunk_size)            : score buffer
+    //   [chunk_size .. chunk_size+2) : cross-sg max scratch
+    //   [chunk_size+2 .. chunk_size+4) : cross-sg sum scratch
+    threadgroup float* sg_max = shared + chunk_size;
+    threadgroup float* sg_sum = shared + chunk_size + 2u;
+
+    device const float* q_h_ptr = q + q_h * hd;
+    device const float* k_h_base = k_cache + kv_h * max_seq * hd;
+    device const float* v_h_base = v_cache + kv_h * max_seq * hd;
+
+    uint hd4 = hd / 4u;
+    device const float4* q_h_ptr4 = (device const float4*)q_h_ptr;
+
+    // Phase A : compute scores cooperatively (64 threads).
+    for (uint p = start + tid; p < end_p; p += 64u) {
+        device const float4* k_p4 = (device const float4*)(k_h_base + p * hd);
+        float4 acc4 = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint d4 = 0; d4 < hd4; ++d4) {
+            acc4 += q_h_ptr4[d4] * k_p4[d4];
+        }
+        float dot = acc4.x + acc4.y + acc4.z + acc4.w;
+        for (uint d = hd4 * 4u; d < hd; ++d) {
+            dot += q_h_ptr[d] * k_h_base[p * hd + d];
+        }
+        shared[p - start] = dot * inv_sqrt_d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase B : max within chunk via cross-simdgroup reduction.
+    float local_max = -INFINITY;
+    for (uint i = tid; i < (end_p - start); i += 64u) {
+        local_max = max(local_max, shared[i]);
+    }
+    float sg_max_val = simd_max(local_max);
+    if (tiisg == 0) {
+        sg_max[sgitg] = sg_max_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float chunk_max = max(sg_max[0], sg_max[1]);
+
+    // Phase C : exp + sum within chunk, store back as exp values.
+    float local_sum = 0.0;
+    for (uint i = tid; i < (end_p - start); i += 64u) {
+        float e = exp(shared[i] - chunk_max);
+        shared[i] = e;
+        local_sum += e;
+    }
+    float sg_sum_val = simd_sum(local_sum);
+    if (tiisg == 0) {
+        sg_sum[sgitg] = sg_sum_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float chunk_sum = sg_sum[0] + sg_sum[1];
+
+    // Phase D : V-weighted sum over chunk → o_chunk[hd]. 64 threads, stride 64.
+    device float* o_chunk = o_partial + (q_h * n_chunks + chunk) * hd;
+    uint hd4_d = hd / 4u;
+    device float4* o_chunk4 = (device float4*)o_chunk;
+    for (uint d4 = tid; d4 < hd4_d; d4 += 64u) {
+        float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint p = 0; p < (end_p - start); ++p) {
+            device const float4* v_p4 = (device const float4*)(v_h_base + (start + p) * hd);
+            acc += shared[p] * v_p4[d4];
+        }
+        o_chunk4[d4] = acc;
+    }
+    uint tail_start = hd4_d * 4u;
+    for (uint d = tail_start + tid; d < hd; d += 64u) {
+        float acc = 0.0;
+        for (uint p = 0; p < (end_p - start); ++p) {
+            acc += shared[p] * v_h_base[(start + p) * hd + d];
+        }
+        o_chunk[d] = acc;
+    }
+
+    if (tid == 0) {
+        m_partial[q_h * n_chunks + chunk] = chunk_max;
+        l_partial[q_h * n_chunks + chunk] = chunk_sum;
+    }
+}
+"#;
+
 const GQA_DECODE_F32_SPLITK_PHASE2_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -13713,6 +13862,96 @@ kernel void gqa_decode_f32_splitk_phase2(
     }
 }
 "#;
+
+/// T194 — split-K GQA decode with NSG=2 widening in Phase 1.
+/// Same dispatch shape as `gqa_decode_f32_splitk` but uses 64 threads/TG instead of 32.
+/// Activable via RUSTORCH_SPLITK_NSG2 env var (see prod wiring).
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_decode_f32_splitk_nsg2(
+    backend: &MetalBackend,
+    q_buf: &Buffer,
+    k_cache: &Buffer,
+    v_cache: &Buffer,
+    out_buf: &Buffer,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    kv_len: usize,
+    max_seq: usize,
+) -> Result<(), MetalError> {
+    if head_dim == 0 || head_dim % 4 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "gqa_decode_f32_splitk_nsg2: head_dim={head_dim} must be > 0 and %4==0"
+        )));
+    }
+    let n_chunks: usize = if kv_len <= 1024 {
+        1
+    } else if kv_len <= 2048 {
+        4
+    } else {
+        8
+    };
+    if n_chunks == 1 {
+        return gqa_decode_f32_nsg2(
+            backend, q_buf, k_cache, v_cache, out_buf, n_heads, n_kv, head_dim, kv_len, max_seq,
+        );
+    }
+    let o_partial_bytes = n_heads * n_chunks * head_dim * 4;
+    let ml_bytes = n_heads * n_chunks * 4;
+    let o_partial = backend.pool_get(o_partial_bytes)?;
+    let m_partial = backend.pool_get(ml_bytes)?;
+    let l_partial = backend.pool_get(ml_bytes)?;
+
+    let chunk_size = kv_len.div_ceil(n_chunks);
+    let pipeline_p1 = backend.pipeline(
+        "gqa_decode_f32_splitk_phase1_nsg2",
+        GQA_DECODE_F32_SPLITK_PHASE1_NSG2_SHADER,
+        "gqa_decode_f32_splitk_phase1_nsg2",
+    )?;
+    let dims = [n_heads as u32, n_kv as u32, head_dim as u32, kv_len as u32];
+    let chunk_dims = [n_chunks as u32, max_seq as u32];
+    let inv_sqrt_d: f32 = 1.0 / (head_dim as f32).sqrt();
+    // Layout : chunk_size scores + 4 cross-sg scratch floats.
+    let shared_bytes_p1 = ((chunk_size + 4) * 4) as u64;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline_p1);
+        encoder.set_buffer(0, Some(q_buf), 0);
+        encoder.set_buffer(1, Some(k_cache), 0);
+        encoder.set_buffer(2, Some(v_cache), 0);
+        encoder.set_buffer(3, Some(&o_partial), 0);
+        encoder.set_buffer(4, Some(&m_partial), 0);
+        encoder.set_buffer(5, Some(&l_partial), 0);
+        encoder.set_bytes(6, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(7, 8, chunk_dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(8, 4, &inv_sqrt_d as *const f32 as *const std::ffi::c_void);
+        encoder.set_threadgroup_memory_length(0, shared_bytes_p1);
+        let tg_size = MTLSize::new(64, 1, 1); // T194 — 2 simdgroups × 32
+        let groups = MTLSize::new(n_heads as u64, n_chunks as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+
+    let pipeline_p2 = backend.pipeline(
+        "gqa_decode_f32_splitk_phase2",
+        GQA_DECODE_F32_SPLITK_PHASE2_SHADER,
+        "gqa_decode_f32_splitk_phase2",
+    )?;
+    let dims_p2 = [n_heads as u32, head_dim as u32, n_chunks as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline_p2);
+        encoder.set_buffer(0, Some(&o_partial), 0);
+        encoder.set_buffer(1, Some(&m_partial), 0);
+        encoder.set_buffer(2, Some(&l_partial), 0);
+        encoder.set_buffer(3, Some(out_buf), 0);
+        encoder.set_bytes(4, 12, dims_p2.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let groups = MTLSize::new(n_heads as u64, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    backend.pool_return(o_partial, o_partial_bytes);
+    backend.pool_return(m_partial, ml_bytes);
+    backend.pool_return(l_partial, ml_bytes);
+    Ok(())
+}
 
 /// T190 v2 — split-K GQA decode (f32 K). Drop-in replacement for `gqa_decode_f32_nsg2`.
 /// Auto-selects n_chunks based on kv_len ; falls back to NSG=2 for kv ≤ 256.
@@ -17278,6 +17517,69 @@ kernel void weighted_reduce_add_f32(
     acc[gid] += s;
 }
 "#;
+
+// T193 — store-only variant of weighted_reduce_add : `acc[d] = sum_b w[b] * src[b, d]`.
+// Drop-in replacement when caller doesn't need to accumulate (i.e. acc is fresh).
+// Eliminates the `zero_f32(acc)` dispatch that would otherwise be needed before
+// `weighted_reduce_add`. Saves 1 dispatch per MoE layer × 40 = 40 dispatches/token
+// on 35B-A3B. Plus 1 less DRAM write (`acc[d] += s` is store-after-load whereas
+// `acc[d] = s` is pure store).
+const WEIGHTED_REDUCE_STORE_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void weighted_reduce_store_f32(
+    device const float* src      [[buffer(0)]],   // [B, D]
+    device const float* weights  [[buffer(1)]],   // [B]
+    device       float* acc      [[buffer(2)]],   // [D] out (overwritten)
+    constant uint2&     dims     [[buffer(3)]],   // (B, D)
+    uint                gid      [[thread_position_in_grid]]
+) {
+    uint B = dims.x;
+    uint D = dims.y;
+    if (gid >= D) return;
+    float s = 0.0;
+    for (uint b = 0; b < B; b++) {
+        s += weights[b] * src[b * D + gid];
+    }
+    acc[gid] = s;
+}
+"#;
+
+/// T193 — store-only weighted reduce : `acc[d] = sum_b w[b] * src[b, d]`.
+/// Drop-in replacement for `zero_f32(acc) + weighted_reduce_add_f32(...)`.
+/// Saves 1 dispatch + the DRAM read of `acc[d]` in the accumulate variant.
+pub fn weighted_reduce_store_f32(
+    backend: &MetalBackend,
+    src_buf: &Buffer,
+    weights_buf: &Buffer,
+    acc_buf: &Buffer,
+    b: usize,
+    d: usize,
+) -> Result<(), MetalError> {
+    if b == 0 || d == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "weighted_reduce_store_f32: B={b}, D={d} must be > 0"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "weighted_reduce_store_f32",
+        WEIGHTED_REDUCE_STORE_F32_SHADER,
+        "weighted_reduce_store_f32",
+    )?;
+    let dims = [b as u32, d as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src_buf), 0);
+        encoder.set_buffer(1, Some(weights_buf), 0);
+        encoder.set_buffer(2, Some(acc_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(d as u64, 1, 1);
+        encoder.dispatch_threads(grid, tg);
+    });
+    Ok(())
+}
 
 // T162 phase 9f — Batched weighted reduce per token.
 // `acc[t, d] += sum_b weights[t, b] * src[t, b, d]` pour T tokens en parallèle.

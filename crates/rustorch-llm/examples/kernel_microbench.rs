@@ -1253,6 +1253,96 @@ fn main() {
                 10,
             ));
         }
+
+        // T194 — Parity check : split-K NSG=2 vs NSG=1 at kv_len=4096.
+        {
+            use rustorch_metal::kernels::gqa_decode_f32_splitk_nsg2;
+            let q_test = fake_f32(n_q * hd, 7.7);
+            let k_test = fake_f32(n_kv * hd * max_seq, 8.8);
+            let v_test = fake_f32(n_kv * hd * max_seq, 9.9);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    q_test.as_ptr(),
+                    q.contents() as *mut f32,
+                    q_test.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    k_test.as_ptr(),
+                    kc.contents() as *mut f32,
+                    k_test.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    v_test.as_ptr(),
+                    vc.contents() as *mut f32,
+                    v_test.len(),
+                );
+            }
+            let kv_len = 4096usize;
+            gqa_decode_f32_splitk(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let mut out_v1 = vec![0.0_f32; n_q * hd];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out.contents() as *const f32,
+                    out_v1.as_mut_ptr(),
+                    n_q * hd,
+                );
+            }
+            gqa_decode_f32_splitk_nsg2(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let mut out_v2 = vec![0.0_f32; n_q * hd];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out.contents() as *const f32,
+                    out_v2.as_mut_ptr(),
+                    n_q * hd,
+                );
+            }
+            let mut max_rel = 0.0_f32;
+            for (a, b) in out_v1.iter().zip(out_v2.iter()) {
+                let denom = a.abs().max(1e-4);
+                let rel = (a - b).abs() / denom;
+                if rel > max_rel {
+                    max_rel = rel;
+                }
+            }
+            println!(
+                "Parity T194 split-K NSG=2 (kv_len={kv_len}): max_rel_err = {max_rel:.3e}  ({})",
+                if max_rel < 1e-3 {
+                    "PASS ✓"
+                } else {
+                    "FAIL ✗"
+                }
+            );
+        }
+
+        // T194 — bench split-K NSG=2 across kv_len.
+        for &kv_len in &[1024usize, 2048, 4096] {
+            use rustorch_metal::kernels::gqa_decode_f32_splitk_nsg2;
+            gqa_decode_f32_splitk_nsg2(backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq)
+                .unwrap();
+            backend.drain();
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                gqa_decode_f32_splitk_nsg2(
+                    backend, &q, &kc, &vc, &out, n_q, n_kv, hd, kv_len, max_seq,
+                )
+                .unwrap();
+            }
+            backend.drain();
+            let dt = t0.elapsed();
+            let label: String = format!("T194 splitK_NSG2 kv={kv_len}");
+            let leaked: &'static str = Box::leak(label.into_boxed_str());
+            results.push((
+                leaked.to_string(),
+                dt.as_secs_f64() * 1000.0,
+                dt.as_secs_f64() * 1e6 / ITERS as f64,
+                format!("n_q={n_q} n_kv={n_kv} hd={hd} kv_len={kv_len} splitK NSG=2"),
+                10,
+            ));
+        }
         // Parity: NSG=2 vs original on kv_len=256
         {
             let q_test = fake_f32(n_q * hd, 1.1);
