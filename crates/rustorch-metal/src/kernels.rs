@@ -15034,9 +15034,37 @@ pub fn ssm_conv1d_step_f32_with_offset(
     kernel_size: usize,
     conv_dim: usize,
 ) -> Result<(), MetalError> {
+    ssm_conv1d_step_f32_with_io_offsets(
+        backend,
+        x_in_buf,
+        x_in_offset_bytes,
+        conv1d_w_buf,
+        conv_state_buf,
+        y_out_buf,
+        0,
+        kernel_size,
+        conv_dim,
+    )
+}
+
+/// T200.3 — Same as `ssm_conv1d_step_f32_with_offset` but also supports
+/// an output offset, allowing the per-timestep conv result to be written
+/// into a batched [B, conv_dim] buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_conv1d_step_f32_with_io_offsets(
+    backend: &MetalBackend,
+    x_in_buf: &Buffer,
+    x_in_offset_bytes: usize,
+    conv1d_w_buf: &Buffer,
+    conv_state_buf: &Buffer,
+    y_out_buf: &Buffer,
+    y_out_offset_bytes: usize,
+    kernel_size: usize,
+    conv_dim: usize,
+) -> Result<(), MetalError> {
     if kernel_size == 0 || conv_dim == 0 {
         return Err(MetalError::ShapeMismatch(format!(
-            "ssm_conv1d_step_f32_with_offset: kernel_size={kernel_size}, conv_dim={conv_dim}"
+            "ssm_conv1d_step_f32_with_io_offsets: kernel_size={kernel_size}, conv_dim={conv_dim}"
         )));
     }
     let pipeline = backend.pipeline(
@@ -15050,7 +15078,7 @@ pub fn ssm_conv1d_step_f32_with_offset(
         encoder.set_buffer(0, Some(x_in_buf), x_in_offset_bytes as u64);
         encoder.set_buffer(1, Some(conv1d_w_buf), 0);
         encoder.set_buffer(2, Some(conv_state_buf), 0);
-        encoder.set_buffer(3, Some(y_out_buf), 0);
+        encoder.set_buffer(3, Some(y_out_buf), y_out_offset_bytes as u64);
         encoder.set_bytes(4, 8, dims.as_ptr() as *const std::ffi::c_void);
         let tg = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new(conv_dim as u64, 1, 1);

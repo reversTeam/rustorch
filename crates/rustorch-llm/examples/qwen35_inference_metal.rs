@@ -48,22 +48,22 @@ use rustorch_metal::backend_singleton::metal_backend;
 use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, argmax_batched_f32, build_em_perm_f32_into,
-    delta_net_step_f32, delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets,
-    delta_net_step_with_l2_f32_with_qkv_offsets, gather_pack_rows_f32, gqa_decode_batched_f32,
-    gqa_decode_f32, gqa_decode_f32_nsg2, gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2,
-    gqa_decode_f32_splitk_nsg4, kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32,
-    mul_mm_id_map0_into, mul_mm_id_q4_k_f32_into, mul_mm_id_q4_k_q4_k_swiglu_f32_into,
-    mul_mm_id_q5_k_f32_into, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
-    rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets,
-    rope_half_split_f32, rope_half_split_partial_batched_f32, scatter_moe_acc_f32_into,
-    sgemm_f32_simdgroup_matrix_into, sgemm_q3_k_f32_simdgroup_matrix_64_into,
-    sgemm_q3_k_f32_simdgroup_matrix_into, sgemm_q4_k_f32_expert_major_8x64_half_into,
-    sgemm_q4_k_f32_expert_major_8x8_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
-    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q5_k_f32_expert_major_8x64_half_into,
-    sgemm_q5_k_f32_expert_major_8x8_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
-    sgemm_q6_k_f32_simdgroup_matrix_into, sgemm_q8_0_f32_8x64_half_into,
-    sgemm_q8_0_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
-    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+    delta_net_persistent_scan_f32_into, delta_net_step_f32, delta_net_step_with_l2_f32,
+    delta_net_step_with_l2_f32_with_offsets, delta_net_step_with_l2_f32_with_qkv_offsets,
+    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, gqa_decode_f32_nsg2,
+    gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2, gqa_decode_f32_splitk_nsg4,
+    kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, mul_mm_id_map0_into,
+    mul_mm_id_q4_k_f32_into, mul_mm_id_q4_k_q4_k_swiglu_f32_into, mul_mm_id_q5_k_f32_into,
+    rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32, rms_norm_per_head_f32,
+    rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
+    rope_half_split_partial_batched_f32, scatter_moe_acc_f32_into, sgemm_f32_simdgroup_matrix_into,
+    sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
+    sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
+    sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
+    sgemm_q5_k_f32_expert_major_8x64_half_into, sgemm_q5_k_f32_expert_major_8x8_into,
+    sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
+    sgemm_q8_0_f32_8x64_half_into, sgemm_q8_0_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into,
+    sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
     sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into,
     sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
     sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
@@ -71,10 +71,10 @@ use rustorch_metal::kernels::{
     sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32,
     split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
     ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
-    ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
-    topk_softmax_norm_f32, topk_softmax_norm_parallel_f32, unpermute_rows_f32,
-    weighted_add_inplace_f32, weighted_reduce_add_batched_f32, weighted_reduce_add_f32,
-    weighted_scatter_add_f32, zero_f32,
+    ssm_conv1d_step_f32_with_io_offsets, ssm_conv1d_step_f32_with_offset, swiglu_batched_f32,
+    swiglu_f32, topk_softmax_norm_batched_f32, topk_softmax_norm_f32,
+    topk_softmax_norm_parallel_f32, unpermute_rows_f32, weighted_add_inplace_f32,
+    weighted_reduce_add_batched_f32, weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
 };
 
 /// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
@@ -1419,6 +1419,10 @@ struct BatchScratchSsm {
     beta_sig: Buffer,    // [B_MAX, n_v]
     ssm_out_buf: Buffer, // [B_MAX, value_dim]
     o: Buffer,           // [B_MAX, d] post-ssm_out projection
+    /// T200.3 — Batched conv1d output buffer for persistent scan path.
+    /// Layout: [B_MAX, conv_dim]. Written per-step via conv1d_step with
+    /// io_offsets, read by delta_net_persistent_scan_f32_into.
+    conv_out_batched: Buffer,
 }
 
 impl BatchScratchSsm {
@@ -1442,6 +1446,7 @@ impl BatchScratchSsm {
             beta_sig: alloc(b * n_v * 4),
             ssm_out_buf: alloc(b * value_dim * 4),
             o: alloc(b * d * 4),
+            conv_out_batched: alloc(b * conv_dim * 4),
         }
     }
 }
@@ -1550,56 +1555,108 @@ fn ssm_block_forward_batch(
     let value_off_stride = value_dim * 4;
     let n_v_off_stride = n_v * 4;
     let _t_scan = std::time::Instant::now();
-    for bi in 0..b {
-        // Conv1d step lit batch_scratch.qkv_mixed[bi*conv_dim..] directement.
-        ssm_conv1d_step_f32_with_offset(
+    // T200.3 — Persistent scan path (opt-in via RUSTORCH_T200=1).
+    // Replaces B per-timestep delta_net dispatches by 1 persistent_scan call.
+    // Conv1d and gated_norm still per-step (their state/locality differ).
+    // Net dispatches per layer: 2*B + 1 (vs 3*B before T200).
+    let env_t200 = std::env::var("RUSTORCH_T200")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if env_t200 {
+        // Phase A : per-step conv1d, write each output to batched buffer
+        // [B, conv_dim]. Conv1d's recurrent state forces sequential dispatches.
+        for bi in 0..b {
+            ssm_conv1d_step_f32_with_io_offsets(
+                backend,
+                &batch_scratch.qkv_mixed,
+                bi * conv_off_stride,
+                &ssm.conv1d,
+                &s.conv_state,
+                &batch_scratch.conv_out_batched,
+                bi * conv_off_stride,
+                cfg.ssm_conv_kernel,
+                conv_dim,
+            )?;
+        }
+        // Phase B : single persistent_scan dispatch over all B timesteps.
+        // State row stays in registers across timesteps; B-1 state DRAM
+        // round-trips eliminated.
+        delta_net_persistent_scan_f32_into(
             backend,
-            &batch_scratch.qkv_mixed,
-            bi * conv_off_stride,
-            &ssm.conv1d,
-            &s.conv_state,
-            &scratch.conv_out,
-            cfg.ssm_conv_kernel,
-            conv_dim,
-        )?;
-        // T199b — split_qkv_f32 ELIMINATED. delta_net reads q/k/v directly
-        // from conv_out via Metal buffer offsets (set_buffer with byte offset).
-        // q at offset 0 (key_dim elements), k at offset key_dim*4, v at
-        // offset 2*key_dim*4. Saves 1 dispatch + 1 buffer-to-buffer copy per
-        // SSM scan step (= B × 30_layers × 4_chunks per prefill = ~15k saved).
-        delta_net_step_with_l2_f32_with_qkv_offsets(
-            backend,
-            &scratch.conv_out,
-            0,
-            &scratch.conv_out,
-            key_dim * 4,
-            &scratch.conv_out,
-            2 * key_dim * 4,
+            &batch_scratch.conv_out_batched,
             &batch_scratch.gate_h,
-            bi * n_v_off_stride,
             &batch_scratch.beta_sig,
-            bi * n_v_off_stride,
             &s.state,
             &batch_scratch.ssm_out_buf,
-            bi * value_off_stride,
+            b,
             n_v,
             head_v_dim,
             n_k,
+            conv_dim,
             eps,
         )?;
-        // RMS norm gated by silu(z) : in-place sur batch_scratch.ssm_out_buf[bi]
-        // avec gating depuis batch_scratch.z[bi].
-        rms_norm_per_head_gated_f32_with_offsets(
-            backend,
-            &batch_scratch.ssm_out_buf,
-            bi * value_off_stride,
-            &ssm.ssm_norm,
-            &batch_scratch.z,
-            bi * value_off_stride,
-            n_v,
-            head_v_dim,
-            eps,
-        )?;
+        // Phase C : per-step gated norm (no recurrent state, just element-wise
+        // per head, but kept per-step until a batched variant is added).
+        for bi in 0..b {
+            rms_norm_per_head_gated_f32_with_offsets(
+                backend,
+                &batch_scratch.ssm_out_buf,
+                bi * value_off_stride,
+                &ssm.ssm_norm,
+                &batch_scratch.z,
+                bi * value_off_stride,
+                n_v,
+                head_v_dim,
+                eps,
+            )?;
+        }
+    } else {
+        for bi in 0..b {
+            // Conv1d step lit batch_scratch.qkv_mixed[bi*conv_dim..] directement.
+            ssm_conv1d_step_f32_with_offset(
+                backend,
+                &batch_scratch.qkv_mixed,
+                bi * conv_off_stride,
+                &ssm.conv1d,
+                &s.conv_state,
+                &scratch.conv_out,
+                cfg.ssm_conv_kernel,
+                conv_dim,
+            )?;
+            // T199b — split_qkv_f32 ELIMINATED via Metal buffer offsets.
+            delta_net_step_with_l2_f32_with_qkv_offsets(
+                backend,
+                &scratch.conv_out,
+                0,
+                &scratch.conv_out,
+                key_dim * 4,
+                &scratch.conv_out,
+                2 * key_dim * 4,
+                &batch_scratch.gate_h,
+                bi * n_v_off_stride,
+                &batch_scratch.beta_sig,
+                bi * n_v_off_stride,
+                &s.state,
+                &batch_scratch.ssm_out_buf,
+                bi * value_off_stride,
+                n_v,
+                head_v_dim,
+                n_k,
+                eps,
+            )?;
+            rms_norm_per_head_gated_f32_with_offsets(
+                backend,
+                &batch_scratch.ssm_out_buf,
+                bi * value_off_stride,
+                &ssm.ssm_norm,
+                &batch_scratch.z,
+                bi * value_off_stride,
+                n_v,
+                head_v_dim,
+                eps,
+            )?;
+        }
     }
     profile_drain_record(backend, "  fbs.scan_loop", _t_scan);
 
