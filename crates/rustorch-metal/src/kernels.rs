@@ -12458,6 +12458,29 @@ pub fn add_inplace_batched_f32(
     d: usize,
     b: usize,
 ) -> Result<(), MetalError> {
+    add_inplace_batched_f32_with_y_offset(backend, x_buf, y_buf, 0, d, b)
+}
+
+/// T220.2 — Same as `add_inplace_batched_f32` but with a byte offset on the
+/// y buffer. Used by the InferenceHooks consumer to read a per-layer slice
+/// from a layer-major contiguous hidden_offsets buffer (`[n_layers, B, d]`).
+///
+/// The y_offset_bytes must be a multiple of 16 (float4 alignment) for the
+/// vectorized path to remain valid. Practically this means
+/// `layer_idx * stride_bytes` where `stride_bytes = B_MAX * d * 4`.
+pub fn add_inplace_batched_f32_with_y_offset(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    y_buf: &Buffer,
+    y_offset_bytes: usize,
+    d: usize,
+    b: usize,
+) -> Result<(), MetalError> {
+    if y_offset_bytes % 16 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "add_inplace_batched_f32_with_y_offset: y_offset_bytes ({y_offset_bytes}) must be 16-aligned for float4 path"
+        )));
+    }
     let pipeline = backend.pipeline(
         "add_inplace_batched_f32",
         ADD_INPLACE_BATCHED_F32_SHADER,
@@ -12468,7 +12491,7 @@ pub fn add_inplace_batched_f32(
     backend.with_encoder(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), 0);
-        encoder.set_buffer(1, Some(y_buf), 0);
+        encoder.set_buffer(1, Some(y_buf), y_offset_bytes as u64);
         encoder.set_bytes(2, 8, dims.as_ptr() as *const std::ffi::c_void);
         let tg_size = MTLSize::new(256, 1, 1);
         let t4 = (total / 4) as u64;
