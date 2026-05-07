@@ -3782,6 +3782,7 @@ dependencies = [
 name = "rustorch-llm"
 version = "0.0.1"
 dependencies = [
+ "half",
  "metal",
  "rustorch-core",
  "rustorch-cpu",
