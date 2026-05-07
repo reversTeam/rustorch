@@ -49,20 +49,21 @@ use rustorch_metal::error::MetalError;
 use rustorch_metal::kernels::{
     add_inplace_batched_f32, add_inplace_f32, argmax_batched_f32, build_em_perm_f32_into,
     delta_net_step_f32, delta_net_step_with_l2_f32, delta_net_step_with_l2_f32_with_offsets,
-    gather_pack_rows_f32, gqa_decode_batched_f32, gqa_decode_f32, gqa_decode_f32_nsg2,
-    gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2, gqa_decode_f32_splitk_nsg4,
-    kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32, mul_mm_id_map0_into,
-    mul_mm_id_q4_k_f32_into, mul_mm_id_q4_k_q4_k_swiglu_f32_into, mul_mm_id_q5_k_f32_into,
-    rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32, rms_norm_per_head_f32,
-    rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets, rope_half_split_f32,
-    rope_half_split_partial_batched_f32, scatter_moe_acc_f32_into, sgemm_f32_simdgroup_matrix_into,
-    sgemm_q3_k_f32_simdgroup_matrix_64_into, sgemm_q3_k_f32_simdgroup_matrix_into,
-    sgemm_q4_k_f32_expert_major_8x64_half_into, sgemm_q4_k_f32_expert_major_8x8_into,
-    sgemm_q4_k_f32_simdgroup_matrix_64_into, sgemm_q4_k_f32_simdgroup_matrix_into,
-    sgemm_q5_k_f32_expert_major_8x64_half_into, sgemm_q5_k_f32_expert_major_8x8_into,
-    sgemm_q6_k_f32_simdgroup_matrix_64_into, sgemm_q6_k_f32_simdgroup_matrix_into,
-    sgemm_q8_0_f32_8x64_half_into, sgemm_q8_0_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into,
-    sgemv_q3_k_f32_lcpp_nsg1_into, sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+    delta_net_step_with_l2_f32_with_qkv_offsets, gather_pack_rows_f32, gqa_decode_batched_f32,
+    gqa_decode_f32, gqa_decode_f32_nsg2, gqa_decode_f32_splitk, gqa_decode_f32_splitk_nsg2,
+    gqa_decode_f32_splitk_nsg4, kv_append_batched_f32, kv_append_f32, l2_norm_per_head_f32,
+    mul_mm_id_map0_into, mul_mm_id_q4_k_f32_into, mul_mm_id_q4_k_q4_k_swiglu_f32_into,
+    mul_mm_id_q5_k_f32_into, rms_norm_batched_f32, rms_norm_f32, rms_norm_per_head_batched_f32,
+    rms_norm_per_head_f32, rms_norm_per_head_gated_f32, rms_norm_per_head_gated_f32_with_offsets,
+    rope_half_split_f32, rope_half_split_partial_batched_f32, scatter_moe_acc_f32_into,
+    sgemm_f32_simdgroup_matrix_into, sgemm_q3_k_f32_simdgroup_matrix_64_into,
+    sgemm_q3_k_f32_simdgroup_matrix_into, sgemm_q4_k_f32_expert_major_8x64_half_into,
+    sgemm_q4_k_f32_expert_major_8x8_into, sgemm_q4_k_f32_simdgroup_matrix_64_into,
+    sgemm_q4_k_f32_simdgroup_matrix_into, sgemm_q5_k_f32_expert_major_8x64_half_into,
+    sgemm_q5_k_f32_expert_major_8x8_into, sgemm_q6_k_f32_simdgroup_matrix_64_into,
+    sgemm_q6_k_f32_simdgroup_matrix_into, sgemm_q8_0_f32_8x64_half_into,
+    sgemm_q8_0_f32_simdgroup_matrix_into, sgemv_f32_lcpp_simd_into, sgemv_q3_k_f32_lcpp_nsg1_into,
+    sgemv_q3_k_f32_lcpp_nsg2_into, sgemv_q4_k_f32_lcpp_nsg2_into,
     sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into,
     sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
     sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
@@ -1561,24 +1562,19 @@ fn ssm_block_forward_batch(
             cfg.ssm_conv_kernel,
             conv_dim,
         )?;
-        // GPU split q/k/v (single-token scratch, pas d'offset).
-        split_qkv_f32(
+        // T199b — split_qkv_f32 ELIMINATED. delta_net reads q/k/v directly
+        // from conv_out via Metal buffer offsets (set_buffer with byte offset).
+        // q at offset 0 (key_dim elements), k at offset key_dim*4, v at
+        // offset 2*key_dim*4. Saves 1 dispatch + 1 buffer-to-buffer copy per
+        // SSM scan step (= B × 30_layers × 4_chunks per prefill = ~15k saved).
+        delta_net_step_with_l2_f32_with_qkv_offsets(
             backend,
             &scratch.conv_out,
-            &scratch.q_ssm,
-            &scratch.k_ssm,
-            &scratch.v_ssm,
-            key_dim,
-            key_dim,
-            value_dim,
-        )?;
-        // delta_net : lit gate_h[bi*n_v..] et beta_sig[bi*n_v..] depuis batch,
-        // écrit directement dans batch_scratch.ssm_out_buf[bi*value_dim..].
-        delta_net_step_with_l2_f32_with_offsets(
-            backend,
-            &scratch.q_ssm,
-            &scratch.k_ssm,
-            &scratch.v_ssm,
+            0,
+            &scratch.conv_out,
+            key_dim * 4,
+            &scratch.conv_out,
+            2 * key_dim * 4,
             &batch_scratch.gate_h,
             bi * n_v_off_stride,
             &batch_scratch.beta_sig,
