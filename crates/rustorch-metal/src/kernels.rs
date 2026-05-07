@@ -17584,6 +17584,384 @@ pub fn mul_mm_id_q5_k_f32_into(
     Ok(())
 }
 
+// ============================================================================
+// T198 — FUSED mul_mm_id Q4_K + Q4_K + SwiGLU (single-pass gate/up/swiglu).
+//
+// Replaces 3 separate kernels (mm_id_q4_k(gate) + mm_id_q4_k(up) + swiglu)
+// by ONE kernel that computes both matmuls in the same K loop, applies
+// swiglu inline, and writes only the silu output.
+//
+// DRAM savings per layer per chunk (35B-A3B B=128, ef=512):
+//   - 1 read of `act` avoided   (h_post 1 MB → 0)
+//   - 2 writes gate_out + up_out avoided (64 MB + 64 MB = 128 MB)
+//   - 2 reads gate_out + up_out avoided  (128 MB)
+//   = ~257 MB DRAM saved per (layer, chunk).
+//   At 546 GB/s : ~0.47 ms saved per (layer, chunk).
+//   For 40 layers × 4 chunks : ~75 ms saved per prefill.
+//
+// TG memory budget: sa_gate (4 KB) + sa_up (4 KB) + sb (2 KB) = 10 KB
+//   (vs 6 KB in non-fused). Well under M4 Max 32 KB limit.
+//
+// Register pressure: 16 simdgroup_matrix<float,8,8> accumulators per SG
+// (8 gate + 8 up). 16 KB across 4 SGs. Should fit (Apple GPU ~32K regs/TG).
+// ============================================================================
+
+const MUL_MM_ID_Q4_K_Q4_K_SWIGLU_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+constant uint Q4K_BYTES = 144u;
+constant uint Q4K_WEIGHTS = 256u;
+
+constant uint NR_W = 64u;     // BN
+constant uint NR_A = 32u;     // BM
+constant uint NK   = 32u;     // K-tile per loop
+constant uint NL0  = NK / 16u; // = 2
+constant uint NL1  = NK / 8u;  // = 4
+
+kernel void mul_mm_id_q4_k_q4_k_swiglu_f32(
+    device const float*  act     [[buffer(0)]],   // [B, K] f32
+    device const uchar*  W_gate  [[buffer(1)]],   // [E, N, K] Q4_K (gate weights)
+    device const uchar*  W_up    [[buffer(2)]],   // [E, N, K] Q4_K (up weights)
+    device const uint*   ids     [[buffer(3)]],   // [E, M_max] from map0
+    device const uint*   tpe     [[buffer(4)]],   // [E] tokens per expert
+    device float*        dst     [[buffer(5)]],   // [E, M_max, N] silu output
+    constant uint4&      dims    [[buffer(6)]],   // (M_max, N, K, n_used)
+    uint3                tgpig   [[threadgroup_position_in_grid]],
+    ushort               tiitg   [[thread_index_in_threadgroup]],
+    ushort               sgitg   [[simdgroup_index_in_threadgroup]]
+) {
+    uint M_max = dims.x;
+    uint N = dims.y;
+    uint K = dims.z;
+    uint n_used = dims.w;
+
+    uint expert = tgpig.z;
+    uint m_tile = tgpig.y * NR_A;
+    uint n_tile = tgpig.x * NR_W;
+
+    uint expert_tpe = tpe[expert];
+    if (m_tile >= expert_tpe) return;
+
+    threadgroup half sa_gate[64 * 32];
+    threadgroup half sa_up[64 * 32];
+    threadgroup half sb[32 * 32];
+
+    uint blocks_per_row_q4k = K / Q4K_WEIGHTS;
+    uint w_row_stride_bytes = blocks_per_row_q4k * Q4K_BYTES;
+    uint w_expert_byte_offset = expert * N * w_row_stride_bytes;
+
+    uint sa_row = tiitg / NL0;
+    uint sa_chunk = tiitg % NL0;
+    uint sb_row = tiitg / NL1;
+    uint sb_chunk = tiitg % NL1;
+
+    uint m_global = m_tile + sb_row;
+    bool m_valid = (m_global < expert_tpe);
+    uint act_row = 0u;
+    if (m_valid) {
+        uint id = ids[expert * M_max + m_global];
+        act_row = id / n_used;
+    }
+
+    // 8 C-fragments per SG, twice (gate + up).
+    simdgroup_matrix<float, 8, 8> mc_gate[8];
+    simdgroup_matrix<float, 8, 8> mc_up[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc_gate[i] = simdgroup_matrix<float, 8, 8>(0.0);
+        mc_up[i]   = simdgroup_matrix<float, 8, 8>(0.0);
+    }
+
+    uint nr_w_eff = NR_W;
+
+    for (uint k_offset = 0; k_offset < K; k_offset += NK) {
+        // ---- Phase 1a : load+dequant W_gate → sa_gate ----
+        if (sa_row < nr_w_eff) {
+            uint w_row_global = n_tile + sa_row;
+            uint k_pos_base = k_offset + sa_chunk * 16u;
+
+            uint super_block_idx = k_pos_base / Q4K_WEIGHTS;
+            uint sb_in_super = (k_pos_base % Q4K_WEIGHTS) / 32u;
+            uint pair_idx = sb_in_super / 2u;
+            bool is_high = (sb_in_super & 1u) != 0u;
+
+            device const uchar* row_block = W_gate
+                + (uint64_t)w_expert_byte_offset
+                + (uint64_t)w_row_global * w_row_stride_bytes
+                + (uint64_t)super_block_idx * Q4K_BYTES;
+            device const half* d_ptr = (device const half*)(row_block);
+            float d    = float(d_ptr[0]);
+            float dmin = float(d_ptr[1]);
+
+            device const uchar* sc_raw = row_block + 4;
+            uchar sc6, m6;
+            if (sb_in_super < 4u) {
+                sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+                m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+            } else {
+                uint i = sb_in_super - 4u;
+                sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+                m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+            }
+            float scale   = d    * float(sc6);
+            float min_val = dmin * float(m6);
+
+            device const uchar* qs_ptr = row_block + 16u + pair_idx * 32u;
+            uint sy = sa_row / 8u;
+            uint lx = sa_row % 8u;
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < 16u; ++c) {
+                uint k_in_tile = sa_chunk * 16u + c;
+                uint sx = k_in_tile / 8u;
+                uint ly = k_in_tile % 8u;
+                uint ib = 8u * sx + sy;
+
+                uchar byte_val = qs_ptr[k_in_tile];
+                uchar nibble = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+                sa_gate[ib * 64u + ly * 8u + lx] = scale * float(nibble) - min_val;
+            }
+        }
+
+        // ---- Phase 1b : load+dequant W_up → sa_up ----
+        if (sa_row < nr_w_eff) {
+            uint w_row_global = n_tile + sa_row;
+            uint k_pos_base = k_offset + sa_chunk * 16u;
+
+            uint super_block_idx = k_pos_base / Q4K_WEIGHTS;
+            uint sb_in_super = (k_pos_base % Q4K_WEIGHTS) / 32u;
+            uint pair_idx = sb_in_super / 2u;
+            bool is_high = (sb_in_super & 1u) != 0u;
+
+            device const uchar* row_block = W_up
+                + (uint64_t)w_expert_byte_offset
+                + (uint64_t)w_row_global * w_row_stride_bytes
+                + (uint64_t)super_block_idx * Q4K_BYTES;
+            device const half* d_ptr = (device const half*)(row_block);
+            float d    = float(d_ptr[0]);
+            float dmin = float(d_ptr[1]);
+
+            device const uchar* sc_raw = row_block + 4;
+            uchar sc6, m6;
+            if (sb_in_super < 4u) {
+                sc6 = sc_raw[sb_in_super]      & 0x3Fu;
+                m6  = sc_raw[sb_in_super + 4u] & 0x3Fu;
+            } else {
+                uint i = sb_in_super - 4u;
+                sc6 = (sc_raw[i + 8u] & 0x0Fu) | ((sc_raw[i]      >> 6u) << 4u);
+                m6  = (sc_raw[i + 8u] >> 4u)   | ((sc_raw[i + 4u] >> 6u) << 4u);
+            }
+            float scale   = d    * float(sc6);
+            float min_val = dmin * float(m6);
+
+            device const uchar* qs_ptr = row_block + 16u + pair_idx * 32u;
+            uint sy = sa_row / 8u;
+            uint lx = sa_row % 8u;
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < 16u; ++c) {
+                uint k_in_tile = sa_chunk * 16u + c;
+                uint sx = k_in_tile / 8u;
+                uint ly = k_in_tile % 8u;
+                uint ib = 8u * sx + sy;
+
+                uchar byte_val = qs_ptr[k_in_tile];
+                uchar nibble = is_high ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+                sa_up[ib * 64u + ly * 8u + lx] = scale * float(nibble) - min_val;
+            }
+        }
+
+        // ---- Phase 2 : load A → sb (with id indirection) ----
+        // Loaded ONCE for both matmuls (the savings vs separate kernels).
+        {
+            uint sx = sb_chunk;
+            uint sy = sb_row / 8u;
+            uint ly = sb_row % 8u;
+            uint ib = 4u * sx + sy;
+            if (m_valid) {
+                uint k_pos = k_offset + sb_chunk * 8u;
+                #pragma clang loop unroll(full)
+                for (uint lx = 0; lx < 8u; ++lx) {
+                    if (k_pos + lx < K) {
+                        sb[ib * 64u + ly * 8u + lx] = (half)act[(uint64_t)act_row * K + k_pos + lx];
+                    } else {
+                        sb[ib * 64u + ly * 8u + lx] = (half)0.0;
+                    }
+                }
+            } else {
+                #pragma clang loop unroll(full)
+                for (uint lx = 0; lx < 8u; ++lx) {
+                    sb[ib * 64u + ly * 8u + lx] = (half)0.0;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Phase 3 : MMAs (8 frags × 2 mat) ----
+        threadgroup const half* lsma_gate = sa_gate + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsma_up   = sa_up   + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb      = sb + 2u * 64u * (sgitg / 2u);
+
+        #pragma clang loop unroll(full)
+        for (uint ik = 0; ik < NK / 8u; ++ik) {
+            simdgroup_matrix<half, 8, 8> ma_gate[4];
+            simdgroup_matrix<half, 8, 8> ma_up[4];
+            simdgroup_matrix<half, 8, 8> mb[2];
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4u; ++i) {
+                simdgroup_load(ma_gate[i], lsma_gate + 64u * i, 8);
+                simdgroup_load(ma_up[i],   lsma_up   + 64u * i, 8);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2u; ++i) {
+                simdgroup_load(mb[i], lsmb + 64u * i, 8);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8u; ++i) {
+                simdgroup_multiply_accumulate(mc_gate[i], mb[i / 4u], ma_gate[i % 4u], mc_gate[i]);
+                simdgroup_multiply_accumulate(mc_up[i],   mb[i / 4u], ma_up[i % 4u],   mc_up[i]);
+            }
+
+            lsma_gate += 8u * 64u;
+            lsma_up   += 8u * 64u;
+            lsmb      += 4u * 64u;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- Apply SwiGLU + Store ----
+    // silu = sigmoid(gate) * gate * up
+    // simdgroup_matrix doesn't expose element-wise sigmoid directly, so we
+    // store gate and up to a small TG buffer and do the math element-wise per
+    // thread before final write. Each SG owns 8 frags = 64 8×8 cells = 4096
+    // elements (32 m × 64 n quarter for SG). 4 SGs total cover 32×128 but
+    // each SG outputs 8 m × 64 n = 512 cells × 8x8 = 32 KB if all stored.
+    //
+    // Simpler: store gate/up to threadgroup, compute silu element-wise,
+    // store silu to dst. But TG mem is full. So we use a small scratch and
+    // do per-frag.
+    //
+    // Each SG processes 8 frags. Per frag = 8x8 = 64 floats. We can extract
+    // values via simdgroup_store to a small per-SG scratch in TG mem
+    // (shared but partitioned: 4 SGs × 64 f32 = 1 KB), then per-thread compute
+    // sigmoid(gate)*gate*up, write to dst.
+
+    threadgroup float scratch_gate[4 * 64];  // 1 KB
+    threadgroup float scratch_up[4 * 64];    // 1 KB
+
+    uint64_t expert_dst_offset = (uint64_t)expert * (uint64_t)M_max * (uint64_t)N;
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8u; ++i) {
+        uint c_row = m_tile + (uint)(sgitg / 2u) * 16u + (i / 4u) * 8u;
+        uint c_col = n_tile + (uint)(sgitg % 2u) * 32u + (i % 4u) * 8u;
+        if (c_row + 7u < M_max && c_col + 7u < N) {
+            // Store gate frag to per-SG scratch
+            threadgroup float* sg_scratch_gate = scratch_gate + sgitg * 64u;
+            threadgroup float* sg_scratch_up   = scratch_up   + sgitg * 64u;
+            simdgroup_store(mc_gate[i], sg_scratch_gate, 8);
+            simdgroup_store(mc_up[i],   sg_scratch_up,   8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Per-thread: 32 lanes × 2 elements = 64 elements processed.
+            // Layout: scratch_gate[ly*8+lx] for ly=0..7, lx=0..7.
+            uint tisg = (uint)tiitg & 31u;
+            uint ly0 = tisg / 4u;
+            uint lx0 = (tisg & 3u) * 2u;
+
+            #pragma clang loop unroll(full)
+            for (uint dlx = 0u; dlx < 2u; ++dlx) {
+                uint lx = lx0 + dlx;
+                uint pos = ly0 * 8u + lx;
+                float g = sg_scratch_gate[pos];
+                float u = sg_scratch_up[pos];
+                float silu = (g / (1.0f + exp(-g))) * u;
+
+                device float* dst_ptr = dst + expert_dst_offset
+                    + (uint64_t)(c_row + ly0) * (uint64_t)N + (uint64_t)(c_col + lx);
+                *dst_ptr = silu;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+"#;
+
+/// T198 — Fused mm_id Q4_K (gate) + Q4_K (up) + SwiGLU.
+///
+/// Single kernel that computes `silu = sigmoid(gate)*gate*up` for the MoE
+/// FFN, where `gate = act @ W_gate` and `up = act @ W_up` (both Q4_K SGEMM
+/// with id indirection from map0).
+///
+/// Replaces 3 calls (mm_id_q4_k_gate + mm_id_q4_k_up + swiglu_f32) by 1.
+/// Eliminates intermediate gate_out / up_out buffers in DRAM.
+///
+/// Pre-conditions :
+/// - Metal3 (Apple7+).
+/// - `M_max % 32 == 0`, `N % 64 == 0`, `K % 256 == 0`.
+/// - Both W_gate and W_up are Q4_K with same shape [E, N, K].
+/// - `dst_buf` is [E, M_max, N] f32 (silu output).
+#[allow(clippy::too_many_arguments)]
+pub fn mul_mm_id_q4_k_q4_k_swiglu_f32_into(
+    backend: &MetalBackend,
+    act_buf: &Buffer,
+    w_gate_q4k_buf: &Buffer,
+    w_up_q4k_buf: &Buffer,
+    ids_buf: &Buffer,
+    tpe_buf: &Buffer,
+    dst_buf: &Buffer,
+    n_experts: usize,
+    m_max: usize,
+    n: usize,
+    k: usize,
+    n_used: usize,
+) -> Result<(), MetalError> {
+    if !backend.supports_metal3() {
+        return Err(MetalError::Unsupported(
+            "mul_mm_id_q4_k_q4_k_swiglu_f32 needs Metal3".to_string(),
+        ));
+    }
+    if n_experts == 0 || m_max == 0 || n == 0 || k == 0 || n_used == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "mul_mm_id_q4_k_q4_k_swiglu_f32: all dims > 0 (got E={n_experts}, M_max={m_max}, N={n}, K={k}, n_used={n_used})"
+        )));
+    }
+    if m_max % 32 != 0 || n % 64 != 0 || k % 256 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "mul_mm_id_q4_k_q4_k_swiglu_f32: M_max%32==0, N%64==0, K%256==0 (got M_max={m_max}, N={n}, K={k})"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "mul_mm_id_q4_k_q4_k_swiglu_f32",
+        MUL_MM_ID_Q4_K_Q4_K_SWIGLU_F32_SHADER,
+        "mul_mm_id_q4_k_q4_k_swiglu_f32",
+    )?;
+    let dims = [m_max as u32, n as u32, k as u32, n_used as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(act_buf), 0);
+        encoder.set_buffer(1, Some(w_gate_q4k_buf), 0);
+        encoder.set_buffer(2, Some(w_up_q4k_buf), 0);
+        encoder.set_buffer(3, Some(ids_buf), 0);
+        encoder.set_buffer(4, Some(tpe_buf), 0);
+        encoder.set_buffer(5, Some(dst_buf), 0);
+        encoder.set_bytes(6, 16, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1);
+        let n_tg_x = (n / 64) as u64;
+        let n_tg_y = (m_max / 32) as u64;
+        let n_tg_z = n_experts as u64;
+        let groups = MTLSize::new(n_tg_x, n_tg_y, n_tg_z);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T174 Day 4 — Scatter per-expert MoE outputs back to moe_acc[B, K] weighted.
 //
 // Stage 3 of the M-major MoE pipeline. Folds `down_out[E, M_max, K]` (the
