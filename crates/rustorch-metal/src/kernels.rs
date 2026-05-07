@@ -15491,6 +15491,231 @@ pub fn delta_net_step_with_l2_f32_with_qkv_offsets(
     Ok(())
 }
 
+// ============================================================================
+// T200.2 — Persistent SSM scan kernel.
+//
+// Replaces the per-timestep dispatch loop in `ssm_block_forward_batch` with a
+// SINGLE kernel that loops over B timesteps internally. State row stays in
+// thread-local registers across all timesteps, eliminating B-1 round-trips
+// through DRAM for the state and B-1 dispatches per layer.
+//
+// Dispatch shape:
+//   grid = (head_dim, n_v_heads)         — 1 TG per (row, head)
+//   threads/TG = 32                       — single simdgroup
+//
+// Per TG:
+//   - Loads its state row [head_dim] from device memory ONCE at start
+//   - For each t in [0, B):
+//     * Reads q_t, k_t (size head_dim, distributed over 32 threads)
+//     * Reads v_t[head_v, row] (1 scalar)
+//     * Computes inv_q, inv_k via simd_sum
+//     * Updates state_row in registers (decay + delta-rule)
+//     * Writes out_t[head_v, row] (1 scalar)
+//   - Stores final state row back to device memory ONCE at end
+//
+// Buffer layout (qkv_combined, output of fused 4-input-proj or split):
+//   per token t: [q_part(key_dim) | k_part(key_dim) | v_part(value_dim)]
+//   total stride: conv_dim * 4 bytes
+//
+// gate_h_batched, beta_sig_batched: [B, n_v_heads]
+// out_batched: [B, n_v_heads, head_dim]
+// state: [n_v_heads, head_dim, head_dim] (read+write in place)
+// ============================================================================
+
+const DELTA_NET_PERSISTENT_SCAN_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MAX_HEAD_DIM = 256u;  // safe upper bound; loop bound is dynamic
+
+kernel void delta_net_persistent_scan_f32(
+    device const float* qkv_combined  [[buffer(0)]],   // [B, conv_dim] f32
+    device const float* gate_h_batched [[buffer(1)]],  // [B, n_v_heads]
+    device const float* beta_sig_batched [[buffer(2)]],// [B, n_v_heads]
+    device       float* state         [[buffer(3)]],   // [n_v, head_dim, head_dim]
+    device       float* out_batched   [[buffer(4)]],   // [B, n_v, head_dim]
+    constant uint4&     dims          [[buffer(5)]],   // (B, n_v_heads, head_dim, n_k_heads)
+    constant uint2&     strides       [[buffer(6)]],   // (conv_stride_floats, key_dim_floats)
+    constant float&     eps           [[buffer(7)]],
+    uint2               tg_id         [[threadgroup_position_in_grid]],
+    ushort              tiisg         [[thread_index_in_simdgroup]]
+) {
+    uint B = dims.x;
+    uint n_v_heads = dims.y;
+    uint head_dim = dims.z;
+    uint n_k_heads = dims.w;
+    uint conv_stride = strides.x;     // conv_dim (in floats per token)
+    uint key_dim = strides.y;          // n_k_heads * head_dim
+
+    uint head_v = tg_id.y;
+    uint row = tg_id.x;
+    if (head_v >= n_v_heads || row >= head_dim) return;
+
+    // Match reference shader: head_k = head_v % n_k_heads (interleaved broadcast).
+    uint head_k = head_v % n_k_heads;
+    uint qk_off = head_k * head_dim;     // offset of q/k for this head_k within key_dim
+    uint v_offset_per_token = 2u * key_dim + head_v * head_dim + row;
+
+    uint state_off = head_v * head_dim * head_dim + row * head_dim;
+
+    // Load state row into thread-local registers. With head_dim ≤ 256 and
+    // 32 threads, each thread holds up to 8 elements (head_dim/32).
+    // For 35B-A3B head_dim=128 → 4 elements per thread.
+    float state_row[MAX_HEAD_DIM / 32u];   // 8 float upper bound
+    uint elements_per_thread = (head_dim + 31u) / 32u;
+    for (uint i = 0u; i < elements_per_thread; ++i) {
+        uint c = tiisg + i * 32u;
+        if (c < head_dim) {
+            state_row[i] = state[state_off + c];
+        } else {
+            state_row[i] = 0.0;
+        }
+    }
+
+    float q_scale = 1.0 / sqrt((float)head_dim);
+
+    // Loop over B timesteps. State stays in registers throughout.
+    for (uint t = 0u; t < B; ++t) {
+        device const float* qkv_t = qkv_combined + (uint64_t)t * (uint64_t)conv_stride;
+
+        // Load q_c, k_c for this thread's element
+        // Per thread: holds elements[c = tiisg + i*32] for i in 0..elements_per_thread
+        float q_local[MAX_HEAD_DIM / 32u];
+        float k_local[MAX_HEAD_DIM / 32u];
+        for (uint i = 0u; i < elements_per_thread; ++i) {
+            uint c = tiisg + i * 32u;
+            if (c < head_dim) {
+                q_local[i] = qkv_t[qk_off + c];
+                k_local[i] = qkv_t[key_dim + qk_off + c];
+            } else {
+                q_local[i] = 0.0;
+                k_local[i] = 0.0;
+            }
+        }
+
+        // L2 norms (reduction across simdgroup)
+        float q_ss_partial = 0.0;
+        float k_ss_partial = 0.0;
+        for (uint i = 0u; i < elements_per_thread; ++i) {
+            q_ss_partial += q_local[i] * q_local[i];
+            k_ss_partial += k_local[i] * k_local[i];
+        }
+        float inv_q = rsqrt(simd_sum(q_ss_partial) + eps);
+        float inv_k = rsqrt(simd_sum(k_ss_partial) + eps);
+
+        // Per-step gate and beta scalars
+        float gamma = exp(gate_h_batched[t * n_v_heads + head_v]);
+        float beta_val = beta_sig_batched[t * n_v_heads + head_v];
+        float v_r = qkv_t[v_offset_per_token];
+
+        // Step 1+2: decay state in registers + projection (q^T S k)
+        float proj_partial = 0.0;
+        for (uint i = 0u; i < elements_per_thread; ++i) {
+            state_row[i] *= gamma;
+            proj_partial += state_row[i] * k_local[i];
+        }
+        float proj_r = simd_sum(proj_partial) * inv_k;
+
+        // Step 3: delta-rule update (rank-1 outer with k)
+        float delta_eff = beta_val * (v_r - proj_r) * inv_k;
+        for (uint i = 0u; i < elements_per_thread; ++i) {
+            state_row[i] += delta_eff * k_local[i];
+        }
+
+        // Step 4: output (linear attention readout with q)
+        float out_partial = 0.0;
+        for (uint i = 0u; i < elements_per_thread; ++i) {
+            out_partial += state_row[i] * q_local[i] * q_scale;
+        }
+        float row_sum = simd_sum(out_partial) * inv_q;
+        if (tiisg == 0) {
+            out_batched[(uint64_t)t * (uint64_t)(n_v_heads * head_dim)
+                        + head_v * head_dim + row] = row_sum;
+        }
+    }
+
+    // Final write: state row back to device memory
+    for (uint i = 0u; i < elements_per_thread; ++i) {
+        uint c = tiisg + i * 32u;
+        if (c < head_dim) {
+            state[state_off + c] = state_row[i];
+        }
+    }
+}
+"#;
+
+/// T200.2 — Persistent delta-net scan over B timesteps.
+///
+/// Single kernel dispatch replaces the per-timestep loop of:
+///   `ssm_conv1d_step + delta_net_step + rms_norm_per_head_gated`.
+/// (Caller must still run conv1d + gated_norm separately for now.)
+///
+/// Reduces dispatches from B*3 per layer to 1 per layer for the
+/// delta-rule recurrence. State row stays in thread-local registers
+/// throughout the B-loop, eliminating DRAM round-trips for state.
+///
+/// Pre-conditions:
+/// - `head_dim ≤ 256` (kernel hardcodes register size)
+/// - `head_dim % 32 == 0` (clean simdgroup distribution)
+/// - `n_v_heads % n_k_heads == 0`
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net_persistent_scan_f32_into(
+    backend: &MetalBackend,
+    qkv_combined_buf: &Buffer,
+    gate_h_batched_buf: &Buffer,
+    beta_sig_batched_buf: &Buffer,
+    state_buf: &Buffer,
+    out_batched_buf: &Buffer,
+    b: usize,
+    n_v_heads: usize,
+    head_dim: usize,
+    n_k_heads: usize,
+    conv_dim: usize, // total per-token stride in floats (qkv_combined has [B, conv_dim])
+    eps: f32,
+) -> Result<(), MetalError> {
+    if head_dim > 256 || head_dim % 32 != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "delta_net_persistent_scan_f32: head_dim must be ≤ 256 and multiple of 32 (got {head_dim})"
+        )));
+    }
+    if n_v_heads == 0 || n_k_heads == 0 || n_v_heads % n_k_heads != 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "delta_net_persistent_scan_f32: n_v_heads={n_v_heads} must be a multiple of n_k_heads={n_k_heads}"
+        )));
+    }
+    if b == 0 {
+        return Ok(()); // nothing to do
+    }
+    let pipeline = backend.pipeline(
+        "delta_net_persistent_scan_f32",
+        DELTA_NET_PERSISTENT_SCAN_F32_SHADER,
+        "delta_net_persistent_scan_f32",
+    )?;
+    let dims = [
+        b as u32,
+        n_v_heads as u32,
+        head_dim as u32,
+        n_k_heads as u32,
+    ];
+    let key_dim = (n_k_heads * head_dim) as u32;
+    let strides = [conv_dim as u32, key_dim];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(qkv_combined_buf), 0);
+        encoder.set_buffer(1, Some(gate_h_batched_buf), 0);
+        encoder.set_buffer(2, Some(beta_sig_batched_buf), 0);
+        encoder.set_buffer(3, Some(state_buf), 0);
+        encoder.set_buffer(4, Some(out_batched_buf), 0);
+        encoder.set_bytes(5, 16, dims.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(6, 8, strides.as_ptr() as *const std::ffi::c_void);
+        encoder.set_bytes(7, 4, &eps as *const f32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(32, 1, 1);
+        let groups = MTLSize::new(head_dim as u64, n_v_heads as u64, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T144 — gated delta-net step (state update + read-out).
 ///
 /// `state` is read+written in place. Shape: `[n_v_heads, head_dim,
@@ -19655,6 +19880,182 @@ mod tests {
                 rel
             );
         }
+    }
+
+    /// T200.2 — Parity: persistent scan kernel matches sequential scan loop.
+    ///
+    /// Runs B=8 timesteps of delta-net both ways:
+    ///   Path A (reference): B-iteration loop calling
+    ///     `delta_net_step_with_l2_f32_with_qkv_offsets`.
+    ///   Path B (T200.2): single dispatch of
+    ///     `delta_net_persistent_scan_f32_into`.
+    /// Compares final state and per-timestep outputs.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn delta_net_persistent_scan_matches_sequential() {
+        let backend = metal_backend();
+        if !backend.supports_metal3() {
+            eprintln!("[delta_net_persistent_scan] skipping: no Metal3");
+            return;
+        }
+        // Small but realistic shape (matches Qwen3.6 SSM with n_v=4, n_k=2,
+        // head_dim=32 — multiple of 32 required).
+        let b = 8_usize;
+        let head_dim = 32_usize;
+        let n_k = 2_usize;
+        let n_v = 4_usize;
+        let key_dim = n_k * head_dim;
+        let value_dim = n_v * head_dim;
+        let conv_dim = 2 * key_dim + value_dim;
+        let state_size = n_v * head_dim * head_dim;
+        let eps = 1e-5_f32;
+
+        // Inputs: deterministic vectors.
+        let qkv_combined = det_vec(b * conv_dim, 0.7);
+        let gate_h = det_vec(b * n_v, 0.05);
+        let beta_sig = det_vec(b * n_v, 0.5);
+        let state_init = det_vec(state_size, 0.001);
+
+        // ===== Path A : sequential =====
+        let qkv_a = backend.alloc_shared(b * conv_dim * 4).unwrap();
+        let gate_a = backend.alloc_shared(b * n_v * 4).unwrap();
+        let beta_a = backend.alloc_shared(b * n_v * 4).unwrap();
+        let state_a = backend.alloc_shared(state_size * 4).unwrap();
+        let out_a = backend.alloc_shared(b * value_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                qkv_combined.as_ptr(),
+                qkv_a.contents() as *mut f32,
+                b * conv_dim,
+            );
+            std::ptr::copy_nonoverlapping(gate_h.as_ptr(), gate_a.contents() as *mut f32, b * n_v);
+            std::ptr::copy_nonoverlapping(
+                beta_sig.as_ptr(),
+                beta_a.contents() as *mut f32,
+                b * n_v,
+            );
+            std::ptr::copy_nonoverlapping(
+                state_init.as_ptr(),
+                state_a.contents() as *mut f32,
+                state_size,
+            );
+        }
+        let conv_off_stride = conv_dim * 4;
+        let value_off_stride = value_dim * 4;
+        let n_v_off_stride = n_v * 4;
+        for t in 0..b {
+            delta_net_step_with_l2_f32_with_qkv_offsets(
+                backend,
+                &qkv_a,
+                t * conv_off_stride,
+                &qkv_a,
+                t * conv_off_stride + key_dim * 4,
+                &qkv_a,
+                t * conv_off_stride + 2 * key_dim * 4,
+                &gate_a,
+                t * n_v_off_stride,
+                &beta_a,
+                t * n_v_off_stride,
+                &state_a,
+                &out_a,
+                t * value_off_stride,
+                n_v,
+                head_dim,
+                n_k,
+                eps,
+            )
+            .unwrap();
+        }
+        backend.drain();
+        let mut out_a_host = vec![0.0_f32; b * value_dim];
+        let mut state_a_host = vec![0.0_f32; state_size];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_a.contents() as *const f32,
+                out_a_host.as_mut_ptr(),
+                b * value_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                state_a.contents() as *const f32,
+                state_a_host.as_mut_ptr(),
+                state_size,
+            );
+        }
+
+        // ===== Path B : persistent scan =====
+        let qkv_b = backend.alloc_shared(b * conv_dim * 4).unwrap();
+        let gate_b = backend.alloc_shared(b * n_v * 4).unwrap();
+        let beta_b = backend.alloc_shared(b * n_v * 4).unwrap();
+        let state_b = backend.alloc_shared(state_size * 4).unwrap();
+        let out_b = backend.alloc_shared(b * value_dim * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                qkv_combined.as_ptr(),
+                qkv_b.contents() as *mut f32,
+                b * conv_dim,
+            );
+            std::ptr::copy_nonoverlapping(gate_h.as_ptr(), gate_b.contents() as *mut f32, b * n_v);
+            std::ptr::copy_nonoverlapping(
+                beta_sig.as_ptr(),
+                beta_b.contents() as *mut f32,
+                b * n_v,
+            );
+            std::ptr::copy_nonoverlapping(
+                state_init.as_ptr(),
+                state_b.contents() as *mut f32,
+                state_size,
+            );
+        }
+        delta_net_persistent_scan_f32_into(
+            backend, &qkv_b, &gate_b, &beta_b, &state_b, &out_b, b, n_v, head_dim, n_k, conv_dim,
+            eps,
+        )
+        .unwrap();
+        backend.drain();
+        let mut out_b_host = vec![0.0_f32; b * value_dim];
+        let mut state_b_host = vec![0.0_f32; state_size];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_b.contents() as *const f32,
+                out_b_host.as_mut_ptr(),
+                b * value_dim,
+            );
+            std::ptr::copy_nonoverlapping(
+                state_b.contents() as *const f32,
+                state_b_host.as_mut_ptr(),
+                state_size,
+            );
+        }
+
+        // ===== Compare =====
+        let mut max_rel_out = 0.0_f32;
+        for (a, b) in out_a_host.iter().zip(out_b_host.iter()) {
+            let denom = a.abs().max(1e-4);
+            let rel = (a - b).abs() / denom;
+            if rel > max_rel_out {
+                max_rel_out = rel;
+            }
+        }
+        let mut max_rel_state = 0.0_f32;
+        for (a, b) in state_a_host.iter().zip(state_b_host.iter()) {
+            let denom = a.abs().max(1e-4);
+            let rel = (a - b).abs() / denom;
+            if rel > max_rel_state {
+                max_rel_state = rel;
+            }
+        }
+        eprintln!(
+            "delta_net_persistent_scan parity: max_rel_out={max_rel_out:.3e} \
+             max_rel_state={max_rel_state:.3e}"
+        );
+        assert!(
+            max_rel_out < 1e-3,
+            "out parity: max_rel_out={max_rel_out:.3e} (>= 1e-3)"
+        );
+        assert!(
+            max_rel_state < 1e-3,
+            "state parity: max_rel_state={max_rel_state:.3e} (>= 1e-3)"
+        );
     }
 
     /// T175 P0 — Parity: `ssm_conv1d_step_f32_with_offset` reads from the
