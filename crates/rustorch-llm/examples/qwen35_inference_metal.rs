@@ -1642,6 +1642,18 @@ struct BatchScratchMoe {
     em_fd: Buffer,          // [M_padded, ef] post-swiglu
     em_out_d: Buffer,       // [M_padded, d] expert_major down output
     em_m_padded: Buffer,    // T175 P0' — [1] u32, m_padded computed by GPU sort kernel
+
+    // T197 — mul_mm_id pipeline buffers (alternative to expert-major above).
+    // Tile M=32 (vs em 8) + indirected gather inside kernel = no x_packed staging.
+    // M_max = B_MAX_BATCH (max tokens routed to one expert ≤ B since top-K returns
+    // distinct experts per token).
+    mmid_tpe: Buffer,      // [E] u32 — tokens per expert (output of map0)
+    mmid_ids: Buffer,      // [E * M_max] u32 — sorted (b*n_used+slot) per expert
+    mmid_pos: Buffer,      // [B * n_used] u32 — inverse permutation
+    mmid_gate_out: Buffer, // [E, M_max, ef] f32 per-expert gate output
+    mmid_up_out: Buffer,   // [E, M_max, ef] f32 per-expert up output
+    mmid_silu: Buffer,     // [E, M_max, ef] f32 post-SwiGLU (or alias gate_out)
+    mmid_down_out: Buffer, // [E, M_max, d] f32 per-expert down output
 }
 
 impl BatchScratchMoe {
@@ -1679,6 +1691,17 @@ impl BatchScratchMoe {
             em_fd: alloc((b * n_used + 7 * n_experts) * ef * 4),
             em_out_d: alloc((b * n_used + 7 * n_experts) * d * 4),
             em_m_padded: alloc(4),
+
+            // T197 — mul_mm_id buffers. M_max = B = B_MAX_BATCH (safe upper bound
+            // documented in mul_mm_id_map0_into: top-K with distinct experts per
+            // token guarantees tpe[e] ≤ B for all e).
+            mmid_tpe: alloc(n_experts * 4),
+            mmid_ids: alloc(n_experts * b * 4),
+            mmid_pos: alloc(b * n_used * 4),
+            mmid_gate_out: alloc(n_experts * b * ef * 4),
+            mmid_up_out: alloc(n_experts * b * ef * 4),
+            mmid_silu: alloc(n_experts * b * ef * 4),
+            mmid_down_out: alloc(n_experts * b * d * 4),
         }
     }
 }
