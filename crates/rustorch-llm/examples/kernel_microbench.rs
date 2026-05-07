@@ -33,13 +33,14 @@ fn main() {
     use rustorch_metal::backend_singleton::metal_backend;
     use rustorch_metal::kernels::{
         add_inplace_f32, argmax_batched_f32, delta_net_step_with_l2_f32, gqa_decode_f32,
-        gqa_decode_f32_nsg2, kv_append_f32, rms_norm_f32, rms_norm_per_head_gated_f32,
-        rope_half_split_f32, sgemv_f32_cached_x_into, sgemv_f32_lcpp_simd_into,
-        sgemv_q4_k_f32_lcpp_nsg2_into, sgemv_q4_k_gather_f32_lcpp_nsg2_into,
-        sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q6_k_f32_lcpp_nsg2_into,
-        sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32, sigmoid_mul_inplace_f32, split_qkv_f32,
-        ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32, topk_softmax_norm_f32,
-        topk_softmax_norm_parallel_f32, weighted_reduce_add_f32,
+        gqa_decode_f32_nsg2, kv_append_f32, rms_norm_f32, rms_norm_per_head_f32,
+        rms_norm_per_head_gated_f32, rope_half_split_f32, sgemv_f32_cached_x_into,
+        sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+        sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
+        sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
+        sigmoid_mul_inplace_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
+        swiglu_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32, weighted_reduce_add_f32,
+        zero_f32,
     };
     use std::time::Instant;
 
@@ -1075,6 +1076,273 @@ fn main() {
             dt.as_secs_f64() * 1e6 / ITERS as f64,
             format!("d={d}"),
             80, // 40 layers × 2 residuals
+        ));
+    }
+
+    // ============================================================================
+    // T187 — extend microbench to cover the rest of the decode hot path
+    // ============================================================================
+
+    // -------- Kernel 24: ATTN w_q (Q8_0, K=2048 N=8192) — combined QKV in some
+    // Qwen3.5 layouts; ours is Q8_0 in shape [8192, 2048] per smoke-test.
+    {
+        let k = 2048usize;
+        let n = 8192usize;
+        let w = fake_q8_0_bytes(k, n);
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w.len()).unwrap();
+        let y_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr(), w_buf.contents() as *mut u8, w.len());
+        }
+        sgemv_q8_0_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_q8_0_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sgemv_q8_0 (attn w_q)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={k} N={n} Q8_0"),
+            10,
+        ));
+    }
+
+    // -------- Kernel 25: ATTN w_k/w_v (Q8_0, K=2048 N=512) --------
+    {
+        let k = 2048usize;
+        let n = 512usize;
+        let w = fake_q8_0_bytes(k, n);
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w.len()).unwrap();
+        let y_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr(), w_buf.contents() as *mut u8, w.len());
+        }
+        sgemv_q8_0_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_q8_0_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sgemv_q8_0 (attn w_k/w_v)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={k} N={n} Q8_0"),
+            20, // 10 attn × 2 (w_k + w_v)
+        ));
+    }
+
+    // -------- Kernel 26: ATTN w_o (Q8_0, K=4096 N=2048) --------
+    {
+        let k = 4096usize;
+        let n = 2048usize;
+        let w = fake_q8_0_bytes(k, n);
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w.len()).unwrap();
+        let y_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr(), w_buf.contents() as *mut u8, w.len());
+        }
+        sgemv_q8_0_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_q8_0_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sgemv_q8_0 (attn w_o)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={k} N={n} Q8_0"),
+            10,
+        ));
+    }
+
+    // -------- Kernel 27: SSM small F32 matmul (ssm_alpha/beta, K=2048 N=32) --------
+    {
+        let k = 2048usize;
+        let n = 32usize;
+        let x = fake_f32(k, 8.1);
+        let w = fake_f32(k * n, 8.3);
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(k * n * 4).unwrap();
+        let y_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, k);
+            std::ptr::copy_nonoverlapping(w.as_ptr(), w_buf.contents() as *mut f32, k * n);
+        }
+        sgemv_f32_lcpp_simd_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_f32_lcpp_simd_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sgemv_f32 (ssm_alpha/beta)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={k} N={n} F32"),
+            60, // 30 SSM layers × 2 (alpha + beta)
+        ));
+    }
+
+    // -------- Kernel 28: F32 dot scalar (gate_inp_shexp, K=2048 N=1) --------
+    {
+        let k = 2048usize;
+        let n = 1usize;
+        let x = fake_f32(k, 9.1);
+        let w = fake_f32(k * n, 9.3);
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(k * n * 4).unwrap();
+        let y_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, k);
+            std::ptr::copy_nonoverlapping(w.as_ptr(), w_buf.contents() as *mut f32, k * n);
+        }
+        sgemv_f32_lcpp_simd_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_f32_lcpp_simd_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sgemv_f32 (shared dot N=1)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={k} N={n} F32"),
+            40,
+        ));
+    }
+
+    // -------- Kernel 29: MoE shared expert gate/up (Q4_K, K=2048 N=512) --------
+    {
+        let k = 2048usize;
+        let n = 512usize;
+        let w = fake_q4k_bytes(k, n);
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w.len()).unwrap();
+        let y_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr(), w_buf.contents() as *mut u8, w.len());
+        }
+        sgemv_q4_k_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_q4_k_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sgemv_q4_k (shexp gate/up)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={k} N={n} Q4_K"),
+            80, // 40 layers × 2 (gate + up)
+        ));
+    }
+
+    // -------- Kernel 30: MoE shared expert down (Q4_K, K=512 N=2048) --------
+    {
+        let k = 512usize;
+        let n = 2048usize;
+        let w = fake_q4k_bytes(k, n);
+        let x_buf = backend.alloc_shared(k * 4).unwrap();
+        let w_buf = backend.alloc_shared(w.len()).unwrap();
+        let y_buf = backend.alloc_shared(n * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr(), w_buf.contents() as *mut u8, w.len());
+        }
+        sgemv_q4_k_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_q4_k_f32_lcpp_nsg2_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sgemv_q4_k (shexp down)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={k} N={n} Q4_K"),
+            40,
+        ));
+    }
+
+    // -------- Kernel 31: rms_norm_per_head_f32 (Q-norm, K-norm in attn) --------
+    {
+        let n_q = 16usize;
+        let n_kv = 2usize;
+        let hd = 256usize;
+        let x_q = backend.alloc_shared(n_q * hd * 4).unwrap();
+        let g = backend.alloc_shared(hd * 4).unwrap();
+        rms_norm_per_head_f32(backend, &x_q, &g, n_q, hd, 1e-6).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            rms_norm_per_head_f32(backend, &x_q, &g, n_q, hd, 1e-6).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "rms_norm_per_head_f32 (attn Q)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("n={n_q} hd={hd}"),
+            10,
+        ));
+        // K-norm has fewer heads (n_kv=2)
+        let x_k = backend.alloc_shared(n_kv * hd * 4).unwrap();
+        rms_norm_per_head_f32(backend, &x_k, &g, n_kv, hd, 1e-6).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            rms_norm_per_head_f32(backend, &x_k, &g, n_kv, hd, 1e-6).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "rms_norm_per_head_f32 (attn K)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("n={n_kv} hd={hd}"),
+            10,
+        ));
+    }
+
+    // -------- Kernel 32: zero_f32 (MoE acc reset, n=2048 d) --------
+    {
+        let n = 2048usize;
+        let buf = backend.alloc_shared(n * 4).unwrap();
+        zero_f32(backend, &buf, n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            zero_f32(backend, &buf, n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "zero_f32 (MoE acc init)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("n={n}"),
+            40,
         ));
     }
 
