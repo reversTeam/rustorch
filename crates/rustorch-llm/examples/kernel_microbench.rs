@@ -34,7 +34,7 @@ fn main() {
     use rustorch_metal::kernels::{
         add_inplace_f32, argmax_batched_f32, delta_net_step_with_l2_f32, gqa_decode_f32,
         kv_append_f32, rms_norm_f32, rms_norm_per_head_gated_f32, rope_half_split_f32,
-        sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
+        sgemv_f32_cached_x_into, sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
         sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
         sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
         sigmoid_mul_inplace_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
@@ -112,35 +112,91 @@ fn main() {
     // Result accumulator
     let mut results: Vec<(String, f64, f64, String, usize)> = Vec::new(); // (label, total_ms, avg_us, shape, calls_per_token)
 
-    // -------- Kernel 1: F32 routing matmul (gate_inp), K=2048 N=256 --------
+    // -------- Kernel 1: F32 routing matmul (gate_inp), K=2048 N=256 (CURRENT) --------
+    let rt_k = 2048usize;
+    let rt_n = 256usize;
+    let rt_x = fake_f32(rt_k, 1.7);
+    let rt_w = fake_f32(rt_k * rt_n, 2.3);
+    let rt_x_buf = backend.alloc_shared(rt_k * 4).unwrap();
+    let rt_w_buf = backend.alloc_shared(rt_k * rt_n * 4).unwrap();
+    let rt_y_buf = backend.alloc_shared(rt_n * 4).unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(rt_x.as_ptr(), rt_x_buf.contents() as *mut f32, rt_k);
+        std::ptr::copy_nonoverlapping(rt_w.as_ptr(), rt_w_buf.contents() as *mut f32, rt_k * rt_n);
+    }
     {
-        let k = 2048usize;
-        let n = 256usize;
-        let x = fake_f32(k, 1.7);
-        let w = fake_f32(k * n, 2.3);
-        let x_buf = backend.alloc_shared(k * 4).unwrap();
-        let w_buf = backend.alloc_shared(k * n * 4).unwrap();
-        let y_buf = backend.alloc_shared(n * 4).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, k);
-            std::ptr::copy_nonoverlapping(w.as_ptr(), w_buf.contents() as *mut f32, k * n);
-        }
-        // Warmup
-        sgemv_f32_lcpp_simd_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+        sgemv_f32_lcpp_simd_into(backend, &rt_x_buf, &rt_w_buf, &rt_y_buf, rt_k, rt_n).unwrap();
         backend.drain();
         let t0 = Instant::now();
         for _ in 0..ITERS {
-            sgemv_f32_lcpp_simd_into(backend, &x_buf, &w_buf, &y_buf, k, n).unwrap();
+            sgemv_f32_lcpp_simd_into(backend, &rt_x_buf, &rt_w_buf, &rt_y_buf, rt_k, rt_n).unwrap();
         }
         backend.drain();
         let dt = t0.elapsed();
         results.push((
-            "sgemv_f32 (routing)".to_string(),
+            "sgemv_f32 (routing CURRENT)".to_string(),
             dt.as_secs_f64() * 1000.0,
             dt.as_secs_f64() * 1e6 / ITERS as f64,
-            format!("K={k} N={n} F32"),
-            40, // 40 layers × 1 routing/layer
+            format!("K={rt_k} N={rt_n} F32"),
+            40,
         ));
+    }
+    // -------- Kernel 1b: T183 F32 sgemv with cached x --------
+    {
+        sgemv_f32_cached_x_into(backend, &rt_x_buf, &rt_w_buf, &rt_y_buf, rt_k, rt_n).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_f32_cached_x_into(backend, &rt_x_buf, &rt_w_buf, &rt_y_buf, rt_k, rt_n).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "sgemv_f32 CACHED_X (T183)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("K={rt_k} N={rt_n} F32"),
+            40,
+        ));
+    }
+    // -------- Parity check T183 vs current --------
+    {
+        let mut y_cur = vec![0.0_f32; rt_n];
+        let mut y_t183 = vec![0.0_f32; rt_n];
+        sgemv_f32_lcpp_simd_into(backend, &rt_x_buf, &rt_w_buf, &rt_y_buf, rt_k, rt_n).unwrap();
+        backend.drain();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                rt_y_buf.contents() as *const f32,
+                y_cur.as_mut_ptr(),
+                rt_n,
+            );
+        }
+        sgemv_f32_cached_x_into(backend, &rt_x_buf, &rt_w_buf, &rt_y_buf, rt_k, rt_n).unwrap();
+        backend.drain();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                rt_y_buf.contents() as *const f32,
+                y_t183.as_mut_ptr(),
+                rt_n,
+            );
+        }
+        let mut max_rel = 0.0_f32;
+        for (a, b) in y_cur.iter().zip(y_t183.iter()) {
+            let denom = a.abs().max(1e-4);
+            let rel = (a - b).abs() / denom;
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+        println!(
+            "\nParity T183 sgemv_f32_cached_x: max_rel_err = {max_rel:.3e}  ({})",
+            if max_rel < 1e-4 {
+                "PASS ✓"
+            } else {
+                "FAIL ✗"
+            }
+        );
     }
 
     // -------- Kernel 2: Q4_K MoE gather sgemv, K=2048 N=512 b=8 --------

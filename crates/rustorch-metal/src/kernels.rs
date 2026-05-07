@@ -2276,6 +2276,132 @@ kernel void sgemv_f32_lcpp_simd(
 }
 "#;
 
+// ============================================================================
+// T183 — F32 sgemv with cached x in threadgroup memory.
+//
+// The original `sgemv_f32_lcpp_simd` reads x[K] redundantly from DRAM N times
+// (once per output simdgroup). For routing matmul (K=2048 N=256), that's
+// 2 MB of redundant x reads per call. Microbench measures 23.6 µs/call =
+// ~6.4× theoretical bandwidth floor.
+//
+// This variant loads x[K] cooperatively into threadgroup memory ONCE per TG,
+// then 4 simdgroups (NSG=4) per TG each produce 1 output sharing the cache.
+// 4 outputs/TG × 64 TGs (for N=256) = full N coverage with just 64 TG launches.
+//
+// Bandwidth saved:
+//   Original: N × K × 4 (x re-reads) = 2 MB
+//   Cached:   N/4 × K × 4 (x reads per TG) = 0.5 MB
+//   = 75% reduction in x bandwidth → ~50% total bandwidth reduction
+//
+// Pre-conditions: K <= 4096 (8 KB threadgroup memory at 4 bytes/float).
+// ============================================================================
+
+const SGEMV_F32_CACHED_X_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MAX_K_CACHED = 4096u;
+constant uint NSG_C = 4u;
+constant uint TG_THREADS = 128u; // NSG × 32
+
+kernel void sgemv_f32_cached_x(
+    device const float*  x       [[buffer(0)]],   // [K] activation
+    device const float*  w       [[buffer(1)]],   // [N, K] row-major
+    device float*        y       [[buffer(2)]],   // [N] output
+    constant uint2&      dims    [[buffer(3)]],   // (K, N)
+    uint                 tg_id   [[threadgroup_position_in_grid]],
+    ushort               tiisg   [[thread_index_in_simdgroup]],
+    ushort               sgitg   [[simdgroup_index_in_threadgroup]],
+    uint                 lid     [[thread_position_in_threadgroup]]
+) {
+    uint K = dims.x;
+    uint N = dims.y;
+
+    threadgroup float shm_x[MAX_K_CACHED];
+
+    // Phase 1: cooperative x[K] load into threadgroup memory.
+    for (uint k = lid; k < K; k += TG_THREADS) {
+        shm_x[k] = x[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: each simdgroup produces 1 output.
+    uint n_idx = tg_id * NSG_C + (uint)sgitg;
+    if (n_idx >= N) return;
+
+    uint base = n_idx * K;
+    float partial = 0.0;
+    for (uint k = (uint)tiisg; k < K; k += 32u) {
+        partial += w[base + k] * shm_x[k];
+    }
+    float sum = simd_sum(partial);
+    if (tiisg == 0) {
+        y[n_idx] = sum;
+    }
+}
+"#;
+
+/// T183 — **REJECTED end-to-end, dead-code conservé pour référence**.
+///
+/// F32 sgemv with x cached in threadgroup memory.
+///
+/// Microbench (M4 Max, K=2048, N=256, 1000 iters):
+/// - Original `sgemv_f32_lcpp_simd_into`: 22.2 µs/call
+/// - This T183 cached_x:                   11.0 µs/call
+/// - **Speedup ×2.0, parity byte-identical (max_rel_err = 0)**
+///
+/// End-to-end on Qwen3.6-35B-A3B Q4_K_M decode:
+/// - WASH to slight regression (-1% to -2%) on natural prompts.
+///
+/// Hypothesis: in production the L2 cache already absorbs x reads between
+/// chained dispatches, so explicit TG-memory caching is pure overhead.
+/// Microbench runs the same kernel back-to-back with full SM availability,
+/// which doesn't reflect the production cache state.
+///
+/// Méta-leçon: micro-bench identifies slow kernels reliably, but "this fix
+/// is faster" claims require end-to-end validation. Kept available for
+/// future workloads where x is NOT cache-warm (e.g. cross-layer x reuse,
+/// long sequence prefill).
+#[allow(dead_code)]
+pub fn sgemv_f32_cached_x_into(
+    backend: &MetalBackend,
+    x_buf: &Buffer,
+    w_buf: &Buffer,
+    out_buf: &Buffer,
+    k: usize,
+    n: usize,
+) -> Result<(), MetalError> {
+    if k == 0 || n == 0 {
+        return Err(MetalError::ShapeMismatch(format!(
+            "sgemv_f32_cached_x_into: K, N must be > 0 (got K={k}, N={n})"
+        )));
+    }
+    if k > 4096 {
+        return Err(MetalError::Unsupported(format!(
+            "sgemv_f32_cached_x_into: K={k} exceeds MAX_K_CACHED=4096 (TG memory budget)"
+        )));
+    }
+    let pipeline = backend.pipeline(
+        "sgemv_f32_cached_x",
+        SGEMV_F32_CACHED_X_SHADER,
+        "sgemv_f32_cached_x",
+    )?;
+    let dims = [k as u32, n as u32];
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(w_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(3, 8, dims.as_ptr() as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1); // 4 simdgroups × 32
+                                               // Each TG produces NSG=4 outputs.
+        let n_tgs = (n as u64).div_ceil(4);
+        let groups = MTLSize::new(n_tgs, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 /// T151 — F32 sgemv `y = W @ x` for GGUF Linear-weight layout (output rows
 /// of input columns). One simdgroup per output column; no drain needed.
 /// Used as the GPU replacement for the prior CPU F32 fallback in

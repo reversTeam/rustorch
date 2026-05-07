@@ -171,14 +171,15 @@ impl HybridMetalWeight {
                 sgemv_q8_0_f32_lcpp_nsg2_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
             },
             GgmlType::F32 => {
-                // T151 — Small F32 projections (e.g. ssm_alpha, ssm_beta) now
-                // run on GPU via `sgemv_f32_lcpp_simd_into` (1 simdgroup per
-                // output column). The previous path was CPU naive matmul +
-                // `backend.drain()`, costing ~250 µs/call × 64 calls/token
-                // (= 32 SSM layers × 2 F32 projections) = ~16 ms/token =
-                // ~23% of the 27B decode budget. The new path keeps the
-                // matmul on the same Metal command buffer, no host-side
-                // synchronisation needed.
+                // T151 — Small F32 projections on GPU via `sgemv_f32_lcpp_simd_into`.
+                //
+                // T183 (rejected end-to-end) — wrote `sgemv_f32_cached_x_into`
+                // that caches x[K] in threadgroup memory. Microbench: ×2 speedup
+                // (22µs → 11µs, parity byte-identical). End-to-end on natural
+                // prompts: WASH (-1% to -2%). Likely cause: in production the
+                // L2 cache already absorbs x reads, so our explicit TG-mem
+                // caching is pure overhead. Lesson: microbench gains require
+                // end-to-end confirmation. Kernel kept dead-code in kernels.rs.
                 sgemv_f32_lcpp_simd_into(backend, x_buf, &self.buffer, out_buf, self.k, self.n)
             },
             other => Err(MetalError::Unsupported(format!(
