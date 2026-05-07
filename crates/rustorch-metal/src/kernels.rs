@@ -15914,6 +15914,108 @@ kernel void sigmoid_add_moe_f32(
 }
 "#;
 
+// ============================================================================
+// T188 — Fused dot + sigmoid_add_moe (per-token decode, B=1).
+//
+// Replaces the 2-dispatch sequence:
+//   sgemv_f32_lcpp_simd_into(h, gate_inp_shexp, moe_dot_scalar, d, 1)
+//   sigmoid_add_moe_f32(moe_acc, shared_out, moe_dot_scalar, xd, d)
+//
+// with a single fused kernel that:
+//   1. Cooperatively computes dot(gate_inp_shexp, h) across 4 simdgroups
+//   2. Computes sigmoid(dot) once
+//   3. Each thread writes xd[i] += moe_acc[i] + sig * shared_out[i]
+//
+// Saves 1 dispatch per MoE layer × 40 layers = 40 dispatches/token.
+// Microbench expectation: dot = 8.9 µs/call (dispatch-bound). Fused ~ 2 µs.
+// Per-token saving: ~280 µs = ~1.5% global decode gain.
+//
+// Pre-conditions: D % 4 == 0 (float4 inner loop). For Qwen3.6 d=2048 ✓.
+// ============================================================================
+
+const SIGMOID_ADD_MOE_DOT_FUSED_F32_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void sigmoid_add_moe_dot_fused_f32(
+    device const float* moe_acc          [[buffer(0)]],   // [D]
+    device const float* shared_out       [[buffer(1)]],   // [D]
+    device const float* gate_inp_shexp   [[buffer(2)]],   // [D] router weight (1-row sgemv)
+    device const float* h                [[buffer(3)]],   // [D] post-norm hidden
+    device       float* xd               [[buffer(4)]],   // [D] in/out residual
+    constant uint&      d                [[buffer(5)]],
+    uint                tid              [[thread_position_in_threadgroup]],
+    ushort              tiisg            [[thread_index_in_simdgroup]],
+    ushort              sgitg            [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float s_red[4];
+    threadgroup float dot_tg;
+
+    // Phase 1: cooperative dot(gate_inp_shexp, h) across 128 threads (4 simdgroups).
+    float partial = 0.0;
+    for (uint i = tid; i < d; i += 128u) {
+        partial += gate_inp_shexp[i] * h[i];
+    }
+    float sg_sum = simd_sum(partial);
+    if (tiisg == 0) s_red[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        float t = (tiisg < 4) ? s_red[tiisg] : 0.0;
+        float dot_global = simd_sum(t);
+        if (tiisg == 0) dot_tg = dot_global;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sig = 1.0 / (1.0 + exp(-dot_tg));
+
+    // Phase 2: write xd[i] += moe_acc[i] + sig * shared_out[i] cooperatively.
+    for (uint i = tid; i < d; i += 128u) {
+        xd[i] += moe_acc[i] + sig * shared_out[i];
+    }
+}
+"#;
+
+/// T188 — Fused dot + sigmoid_add_moe for per-token decode (B=1).
+/// Drop-in replacement for the pair `(sgemv_f32_lcpp_simd_into for dot,
+/// sigmoid_add_moe_f32 for write)`.
+///
+/// Pre-condition: `d` is the residual stream dimension. No alignment required
+/// (inner loop strides 128 threads).
+#[allow(clippy::too_many_arguments)]
+pub fn sigmoid_add_moe_dot_fused_f32(
+    backend: &MetalBackend,
+    moe_acc_buf: &Buffer,
+    shared_out_buf: &Buffer,
+    gate_inp_shexp_buf: &Buffer,
+    h_buf: &Buffer,
+    xd_buf: &Buffer,
+    d: usize,
+) -> Result<(), MetalError> {
+    if d == 0 {
+        return Err(MetalError::ShapeMismatch(
+            "sigmoid_add_moe_dot_fused_f32: D must be > 0".to_string(),
+        ));
+    }
+    let pipeline = backend.pipeline(
+        "sigmoid_add_moe_dot_fused_f32",
+        SIGMOID_ADD_MOE_DOT_FUSED_F32_SHADER,
+        "sigmoid_add_moe_dot_fused_f32",
+    )?;
+    let d_u = d as u32;
+    backend.with_encoder(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(moe_acc_buf), 0);
+        encoder.set_buffer(1, Some(shared_out_buf), 0);
+        encoder.set_buffer(2, Some(gate_inp_shexp_buf), 0);
+        encoder.set_buffer(3, Some(h_buf), 0);
+        encoder.set_buffer(4, Some(xd_buf), 0);
+        encoder.set_bytes(5, 4, &d_u as *const u32 as *const std::ffi::c_void);
+        let tg_size = MTLSize::new(128, 1, 1); // 4 simdgroups
+        let groups = MTLSize::new(1, 1, 1);
+        encoder.dispatch_thread_groups(groups, tg_size);
+    });
+    Ok(())
+}
+
 // T162 phase 9f — Batched fused dot product + sigmoid_add_moe.
 // Computes per token b :
 //   scalar[b] = dot(gate_inp_shexp, h_post[b])

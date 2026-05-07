@@ -37,10 +37,10 @@ fn main() {
         rms_norm_per_head_gated_f32, rope_half_split_f32, sgemv_f32_cached_x_into,
         sgemv_f32_lcpp_simd_into, sgemv_q4_k_f32_lcpp_nsg2_into,
         sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q5_k_f32_lcpp_nsg2_into,
-        sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_f32,
-        sigmoid_mul_inplace_f32, split_qkv_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
-        swiglu_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32, weighted_reduce_add_f32,
-        zero_f32,
+        sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q8_0_f32_lcpp_nsg2_into,
+        sigmoid_add_moe_dot_fused_f32, sigmoid_add_moe_f32, sigmoid_mul_inplace_f32, split_qkv_f32,
+        ssm_apply_gate_f32, ssm_conv1d_step_f32, swiglu_f32, topk_softmax_norm_f32,
+        topk_softmax_norm_parallel_f32, weighted_reduce_add_f32, zero_f32,
     };
     use std::time::Instant;
 
@@ -1344,6 +1344,111 @@ fn main() {
             format!("n={n}"),
             40,
         ));
+    }
+
+    // -------- T188 : sigmoid_add_moe_dot_fused vs (sgemv N=1 + sigmoid_add_moe) --------
+    {
+        let d = 2048usize;
+        let h = fake_f32(d, 7.7);
+        let g_router = fake_f32(d, 8.8);
+        let h_buf = backend.alloc_shared(d * 4).unwrap();
+        let g_buf = backend.alloc_shared(d * 4).unwrap();
+        let dot_buf = backend.alloc_shared(4).unwrap();
+        let acc_buf = backend.alloc_shared(d * 4).unwrap();
+        let sh_buf = backend.alloc_shared(d * 4).unwrap();
+        let xd_buf = backend.alloc_shared(d * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(h.as_ptr(), h_buf.contents() as *mut f32, d);
+            std::ptr::copy_nonoverlapping(g_router.as_ptr(), g_buf.contents() as *mut f32, d);
+        }
+        // Bench the unfused 2-dispatch sequence (current production):
+        sgemv_f32_lcpp_simd_into(backend, &h_buf, &g_buf, &dot_buf, d, 1).unwrap();
+        sigmoid_add_moe_f32(backend, &acc_buf, &sh_buf, &dot_buf, &xd_buf, d).unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sgemv_f32_lcpp_simd_into(backend, &h_buf, &g_buf, &dot_buf, d, 1).unwrap();
+            sigmoid_add_moe_f32(backend, &acc_buf, &sh_buf, &dot_buf, &xd_buf, d).unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "dot+sigmoid_add (2 dispatches)".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("d={d}"),
+            40,
+        ));
+        // Bench the fused single-dispatch version (T188):
+        sigmoid_add_moe_dot_fused_f32(backend, &acc_buf, &sh_buf, &g_buf, &h_buf, &xd_buf, d)
+            .unwrap();
+        backend.drain();
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            sigmoid_add_moe_dot_fused_f32(backend, &acc_buf, &sh_buf, &g_buf, &h_buf, &xd_buf, d)
+                .unwrap();
+        }
+        backend.drain();
+        let dt = t0.elapsed();
+        results.push((
+            "T188 sigmoid_add_moe_FUSED".to_string(),
+            dt.as_secs_f64() * 1000.0,
+            dt.as_secs_f64() * 1e6 / ITERS as f64,
+            format!("d={d}"),
+            40,
+        ));
+        // Parity check : reset xd, run both paths, compare.
+        let init_xd = fake_f32(d, 5.5);
+        unsafe {
+            std::ptr::copy_nonoverlapping(init_xd.as_ptr(), xd_buf.contents() as *mut f32, d);
+            std::ptr::copy_nonoverlapping(
+                fake_f32(d, 1.1).as_ptr(),
+                acc_buf.contents() as *mut f32,
+                d,
+            );
+            std::ptr::copy_nonoverlapping(
+                fake_f32(d, 2.2).as_ptr(),
+                sh_buf.contents() as *mut f32,
+                d,
+            );
+        }
+        sgemv_f32_lcpp_simd_into(backend, &h_buf, &g_buf, &dot_buf, d, 1).unwrap();
+        sigmoid_add_moe_f32(backend, &acc_buf, &sh_buf, &dot_buf, &xd_buf, d).unwrap();
+        backend.drain();
+        let mut xd_orig = vec![0.0_f32; d];
+        unsafe {
+            std::ptr::copy_nonoverlapping(xd_buf.contents() as *const f32, xd_orig.as_mut_ptr(), d);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(init_xd.as_ptr(), xd_buf.contents() as *mut f32, d);
+        }
+        sigmoid_add_moe_dot_fused_f32(backend, &acc_buf, &sh_buf, &g_buf, &h_buf, &xd_buf, d)
+            .unwrap();
+        backend.drain();
+        let mut xd_fused = vec![0.0_f32; d];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                xd_buf.contents() as *const f32,
+                xd_fused.as_mut_ptr(),
+                d,
+            );
+        }
+        let mut max_rel = 0.0_f32;
+        for (a, b) in xd_orig.iter().zip(xd_fused.iter()) {
+            let denom = a.abs().max(1e-4);
+            let rel = (a - b).abs() / denom;
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+        println!(
+            "\nParity T188 sigmoid_add_moe_FUSED: max_rel_err = {max_rel:.3e}  ({})",
+            if max_rel < 1e-4 {
+                "PASS ✓"
+            } else {
+                "FAIL ✗"
+            }
+        );
     }
 
     // -------- Print results --------

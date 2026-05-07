@@ -64,13 +64,14 @@ use rustorch_metal::kernels::{
     sgemv_q4_k_gather_f32_lcpp_nsg2_into, sgemv_q4_k_gather_per_token_f32_lcpp_nsg2_into,
     sgemv_q5_k_f32_lcpp_nsg2_into, sgemv_q5_k_gather_f32_lcpp_nsg2_into,
     sgemv_q6_k_f32_lcpp_nsg2_into, sgemv_q6_k_gather_f32_lcpp_nsg2_into,
-    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_batched_f32, sigmoid_add_moe_f32,
-    sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32, split_qg_per_head_batched_f32,
-    split_qg_per_head_f32, split_qkv_f32, ssm_apply_gate_batched_f32, ssm_apply_gate_f32,
-    ssm_conv1d_step_f32, ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32,
-    topk_softmax_norm_batched_f32, topk_softmax_norm_f32, topk_softmax_norm_parallel_f32,
-    unpermute_rows_f32, weighted_add_inplace_f32, weighted_reduce_add_batched_f32,
-    weighted_reduce_add_f32, weighted_scatter_add_f32, zero_f32,
+    sgemv_q8_0_f32_lcpp_nsg2_into, sigmoid_add_moe_batched_f32, sigmoid_add_moe_dot_fused_f32,
+    sigmoid_add_moe_f32, sigmoid_mul_inplace_batched_f32, sigmoid_mul_inplace_f32,
+    split_qg_per_head_batched_f32, split_qg_per_head_f32, split_qkv_f32,
+    ssm_apply_gate_batched_f32, ssm_apply_gate_f32, ssm_conv1d_step_f32,
+    ssm_conv1d_step_f32_with_offset, swiglu_batched_f32, swiglu_f32, topk_softmax_norm_batched_f32,
+    topk_softmax_norm_f32, topk_softmax_norm_parallel_f32, unpermute_rows_f32,
+    weighted_add_inplace_f32, weighted_reduce_add_batched_f32, weighted_reduce_add_f32,
+    weighted_scatter_add_f32, zero_f32,
 };
 
 /// T172 Day 5 — Lazy global AMX executor for Innovation 1 hybrid forward.
@@ -3188,25 +3189,46 @@ fn ffn_dense_forward(
             // 1 dispatch GPU au lieu de 1 drain + 2 CPU loops sur d éléments.
             // Économie : 1 drain × 16 MoE layers = 16 drains/token sur 35B-A3B.
             // T173 : skip dot_scalar if async path already computed it.
+            // T188 — when AMX async is OFF (default), use the fused
+            // `sigmoid_add_moe_dot_fused_f32` kernel which inlines the dot
+            // computation into the same dispatch. Saves 1 dispatch per MoE
+            // layer × 40 = 40 dispatches/token.
+            // Microbench : 10.3 µs (2 dispatches) → 5.6 µs (fused) = ×1.84.
+            // Activable via RUSTORCH_DOT_FUSED (default ON, set =0 for bisect).
             let _moe_t0_final = std::time::Instant::now();
-            if !use_amx_async {
-                sgemv_f32_lcpp_simd_into(
+            let use_dot_fused = std::env::var("RUSTORCH_DOT_FUSED")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if !use_amx_async && use_dot_fused {
+                sigmoid_add_moe_dot_fused_f32(
                     backend,
-                    &scratch.h,
+                    &scratch.moe_acc,
+                    &scratch.moe_expert_out,
                     gate_inp_shexp,
-                    &scratch.moe_dot_scalar,
+                    &scratch.h,
+                    &scratch.xd,
                     d,
-                    1,
+                )?;
+            } else {
+                if !use_amx_async {
+                    sgemv_f32_lcpp_simd_into(
+                        backend,
+                        &scratch.h,
+                        gate_inp_shexp,
+                        &scratch.moe_dot_scalar,
+                        d,
+                        1,
+                    )?;
+                }
+                sigmoid_add_moe_f32(
+                    backend,
+                    &scratch.moe_acc,
+                    &scratch.moe_expert_out,
+                    &scratch.moe_dot_scalar,
+                    &scratch.xd,
+                    d,
                 )?;
             }
-            sigmoid_add_moe_f32(
-                backend,
-                &scratch.moe_acc,
-                &scratch.moe_expert_out,
-                &scratch.moe_dot_scalar,
-                &scratch.xd,
-                d,
-            )?;
             profile_drain_record(backend, "  moe.final_add", _moe_t0_final);
             Ok(())
         },
