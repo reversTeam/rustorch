@@ -23,8 +23,38 @@ fn main() {
     println!("[cublas_gemm_bench] Re-run with: cargo run --release -p rustorch-cuda --features cuda --example cublas_gemm_bench");
 }
 
+/// Lightweight String-backed error so we can `?` through cudarc's
+/// CublasError + DriverError without pulling in anyhow as a dev-dep.
 #[cfg(feature = "cuda")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug)]
+struct BenchError(String);
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Display for BenchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl std::error::Error for BenchError {}
+
+#[cfg(feature = "cuda")]
+impl From<cudarc::driver::DriverError> for BenchError {
+    fn from(e: cudarc::driver::DriverError) -> Self {
+        Self(format!("driver: {e:?}"))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl From<cudarc::cublas::result::CublasError> for BenchError {
+    fn from(e: cudarc::cublas::result::CublasError) -> Self {
+        Self(format!("cublas: {e:?}"))
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn main() -> Result<(), BenchError> {
     use cudarc::cublas::{sys, CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::CudaContext;
     use std::time::Instant;
