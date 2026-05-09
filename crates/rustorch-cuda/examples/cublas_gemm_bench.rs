@@ -203,16 +203,63 @@ fn main() -> Result<(), BenchError> {
         let a_dev_fp8 = stream.memcpy_stod(&a_fp8)?;
         let b_dev_fp8 = stream.memcpy_stod(&b_fp8)?;
         let mut c_dev_fp8_out = stream.alloc_zeros::<half::bf16>(m * n)?;
-        let alpha_f32: f32 = 1.0;
-        let beta_f32: f32 = 0.0;
+        // alpha/beta defined inside the fp8_attempt closure since cublasLt
+        // setup happens there now (cublasLt has its own handle separate
+        // from CudaBlas).
 
-        // FP8 GEMM via cublasGemmEx requires transa=T, transb=N (TN pattern)
-        // on Hopper+. We call gemm_ex with that combo, plus k must be aligned
-        // to 16 (always true here since dim ∈ {128, 256, 512, ...}). The
-        // result memory layout differs from the f32/bf16 paths (this is a
-        // transposed problem), but for throughput measurement that's fine —
-        // we don't validate FP8 output values.
+        // FP8 GEMM via cublasLtMatmul (cublasGemmEx rejects FP8 inputs on
+        // Blackwell). We hand-build MatrixLayout descriptors with
+        // CUDA_R_8F_E4M3 for A,B and CUDA_R_16BF for C, MatmulDesc with
+        // CUBLAS_COMPUTE_32F + scale type R_32F. cublasLt requires
+        // transa=T, transb=N for FP8 ("TN" gemm). lda=ldb=k, ldc=m.
         let mut fp8_attempt = || -> Result<f64, BenchError> {
+            use cudarc::cublaslt::{
+                CudaBlasLT, MatmulDesc, MatmulPref, Matrix, MatrixLayout, Workspace as LtWorkspace,
+            };
+
+            let blas_lt = CudaBlasLT::new(stream.clone())?;
+            let workspace = LtWorkspace::new(stream.clone(), 32 * 1024 * 1024)?; // 32 MiB
+
+            let a_layout = MatrixLayout::new(
+                cudarc::cublaslt::sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                k as u64,
+                m as u64,
+                k as i64,
+            )?;
+            let b_layout = MatrixLayout::new(
+                cudarc::cublaslt::sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                k as u64,
+                n as u64,
+                k as i64,
+            )?;
+            let c_layout = MatrixLayout::new(
+                cudarc::cublaslt::sys::cudaDataType_t::CUDA_R_16BF,
+                m as u64,
+                n as u64,
+                m as i64,
+            )?;
+
+            let matmul_desc = MatmulDesc::new(
+                cudarc::cublaslt::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cudarc::cublaslt::sys::cudaDataType_t::CUDA_R_32F,
+            )?;
+            matmul_desc.set_transpose(true, Matrix::A)?;
+            matmul_desc.set_transpose(false, Matrix::B)?;
+
+            let pref = MatmulPref::new()?;
+            pref.set_workspace_size(workspace.size)?;
+
+            let heuristic = cudarc::cublaslt::result::get_matmul_algo_heuristic(
+                *blas_lt.handle(),
+                matmul_desc.handle,
+                a_layout.handle,
+                b_layout.handle,
+                c_layout.handle,
+                c_layout.handle,
+                pref.handle,
+            )?;
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
             // Warm-up: 5 calls.
             for _ in 0..5 {
                 // SAFETY: gemm_ex contract — pointers and types match cfg,
@@ -223,26 +270,24 @@ fn main() -> Result<(), BenchError> {
                     let (a_ptr, _r1) = a_dev_fp8.device_ptr(&stream);
                     let (b_ptr, _r2) = b_dev_fp8.device_ptr(&stream);
                     let (c_ptr, _r3) = c_dev_fp8_out.device_ptr_mut(&stream);
-                    cudarc::cublas::result::gemm_ex(
-                        *blas.handle(),
-                        sys::cublasOperation_t::CUBLAS_OP_T,
-                        sys::cublasOperation_t::CUBLAS_OP_N,
-                        m as i32,
-                        n as i32,
-                        k as i32,
-                        (&alpha_f32) as *const f32 as *const _,
+                    let (w_ptr, _r4) = workspace.buffer.device_ptr(&stream);
+                    cudarc::cublaslt::result::matmul(
+                        *blas_lt.handle(),
+                        matmul_desc.handle,
+                        (&alpha) as *const f32 as *const _,
+                        (&beta) as *const f32 as *const _,
                         a_ptr as *const _,
-                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                        k as i32,
+                        a_layout.handle,
                         b_ptr as *const _,
-                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                        k as i32,
-                        (&beta_f32) as *const f32 as *const _,
+                        b_layout.handle,
+                        c_ptr as *const _,
+                        c_layout.handle,
                         c_ptr as *mut _,
-                        sys::cudaDataType_t::CUDA_R_16BF,
-                        m as i32,
-                        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                        c_layout.handle,
+                        (&heuristic.algo) as *const _,
+                        w_ptr as *mut _,
+                        workspace.size,
+                        stream.cu_stream() as *mut _,
                     )?;
                 }
             }
@@ -254,26 +299,24 @@ fn main() -> Result<(), BenchError> {
                     let (a_ptr, _r1) = a_dev_fp8.device_ptr(&stream);
                     let (b_ptr, _r2) = b_dev_fp8.device_ptr(&stream);
                     let (c_ptr, _r3) = c_dev_fp8_out.device_ptr_mut(&stream);
-                    cudarc::cublas::result::gemm_ex(
-                        *blas.handle(),
-                        sys::cublasOperation_t::CUBLAS_OP_T,
-                        sys::cublasOperation_t::CUBLAS_OP_N,
-                        m as i32,
-                        n as i32,
-                        k as i32,
-                        (&alpha_f32) as *const f32 as *const _,
+                    let (w_ptr, _r4) = workspace.buffer.device_ptr(&stream);
+                    cudarc::cublaslt::result::matmul(
+                        *blas_lt.handle(),
+                        matmul_desc.handle,
+                        (&alpha) as *const f32 as *const _,
+                        (&beta) as *const f32 as *const _,
                         a_ptr as *const _,
-                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                        k as i32,
+                        a_layout.handle,
                         b_ptr as *const _,
-                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                        k as i32,
-                        (&beta_f32) as *const f32 as *const _,
+                        b_layout.handle,
+                        c_ptr as *const _,
+                        c_layout.handle,
                         c_ptr as *mut _,
-                        sys::cudaDataType_t::CUDA_R_16BF,
-                        m as i32,
-                        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                        c_layout.handle,
+                        (&heuristic.algo) as *const _,
+                        w_ptr as *mut _,
+                        workspace.size,
+                        stream.cu_stream() as *mut _,
                     )?;
                 }
             }
