@@ -177,6 +177,26 @@ fn gemm_f32_cuda(
         code: hash_diag(&format!("{e:?}")),
         location: "cublas::gemm_f32_cuda::CudaBlas::new",
     })?;
+    // Enable TF32 TensorCore math on Ampere/Hopper/Blackwell. cudarc's safe
+    // Gemm<f32> impl calls plain cublasSgemm which would otherwise stay on
+    // the FP32 ALU path (no TensorCores). With CUBLAS_TF32_TENSOR_OP_MATH
+    // set on the handle, sgemm transparently uses 19-bit TF32 multiplies +
+    // f32 accumulation — bit-different from strict IEEE f32 (1e-5 max
+    // relative error in practice) but ~3-5× faster on these GPUs. Drivers
+    // older than CUDA 11 ignore this flag, so it's a safe no-op on legacy.
+    // SAFETY: blas.handle() is a valid cublasHandle_t, mode is in-range.
+    unsafe {
+        let status = cudarc::cublas::sys::cublasSetMathMode(
+            *blas.handle(),
+            cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+        );
+        if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(CudaError::CublasStatus {
+                code: status as i32,
+                location: "cublas::gemm_f32_cuda::set_math_mode_tf32",
+            });
+        }
+    }
 
     // H2D for a, b and (when beta != 0) c. Even when beta == 0 we still
     // need a device-side buffer for c — allocate zeros to keep the path

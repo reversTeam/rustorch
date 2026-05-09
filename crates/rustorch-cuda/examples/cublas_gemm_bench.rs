@@ -69,7 +69,22 @@ fn main() -> Result<(), BenchError> {
     let stream = ctx.default_stream();
     let blas = CudaBlas::new(stream.clone())?;
 
-    println!("[cublas_gemm_bench] device ready, running sgemm sweep");
+    // Enable TF32 TensorCore path. Without this, cublasSgemm stays on
+    // the slow FP32 ALU path. CUBLAS_TF32_TENSOR_OP_MATH = 3.
+    // SAFETY: handle is valid (just constructed), mode is in-range.
+    unsafe {
+        let status = cudarc::cublas::sys::cublasSetMathMode(
+            *blas.handle(),
+            cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+        );
+        if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(BenchError(format!(
+                "cublasSetMathMode(TF32) failed: status={status:?}"
+            )));
+        }
+    }
+
+    println!("[cublas_gemm_bench] device ready (TF32 math mode), running sgemm sweep");
     println!();
     println!(
         "  {:>5} {:>10} {:>14} {:>10} {:>12}",
