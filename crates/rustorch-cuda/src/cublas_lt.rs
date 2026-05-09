@@ -1219,6 +1219,23 @@ unsafe fn build_cached(
     seed_a_scale: u64,
     seed_b_scale: u64,
 ) -> Result<CachedMatmul, CudaError> {
+    // Convention : we expect row-major buffers (the standard layout
+    // produced by torch / our CPU loader after `transpose_2d`) :
+    //   A row-major (m, k)  → physical layout = col-major (k, m, ld=k)
+    //   B row-major (k, n)  → physical layout = col-major (n, k, ld=n)
+    //   C row-major (m, n)  → physical layout = col-major (m, n, ld=m)
+    //                          (only equivalent to row-major when m=1,
+    //                           which is the autoregressive decode case)
+    //
+    // We then ask cuBLASLt to compute  C = op(A) * op(B)  with
+    //   transa = OP_T   →  op(A) = (col(k, m))^T = col(m, k) ↔ row(m, k) = A
+    //   transb = OP_T   →  op(B) = (col(n, k))^T = col(k, n) ↔ row(k, n) = B
+    //
+    // Previously transb = OP_N gave  op(B) = col(k, n) reading the same
+    // row-major buffer as if it were already col-major, which produces
+    // a scrambled matrix unrelated to the math W. T241.6b parity test
+    // surfaced this : Q/K/V projections were silently computing W^-junk
+    // instead of x · W, hence the divergence vs. CPU.
     let a_layout =
         result::create_matrix_layout(a_dt, k as u64, m as u64, k as i64).map_err(|e| {
             CudaError::CublasStatus {
@@ -1227,7 +1244,7 @@ unsafe fn build_cached(
             }
         })?;
     let b_layout =
-        result::create_matrix_layout(b_dt, k as u64, n as u64, k as i64).map_err(|e| {
+        result::create_matrix_layout(b_dt, n as u64, k as u64, n as i64).map_err(|e| {
             CudaError::CublasStatus {
                 code: lt_err_code(e),
                 location: "build_cached::b_layout",
@@ -1251,7 +1268,7 @@ unsafe fn build_cached(
     })?;
 
     let transa = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
-    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
     result::set_matmul_desc_attribute(
         matmul_desc,
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
