@@ -33,6 +33,8 @@ half = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Used by sgemv_q4k_bf16 parity test — references the CPU dequant + Q4_K block format.
+rustorch-gguf = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true
