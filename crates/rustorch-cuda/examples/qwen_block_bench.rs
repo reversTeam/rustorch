@@ -61,6 +61,10 @@ fn main() -> Result<(), BenchError> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let mut session = LtSession::new(stream.clone())?;
+    println!(
+        "[qwen_block_bench] cublasLt workspace: {} MiB (override via RUSTORCH_CUBLASLT_WORKSPACE_MB)",
+        session.workspace_bytes / (1024 * 1024)
+    );
 
     // Qwen3.6-27B-style dense block dims (same hidden as 35B-A3B MoE).
     let hidden = 2048usize;

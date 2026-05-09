@@ -393,9 +393,19 @@ pub struct LtSession {
 #[cfg(feature = "cuda")]
 impl LtSession {
     /// Allocate handle + workspace on the given stream's device.
-    /// Default workspace = 32 MiB (Hopper+ recommendation).
+    ///
+    /// Default workspace = **256 MiB** (Blackwell-tuned, T240.8b). Hopper's
+    /// rule of thumb was 32 MiB, but on GB10 the cuBLASLt heuristic needs
+    /// more scratch to pick split-K and pipelined kernels for the larger
+    /// shapes used in LLM prefill (FFN_up: M=2048, N=11008, K=2048 →
+    /// ~90 MiB just for the algo's persistent state). Override via
+    /// `RUSTORCH_CUBLASLT_WORKSPACE_MB` env var or `new_with_workspace`.
     pub fn new(stream: std::sync::Arc<cudarc::driver::CudaStream>) -> Result<Self, CudaError> {
-        Self::new_with_workspace(stream, 32 * 1024 * 1024)
+        let mb = std::env::var("RUSTORCH_CUBLASLT_WORKSPACE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(256);
+        Self::new_with_workspace(stream, mb * 1024 * 1024)
     }
 
     /// Custom workspace size variant.
