@@ -384,17 +384,27 @@ fn try_run_sparse_block(
     // Warm-up.
     for _ in 0..3 {
         unsafe {
-            let (b_p, _r) = act.device_ptr(stream);
-            let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
-            sparse_session.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
-            let (c_p, _r2) = out_attn.device_ptr_mut(stream);
-            sparse_session.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
-            let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
-            sparse_session.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
+            {
+                let (b_p, _r) = act.device_ptr(stream);
+                let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
+            }
+            {
+                let (b_p, _r) = act.device_ptr(stream);
+                let (c_p, _r2) = out_attn.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
+            }
+            {
+                let (b_p, _r) = act.device_ptr(stream);
+                let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
+            }
             // FFN-down takes the (k=ffn, n=seq) slice of out_gate_up
-            let (b_p, _r3) = out_gate_up.device_ptr(stream);
-            let (c_p, _r2) = out_down.device_ptr_mut(stream);
-            sparse_session.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
+            {
+                let (b_p, _r3) = out_gate_up.device_ptr(stream);
+                let (c_p, _r2) = out_down.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
+            }
         }
     }
     stream.synchronize()?;
