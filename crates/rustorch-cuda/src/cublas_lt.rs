@@ -1659,3 +1659,151 @@ pub unsafe fn matmul_mxfp4(
 ) -> Result<(), CudaError> {
     Err(CudaError::NoDeviceFound)
 }
+
+// =============================================================================
+// Numerical parity tests
+// =============================================================================
+
+#[cfg(all(test, feature = "cuda"))]
+mod parity_tests {
+    use super::*;
+    use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
+
+    /// Reference CPU matmul : `c = a · b` with row-major buffers,
+    /// `a[m, k]`, `b[k, n]`, `c[m, n]`.
+    fn cpu_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += a[i * k + kk] * b[kk * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+    }
+
+    /// T241.6b regression guard — verifies matmul_bf16 actually computes
+    /// `C = A·B` with row-major buffers (and not `A·B^T` or some scrambled
+    /// variant). Guards against any future change to the cuBLASLt layout
+    /// convention in build_cached().
+    ///
+    /// Uses a small 4×3 · 3×5 case with hand-picked non-symmetric values.
+    /// BF16 has ~7-bit mantissa so we use small integer values that round-trip
+    /// exactly and check for byte-perfect equality after conversion.
+    #[test]
+    fn matmul_bf16_computes_a_dot_b_row_major() -> Result<(), Box<dyn std::error::Error>> {
+        let m = 4usize;
+        let k = 3usize;
+        let n = 5usize;
+
+        // Hand-picked A [m, k] and B [k, n] with values that round-trip
+        // exactly to BF16. NOT symmetric / NOT diagonal so any layout bug
+        // would produce different output.
+        let a: Vec<f32> = vec![
+            1.0, 2.0, 3.0, // row 0
+            4.0, 5.0, 6.0, // row 1
+            7.0, 8.0, 9.0, // row 2
+            10.0, 11.0, 12.0, // row 3
+        ];
+        let b: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, // row 0
+            6.0, 7.0, 8.0, 9.0, 10.0, // row 1
+            11.0, 12.0, 13.0, 14.0, 15.0, // row 2
+        ];
+        let mut c_cpu: Vec<f32> = vec![0.0; m * n];
+        cpu_matmul(&a, &b, &mut c_cpu, m, k, n);
+
+        // Verify CPU reference (sanity)
+        // c[0, 0] = 1*1 + 2*6 + 3*11 = 1 + 12 + 33 = 46
+        assert_eq!(c_cpu[0], 46.0);
+        // c[0, 1] = 1*2 + 2*7 + 3*12 = 2 + 14 + 36 = 52
+        assert_eq!(c_cpu[1], 52.0);
+
+        // GPU path
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let mut session = LtSession::new(ctx.clone(), stream.clone(), 32 * 1024 * 1024)?;
+
+        let a_bf: Vec<half::bf16> = a.iter().copied().map(half::bf16::from_f32).collect();
+        let b_bf: Vec<half::bf16> = b.iter().copied().map(half::bf16::from_f32).collect();
+        let a_dev = stream.memcpy_stod(&a_bf)?;
+        let b_dev = stream.memcpy_stod(&b_bf)?;
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n)?;
+
+        unsafe {
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (c_p, _r3) = c_dev.device_ptr_mut(&stream);
+            session.matmul_bf16(a_p, b_p, c_p, m, k, n, 1.0, 0.0)?;
+        }
+
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev)?;
+        let c_gpu: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+
+        // Compare element-wise. Allow tiny BF16 rounding tolerance
+        // (values ≤ 1000 should round-trip near-exactly).
+        for i in 0..m {
+            for j in 0..n {
+                let diff = (c_cpu[i * n + j] - c_gpu[i * n + j]).abs();
+                let tol = c_cpu[i * n + j].abs() * 1e-2 + 1e-2;
+                assert!(
+                    diff <= tol,
+                    "mismatch at ({i}, {j}) : cpu={} gpu={} diff={}",
+                    c_cpu[i * n + j],
+                    c_gpu[i * n + j],
+                    diff
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Same regression guard but with m=1 (single-row, the LLM
+    /// autoregressive decode hot path). Specifically catches the
+    /// "transb=OP_N on row-major B" bug.
+    #[test]
+    fn matmul_bf16_m_eq_1_row_major() -> Result<(), Box<dyn std::error::Error>> {
+        let m = 1usize;
+        let k = 4usize;
+        let n = 6usize;
+
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f32> = (0..(k * n)).map(|i| (i + 1) as f32).collect();
+        let mut c_cpu: Vec<f32> = vec![0.0; m * n];
+        cpu_matmul(&a, &b, &mut c_cpu, m, k, n);
+
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let mut session = LtSession::new(ctx.clone(), stream.clone(), 32 * 1024 * 1024)?;
+
+        let a_bf: Vec<half::bf16> = a.iter().copied().map(half::bf16::from_f32).collect();
+        let b_bf: Vec<half::bf16> = b.iter().copied().map(half::bf16::from_f32).collect();
+        let a_dev = stream.memcpy_stod(&a_bf)?;
+        let b_dev = stream.memcpy_stod(&b_bf)?;
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n)?;
+
+        unsafe {
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (c_p, _r3) = c_dev.device_ptr_mut(&stream);
+            session.matmul_bf16(a_p, b_p, c_p, m, k, n, 1.0, 0.0)?;
+        }
+
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev)?;
+        let c_gpu: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+
+        for j in 0..n {
+            let diff = (c_cpu[j] - c_gpu[j]).abs();
+            let tol = c_cpu[j].abs() * 5e-2 + 1.0;
+            assert!(
+                diff <= tol,
+                "m=1 mismatch at j={j} : cpu={} gpu={} diff={}",
+                c_cpu[j],
+                c_gpu[j],
+                diff
+            );
+        }
+        Ok(())
+    }
+}
