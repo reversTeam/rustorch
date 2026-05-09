@@ -164,15 +164,124 @@ fn main() -> Result<(), BenchError> {
         bf16_per_block_ms, bf16_per_forward_ms, bf16_tok_s, bf16_tflops
     );
 
+    // ───────── NVFP4 path (T240.8e) ─────────
+    // GB10/sm_121 takes NVFP4 (VEC16 blocks, UE4M3 scales). Datacenter
+    // Blackwell + Hopper want MXFP4 (VEC32 + UE8M0). UE4M3 byte 0x70
+    // decodes to ≈1.0 → unscaled matmul (the byte values are dummies; the
+    // bench measures kernel cost, not numerical output).
+    use rustorch_cuda::cublas_lt::{Fp4ScaleMode, Fp8Output};
+    let block = 16usize; // NVFP4 block size
+    assert!(hidden % block == 0 && ffn % block == 0);
+
+    // FP4 packed: 1 byte per 2 elements. Activation buffers, weight
+    // buffers, FFN intermediate buffer.
+    let act_fp4: Vec<u8> = (0..seq * hidden / 2)
+        .map(|i| (i as u8).wrapping_mul(11))
+        .collect();
+    let ffn_int_fp4: Vec<u8> = (0..seq * ffn / 2)
+        .map(|i| (i as u8).wrapping_mul(13))
+        .collect();
+    let w_qkv_fp4: Vec<u8> = (0..hidden * qkv_n / 2)
+        .map(|i| (i as u8).wrapping_mul(17))
+        .collect();
+    let w_attn_out_fp4: Vec<u8> = (0..hidden * attn_out_n / 2)
+        .map(|i| (i as u8).wrapping_mul(19))
+        .collect();
+    let w_ffn_up_fp4: Vec<u8> = (0..hidden * ffn_up_n / 2)
+        .map(|i| (i as u8).wrapping_mul(23))
+        .collect();
+    let w_ffn_gate_fp4: Vec<u8> = (0..hidden * ffn_gate_n / 2)
+        .map(|i| (i as u8).wrapping_mul(29))
+        .collect();
+    let w_ffn_down_fp4: Vec<u8> = (0..ffn * ffn_down_n / 2)
+        .map(|i| (i as u8).wrapping_mul(31))
+        .collect();
+
+    // Scales (UE4M3 byte 0x70 ≈ 1.0). Sized per FP4 layout convention:
+    // for an [M × K] matrix, scale tensor is M × (K/block_size).
+    let act_scale: Vec<u8> = vec![0x70u8; seq * (hidden / block)];
+    let ffn_int_scale: Vec<u8> = vec![0x70u8; seq * (ffn / block)];
+    let w_qkv_scale: Vec<u8> = vec![0x70u8; (hidden / block) * qkv_n];
+    let w_attn_out_scale: Vec<u8> = vec![0x70u8; (hidden / block) * attn_out_n];
+    let w_ffn_up_scale: Vec<u8> = vec![0x70u8; (hidden / block) * ffn_up_n];
+    let w_ffn_gate_scale: Vec<u8> = vec![0x70u8; (hidden / block) * ffn_gate_n];
+    let w_ffn_down_scale: Vec<u8> = vec![0x70u8; (ffn / block) * ffn_down_n];
+
+    let act_fp4_dev = stream.memcpy_stod(&act_fp4)?;
+    let ffn_int_fp4_dev = stream.memcpy_stod(&ffn_int_fp4)?;
+    let w_qkv_fp4_dev = stream.memcpy_stod(&w_qkv_fp4)?;
+    let w_attn_out_fp4_dev = stream.memcpy_stod(&w_attn_out_fp4)?;
+    let w_ffn_up_fp4_dev = stream.memcpy_stod(&w_ffn_up_fp4)?;
+    let w_ffn_gate_fp4_dev = stream.memcpy_stod(&w_ffn_gate_fp4)?;
+    let w_ffn_down_fp4_dev = stream.memcpy_stod(&w_ffn_down_fp4)?;
+
+    let act_scale_dev = stream.memcpy_stod(&act_scale)?;
+    let ffn_int_scale_dev = stream.memcpy_stod(&ffn_int_scale)?;
+    let w_qkv_scale_dev = stream.memcpy_stod(&w_qkv_scale)?;
+    let w_attn_out_scale_dev = stream.memcpy_stod(&w_attn_out_scale)?;
+    let w_ffn_up_scale_dev = stream.memcpy_stod(&w_ffn_up_scale)?;
+    let w_ffn_gate_scale_dev = stream.memcpy_stod(&w_ffn_gate_scale)?;
+    let w_ffn_down_scale_dev = stream.memcpy_stod(&w_ffn_down_scale)?;
+
     println!();
-    println!("[qwen_block_bench] for FP8/FP4 paths the per-call FLOPS are identical;");
+    println!("[qwen_block_bench] NVFP4 path (Vec16Ue4m3, native on GB10)");
+
+    let fp4_per_block_ms = run_fp4_block(
+        &mut session,
+        &stream,
+        &act_fp4_dev,
+        &act_scale_dev,
+        &ffn_int_fp4_dev,
+        &ffn_int_scale_dev,
+        &w_qkv_fp4_dev,
+        &w_qkv_scale_dev,
+        &mut out_qkv,
+        &w_attn_out_fp4_dev,
+        &w_attn_out_scale_dev,
+        &mut out_attn,
+        &w_ffn_up_fp4_dev,
+        &w_ffn_up_scale_dev,
+        &mut out_up,
+        &w_ffn_gate_fp4_dev,
+        &w_ffn_gate_scale_dev,
+        &mut out_gate,
+        &w_ffn_down_fp4_dev,
+        &w_ffn_down_scale_dev,
+        &mut out_down,
+        seq,
+        hidden,
+        qkv_n,
+        attn_out_n,
+        ffn_up_n,
+        ffn_gate_n,
+        ffn_down_n,
+        ffn,
+        Fp4ScaleMode::Vec16Ue4m3,
+        Fp8Output::Bf16,
+        50,
+    )?;
+    let fp4_per_forward_ms = fp4_per_block_ms * n_layers as f64;
+    let fp4_tok_s = (seq as f64 / fp4_per_forward_ms) * 1000.0;
+    let fp4_tflops = flops_per_forward / 1e12 / (fp4_per_forward_ms / 1000.0);
     println!(
-        "[qwen_block_bench] expected speedup follows the gemm bench: BF16→FP8 ~2x, FP8→FP4 ~1.7x."
+        "  per-block: {:.3} ms  |  per-forward (40 layers): {:.1} ms  |  prefill: {:.0} tok/s  |  effective {:.1} TFLOPS",
+        fp4_per_block_ms, fp4_per_forward_ms, fp4_tok_s, fp4_tflops
+    );
+
+    println!();
+    println!(
+        "[qwen_block_bench] BF16 → NVFP4 speedup: {:.2}× ({:.1} → {:.1} TFLOPS)",
+        bf16_per_block_ms / fp4_per_block_ms,
+        bf16_tflops,
+        fp4_tflops
     );
     println!(
-        "[qwen_block_bench] per-block FP4 cached projection: ~{:.3} ms  →  ~{:.0} tok/s prefill",
-        bf16_per_block_ms / 3.5,
-        bf16_tok_s * 3.5
+        "[qwen_block_bench] gap to GB10 FP4-dense ceiling 427 TFLOPS: {:.1}%",
+        100.0 * fp4_tflops / 427.0
+    );
+    println!(
+        "[qwen_block_bench] gap to advertised 1000 TOPS (FP4 sparse): {:.1}%",
+        100.0 * fp4_tflops / 1000.0
     );
 
     Ok(())
@@ -384,6 +493,177 @@ fn run_bf16_block(
                 let (b_p, _r2) = w_ffn_down.device_ptr(stream);
                 let (c_p, _r3) = out_down.device_ptr_mut(stream);
                 session.matmul_bf16(a_p, b_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0)?;
+            }
+        }
+    }
+    stream.synchronize()?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    Ok(elapsed_ms / iters as f64)
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn run_fp4_block(
+    session: &mut rustorch_cuda::cublas_lt::LtSession,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    act_fp4: &cudarc::driver::CudaSlice<u8>,
+    act_scale: &cudarc::driver::CudaSlice<u8>,
+    ffn_int_fp4: &cudarc::driver::CudaSlice<u8>,
+    ffn_int_scale: &cudarc::driver::CudaSlice<u8>,
+    w_qkv: &cudarc::driver::CudaSlice<u8>,
+    w_qkv_scale: &cudarc::driver::CudaSlice<u8>,
+    out_qkv: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_attn_out: &cudarc::driver::CudaSlice<u8>,
+    w_attn_out_scale: &cudarc::driver::CudaSlice<u8>,
+    out_attn: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_ffn_up: &cudarc::driver::CudaSlice<u8>,
+    w_ffn_up_scale: &cudarc::driver::CudaSlice<u8>,
+    out_up: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_ffn_gate: &cudarc::driver::CudaSlice<u8>,
+    w_ffn_gate_scale: &cudarc::driver::CudaSlice<u8>,
+    out_gate: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_ffn_down: &cudarc::driver::CudaSlice<u8>,
+    w_ffn_down_scale: &cudarc::driver::CudaSlice<u8>,
+    out_down: &mut cudarc::driver::CudaSlice<half::bf16>,
+    seq: usize,
+    hidden: usize,
+    qkv_n: usize,
+    attn_out_n: usize,
+    ffn_up_n: usize,
+    ffn_gate_n: usize,
+    ffn_down_n: usize,
+    ffn: usize,
+    scale_mode: rustorch_cuda::cublas_lt::Fp4ScaleMode,
+    out_dtype: rustorch_cuda::cublas_lt::Fp8Output,
+    iters: usize,
+) -> Result<f64, BenchError> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use std::time::Instant;
+
+    let _ = ffn_gate_n;
+
+    // Warm-up.
+    for _ in 0..3 {
+        unsafe {
+            // QKV proj : (seq × hidden) FP4 @ (hidden × qkv_n) FP4 → (seq × qkv_n) BF16
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(stream);
+                let (sa_p, _r2) = act_scale.device_ptr(stream);
+                let (b_p, _r3) = w_qkv.device_ptr(stream);
+                let (sb_p, _r4) = w_qkv_scale.device_ptr(stream);
+                let (c_p, _r5) = out_qkv.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, qkv_n, 1.0, 0.0, out_dtype, scale_mode,
+                )?;
+            }
+            // Attn out
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(stream);
+                let (sa_p, _r2) = act_scale.device_ptr(stream);
+                let (b_p, _r3) = w_attn_out.device_ptr(stream);
+                let (sb_p, _r4) = w_attn_out_scale.device_ptr(stream);
+                let (c_p, _r5) = out_attn.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, attn_out_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
+            }
+            // FFN up
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(stream);
+                let (sa_p, _r2) = act_scale.device_ptr(stream);
+                let (b_p, _r3) = w_ffn_up.device_ptr(stream);
+                let (sb_p, _r4) = w_ffn_up_scale.device_ptr(stream);
+                let (c_p, _r5) = out_up.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
+            }
+            // FFN gate
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(stream);
+                let (sa_p, _r2) = act_scale.device_ptr(stream);
+                let (b_p, _r3) = w_ffn_gate.device_ptr(stream);
+                let (sb_p, _r4) = w_ffn_gate_scale.device_ptr(stream);
+                let (c_p, _r5) = out_gate.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
+            }
+            // FFN down (uses pre-quantized FFN intermediate as input)
+            {
+                let (a_p, _r1) = ffn_int_fp4.device_ptr(stream);
+                let (sa_p, _r2) = ffn_int_scale.device_ptr(stream);
+                let (b_p, _r3) = w_ffn_down.device_ptr(stream);
+                let (sb_p, _r4) = w_ffn_down_scale.device_ptr(stream);
+                let (c_p, _r5) = out_down.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
+            }
+        }
+    }
+    stream.synchronize()?;
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        unsafe {
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(stream);
+                let (sa_p, _r2) = act_scale.device_ptr(stream);
+                let (b_p, _r3) = w_qkv.device_ptr(stream);
+                let (sb_p, _r4) = w_qkv_scale.device_ptr(stream);
+                let (c_p, _r5) = out_qkv.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, qkv_n, 1.0, 0.0, out_dtype, scale_mode,
+                )?;
+            }
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(stream);
+                let (sa_p, _r2) = act_scale.device_ptr(stream);
+                let (b_p, _r3) = w_attn_out.device_ptr(stream);
+                let (sb_p, _r4) = w_attn_out_scale.device_ptr(stream);
+                let (c_p, _r5) = out_attn.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, attn_out_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
+            }
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(stream);
+                let (sa_p, _r2) = act_scale.device_ptr(stream);
+                let (b_p, _r3) = w_ffn_up.device_ptr(stream);
+                let (sb_p, _r4) = w_ffn_up_scale.device_ptr(stream);
+                let (c_p, _r5) = out_up.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
+            }
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(stream);
+                let (sa_p, _r2) = act_scale.device_ptr(stream);
+                let (b_p, _r3) = w_ffn_gate.device_ptr(stream);
+                let (sb_p, _r4) = w_ffn_gate_scale.device_ptr(stream);
+                let (c_p, _r5) = out_gate.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
+            }
+            {
+                let (a_p, _r1) = ffn_int_fp4.device_ptr(stream);
+                let (sa_p, _r2) = ffn_int_scale.device_ptr(stream);
+                let (b_p, _r3) = w_ffn_down.device_ptr(stream);
+                let (sb_p, _r4) = w_ffn_down_scale.device_ptr(stream);
+                let (c_p, _r5) = out_down.device_ptr_mut(stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
             }
         }
     }
