@@ -620,22 +620,22 @@ fn try_run_sparse_block(
         unsafe {
             let (b_p, _r) = act.device_ptr(stream);
             let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
-            sparse_session.autotune(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
+            sparse_session_qkv.autotune(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
         }
         unsafe {
             let (b_p, _r) = act.device_ptr(stream);
             let (c_p, _r2) = out_attn.device_ptr_mut(stream);
-            sparse_session.autotune(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
+            sparse_session_attn.autotune(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
         }
         unsafe {
             let (b_p, _r) = act.device_ptr(stream);
             let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
-            sparse_session.autotune(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
+            sparse_session_gu.autotune(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
         }
         unsafe {
             let (b_p, _r3) = out_gate_up.device_ptr(stream);
             let (c_p, _r2) = out_down.device_ptr_mut(stream);
-            sparse_session.autotune(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
+            sparse_session_dn.autotune(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
         }
         println!("  autotune done");
     }
