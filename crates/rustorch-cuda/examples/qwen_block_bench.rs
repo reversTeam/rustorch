@@ -66,13 +66,16 @@ fn main() -> Result<(), BenchError> {
         session.workspace_bytes / (1024 * 1024)
     );
 
-    // Qwen3.6-27B-style dense block dims (same hidden as 35B-A3B MoE).
-    let hidden = 2048usize;
-    let ffn = 11008usize;
-    let n_heads = 16usize;
-    let n_kv = 2usize;
-    let head_dim = 256usize;
-    let n_layers = 40usize;
+    // Qwen3.6-27B-style dense block dims. Override via RUSTORCH_BENCH_MODEL=72b
+    // pour Qwen-72B-like shapes (hidden=8192, ffn=29568) — beaucoup plus gros
+    // matmuls qui devraient mieux utiliser les Tensor Cores GB10.
+    let model = std::env::var("RUSTORCH_BENCH_MODEL").unwrap_or_else(|_| "27b".into());
+    let (hidden, ffn, n_heads, n_kv, head_dim, n_layers) = match model.as_str() {
+        "72b" => (8192usize, 29568usize, 64usize, 8usize, 128usize, 80usize),
+        "qwen3-235b" | "235b" => (4096usize, 12288usize, 64usize, 4usize, 128usize, 94usize),
+        _ => (2048usize, 11008usize, 16usize, 2usize, 256usize, 40usize),
+    };
+    println!("[qwen_block_bench] model={model}");
     // Override seq via RUSTORCH_BENCH_SEQ to test scaling (1024/2048/4096/8192).
     let seq = std::env::var("RUSTORCH_BENCH_SEQ")
         .ok()
