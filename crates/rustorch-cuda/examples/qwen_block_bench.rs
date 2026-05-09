@@ -444,10 +444,13 @@ fn try_run_sparse_fp4_block(
     use rustorch_cuda::cusparse_lt::SparseLtSession;
     use std::time::Instant;
 
-    let sparse_session = SparseLtSession::new(stream.clone())?;
+    // Workaround GB10 0.9.1.1 — une session par poids
+    let ses_qkv = SparseLtSession::new(stream.clone())?;
+    let ses_attn = SparseLtSession::new(stream.clone())?;
+    let ses_gu = SparseLtSession::new(stream.clone())?;
+    let ses_dn = SparseLtSession::new(stream.clone())?;
 
-    println!("  prune+compress FP4 weights to 2:4 ...");
-    // Récup pointeurs scale (immuables) pour binding dans le matmul desc
+    println!("  prune+compress FP4 weights to 2:4 (4 sessions) ...");
     let (sa_qkv, _r) = unsafe { w_qkv_scale.device_ptr(stream) };
     let (sa_attn, _r) = unsafe { w_attn_out_scale.device_ptr(stream) };
     let (sa_gu, _r) = unsafe { w_ffn_gate_up_scale.device_ptr(stream) };
@@ -457,18 +460,16 @@ fn try_run_sparse_fp4_block(
 
     let (w_qkv_p, _r) = unsafe { w_qkv.device_ptr(stream) };
     let mut sp_qkv =
-        unsafe { sparse_session.prune_compress_fp4(w_qkv_p, sa_qkv, sb_act, qkv_n, hidden, seq) }?;
+        unsafe { ses_qkv.prune_compress_fp4(w_qkv_p, sa_qkv, sb_act, qkv_n, hidden, seq) }?;
     let (w_attn_p, _r) = unsafe { w_attn_out.device_ptr(stream) };
-    let mut sp_attn = unsafe {
-        sparse_session.prune_compress_fp4(w_attn_p, sa_attn, sb_act, attn_out_n, hidden, seq)
-    }?;
+    let mut sp_attn =
+        unsafe { ses_attn.prune_compress_fp4(w_attn_p, sa_attn, sb_act, attn_out_n, hidden, seq) }?;
     let (w_gu_p, _r) = unsafe { w_ffn_gate_up.device_ptr(stream) };
-    let mut sp_gu = unsafe {
-        sparse_session.prune_compress_fp4(w_gu_p, sa_gu, sb_act, ffn_gate_up_n, hidden, seq)
-    }?;
+    let mut sp_gu =
+        unsafe { ses_gu.prune_compress_fp4(w_gu_p, sa_gu, sb_act, ffn_gate_up_n, hidden, seq) }?;
     let (w_dn_p, _r) = unsafe { w_ffn_down.device_ptr(stream) };
     let mut sp_dn =
-        unsafe { sparse_session.prune_compress_fp4(w_dn_p, sa_dn, sb_int, ffn_down_n, ffn, seq) }?;
+        unsafe { ses_dn.prune_compress_fp4(w_dn_p, sa_dn, sb_int, ffn_down_n, ffn, seq) }?;
     println!("  weights ready, running 4 sparse-FP4 matmuls per block");
 
     // Warm-up.
@@ -477,22 +478,22 @@ fn try_run_sparse_fp4_block(
             {
                 let (b_p, _r) = act_fp4.device_ptr(stream);
                 let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sp_qkv, b_p, c_p, 1.0, 0.0)?;
+                ses_qkv.matmul_bf16(&mut sp_qkv, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = act_fp4.device_ptr(stream);
                 let (c_p, _r2) = out_attn.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sp_attn, b_p, c_p, 1.0, 0.0)?;
+                ses_attn.matmul_bf16(&mut sp_attn, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = act_fp4.device_ptr(stream);
                 let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sp_gu, b_p, c_p, 1.0, 0.0)?;
+                ses_gu.matmul_bf16(&mut sp_gu, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = ffn_int_fp4.device_ptr(stream);
                 let (c_p, _r2) = out_down.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sp_dn, b_p, c_p, 1.0, 0.0)?;
+                ses_dn.matmul_bf16(&mut sp_dn, b_p, c_p, 1.0, 0.0)?;
             }
         }
     }
@@ -504,22 +505,22 @@ fn try_run_sparse_fp4_block(
             {
                 let (b_p, _r) = act_fp4.device_ptr(stream);
                 let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sp_qkv, b_p, c_p, 1.0, 0.0)?;
+                ses_qkv.matmul_bf16(&mut sp_qkv, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = act_fp4.device_ptr(stream);
                 let (c_p, _r2) = out_attn.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sp_attn, b_p, c_p, 1.0, 0.0)?;
+                ses_attn.matmul_bf16(&mut sp_attn, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = act_fp4.device_ptr(stream);
                 let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sp_gu, b_p, c_p, 1.0, 0.0)?;
+                ses_gu.matmul_bf16(&mut sp_gu, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = ffn_int_fp4.device_ptr(stream);
                 let (c_p, _r2) = out_down.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sp_dn, b_p, c_p, 1.0, 0.0)?;
+                ses_dn.matmul_bf16(&mut sp_dn, b_p, c_p, 1.0, 0.0)?;
             }
         }
     }
@@ -554,27 +555,28 @@ fn try_run_sparse_block(
     use rustorch_cuda::cusparse_lt::SparseLtSession;
     use std::time::Instant;
 
-    let sparse_session = SparseLtSession::new(stream.clone())?;
+    // T240.8c WORKAROUND : cuSPARSELt 0.9.1.1 sur GB10 corrompt l'état
+    // interne quand on partage la même Session entre N SparseWeight.
+    // Workaround : une Session par poids (4 ici).
+    let sparse_session_qkv = SparseLtSession::new(stream.clone())?;
+    let sparse_session_attn = SparseLtSession::new(stream.clone())?;
+    let sparse_session_gu = SparseLtSession::new(stream.clone())?;
+    let sparse_session_dn = SparseLtSession::new(stream.clone())?;
 
-    // Build SparseWeight for each Qwen weight (one-time, like model loading).
-    // cuSPARSELt convention: sparse-A. We model the matmul as
-    //   C = W_sparse · X    (weight on the left, activation on the right)
-    // where W has shape (n × hidden) and X has shape (hidden × seq).
-    // For QKV: m=qkv_n, k=hidden, n=seq.
-    println!("  pruning + compressing weights to 2:4 ...");
+    println!("  pruning + compressing weights to 2:4 (4 sessions) ...");
     let (w_qkv_p, _r) = unsafe { w_qkv.device_ptr(stream) };
     let mut sparse_qkv =
-        unsafe { sparse_session.prune_compress_bf16(w_qkv_p, qkv_n, hidden, seq) }?;
+        unsafe { sparse_session_qkv.prune_compress_bf16(w_qkv_p, qkv_n, hidden, seq) }?;
     let (w_attn_p, _r) = unsafe { w_attn_out.device_ptr(stream) };
     let mut sparse_attn =
-        unsafe { sparse_session.prune_compress_bf16(w_attn_p, attn_out_n, hidden, seq) }?;
+        unsafe { sparse_session_attn.prune_compress_bf16(w_attn_p, attn_out_n, hidden, seq) }?;
     let (w_gu_p, _r) = unsafe { w_ffn_gate_up.device_ptr(stream) };
     let mut sparse_gu =
-        unsafe { sparse_session.prune_compress_bf16(w_gu_p, ffn_gate_up_n, hidden, seq) }?;
+        unsafe { sparse_session_gu.prune_compress_bf16(w_gu_p, ffn_gate_up_n, hidden, seq) }?;
     let (w_dn_p, _r) = unsafe { w_ffn_down.device_ptr(stream) };
     let mut sparse_dn =
-        unsafe { sparse_session.prune_compress_bf16(w_dn_p, ffn_down_n, ffn, seq) }?;
-    println!("  weights ready, running 4 sparse matmuls per block (default algo; set RUSTORCH_SPARSE_AUTOTUNE=1 for cusparseLtMatmulSearch — slow!)");
+        unsafe { sparse_session_dn.prune_compress_bf16(w_dn_p, ffn_down_n, ffn, seq) }?;
+    println!("  weights ready, running 4 sparse matmuls per block (4 sessions, workaround GB10 0.9.1.1 bug)");
     // Diagnostic : sync après chacune pour identifier laquelle échoue
     if std::env::var("RUSTORCH_SPARSE_DEBUG")
         .map(|v| v == "1")
@@ -583,28 +585,28 @@ fn try_run_sparse_block(
         unsafe {
             let (b_p, _r) = act.device_ptr(stream);
             let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
-            let r = sparse_session.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0);
+            let r = sparse_session_qkv.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0);
             stream.synchronize().ok();
             println!("    [debug] qkv sparse matmul: {r:?}");
         }
         unsafe {
             let (b_p, _r) = act.device_ptr(stream);
             let (c_p, _r2) = out_attn.device_ptr_mut(stream);
-            let r = sparse_session.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0);
+            let r = sparse_session_attn.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0);
             stream.synchronize().ok();
             println!("    [debug] attn sparse matmul: {r:?}");
         }
         unsafe {
             let (b_p, _r) = act.device_ptr(stream);
             let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
-            let r = sparse_session.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0);
+            let r = sparse_session_gu.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0);
             stream.synchronize().ok();
             println!("    [debug] gate_up sparse matmul: {r:?}");
         }
         unsafe {
             let (b_p, _r) = out_gate_up.device_ptr(stream);
             let (c_p, _r2) = out_down.device_ptr_mut(stream);
-            let r = sparse_session.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0);
+            let r = sparse_session_dn.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0);
             stream.synchronize().ok();
             println!("    [debug] down sparse matmul: {r:?}");
         }
@@ -644,23 +646,23 @@ fn try_run_sparse_block(
             {
                 let (b_p, _r) = act.device_ptr(stream);
                 let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
+                sparse_session_qkv.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = act.device_ptr(stream);
                 let (c_p, _r2) = out_attn.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
+                sparse_session_attn.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = act.device_ptr(stream);
                 let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
+                sparse_session_gu.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
             }
             // FFN-down takes the (k=ffn, n=seq) slice of out_gate_up
             {
                 let (b_p, _r3) = out_gate_up.device_ptr(stream);
                 let (c_p, _r2) = out_down.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
+                sparse_session_dn.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
             }
         }
     }
@@ -672,22 +674,22 @@ fn try_run_sparse_block(
             {
                 let (b_p, _r) = act.device_ptr(stream);
                 let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
+                sparse_session_qkv.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = act.device_ptr(stream);
                 let (c_p, _r2) = out_attn.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
+                sparse_session_attn.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r) = act.device_ptr(stream);
                 let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
+                sparse_session_gu.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
             }
             {
                 let (b_p, _r3) = out_gate_up.device_ptr(stream);
                 let (c_p, _r2) = out_down.device_ptr_mut(stream);
-                sparse_session.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
+                sparse_session_dn.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
             }
         }
     }
