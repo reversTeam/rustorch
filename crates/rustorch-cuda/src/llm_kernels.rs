@@ -261,27 +261,49 @@ impl LlmKernels {
         if let Some(pair) = slot.get() {
             return Ok((pair.0.clone(), pair.1.clone()));
         }
-        // Compile via nvrtc
-        // Arch override via env (RUSTORCH_NVRTC_ARCH=sm_121a). Default :
-        // sm_121 (GB10 / DGX Spark Grace-Blackwell). Pour B200 → sm_100a,
-        // RTX 5090 → sm_120, RTX 4090 → sm_89.
-        let arch_owned: String =
-            std::env::var("RUSTORCH_NVRTC_ARCH").unwrap_or_else(|_| "sm_121".to_string());
-        let arch_static: &'static str = Box::leak(arch_owned.into_boxed_str());
-        let opts = cudarc::nvrtc::CompileOptions {
-            arch: Some(arch_static),
-            include_paths: vec![
-                "/usr/local/cuda/include".to_string(),
-                "/usr/local/cuda-13.2/include".to_string(),
-                "/usr/local/cuda-13.0/include".to_string(),
-            ],
-            use_fast_math: Some(true),
-            ..Default::default()
+        // PTX forward-compatibility chain : on essaie plusieurs arch dans
+        // l'ordre. Avec cudarc compilé contre CUDA 13.0 ABI, nvrtc peut ne
+        // pas connaître sm_121 (GB10) — fallback vers archs plus anciens
+        // que le driver runtime peut JIT-recompiler vers sm_121.
+        // Override via RUSTORCH_NVRTC_ARCH=sm_xxx pour forcer.
+        let candidates: Vec<&'static str> = if let Ok(forced) = std::env::var("RUSTORCH_NVRTC_ARCH")
+        {
+            let s: &'static str = Box::leak(forced.into_boxed_str());
+            vec![s]
+        } else {
+            vec![
+                "sm_121", "sm_120", "sm_100", "sm_90", "sm_89", "sm_86", "sm_80",
+            ]
         };
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| {
-            CudaError::Unsupported {
-                msg: format!("nvrtc compile {name}: {e:?}"),
+        let mut last_err: Option<String> = None;
+        let mut ptx_opt: Option<cudarc::nvrtc::Ptx> = None;
+        for arch in &candidates {
+            let opts = cudarc::nvrtc::CompileOptions {
+                arch: Some(*arch),
+                include_paths: vec![
+                    "/usr/local/cuda/include".to_string(),
+                    "/usr/local/cuda-13.2/include".to_string(),
+                    "/usr/local/cuda-13.0/include".to_string(),
+                ],
+                use_fast_math: Some(true),
+                ..Default::default()
+            };
+            match cudarc::nvrtc::compile_ptx_with_opts(src, opts) {
+                Ok(p) => {
+                    ptx_opt = Some(p);
+                    eprintln!("[llm_kernels] {name} compiled with arch={arch}");
+                    break;
+                },
+                Err(e) => {
+                    last_err = Some(format!("{arch}: {e:?}"));
+                },
             }
+        }
+        let ptx = ptx_opt.ok_or_else(|| CudaError::Unsupported {
+            msg: format!(
+                "nvrtc compile {name} failed for all arch candidates: {:?}",
+                last_err
+            ),
         })?;
         let module = self.ctx.load_module(ptx).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
