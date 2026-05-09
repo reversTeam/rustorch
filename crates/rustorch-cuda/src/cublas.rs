@@ -273,7 +273,10 @@ fn hash_diag(s: &str) -> i32 {
     }
 }
 
-/// `y = alpha * A @ x + beta * y` for f32 buffers.
+/// `y = alpha * A @ x + beta * y` for f32 buffers (row-major A is `m × n`).
+///
+/// Without `--features cuda`, scalar fallback. With cuda, dispatches to
+/// `cublasSgemv` on the primary CUDA context's default stream.
 pub fn gemv_f32(
     a: &[f32],
     x: &[f32],
@@ -301,8 +304,30 @@ pub fn gemv_f32(
     if m == 0 {
         return Ok(());
     }
-    // T240.1 keeps gemv on the scalar fallback. cuBLAS gemv lands in T240.2
-    // when device-resident vectors are wired.
+    if n == 0 {
+        // No cols → y = beta * y.
+        for v in y.iter_mut() {
+            *v *= beta;
+        }
+        return Ok(());
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        return gemv_f32_cuda(a, x, y, m, n, alpha, beta);
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        gemv_f32_scalar(a, x, y, m, n, alpha, beta);
+        Ok(())
+    }
+}
+
+/// Scalar fallback used both as a reference (when cuda feature is off)
+/// and for parity tests.
+#[allow(dead_code)]
+fn gemv_f32_scalar(a: &[f32], x: &[f32], y: &mut [f32], m: usize, n: usize, alpha: f32, beta: f32) {
     for row in 0..m {
         let mut acc = 0.0f32;
         for col in 0..n {
@@ -310,10 +335,90 @@ pub fn gemv_f32(
         }
         y[row] = alpha * acc + beta * y[row];
     }
+}
+
+/// CUDA-backed gemv via cuBLAS.
+///
+/// Row-major A (m×n) is laid out the same in memory as col-major Aᵀ (n×m).
+/// We tell cuBLAS the matrix is (n×m) col-major and ask it to transpose:
+/// trans=T, cublas.m=n_rm, cublas.n=m_rm, lda=n_rm.
+///
+/// y_rm = alpha · A_rm · x + beta · y
+///      = alpha · (A_cm)ᵀ · x + beta · y
+#[cfg(feature = "cuda")]
+fn gemv_f32_cuda(
+    a: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), CudaError> {
+    use cudarc::cublas::{sys, CudaBlas, Gemv, GemvConfig};
+    use cudarc::driver::CudaContext;
+
+    let ctx = CudaContext::new(0).map_err(|e| CudaError::Driver {
+        code: hash_diag(&format!("{e:?}")),
+        location: "cublas::gemv_f32_cuda::CudaContext::new",
+    })?;
+    let stream = ctx.default_stream();
+    let blas = CudaBlas::new(stream.clone()).map_err(|e| CudaError::CublasStatus {
+        code: hash_diag(&format!("{e:?}")),
+        location: "cublas::gemv_f32_cuda::CudaBlas::new",
+    })?;
+
+    let a_dev = stream
+        .memcpy_stod(a)
+        .map_err(|e| map_driver_err(&e, "cublas::gemv_f32_cuda::h2d_a"))?;
+    let x_dev = stream
+        .memcpy_stod(x)
+        .map_err(|e| map_driver_err(&e, "cublas::gemv_f32_cuda::h2d_x"))?;
+    let mut y_dev = if beta == 0.0 {
+        stream
+            .alloc_zeros::<f32>(y.len())
+            .map_err(|e| map_driver_err(&e, "cublas::gemv_f32_cuda::alloc_y"))?
+    } else {
+        stream
+            .memcpy_stod(y)
+            .map_err(|e| map_driver_err(&e, "cublas::gemv_f32_cuda::h2d_y"))?
+    };
+
+    let cfg = GemvConfig::<f32> {
+        trans: sys::cublasOperation_t::CUBLAS_OP_T,
+        m: n as i32, // rows of A in col-major view = n_rm
+        n: m as i32, // cols of A in col-major view = m_rm
+        alpha,
+        lda: n as i32,
+        incx: 1,
+        beta,
+        incy: 1,
+    };
+    // SAFETY: shapes validated at the top of `gemv_f32`. Buffers freshly
+    // alloc'd to matching sizes.
+    unsafe {
+        blas.gemv(cfg, &a_dev, &x_dev, &mut y_dev)
+            .map_err(|e| CudaError::CublasStatus {
+                code: hash_diag(&format!("{e:?}")),
+                location: "cublas::gemv_f32_cuda::blas.gemv",
+            })?;
+    }
+
+    stream
+        .memcpy_dtoh(&y_dev, y)
+        .map_err(|e| map_driver_err(&e, "cublas::gemv_f32_cuda::d2h_y"))?;
+    stream
+        .synchronize()
+        .map_err(|e| map_driver_err(&e, "cublas::gemv_f32_cuda::sync"))?;
+
     Ok(())
 }
 
 /// Batched gemm: `C[b] = alpha * A[b] @ B[b] + beta * C[b]` for B=batch.
+///
+/// Without `--features cuda`, loops over the scalar reference. With cuda,
+/// dispatches to `cublasSgemmStridedBatched` so the entire batch runs in
+/// one kernel launch.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched_f32(
     a: &[f32],
@@ -334,12 +439,138 @@ pub fn gemm_batched_f32(
             msg: "batched gemm shape mismatch".into(),
         });
     }
-    for bi in 0..batch {
-        let ai = &a[bi * stride_a..(bi + 1) * stride_a];
-        let bi_ = &b[bi * stride_b..(bi + 1) * stride_b];
-        let ci = &mut c[bi * stride_c..(bi + 1) * stride_c];
-        gemm_f32(ai, bi_, ci, m, k, n, alpha, beta)?;
+    if batch == 0 || m == 0 || n == 0 {
+        return Ok(());
     }
+
+    #[cfg(feature = "cuda")]
+    {
+        return gemm_batched_f32_cuda(a, b, c, batch, m, k, n, alpha, beta);
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        for bi in 0..batch {
+            let ai = &a[bi * stride_a..(bi + 1) * stride_a];
+            let bi_ = &b[bi * stride_b..(bi + 1) * stride_b];
+            let ci = &mut c[bi * stride_c..(bi + 1) * stride_c];
+            gemm_f32(ai, bi_, ci, m, k, n, alpha, beta)?;
+        }
+        Ok(())
+    }
+}
+
+/// Single-launch batched gemm via `cublasSgemmStridedBatched`. Same row/col
+/// major swap as `gemm_f32_cuda`. The strides are per-batch element counts
+/// (not bytes) — cudarc converts to byte strides internally.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gemm_batched_f32_cuda(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), CudaError> {
+    use cudarc::cublas::{sys, CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
+    use cudarc::driver::CudaContext;
+
+    if k == 0 {
+        // Pure scaling on c, per-batch.
+        let stride_c = m * n;
+        for bi in 0..batch {
+            let ci = &mut c[bi * stride_c..(bi + 1) * stride_c];
+            for v in ci.iter_mut() {
+                *v *= beta;
+            }
+        }
+        return Ok(());
+    }
+
+    let ctx = CudaContext::new(0).map_err(|e| CudaError::Driver {
+        code: hash_diag(&format!("{e:?}")),
+        location: "cublas::gemm_batched_f32_cuda::CudaContext::new",
+    })?;
+    let stream = ctx.default_stream();
+    let blas = CudaBlas::new(stream.clone()).map_err(|e| CudaError::CublasStatus {
+        code: hash_diag(&format!("{e:?}")),
+        location: "cublas::gemm_batched_f32_cuda::CudaBlas::new",
+    })?;
+    // TF32 to keep parity with the scalar gemm path.
+    unsafe {
+        let status = cudarc::cublas::sys::cublasSetMathMode(
+            *blas.handle(),
+            cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+        );
+        if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(CudaError::CublasStatus {
+                code: status as i32,
+                location: "cublas::gemm_batched_f32_cuda::set_math_mode_tf32",
+            });
+        }
+    }
+
+    let a_dev = stream
+        .memcpy_stod(a)
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_batched_f32_cuda::h2d_a"))?;
+    let b_dev = stream
+        .memcpy_stod(b)
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_batched_f32_cuda::h2d_b"))?;
+    let mut c_dev = if beta == 0.0 {
+        stream
+            .alloc_zeros::<f32>(c.len())
+            .map_err(|e| map_driver_err(&e, "cublas::gemm_batched_f32_cuda::alloc_c"))?
+    } else {
+        stream
+            .memcpy_stod(c)
+            .map_err(|e| map_driver_err(&e, "cublas::gemm_batched_f32_cuda::h2d_c"))?
+    };
+
+    // Same row→col swap as `gemm_f32_cuda`: cuBLAS sees (B, A) with
+    // dims (n, m, k). Per-batch strides reflect the row-major layout
+    // since the col-major view shares the same byte stride.
+    let cfg = StridedBatchedConfig::<f32> {
+        gemm: GemmConfig {
+            transa: sys::cublasOperation_t::CUBLAS_OP_N,
+            transb: sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha,
+            lda: n as i32,
+            ldb: k as i32,
+            beta,
+            ldc: n as i32,
+        },
+        batch_size: batch as i32,
+        // cuBLAS arg-order is (cublas_A, cublas_B, cublas_C) which we
+        // swapped with (B_rm, A_rm, C_rm). So stride_a here = stride
+        // per batch of B_rm (= k*n), stride_b = stride of A_rm (= m*k).
+        stride_a: (k * n) as i64,
+        stride_b: (m * k) as i64,
+        stride_c: (m * n) as i64,
+    };
+    // SAFETY: shapes validated upstream; strides match the slice lengths
+    // (a.len = batch*m*k, b.len = batch*k*n, c.len = batch*m*n).
+    unsafe {
+        blas.gemm_strided_batched(cfg, &b_dev, &a_dev, &mut c_dev)
+            .map_err(|e| CudaError::CublasStatus {
+                code: hash_diag(&format!("{e:?}")),
+                location: "cublas::gemm_batched_f32_cuda::blas.gemm_strided_batched",
+            })?;
+    }
+
+    stream
+        .memcpy_dtoh(&c_dev, c)
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_batched_f32_cuda::d2h_c"))?;
+    stream
+        .synchronize()
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_batched_f32_cuda::sync"))?;
+
     Ok(())
 }
 
@@ -441,7 +672,34 @@ mod tests {
         let x = [1.0f32, 1.0, 1.0];
         let mut y = vec![0.0f32; 2];
         gemv_f32(&a, &x, &mut y, 2, 3, 1.0, 0.0).unwrap();
-        assert_eq!(y, vec![6.0, 15.0]);
+        // a[0,:] = [1,2,3] @ [1,1,1] = 6
+        // a[1,:] = [4,5,6] @ [1,1,1] = 15
+        assert!((y[0] - 6.0).abs() < 1e-4, "y[0]={} expected 6.0", y[0]);
+        assert!((y[1] - 15.0).abs() < 1e-4, "y[1]={} expected 15.0", y[1]);
+    }
+
+    #[test]
+    fn gemv_5x7_alpha_beta_matches_scalar() {
+        // Non-trivial 5×7 with alpha,beta — exercise the row→col-major
+        // transpose-on-gemv mapping on a non-square shape.
+        let m = 5;
+        let n = 7;
+        let a: Vec<f32> = (0..m * n).map(|i| (i as f32 - 17.0) * 0.13).collect();
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.21).collect();
+        let mut y_cuda: Vec<f32> = (0..m).map(|i| i as f32 * 0.5).collect();
+        let mut y_ref = y_cuda.clone();
+
+        gemv_f32(&a, &x, &mut y_cuda, m, n, 0.7, 0.3).unwrap();
+        gemv_f32_scalar(&a, &x, &mut y_ref, m, n, 0.7, 0.3);
+
+        for i in 0..m {
+            assert!(
+                (y_cuda[i] - y_ref[i]).abs() < 1e-3,
+                "y[{i}]: cuda={} ref={}",
+                y_cuda[i],
+                y_ref[i]
+            );
+        }
     }
 
     #[test]
@@ -455,5 +713,43 @@ mod tests {
         let mut c = vec![0.0f32; 2];
         gemm_batched_f32(&a, &b, &mut c, batch, m, k, n, 1.0, 0.0).unwrap();
         assert_eq!(c, vec![8.0, 15.0]);
+    }
+
+    #[test]
+    fn batched_gemm_3x_2x3x4_matches_per_batch_scalar() {
+        // 3 batches of 2×3 @ 3×4 = 2×4. Validate the strided-batched
+        // path produces the same numbers as a per-batch scalar loop.
+        let batch = 3;
+        let m = 2;
+        let k = 3;
+        let n = 4;
+        let stride_a = m * k;
+        let stride_b = k * n;
+        let stride_c = m * n;
+        let a: Vec<f32> = (0..batch * stride_a)
+            .map(|i| (i as f32 - 7.0) * 0.11)
+            .collect();
+        let b: Vec<f32> = (0..batch * stride_b)
+            .map(|i| (i as f32 + 3.0) * 0.07)
+            .collect();
+        let mut c_cuda: Vec<f32> = (0..batch * stride_c).map(|i| i as f32 * 0.05).collect();
+        let mut c_ref = c_cuda.clone();
+
+        gemm_batched_f32(&a, &b, &mut c_cuda, batch, m, k, n, 0.5, 0.4).unwrap();
+        for bi in 0..batch {
+            let ai = &a[bi * stride_a..(bi + 1) * stride_a];
+            let bi_ = &b[bi * stride_b..(bi + 1) * stride_b];
+            let ci = &mut c_ref[bi * stride_c..(bi + 1) * stride_c];
+            gemm_f32_scalar(ai, bi_, ci, m, k, n, 0.5, 0.4);
+        }
+
+        for i in 0..batch * stride_c {
+            assert!(
+                (c_cuda[i] - c_ref[i]).abs() < 1e-3,
+                "elem {i}: cuda={} ref={}",
+                c_cuda[i],
+                c_ref[i]
+            );
+        }
     }
 }
