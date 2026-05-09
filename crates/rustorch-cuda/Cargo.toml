@@ -13,12 +13,20 @@ categories.workspace = true
 [features]
 default = []
 # Enable real CUDA bindings via cudarc. Requires the CUDA toolkit
-# installed on the host and an NVIDIA GPU at runtime.
-cuda = []
+# installed on the host and an NVIDIA GPU at runtime. Uses dynamic-loading
+# so the same binary can run against any installed CUDA version (12.x or
+# 13.x) — important for portability between dev hosts and the GB10 DGX
+# Spark which ships CUDA 13.
+cuda = ["dep:cudarc"]
 # Reserved for future expandable-segment caching allocator path.
 cuda-allocator = ["cuda"]
 
 [dependencies]
+# Optional cudarc bindings — only pulled in when --features cuda. The
+# `driver` feature gives us CudaDevice/CudaStream/DevicePtr; `cublas`
+# wraps cuBLAS for gemm/gemv. `dynamic-loading` postpones linking to
+# runtime so the toolkit version can vary at install time.
+cudarc = { version = "0.17", default-features = false, features = ["driver", "cublas", "dynamic-loading", "cuda-version-from-build-system"], optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
