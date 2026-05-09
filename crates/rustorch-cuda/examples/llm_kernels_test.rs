@@ -81,8 +81,7 @@ fn main() -> Result<(), TestErr> {
         kernels.rms_norm_bf16(&stream, x_p, g_p, eps, n as i32, batch as i32)?;
     }
     stream.synchronize()?;
-    let x_gpu_bytes = stream.memcpy_dtov(&x_dev)?;
-    let x_gpu: &[half::bf16] = bytemuck::cast_slice(&x_gpu_bytes);
+    let x_gpu: Vec<half::bf16> = stream.memcpy_dtov(&x_dev)?;
 
     let mut max_diff = 0f32;
     for i in 0..n * batch {
@@ -112,8 +111,7 @@ fn main() -> Result<(), TestErr> {
         kernels.silu_bf16(&stream, x_p, n_silu as i32)?;
     }
     stream.synchronize()?;
-    let x_gpu_bytes = stream.memcpy_dtov(&x_dev)?;
-    let x_gpu: &[half::bf16] = bytemuck::cast_slice(&x_gpu_bytes);
+    let x_gpu: Vec<half::bf16> = stream.memcpy_dtov(&x_dev)?;
     let mut max_diff = 0f32;
     for i in 0..n_silu {
         let d = (x_cpu[i].to_f32() - x_gpu[i].to_f32()).abs();
@@ -151,8 +149,7 @@ fn main() -> Result<(), TestErr> {
         kernels.swiglu_bf16(&stream, g_p, u_p, o_p, n_sw as i32)?;
     }
     stream.synchronize()?;
-    let out_gpu_bytes = stream.memcpy_dtov(&out_dev)?;
-    let out_gpu: &[half::bf16] = bytemuck::cast_slice(&out_gpu_bytes);
+    let out_gpu: Vec<half::bf16> = stream.memcpy_dtov(&out_dev)?;
     let mut max_diff = 0f32;
     for i in 0..n_sw {
         let d = (out_cpu[i].to_f32() - out_gpu[i].to_f32()).abs();

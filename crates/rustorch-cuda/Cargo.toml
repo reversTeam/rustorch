@@ -33,7 +33,6 @@ half = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-bytemuck = { version = "1", features = ["derive"] }
 
 [package.metadata.docs.rs]
 all-features = true
