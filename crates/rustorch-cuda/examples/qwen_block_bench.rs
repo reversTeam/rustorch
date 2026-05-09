@@ -499,6 +499,112 @@ fn run_fp4_block(
 
     // T240.8f — 4 matmuls per block (was 5): fused FFN gate+up.
 
+    // T240.8g — opt-in NVFP4 autotune (set RUSTORCH_CUBLASLT_AUTOTUNE=1).
+    let autotune = std::env::var("RUSTORCH_CUBLASLT_AUTOTUNE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if autotune {
+        let n_candidates: u32 = std::env::var("RUSTORCH_CUBLASLT_AUTOTUNE_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let n_passes: u32 = 5;
+        unsafe {
+            let (a_p, _r1) = act_fp4.device_ptr(stream);
+            let (sa_p, _r2) = act_scale.device_ptr(stream);
+            let (b_p, _r3) = w_qkv.device_ptr(stream);
+            let (sb_p, _r4) = w_qkv_scale.device_ptr(stream);
+            let (c_p, _r5) = out_qkv.device_ptr_mut(stream);
+            let ms = session.autotune_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                seq,
+                hidden,
+                qkv_n,
+                out_dtype,
+                scale_mode,
+                n_candidates,
+                n_passes,
+            )?;
+            println!(
+                "[autotune-fp4] QKV proj   m={seq} k={hidden} n={qkv_n}        best={ms:.3} ms"
+            );
+        }
+        unsafe {
+            let (a_p, _r1) = act_fp4.device_ptr(stream);
+            let (sa_p, _r2) = act_scale.device_ptr(stream);
+            let (b_p, _r3) = w_attn_out.device_ptr(stream);
+            let (sb_p, _r4) = w_attn_out_scale.device_ptr(stream);
+            let (c_p, _r5) = out_attn.device_ptr_mut(stream);
+            let ms = session.autotune_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                seq,
+                hidden,
+                attn_out_n,
+                out_dtype,
+                scale_mode,
+                n_candidates,
+                n_passes,
+            )?;
+            println!("[autotune-fp4] Attn out   m={seq} k={hidden} n={attn_out_n}        best={ms:.3} ms");
+        }
+        unsafe {
+            let (a_p, _r1) = act_fp4.device_ptr(stream);
+            let (sa_p, _r2) = act_scale.device_ptr(stream);
+            let (b_p, _r3) = w_ffn_gate_up.device_ptr(stream);
+            let (sb_p, _r4) = w_ffn_gate_up_scale.device_ptr(stream);
+            let (c_p, _r5) = out_gate_up.device_ptr_mut(stream);
+            let ms = session.autotune_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                seq,
+                hidden,
+                ffn_gate_up_n,
+                out_dtype,
+                scale_mode,
+                n_candidates,
+                n_passes,
+            )?;
+            println!(
+                "[autotune-fp4] FFN g+up   m={seq} k={hidden} n={ffn_gate_up_n}    best={ms:.3} ms"
+            );
+        }
+        unsafe {
+            let (a_p, _r1) = ffn_int_fp4.device_ptr(stream);
+            let (sa_p, _r2) = ffn_int_scale.device_ptr(stream);
+            let (b_p, _r3) = w_ffn_down.device_ptr(stream);
+            let (sb_p, _r4) = w_ffn_down_scale.device_ptr(stream);
+            let (c_p, _r5) = out_down.device_ptr_mut(stream);
+            let ms = session.autotune_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                seq,
+                ffn,
+                ffn_down_n,
+                out_dtype,
+                scale_mode,
+                n_candidates,
+                n_passes,
+            )?;
+            println!(
+                "[autotune-fp4] FFN down   m={seq} k={ffn} n={ffn_down_n}        best={ms:.3} ms"
+            );
+        }
+    }
+
     // Warm-up.
     for _ in 0..3 {
         unsafe {

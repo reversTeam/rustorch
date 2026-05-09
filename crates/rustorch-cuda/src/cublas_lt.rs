@@ -920,6 +920,223 @@ impl LtSession {
         let _ = sum_per_call; // (kept for future verbose mode)
         Ok(best_ms)
     }
+
+    /// Multi-algo autotune for an NVFP4 / MXFP4 (m,k)·(k,n) shape (T240.8g).
+    ///
+    /// Same idea as `autotune_bf16` but for FP4. Picks the fastest algo
+    /// among up to `n_candidates` heuristic candidates and stores it in
+    /// the cache. cublasLt FP4 heuristic is even less GB10-optimized than
+    /// the BF16 one — community reports show 15–30% lift from autotuning.
+    ///
+    /// # Safety
+    /// `*_dev` must be valid for FP4 packed inputs (1 byte per 2 elems),
+    /// scales, and BF16/FP16/F32 output. Caller accepts that `c_dev` is
+    /// written through during timing.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn autotune_mxfp4(
+        &mut self,
+        a_dev: u64,
+        a_scale_dev: u64,
+        b_dev: u64,
+        b_scale_dev: u64,
+        c_dev: u64,
+        m: usize,
+        k: usize,
+        n: usize,
+        out: Fp8Output,
+        scale_mode: Fp4ScaleMode,
+        n_candidates: u32,
+        n_passes: u32,
+    ) -> Result<f32, CudaError> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(0.0);
+        }
+        let block = scale_mode.block_size();
+        if k % block != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("FP4 requires k % {block} == 0, got k={k}"),
+            });
+        }
+        let n_candidates = n_candidates.max(1).min(32);
+        let n_passes = n_passes.max(1).min(50);
+
+        // 1. Ensure base cache entry exists.
+        let _ = self.get_or_build(
+            m,
+            n,
+            k,
+            sys::cudaDataType_t::CUDA_R_4F_E2M1,
+            sys::cudaDataType_t::CUDA_R_4F_E2M1,
+            out.cuda_type(),
+            Some(scale_mode),
+            a_scale_dev,
+            b_scale_dev,
+        )?;
+        let key = ConfigKey {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            a_dt: sys::cudaDataType_t::CUDA_R_4F_E2M1 as i32,
+            b_dt: sys::cudaDataType_t::CUDA_R_4F_E2M1 as i32,
+            c_dt: out.cuda_type() as i32,
+            transa: true,
+            transb: false,
+            scale_mode: match scale_mode {
+                Fp4ScaleMode::Vec32Ue8m0 => 1,
+                Fp4ScaleMode::Vec16Ue4m3 => 2,
+            },
+        };
+        let (a_layout, b_layout, c_layout, matmul_desc, pref) = {
+            let cached = self.cache.get(&key).expect("just-built cache entry");
+            (
+                cached.a_layout,
+                cached.b_layout,
+                cached.c_layout,
+                cached.matmul_desc,
+                cached.pref,
+            )
+        };
+
+        // 2. Bind the per-call scale pointers on the desc (used by all candidates).
+        result::set_matmul_desc_attribute(
+            matmul_desc,
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            (&a_scale_dev) as *const _ as *const _,
+            std::mem::size_of::<u64>(),
+        )
+        .map_err(|e| CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "autotune_mxfp4::set_a_scale_ptr",
+        })?;
+        result::set_matmul_desc_attribute(
+            matmul_desc,
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            (&b_scale_dev) as *const _ as *const _,
+            std::mem::size_of::<u64>(),
+        )
+        .map_err(|e| CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "autotune_mxfp4::set_b_scale_ptr",
+        })?;
+
+        // 3. Query top-N candidate algos.
+        let mut results: Vec<sys::cublasLtMatmulHeuristicResult_t> =
+            vec![std::mem::zeroed(); n_candidates as usize];
+        let mut return_count: std::os::raw::c_int = 0;
+        let status = sys::cublasLtMatmulAlgoGetHeuristic(
+            self.handle,
+            matmul_desc,
+            a_layout,
+            b_layout,
+            c_layout,
+            c_layout,
+            pref,
+            n_candidates as std::os::raw::c_int,
+            results.as_mut_ptr(),
+            &mut return_count,
+        );
+        if status != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(CudaError::CublasStatus {
+                code: status as i32,
+                location: "autotune_mxfp4::heuristic_multi",
+            });
+        }
+        let actual = return_count.max(1) as usize;
+        results.truncate(actual);
+
+        // 4. Time each candidate.
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let workspace_ptr = {
+            use cudarc::driver::DevicePtr;
+            self.workspace.device_ptr(&self.stream).0
+        };
+        let ctx = self.stream.context();
+        let mk_event = || -> Result<cudarc::driver::CudaEvent, CudaError> {
+            ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|e| CudaError::Driver {
+                    code: format!("{e:?}").len() as i32,
+                    location: "autotune_mxfp4::new_event",
+                })
+        };
+
+        let mut best_idx = 0usize;
+        let mut best_ms = f32::INFINITY;
+
+        for (idx, hr) in results.iter().enumerate() {
+            if hr.state != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                continue;
+            }
+            // 1 warm-up
+            let _ = result::matmul(
+                self.handle,
+                matmul_desc,
+                (&alpha) as *const f32 as *const _,
+                (&beta) as *const f32 as *const _,
+                a_dev as *const _,
+                a_layout,
+                b_dev as *const _,
+                b_layout,
+                c_dev as *const _,
+                c_layout,
+                c_dev as *mut _,
+                c_layout,
+                (&hr.algo) as *const _,
+                workspace_ptr as *mut _,
+                self.workspace_bytes,
+                self.stream.cu_stream() as *mut _,
+            );
+            let start = mk_event()?;
+            let stop = mk_event()?;
+            start.record(&self.stream).map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "autotune_mxfp4::record_start",
+            })?;
+            for _ in 0..n_passes {
+                let _ = result::matmul(
+                    self.handle,
+                    matmul_desc,
+                    (&alpha) as *const f32 as *const _,
+                    (&beta) as *const f32 as *const _,
+                    a_dev as *const _,
+                    a_layout,
+                    b_dev as *const _,
+                    b_layout,
+                    c_dev as *const _,
+                    c_layout,
+                    c_dev as *mut _,
+                    c_layout,
+                    (&hr.algo) as *const _,
+                    workspace_ptr as *mut _,
+                    self.workspace_bytes,
+                    self.stream.cu_stream() as *mut _,
+                );
+            }
+            stop.record(&self.stream).map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "autotune_mxfp4::record_stop",
+            })?;
+            stop.synchronize().map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "autotune_mxfp4::sync",
+            })?;
+            let elapsed_total = start.elapsed_ms(&stop).map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "autotune_mxfp4::elapsed",
+            })?;
+            let per_call = elapsed_total / n_passes as f32;
+            if per_call < best_ms {
+                best_ms = per_call;
+                best_idx = idx;
+            }
+        }
+
+        // 5. Patch cache entry.
+        if let Some(entry) = self.cache.get_mut(&key) {
+            entry.algo = results[best_idx].algo;
+        }
+        Ok(best_ms)
+    }
 }
 
 #[cfg(feature = "cuda")]
