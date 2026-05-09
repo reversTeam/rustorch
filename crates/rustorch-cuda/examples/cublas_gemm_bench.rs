@@ -286,7 +286,14 @@ fn main() -> Result<(), BenchError> {
                 let ms_per_iter_fp8 = wall_ms_fp8 / n_iters as f64;
                 flops_per_iter / (ms_per_iter_fp8 / 1000.0) / 1e12
             },
-            Err(_) => f64::NAN, // FP8 unsupported on this hardware/driver
+            Err(e) => {
+                if dim == 128 {
+                    eprintln!("[cublas_gemm_bench] FP8 path skipped — {e}");
+                    eprintln!("[cublas_gemm_bench] FP8 GEMM via cublasGemmEx is heavily restricted on Blackwell;");
+                    eprintln!("[cublas_gemm_bench] full FP8/FP4 path needs cublasLtMatmul (tracked as T240.5).");
+                }
+                f64::NAN
+            },
         };
 
         println!(
