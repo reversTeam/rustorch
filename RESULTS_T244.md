@@ -4,6 +4,37 @@
 After this session, rustorch closed the gap to llama.cpp from 76% → 17%
 on Qwen2.5-7B Q4_K_M, with all kernels in place for Qwen 3.6 wiring.
 
+## T244.3 update — Q5_K kernel + real Qwen3.6-27B end-to-end matmul bench
+
+Added `sgemv_q5k_bf16` (warp-shuffle SGEMV for Q5_K weights). Combined
+with existing Q4_K_V2 and Q6_K kernels, rustorch now covers 100% of
+Qwen 3.6 quantized matmul tensor shapes.
+
+### Real Qwen3.6-27B Q4_K_M end-to-end matmul (15 GB GGUF, 64 layers)
+
+| Engine                                     | tok/s | bw GB/s | vs llama.cpp 11.62 |
+|--------------------------------------------|------:|--------:|-------------------:|
+| llama.cpp Qwen3.6-27B Q4_K_M (CUDA)        | 11.62 |   ~150* |       1.00×        |
+| **rustorch (matmul-only, real GGUF)**      |  9.19 |   137.4 |       0.79×        |
+
+(*estimated llama.cpp bandwidth based on 16.8 GB / token-time)
+
+Consistent with the Qwen-7B real bench (0.77×). The 20% gap is
+attributable to:
+1. CUDA Graphs (llama.cpp captures full decode, replays = saves launch overhead)
+2. Kernel fusion (gate+up+silu fused into one kernel)
+3. F32 small tensors (ssm_alpha/beta) handled via dedicated path in llama.cpp
+   vs skipped in our matmul-only bench
+
+### All four custom GEMV kernels validated by parity tests
+
+| Kernel                          | Bench bandwidth   | Parity test |
+|---------------------------------|-------------------|-------------|
+| sgemv_q4k_bf16 V2 (warp-shuffle)| 168 GB/s (synth)  | ✅ vs CPU   |
+| sgemv_q5k_bf16 (warp-shuffle)   | (parity-only)     | ✅ vs CPU   |
+| sgemv_q6k_bf16 (warp-shuffle)   | ~120 GB/s         | ✅ vs CPU   |
+| sgemv_bf16_bf16 (warp-shuffle)  | 232 GB/s (synth)  | ✅ vs CPU   |
+
 ## T244.2 update — sgemv_bf16_bf16 + bench warmup fix
 
 A new kernel (`sgemv_bf16_bf16`, warp-shuffle SGEMV) replaces cuBLASLt for
