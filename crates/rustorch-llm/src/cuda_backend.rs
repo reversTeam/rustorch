@@ -452,7 +452,10 @@ impl LlamaModelCuda {
                         head_dim as i32,
                     )
                     .map_err(|e| LlmError::Backend(format!("rope Q L{li}: {e:?}")))?;
-                let (qkv_base2, _r3) = self.scratch.qkv.device_ptr_mut(&self.stream);
+            }
+            unsafe {
+                let (qkv_base2, _r1) = self.scratch.qkv.device_ptr_mut(&self.stream);
+                let (inv_p, _r2) = self.rope_inv_freq.device_ptr(&self.stream);
                 self.kernels
                     .rope_half_split_bf16(
                         &self.stream,
