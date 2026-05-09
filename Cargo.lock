@@ -3794,10 +3794,12 @@ dependencies = [
 name = "rustorch-llm"
 version = "0.0.1"
 dependencies = [
+ "cudarc",
  "half",
  "metal",
  "rustorch-core",
  "rustorch-cpu",
+ "rustorch-cuda",
  "rustorch-fusion",
  "rustorch-gguf",
  "rustorch-metal",

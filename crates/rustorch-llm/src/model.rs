@@ -450,6 +450,63 @@ impl LlamaModel {
         new_tokens
     }
 
+    /// Debug helper — runs prefill on `prompt_ids` then `max_new`
+    /// greedy decode steps, and returns the full F32 logits vector
+    /// at each step (one entry per `prompt_ids` and per new token,
+    /// in sequence order). Length = `prompt_ids.len() + max_new`.
+    ///
+    /// Used by the parity test to compare CPU vs CUDA distributions
+    /// step-by-step (not just the argmax, which can flip on tied
+    /// or near-tied logits).
+    pub fn forward_step_logits(
+        &self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        max_seq: usize,
+    ) -> Vec<Vec<f32>> {
+        let cfg = &self.config;
+        let mut cache = KVCache::new(
+            cfg.num_hidden_layers,
+            1,
+            cfg.n_kv_heads(),
+            cfg.head_dim(),
+            max_seq,
+        );
+        let mut scratch = Scratch::new(cfg);
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(prompt_ids.len() + max_new);
+        // Prefill — record logits at each prompt position.
+        for (pos, &tok) in prompt_ids.iter().enumerate() {
+            self.decode_step(tok as i64, pos, &mut cache, &mut scratch);
+            cache.advance(1).unwrap();
+            out.push(scratch.logits.clone());
+        }
+        // Greedy decode — feed argmax of last logits.
+        let argmax = |xs: &[f32]| -> usize {
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in xs.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    best = i;
+                }
+            }
+            best
+        };
+        let mut last = if prompt_ids.is_empty() {
+            0i64
+        } else {
+            argmax(&scratch.logits) as i64
+        };
+        for _ in 0..max_new {
+            let pos = cache.current_len();
+            self.decode_step(last, pos, &mut cache, &mut scratch);
+            cache.advance(1).unwrap();
+            out.push(scratch.logits.clone());
+            last = argmax(&scratch.logits) as i64;
+        }
+        out
+    }
+
     /// Debug helper — runs prefill then a single decode step on the
     /// last prompt token and returns the top-`k` `(token_id, logit)`
     /// entries from the resulting logits, sorted descending. Useful

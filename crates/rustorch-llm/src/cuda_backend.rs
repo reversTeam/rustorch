@@ -829,6 +829,17 @@ impl LlamaModelCuda {
         self.config.vocab_size
     }
 
+    /// Returns the last logits computed (after the most recent
+    /// `decode_step*` call) as F32 host vector. Used by the parity
+    /// test to compare CPU vs CUDA distributions step-by-step.
+    pub fn last_logits(&self) -> Result<Vec<f32>, LlmError> {
+        let host: Vec<half::bf16> = self
+            .stream
+            .memcpy_dtov(&self.scratch.logits)
+            .map_err(|e| LlmError::Backend(format!("dtov logits: {e:?}")))?;
+        Ok(host.into_iter().map(|x| x.to_f32()).collect())
+    }
+
     /// Decode 1 token, full forward Qwen-style (T241.4 step 3).
     ///
     /// Pour chaque layer applique le bloc complet :
