@@ -56,6 +56,13 @@ fn main() -> Result<(), ProbeError> {
         (5120, 2048, 8192, "qwen-qkv-real"),
         (2048, 2048, 2048, "qwen-attnout-tiny"),
         (2048, 2048, 8192, "qwen-attnout-real"),
+        // Larger shapes that fail in qwen_block_bench
+        (22016, 2048, 2048, "qwen-ffngu-tiny"),
+        (22016, 2048, 4096, "qwen-ffngu-mid"),
+        (22016, 2048, 8192, "qwen-ffngu-real"),
+        (2048, 11008, 2048, "qwen-ffndn-tiny"),
+        (2048, 11008, 4096, "qwen-ffndn-mid"),
+        (2048, 11008, 8192, "qwen-ffndn-real"),
     ];
 
     // Allocate big enough buffers once (max from grid)
