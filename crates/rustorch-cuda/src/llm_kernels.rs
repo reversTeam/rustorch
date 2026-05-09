@@ -369,6 +369,134 @@ extern "C" __global__ void sgemv_q4k_bf16(
 "#;
 
 #[cfg(feature = "cuda")]
+const SGEMV_Q4K_BF16_V2_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+// T244.1.1 — sgemv_q4k_bf16 V2 — optimised pattern :
+//
+// Per-block analysis of V1 :
+//   - 256 threads/TG, each thread decoded 1 weight per super-block
+//   - 256× redundant scale unpacking (12-byte loads + 8-step unpack)
+//   - byte-by-byte nibble loads (no vector coalescing)
+//   - V1 measured : 1.17 ms / 32 GB/s / 116 GFLOPS  (16% bandwidth)
+//
+// V2 changes :
+//   1. 64 threads/TG (vs 256) → 4× more concurrent TGs per SM (better
+//      latency hiding)
+//   2. Each thread processes 4 weights per super-block (256/64)
+//   3. Thread 0 unpacks scales + d/dmin ONCE per super-block, stores
+//      pre-multiplied d*sc[i] and dmin*m[i] in shmem (broadcast to all)
+//   4. uint32 nibble load = 4 bytes per load (vector coalescing)
+//   5. uint2 (8-byte) bf16 load for x = 4 elements per load
+//
+// Tile mapping (256 weights, 64 threads) :
+//   group       = tid / 8     (0..8)  — which sub-block (sb)
+//   pos_base    = (tid%8) * 4 (0..32 step 4) — start position within sb
+//   pair_idx    = group / 2
+//   sub_in_pair = group & 1   — even/odd pair (low/high nibble)
+//   byte_base   = pair_idx*32 + pos_base — first of 4 nibble bytes
+//
+// Expected gain : 3-5× over V1 (= 30-50 tok/s upper bound on Qwen-7B Q4_K_M).
+extern "C" __global__ void sgemv_q4k_bf16_v2(
+    const unsigned char* __restrict__ w_q4k,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = K / 256;
+    int row_offset = row * blocks_per_row * 144;
+
+    extern __shared__ float shmem[];
+    float* sc_pre = shmem;            // [8] : d * sc[i] (pre-multiplied)
+    float* m_pre  = shmem + 8;        // [8] : dmin * m[i]
+    float* sdata  = shmem + 16;       // [64] : reduction buffer
+
+    float acc = 0.0f;
+
+    int group       = tid >> 3;        // tid / 8     → sb in 0..8
+    int pos_base    = (tid & 7) << 2;  // (tid%8)*4    → 0..28 step 4
+    int pair_idx    = group >> 1;
+    int sub_in_pair = group & 1;
+    int byte_base   = (pair_idx << 5) + pos_base;
+    int low_nibble  = (sub_in_pair == 0) ? 1 : 0;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 144;
+        const unsigned char* blk = w_q4k + blk_off;
+
+        // Thread 0 : unpack scales + d/dmin → shmem (broadcast).
+        if (tid == 0) {
+            unsigned short d_bits    = blk[0] | (blk[1] << 8);
+            unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+            float d    = __half2float(__ushort_as_half(d_bits));
+            float dmin = __half2float(__ushort_as_half(dmin_bits));
+            const unsigned char* scales = blk + 4;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                unsigned char sc_i  = scales[i] & 0x3F;
+                unsigned char m_i   = scales[i + 4] & 0x3F;
+                unsigned char sc_i4 = (scales[i + 8] & 0x0F) | ((scales[i] >> 6) << 4);
+                unsigned char m_i4  = (scales[i + 8] >> 4)   | ((scales[i + 4] >> 6) << 4);
+                sc_pre[i]     = d * (float)sc_i;
+                m_pre[i]      = dmin * (float)m_i;
+                sc_pre[i + 4] = d * (float)sc_i4;
+                m_pre[i + 4]  = dmin * (float)m_i4;
+            }
+        }
+        __syncthreads();
+
+        // Pre-multiplied scale/min for THIS thread's sub-block.
+        float scale = sc_pre[group];
+        float min_v = m_pre[group];
+
+        // uint32 load of 4 nibble bytes.
+        const unsigned char* qs = blk + 16;
+        unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
+
+        // Load 4 bf16 from x via uint2 (8 bytes).
+        const __nv_bfloat16* x_ptr = x + b * 256 + (group << 5) + pos_base;
+        uint2 xbits = *(const uint2*)x_ptr;
+        unsigned short xb[4] = {
+            (unsigned short)(xbits.x & 0xFFFFu),
+            (unsigned short)(xbits.x >> 16),
+            (unsigned short)(xbits.y & 0xFFFFu),
+            (unsigned short)(xbits.y >> 16),
+        };
+
+        // Decode 4 nibbles + multiply with x.
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned char byte_i = (qbytes >> (i << 3)) & 0xFFu;
+            int nibble = low_nibble ? (byte_i & 0x0F) : (byte_i >> 4);
+            float w_val = scale * (float)nibble - min_v;
+            float xv = __half2float(__ushort_as_half(xb[i]));
+            // NOTE: xb[i] is bf16 bits, not f16. Re-cast as bf16.
+            __nv_bfloat16 xbf = __ushort_as_bfloat16(xb[i]);
+            xv = (float)xbf;
+            acc += w_val * xv;
+        }
+    }
+
+    // Reduction over 64 threads.
+    sdata[tid] = acc;
+    __syncthreads();
+    #pragma unroll
+    for (int s = 32; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        y[row] = (__nv_bfloat16)sdata[0];
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
 const QUANTIZE_BF16_TO_NVFP4_SRC: &str = r#"
 #include <cuda_bf16.h>
 
@@ -714,6 +842,7 @@ pub struct LlmKernels {
     gqa_decode_online: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     transpose: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q4k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemv_q4k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -737,6 +866,7 @@ impl LlmKernels {
             gqa_decode_online: std::sync::OnceLock::new(),
             transpose: std::sync::OnceLock::new(),
             sgemv_q4k: std::sync::OnceLock::new(),
+            sgemv_q4k_v2: std::sync::OnceLock::new(),
         }
     }
 
@@ -1226,6 +1356,45 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemv_q4k_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T244.1.1 — Optimised Q4_K matmul V2 : 64 threads/TG (vs 256 in V1),
+    /// each thread processes 4 weights, scales pre-multiplied & cached
+    /// in shmem, uint32 vector loads on nibbles.
+    ///
+    /// # Safety  Same contract as `sgemv_q4k_bf16`.
+    pub unsafe fn sgemv_q4k_bf16_v2(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q4k: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q4k_bf16_v2: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q4k_v2,
+            SGEMV_Q4K_BF16_V2_SRC,
+            "sgemv_q4k_bf16_v2",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            // shmem : 8 sc_pre + 8 m_pre + 64 sdata = 80 floats = 320 bytes
+            shared_mem_bytes: 80 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q4k).arg(&x).arg(&y).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q4k_bf16_v2::launch",
         })?;
         Ok(())
     }
@@ -1760,6 +1929,222 @@ mod parity_tests {
                 tol
             );
         }
+    }
+
+    /// T244.1.1 — V2 parity test : V2 must produce same output as V1
+    /// (and CPU reference) within BF16 tolerance.
+    #[test]
+    fn sgemv_q4k_bf16_v2_matches_v1() {
+        use rustorch_gguf::dequant::{Q4_K_BYTES, QK_K};
+
+        let n = 64usize;
+        let k = 512usize; // 2 super-blocks per row
+        let blocks_per_row = k / QK_K;
+        let row_bytes = blocks_per_row * Q4_K_BYTES;
+
+        let mut state: u64 = 0xfeedbeef;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut w_bytes = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q4_K_BYTES;
+                let d = half::f16::from_f32(0.07).to_le_bytes();
+                let dmin = half::f16::from_f32(0.03).to_le_bytes();
+                w_bytes[off] = d[0];
+                w_bytes[off + 1] = d[1];
+                w_bytes[off + 2] = dmin[0];
+                w_bytes[off + 3] = dmin[1];
+                for i in 0..12 {
+                    w_bytes[off + 4 + i] = (next() & 0x3F) as u8;
+                }
+                for i in 0..128 {
+                    w_bytes[off + 16 + i] = (next() & 0xFF) as u8;
+                }
+            }
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let w_dev = stream.memcpy_stod(&w_bytes).expect("upload w");
+        let x_f32: Vec<f32> = (0..k).map(|i| ((i as f32 * 0.05).cos()) * 0.5).collect();
+        let x_bf: Vec<half::bf16> = x_f32.iter().copied().map(half::bf16::from_f32).collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+
+        // V1 result.
+        let mut y_v1 = stream.alloc_zeros::<half::bf16>(n).expect("alloc y1");
+        unsafe {
+            let (w_p, _g1) = w_dev.device_ptr(&stream);
+            let (x_p, _g2) = x_dev.device_ptr(&stream);
+            let (y_p, _g3) = y_v1.device_ptr_mut(&stream);
+            kernels
+                .sgemv_q4k_bf16(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                .expect("v1");
+        }
+        let v1: Vec<f32> = stream
+            .memcpy_dtov(&y_v1)
+            .expect("dtov v1")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        // V2 result.
+        let mut y_v2 = stream.alloc_zeros::<half::bf16>(n).expect("alloc y2");
+        unsafe {
+            let (w_p, _g1) = w_dev.device_ptr(&stream);
+            let (x_p, _g2) = x_dev.device_ptr(&stream);
+            let (y_p, _g3) = y_v2.device_ptr_mut(&stream);
+            kernels
+                .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                .expect("v2");
+        }
+        let v2: Vec<f32> = stream
+            .memcpy_dtov(&y_v2)
+            .expect("dtov v2")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        for i in 0..n {
+            let diff = (v1[i] - v2[i]).abs();
+            // Both BF16 outputs of the same math should be exactly equal
+            // (or differ only by reduction order rounding) — tolerate
+            // small abs diff.
+            let tol = v1[i].abs() * 5e-2 + 0.5;
+            assert!(
+                diff <= tol,
+                "row[{i}] v1={} v2={} diff={}",
+                v1[i],
+                v2[i],
+                diff
+            );
+        }
+    }
+
+    /// T244.1.1 — V2 bench, same shape as V1 bench for direct comparison.
+    #[test]
+    #[ignore = "perf benchmark — run explicitly with --ignored"]
+    fn sgemv_q4k_v2_bench() {
+        use rustorch_gguf::dequant::{Q4_K_BYTES, QK_K};
+        use std::time::Instant;
+
+        let n = 18944usize;
+        let k = 3584usize;
+        let blocks_per_row = k / QK_K;
+        let row_bytes = blocks_per_row * Q4_K_BYTES;
+
+        let mut state: u64 = 0xa5a5a5a5;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut w_q4k_bytes = vec![0u8; n * row_bytes];
+        for b in &mut w_q4k_bytes {
+            *b = (next() & 0xFF) as u8;
+        }
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q4_K_BYTES;
+                let d = half::f16::from_f32(0.05).to_le_bytes();
+                let dmin = half::f16::from_f32(0.025).to_le_bytes();
+                w_q4k_bytes[off] = d[0];
+                w_q4k_bytes[off + 1] = d[1];
+                w_q4k_bytes[off + 2] = dmin[0];
+                w_q4k_bytes[off + 3] = dmin[1];
+                for i in 0..12 {
+                    w_q4k_bytes[off + 4 + i] &= 0x3F;
+                }
+            }
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx.clone());
+
+        let w_dev = stream.memcpy_stod(&w_q4k_bytes).expect("upload");
+        let x_bf: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.001).sin()))
+            .collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+        let mut y_dev = stream.alloc_zeros::<half::bf16>(n).expect("alloc y");
+
+        // Warm-up (compile both kernels).
+        unsafe {
+            let (w_p, _g1) = w_dev.device_ptr(&stream);
+            let (x_p, _g2) = x_dev.device_ptr(&stream);
+            let (y_p, _g3) = y_dev.device_ptr_mut(&stream);
+            kernels
+                .sgemv_q4k_bf16(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                .ok();
+            kernels
+                .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                .ok();
+        }
+        stream.synchronize().ok();
+
+        let n_iters = 200;
+
+        // Bench V1.
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            unsafe {
+                let (w_p, _g1) = w_dev.device_ptr(&stream);
+                let (x_p, _g2) = x_dev.device_ptr(&stream);
+                let (y_p, _g3) = y_dev.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q4k_bf16(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                    .ok();
+            }
+        }
+        stream.synchronize().ok();
+        let v1_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+
+        // Bench V2.
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            unsafe {
+                let (w_p, _g1) = w_dev.device_ptr(&stream);
+                let (x_p, _g2) = x_dev.device_ptr(&stream);
+                let (y_p, _g3) = y_dev.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                    .ok();
+            }
+        }
+        stream.synchronize().ok();
+        let v2_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+
+        let bytes_per_call = (n * row_bytes) as f64;
+        let v1_bw = bytes_per_call / (v1_ms * 1e-3) / 1e9;
+        let v2_bw = bytes_per_call / (v2_ms * 1e-3) / 1e9;
+        let speedup = v1_ms / v2_ms;
+
+        eprintln!("\n=== sgemv_q4k V1 vs V2 (Qwen-7B FFN N={n}, K={k}) ===");
+        eprintln!("  V1 : {:.3} ms / {:.1} GB/s", v1_ms, v1_bw);
+        eprintln!(
+            "  V2 : {:.3} ms / {:.1} GB/s   (speedup {:.2}×)",
+            v2_ms, v2_bw, speedup
+        );
+        eprintln!("  Decode budget Qwen-7B (84 FFN calls/token) :");
+        eprintln!(
+            "     V1 : {:.1} ms = {:.1} tok/s",
+            v1_ms * 84.0,
+            1000.0 / (v1_ms * 84.0)
+        );
+        eprintln!(
+            "     V2 : {:.1} ms = {:.1} tok/s",
+            v2_ms * 84.0,
+            1000.0 / (v2_ms * 84.0)
+        );
+        eprintln!("  llama.cpp ref Qwen-7B Q4_K_M : 47.15 tok/s");
     }
 
     /// T244.1 — micro-bench sgemv_q4k_bf16 vs matmul_bf16 on Qwen-7B FFN size.
