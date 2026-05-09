@@ -403,7 +403,7 @@ fn main() -> Result<(), BenchError> {
         let fp4_cached_tflops = {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
             // Warm-up (also primes the cache).
-            let warmup = || -> Result<(), BenchError> {
+            let mut warmup = || -> Result<(), BenchError> {
                 for _ in 0..5 {
                     unsafe {
                         let (a_p, _r1) = a_dev_fp4.device_ptr(&stream);
@@ -441,7 +441,7 @@ fn main() -> Result<(), BenchError> {
                 },
                 Ok(()) => {
                     let t0 = Instant::now();
-                    let timed = || -> Result<(), BenchError> {
+                    let mut timed = || -> Result<(), BenchError> {
                         for _ in 0..n_iters {
                             unsafe {
                                 let (a_p, _r1) = a_dev_fp4.device_ptr(&stream);
