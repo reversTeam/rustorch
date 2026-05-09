@@ -43,6 +43,7 @@ pub mod device;
 pub mod error;
 pub mod event;
 pub mod kernels;
+pub mod llm_kernels;
 pub mod nccl;
 pub mod ops;
 pub mod stream;
