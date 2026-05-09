@@ -583,9 +583,15 @@ extern "C" __global__ void sgemm_q4k_bf16_m8(
         unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
 
         int x_super_pos = (group << 5) + pos_base;
-        // x is [M=8, K] row-major. Read 4 BF16 from each m row directly from global.
-        // Position : x[m, b*256 + x_super_pos + i] = x[m * K + b * 256 + x_super_pos + i]
         const __nv_bfloat16* x_block = x + b * 256 + x_super_pos;
+
+        // Vectorize : load 4 BF16 (= 8 bytes = uint2) per m in one transaction.
+        // Total : 8 m × 8 bytes = 64 bytes (4 cache lines worth).
+        uint2 xv[8];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            xv[m] = *(const uint2*)(x_block + m * K);
+        }
 
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -595,8 +601,11 @@ extern "C" __global__ void sgemm_q4k_bf16_m8(
 
             #pragma unroll
             for (int m = 0; m < 8; ++m) {
-                float xv = (float)x_block[m * K + i];
-                acc[m] += w_val * xv;
+                unsigned short xb_i = (i < 2)
+                    ? (unsigned short)((xv[m].x >> (i << 4)) & 0xFFFFu)
+                    : (unsigned short)((xv[m].y >> ((i - 2) << 4)) & 0xFFFFu);
+                __nv_bfloat16 xbf = __ushort_as_bfloat16(xb_i);
+                acc[m] += w_val * (float)xbf;
             }
         }
     }
@@ -1253,6 +1262,13 @@ extern "C" __global__ void sgemm_q5k_bf16_m8(
         int x_super_pos = (group << 5) + pos_base;
         const __nv_bfloat16* x_block = x + b * 256 + x_super_pos;
 
+        // Vectorize : 1 uint2 (8 bytes = 4 BF16) load per m row.
+        uint2 xv[8];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            xv[m] = *(const uint2*)(x_block + m * K);
+        }
+
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             unsigned char ql_byte = (qlbytes >> (i << 3)) & 0xFFu;
@@ -1264,8 +1280,11 @@ extern "C" __global__ void sgemm_q5k_bf16_m8(
 
             #pragma unroll
             for (int m = 0; m < 8; ++m) {
-                float xv = (float)x_block[m * K + i];
-                acc[m] += w_val * xv;
+                unsigned short xb_i = (i < 2)
+                    ? (unsigned short)((xv[m].x >> (i << 4)) & 0xFFFFu)
+                    : (unsigned short)((xv[m].y >> ((i - 2) << 4)) & 0xFFFFu);
+                __nv_bfloat16 xbf = __ushort_as_bfloat16(xb_i);
+                acc[m] += w_val * (float)xbf;
             }
         }
     }
