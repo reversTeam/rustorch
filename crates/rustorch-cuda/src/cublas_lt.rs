@@ -196,14 +196,15 @@ pub unsafe fn matmul_fp8(
         location: "cublas_lt::matmul_fp8::matmul_desc",
     })?;
 
-    // transa = T, transb = N. Attribute IDs from cublasLt.h.
-    let transa = sys::cublasOperation_t::CUBLAS_OP_T;
-    let transb = sys::cublasOperation_t::CUBLAS_OP_N;
+    // transa = T, transb = N. cublasOperation_t lives in the cublas (not
+    // cublaslt) sys module — same enum is shared.
+    let transa = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
+    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
     result::set_matmul_desc_attribute(
         matmul_desc,
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
         (&transa) as *const _ as *const _,
-        std::mem::size_of::<sys::cublasOperation_t>(),
+        std::mem::size_of::<cudarc::cublas::sys::cublasOperation_t>(),
     )
     .map_err(|e| CudaError::CublasStatus {
         code: lt_err_code(e),
@@ -213,7 +214,7 @@ pub unsafe fn matmul_fp8(
         matmul_desc,
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
         (&transb) as *const _ as *const _,
-        std::mem::size_of::<sys::cublasOperation_t>(),
+        std::mem::size_of::<cudarc::cublas::sys::cublasOperation_t>(),
     )
     .map_err(|e| CudaError::CublasStatus {
         code: lt_err_code(e),
