@@ -106,19 +106,24 @@ extern "C" __global__ void swiglu_bf16(
 const ROPE_HALF_SPLIT_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
 
-// "Half-split" RoPE (the PyTorch / Llama / Qwen convention) :
-//   For dim_pair p in [0, head_dim/2) :
-//     a = x[b, h, 2p]
-//     b = x[b, h, 2p+1]
-//     theta = inv_freq[p] * pos
-//     cos_p = cos(theta), sin_p = sin(theta)
-//     x[b, h, 2p]   = a * cos_p - b * sin_p
-//     x[b, h, 2p+1] = a * sin_p + b * cos_p
+// "Half-split" RoPE — the HuggingFace `apply_rotary_pos_emb` convention
+// used by Llama / Qwen / Mistral / Phi when loaded from HF or GGUF :
 //
-// `inv_freq` is precomputed [head_dim / 2] : 1 / (theta_base ^ (2p / head_dim))
+//   For dim k in [0, head_dim/2) :
+//     a   = x[b, h, k]            (first half)
+//     b   = x[b, h, k + half]     (second half)
+//     theta = inv_freq[k] * pos
+//     cos_k = cos(theta), sin_k = sin(theta)
+//     x[b, h, k]        = a * cos_k - b * sin_k
+//     x[b, h, k + half] = a * sin_k + b * cos_k
+//
+// NOT to be confused with the GPT-NeoX / RoFormer "interleaved" convention
+// which pairs (2k, 2k+1). HF weights are baked for the half-split layout
+// so using interleaved here scrambles Q/K and breaks attention.
+//
+// `inv_freq` is precomputed [head_dim / 2] : 1 / (theta_base ^ (2k / head_dim))
 //
 // Layout : x is (n_heads, head_dim) for ONE token at position `pos`.
-// For multi-token prefill, launch with grid_dim.y = seq and seq_offset.
 extern "C" __global__ void rope_half_split_bf16(
     __nv_bfloat16* __restrict__ x,
     const float* __restrict__ inv_freq,   // [head_dim/2]
@@ -129,18 +134,18 @@ extern "C" __global__ void rope_half_split_bf16(
     int h = blockIdx.x;
     if (h >= n_heads) return;
     int half = head_dim / 2;
-    int p = blockIdx.y * blockDim.x + threadIdx.x;
-    if (p >= half) return;
+    int k = blockIdx.y * blockDim.x + threadIdx.x;
+    if (k >= half) return;
 
-    float theta = inv_freq[p] * (float)pos;
-    float cos_p, sin_p;
-    sincosf(theta, &sin_p, &cos_p);
+    float theta = inv_freq[k] * (float)pos;
+    float cos_k, sin_k;
+    sincosf(theta, &sin_k, &cos_k);
 
-    int base = h * head_dim + 2 * p;
-    float a = (float)x[base];
-    float b = (float)x[base + 1];
-    x[base]     = (__nv_bfloat16)(a * cos_p - b * sin_p);
-    x[base + 1] = (__nv_bfloat16)(a * sin_p + b * cos_p);
+    int row = h * head_dim;
+    float a = (float)x[row + k];
+    float b = (float)x[row + k + half];
+    x[row + k]        = (__nv_bfloat16)(a * cos_k - b * sin_k);
+    x[row + k + half] = (__nv_bfloat16)(a * sin_k + b * cos_k);
 }
 "#;
 
