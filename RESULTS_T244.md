@@ -1,16 +1,17 @@
 # rustorch on DGX Spark GB10 — Performance update (T244 + T245)
 
-## TL;DR (T245.4 — algorithmic breakthrough)
+## TL;DR (T245.4.1 — algorithmic breakthrough + vectorized loads)
 
 The M=1 decode path plateaued at 0.90× llama.cpp (memory-bound at 157/200 GB/s).
 The user pointed out the gap is algorithmic, not tactical. Validated :
 
-| Engine                                            | tok/s | vs llama.cpp |
-|---------------------------------------------------|------:|-------------:|
-| llama.cpp Qwen3.6-27B Q4_K_M                      | 11.62 |    1.00×     |
-| rustorch Qwen3.6-27B Q4_K_M (M=1, T244.4 final)   | 10.49 |    0.90×     |
-| **rustorch Qwen3.6-27B Q4_K_M (M=8 batched)**     | **40.48** | **3.48× ✓** |
-| rustorch projected with spec decoding @ 70% acc.  | ~28.3 |    2.43×     |
+| Engine                                                   | tok/s | vs llama.cpp |
+|----------------------------------------------------------|------:|-------------:|
+| llama.cpp Qwen3.6-27B Q4_K_M                             | 11.62 |    1.00×     |
+| rustorch Qwen3.6-27B Q4_K_M (M=1, T244.4 final)          | 10.49 |    0.90×     |
+| rustorch Qwen3.6-27B Q4_K_M (M=8 batched, scalar x)      | 40.48 |    3.48× ✓   |
+| **rustorch Qwen3.6-27B Q4_K_M (M=8 batched, uint2 x)**   | **53.25** | **4.58× ✓** |
+| rustorch projected with spec decoding @ 70% accept       | ~37.3 |    3.21×     |
 
 **Algorithmic insight** : the entire weight tensor (14.94 GB) is re-read per
 token in standard decode. By batching M=8 tokens through a single weight pass
