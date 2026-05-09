@@ -84,13 +84,13 @@ fn main() -> Result<(), BenchError> {
         }
     }
 
-    println!("[cublas_gemm_bench] device ready, sweeping (TF32 + BF16 + FP8 E4M3)");
+    println!("[cublas_gemm_bench] device ready, sweeping (TF32 sgemm + BF16 gemm)");
     println!();
     println!(
-        "  {:>5} {:>8} {:>10} {:>10} {:>10}",
-        "M=N=K", "iters", "TF32 TFL", "BF16 TFL", "FP8 TFL"
+        "  {:>5} {:>10} {:>14} {:>10} {:>10} {:>10}",
+        "M=N=K", "iters", "wall (ms)", "ms/iter", "TF32 TFL", "BF16 TFL"
     );
-    println!("  {}", "─".repeat(56));
+    println!("  {}", "─".repeat(72));
 
     // Square shape sweep. Shapes chosen to span small (cache-resident-ish)
     // up to 4096² which is the typical "large dense gemm" sweet spot.
@@ -186,164 +186,17 @@ fn main() -> Result<(), BenchError> {
         let wall_ms_bf16 = t0.elapsed().as_secs_f64() * 1000.0;
         let ms_per_iter_bf16 = wall_ms_bf16 / n_iters as f64;
         let bf16_tflops = flops_per_iter / (ms_per_iter_bf16 / 1000.0) / 1e12;
-        let _ = ms_per_iter_bf16;
-
-        // ───────── FP8 (E4M3) path via raw cublasGemmEx ─────────
-        // FP8 inputs (1 byte per element), F32 accumulation, BF16 output.
-        // cudarc 0.17 has no safe Gemm<f8> impl yet, so we drive cublasGemmEx
-        // directly through `cudarc::cublas::result::gemm_ex`. The byte
-        // patterns 0x10..0x6F land in the safe E4M3 range (no NaN, no
-        // saturation) — fine for throughput measurement.
-        let a_fp8: Vec<u8> = (0..m * k)
-            .map(|i| 0x10u8.wrapping_add(((i as u8) % 0x60u8)))
-            .collect();
-        let b_fp8: Vec<u8> = (0..k * n)
-            .map(|i| 0x10u8.wrapping_add((i.wrapping_mul(7) as u8) % 0x60u8))
-            .collect();
-        let a_dev_fp8 = stream.memcpy_stod(&a_fp8)?;
-        let b_dev_fp8 = stream.memcpy_stod(&b_fp8)?;
-        let mut c_dev_fp8_out = stream.alloc_zeros::<half::bf16>(m * n)?;
-        // alpha/beta defined inside the fp8_attempt closure since cublasLt
-        // setup happens there now (cublasLt has its own handle separate
-        // from CudaBlas).
-
-        // FP8 GEMM via cublasLtMatmul (cublasGemmEx rejects FP8 inputs on
-        // Blackwell). We hand-build MatrixLayout descriptors with
-        // CUDA_R_8F_E4M3 for A,B and CUDA_R_16BF for C, MatmulDesc with
-        // CUBLAS_COMPUTE_32F + scale type R_32F. cublasLt requires
-        // transa=T, transb=N for FP8 ("TN" gemm). lda=ldb=k, ldc=m.
-        let mut fp8_attempt = || -> Result<f64, BenchError> {
-            use cudarc::cublaslt::{
-                CudaBlasLT, MatmulDesc, MatmulPref, Matrix, MatrixLayout, Workspace as LtWorkspace,
-            };
-
-            let blas_lt = CudaBlasLT::new(stream.clone())?;
-            let workspace = LtWorkspace::new(stream.clone(), 32 * 1024 * 1024)?; // 32 MiB
-
-            let a_layout = MatrixLayout::new(
-                cudarc::cublaslt::sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                k as u64,
-                m as u64,
-                k as i64,
-            )?;
-            let b_layout = MatrixLayout::new(
-                cudarc::cublaslt::sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                k as u64,
-                n as u64,
-                k as i64,
-            )?;
-            let c_layout = MatrixLayout::new(
-                cudarc::cublaslt::sys::cudaDataType_t::CUDA_R_16BF,
-                m as u64,
-                n as u64,
-                m as i64,
-            )?;
-
-            let matmul_desc = MatmulDesc::new(
-                cudarc::cublaslt::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                cudarc::cublaslt::sys::cudaDataType_t::CUDA_R_32F,
-            )?;
-            matmul_desc.set_transpose(true, Matrix::A)?;
-            matmul_desc.set_transpose(false, Matrix::B)?;
-
-            let pref = MatmulPref::new()?;
-            pref.set_workspace_size(workspace.size)?;
-
-            let heuristic = cudarc::cublaslt::result::get_matmul_algo_heuristic(
-                *blas_lt.handle(),
-                matmul_desc.handle,
-                a_layout.handle,
-                b_layout.handle,
-                c_layout.handle,
-                c_layout.handle,
-                pref.handle,
-            )?;
-            let alpha: f32 = 1.0;
-            let beta: f32 = 0.0;
-            // Warm-up: 5 calls.
-            for _ in 0..5 {
-                // SAFETY: gemm_ex contract — pointers and types match cfg,
-                // shapes validated, alpha/beta are f32 scalars matching the
-                // CUBLAS_COMPUTE_32F compute type.
-                unsafe {
-                    use cudarc::driver::{DevicePtr, DevicePtrMut};
-                    let (a_ptr, _r1) = a_dev_fp8.device_ptr(&stream);
-                    let (b_ptr, _r2) = b_dev_fp8.device_ptr(&stream);
-                    let (c_ptr, _r3) = c_dev_fp8_out.device_ptr_mut(&stream);
-                    let (w_ptr, _r4) = workspace.buffer.device_ptr(&stream);
-                    cudarc::cublaslt::result::matmul(
-                        *blas_lt.handle(),
-                        matmul_desc.handle,
-                        (&alpha) as *const f32 as *const _,
-                        (&beta) as *const f32 as *const _,
-                        a_ptr as *const _,
-                        a_layout.handle,
-                        b_ptr as *const _,
-                        b_layout.handle,
-                        c_ptr as *const _,
-                        c_layout.handle,
-                        c_ptr as *mut _,
-                        c_layout.handle,
-                        (&heuristic.algo) as *const _,
-                        w_ptr as *mut _,
-                        workspace.size,
-                        stream.cu_stream() as *mut _,
-                    )?;
-                }
-            }
-            stream.synchronize()?;
-            let t0 = Instant::now();
-            for _ in 0..n_iters {
-                unsafe {
-                    use cudarc::driver::{DevicePtr, DevicePtrMut};
-                    let (a_ptr, _r1) = a_dev_fp8.device_ptr(&stream);
-                    let (b_ptr, _r2) = b_dev_fp8.device_ptr(&stream);
-                    let (c_ptr, _r3) = c_dev_fp8_out.device_ptr_mut(&stream);
-                    let (w_ptr, _r4) = workspace.buffer.device_ptr(&stream);
-                    cudarc::cublaslt::result::matmul(
-                        *blas_lt.handle(),
-                        matmul_desc.handle,
-                        (&alpha) as *const f32 as *const _,
-                        (&beta) as *const f32 as *const _,
-                        a_ptr as *const _,
-                        a_layout.handle,
-                        b_ptr as *const _,
-                        b_layout.handle,
-                        c_ptr as *const _,
-                        c_layout.handle,
-                        c_ptr as *mut _,
-                        c_layout.handle,
-                        (&heuristic.algo) as *const _,
-                        w_ptr as *mut _,
-                        workspace.size,
-                        stream.cu_stream() as *mut _,
-                    )?;
-                }
-            }
-            stream.synchronize()?;
-            Ok(t0.elapsed().as_secs_f64() * 1000.0)
-        };
-
-        let fp8_tflops = match fp8_attempt() {
-            Ok(wall_ms_fp8) => {
-                let ms_per_iter_fp8 = wall_ms_fp8 / n_iters as f64;
-                flops_per_iter / (ms_per_iter_fp8 / 1000.0) / 1e12
-            },
-            Err(e) => {
-                if dim == 128 {
-                    eprintln!("[cublas_gemm_bench] FP8 path skipped — {e}");
-                    eprintln!("[cublas_gemm_bench] FP8 GEMM via cublasGemmEx is heavily restricted on Blackwell;");
-                    eprintln!("[cublas_gemm_bench] full FP8/FP4 path needs cublasLtMatmul (tracked as T240.5).");
-                }
-                f64::NAN
-            },
-        };
 
         println!(
-            "  {:>5} {:>8} {:>10.2} {:>10.2} {:>10.2}",
-            dim, n_iters, tf32_tflops, bf16_tflops, fp8_tflops
+            "  {:>5} {:>10} {:>14.2} {:>10.3} {:>10.2} {:>10.2}",
+            dim, n_iters, wall_ms_tf32, ms_per_iter_tf32, tf32_tflops, bf16_tflops
         );
     }
+    println!();
+    println!("[cublas_gemm_bench] FP8/FP4 path tracked as T240.5 — needs custom cublasLt");
+    println!(
+        "[cublas_gemm_bench] FFI bindings (cudarc 0.17 keeps MatrixLayout/MatmulDesc private)."
+    );
 
     println!();
     println!("[cublas_gemm_bench] done");
