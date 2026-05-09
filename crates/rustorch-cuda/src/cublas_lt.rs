@@ -549,6 +549,68 @@ impl LtSession {
         Ok(())
     }
 
+    /// Cached BF16 matmul. Uniform BF16 in/out, F32 accumulation,
+    /// TensorCore-native on Ampere+.
+    ///
+    /// # Safety
+    /// `*_dev` pointers must be valid for the duration of the call and
+    /// reference allocations of the right BF16 element count.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matmul_bf16(
+        &mut self,
+        a_dev: u64,
+        b_dev: u64,
+        c_dev: u64,
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), CudaError> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        let cached = self.get_or_build(
+            m,
+            n,
+            k,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            None,
+            0,
+            0,
+        )? as *const CachedMatmul;
+        let cached = &*cached;
+        let workspace_ptr = {
+            use cudarc::driver::DevicePtr;
+            self.workspace.device_ptr(&self.stream).0
+        };
+        result::matmul(
+            self.handle,
+            cached.matmul_desc,
+            (&alpha) as *const f32 as *const _,
+            (&beta) as *const f32 as *const _,
+            a_dev as *const _,
+            cached.a_layout,
+            b_dev as *const _,
+            cached.b_layout,
+            c_dev as *const _,
+            cached.c_layout,
+            c_dev as *mut _,
+            cached.c_layout,
+            (&cached.algo) as *const _,
+            workspace_ptr as *mut _,
+            self.workspace_bytes,
+            self.stream.cu_stream() as *mut _,
+        )
+        .map_err(|e| CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "LtSession::matmul_bf16::dispatch",
+        })?;
+        Ok(())
+    }
+
     /// Cached MXFP4/NVFP4 matmul.
     ///
     /// # Safety
