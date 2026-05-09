@@ -1061,38 +1061,44 @@ impl LtSession {
         };
 
         let mut best_idx = 0usize;
+        let mut best_split_k: i32 = 1;
         let mut best_ms = f32::INFINITY;
+
+        // T240.8m — try plusieurs SPLIT_K values pour chaque algo. SPLIT_K
+        // parallélise l'accumulation = peut débloquer plus de SMs sur les
+        // matmuls non-square (FFN g+up où N >> K).
+        // Override via RUSTORCH_CUBLASLT_SPLIT_K_VALUES="1,2,4,8" (default).
+        let split_k_values: Vec<i32> = std::env::var("RUSTORCH_CUBLASLT_SPLIT_K_VALUES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|x| x.trim().parse().ok())
+                    .collect::<Vec<i32>>()
+            })
+            .filter(|v: &Vec<i32>| !v.is_empty())
+            .unwrap_or_else(|| vec![1, 2, 4, 8]);
 
         for (idx, hr) in results.iter().enumerate() {
             if hr.state != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                 continue;
             }
-            // 1 warm-up
-            let _ = result::matmul(
-                self.handle,
-                matmul_desc,
-                (&alpha) as *const f32 as *const _,
-                (&beta) as *const f32 as *const _,
-                a_dev as *const _,
-                a_layout,
-                b_dev as *const _,
-                b_layout,
-                c_dev as *const _,
-                c_layout,
-                c_dev as *mut _,
-                c_layout,
-                (&hr.algo) as *const _,
-                workspace_ptr as *mut _,
-                self.workspace_bytes,
-                self.stream.cu_stream() as *mut _,
-            );
-            let start = mk_event()?;
-            let stop = mk_event()?;
-            start.record(&self.stream).map_err(|e| CudaError::Driver {
-                code: format!("{e:?}").len() as i32,
-                location: "autotune_mxfp4::record_start",
-            })?;
-            for _ in 0..n_passes {
+            // Cloner l'algo une fois (les set_attribute le mutent)
+            let mut algo_template = hr.algo;
+            for &split_k in &split_k_values {
+                let mut algo = algo_template;
+                if split_k > 1 {
+                    let status = sys::cublasLtMatmulAlgoConfigSetAttribute(
+                        &mut algo,
+                        sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                        (&split_k) as *const i32 as *const _,
+                        std::mem::size_of::<i32>(),
+                    );
+                    if status != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                        // Algo ne supporte pas split_k > 1, skip
+                        continue;
+                    }
+                }
+                // 1 warm-up
                 let _ = result::matmul(
                     self.handle,
                     matmul_desc,
@@ -1106,34 +1112,79 @@ impl LtSession {
                     c_layout,
                     c_dev as *mut _,
                     c_layout,
-                    (&hr.algo) as *const _,
+                    (&algo) as *const _,
                     workspace_ptr as *mut _,
                     self.workspace_bytes,
                     self.stream.cu_stream() as *mut _,
                 );
+                let start = mk_event()?;
+                let stop = mk_event()?;
+                start.record(&self.stream).map_err(|e| CudaError::Driver {
+                    code: format!("{e:?}").len() as i32,
+                    location: "autotune_mxfp4::record_start",
+                })?;
+                let mut had_err = false;
+                for _ in 0..n_passes {
+                    let r = result::matmul(
+                        self.handle,
+                        matmul_desc,
+                        (&alpha) as *const f32 as *const _,
+                        (&beta) as *const f32 as *const _,
+                        a_dev as *const _,
+                        a_layout,
+                        b_dev as *const _,
+                        b_layout,
+                        c_dev as *const _,
+                        c_layout,
+                        c_dev as *mut _,
+                        c_layout,
+                        (&algo) as *const _,
+                        workspace_ptr as *mut _,
+                        self.workspace_bytes,
+                        self.stream.cu_stream() as *mut _,
+                    );
+                    if r.is_err() {
+                        had_err = true;
+                        break;
+                    }
+                }
+                if had_err {
+                    let _ = algo_template;
+                    continue;
+                }
+                stop.record(&self.stream).map_err(|e| CudaError::Driver {
+                    code: format!("{e:?}").len() as i32,
+                    location: "autotune_mxfp4::record_stop",
+                })?;
+                stop.synchronize().map_err(|e| CudaError::Driver {
+                    code: format!("{e:?}").len() as i32,
+                    location: "autotune_mxfp4::sync",
+                })?;
+                let elapsed_total = start.elapsed_ms(&stop).map_err(|e| CudaError::Driver {
+                    code: format!("{e:?}").len() as i32,
+                    location: "autotune_mxfp4::elapsed",
+                })?;
+                let per_call = elapsed_total / n_passes as f32;
+                if per_call < best_ms {
+                    best_ms = per_call;
+                    best_idx = idx;
+                    best_split_k = split_k;
+                }
             }
-            stop.record(&self.stream).map_err(|e| CudaError::Driver {
-                code: format!("{e:?}").len() as i32,
-                location: "autotune_mxfp4::record_stop",
-            })?;
-            stop.synchronize().map_err(|e| CudaError::Driver {
-                code: format!("{e:?}").len() as i32,
-                location: "autotune_mxfp4::sync",
-            })?;
-            let elapsed_total = start.elapsed_ms(&stop).map_err(|e| CudaError::Driver {
-                code: format!("{e:?}").len() as i32,
-                location: "autotune_mxfp4::elapsed",
-            })?;
-            let per_call = elapsed_total / n_passes as f32;
-            if per_call < best_ms {
-                best_ms = per_call;
-                best_idx = idx;
-            }
+            let _ = algo_template;
         }
 
-        // 5. Patch cache entry.
+        // 5. Patch cache entry — réapplique le SPLIT_K winner sur l'algo cached.
         if let Some(entry) = self.cache.get_mut(&key) {
             entry.algo = results[best_idx].algo;
+            if best_split_k > 1 {
+                let _ = sys::cublasLtMatmulAlgoConfigSetAttribute(
+                    &mut entry.algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                    (&best_split_k) as *const i32 as *const _,
+                    std::mem::size_of::<i32>(),
+                );
+            }
         }
         Ok(best_ms)
     }
