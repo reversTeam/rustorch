@@ -577,6 +577,62 @@ fn try_run_sparse_block(
     let mut sparse_dn =
         unsafe { sparse_session_dn.prune_compress_bf16(w_dn_p, ffn_down_n, ffn, seq) }?;
     println!("  weights ready, running 4 sparse matmuls per block (4 sessions, workaround GB10 0.9.1.1 bug)");
+    // Test mode "ITER1" : combien de répétitions tient avant fail
+    if std::env::var("RUSTORCH_SPARSE_ITER")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some()
+    {
+        let n: usize = std::env::var("RUSTORCH_SPARSE_ITER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        println!("  [iter-test] running {n} iterations, sync each, report when fails");
+        for i in 0..n {
+            unsafe {
+                let (b_p, _r) = act.device_ptr(stream);
+                let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
+                let r = sparse_session_qkv.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0);
+                stream.synchronize().ok();
+                if r.is_err() {
+                    println!("    iter {i}: qkv FAIL {r:?}");
+                    return Ok(0.001);
+                }
+            }
+            unsafe {
+                let (b_p, _r) = act.device_ptr(stream);
+                let (c_p, _r2) = out_attn.device_ptr_mut(stream);
+                let r = sparse_session_attn.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0);
+                stream.synchronize().ok();
+                if r.is_err() {
+                    println!("    iter {i}: attn FAIL {r:?}");
+                    return Ok(0.001);
+                }
+            }
+            unsafe {
+                let (b_p, _r) = act.device_ptr(stream);
+                let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
+                let r = sparse_session_gu.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0);
+                stream.synchronize().ok();
+                if r.is_err() {
+                    println!("    iter {i}: gu FAIL {r:?}");
+                    return Ok(0.001);
+                }
+            }
+            unsafe {
+                let (b_p, _r3) = out_gate_up.device_ptr(stream);
+                let (c_p, _r2) = out_down.device_ptr_mut(stream);
+                let r = sparse_session_dn.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0);
+                stream.synchronize().ok();
+                if r.is_err() {
+                    println!("    iter {i}: dn FAIL {r:?}");
+                    return Ok(0.001);
+                }
+            }
+        }
+        println!("    {n} iterations OK");
+        return Ok(0.001);
+    }
     // Diagnostic : sync après chacune pour identifier laquelle échoue
     if std::env::var("RUSTORCH_SPARSE_DEBUG")
         .map(|v| v == "1")
