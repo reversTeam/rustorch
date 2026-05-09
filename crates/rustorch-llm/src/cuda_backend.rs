@@ -244,6 +244,147 @@ impl LlamaModelCuda {
         self.config.vocab_size
     }
 
+    /// Decode 1 token avec layers FFN-only (T241.4 step 2).
+    ///
+    /// Pour chaque layer applique :
+    ///  - RMSNorm pre-FFN
+    ///  - Fused gate+up matmul (LtSession)
+    ///  - SwiGLU (silu(gate) * up)
+    ///  - Down matmul
+    ///  - Residual : x += block_out
+    ///
+    /// L'attention est **skipped** (pas encore wirée — T241.4 step 3).
+    /// Le résultat est numériquement faux pour un vrai modèle mais
+    /// exerce le pipeline FFN bout-en-bout.
+    ///
+    /// # Safety
+    /// Le caller garantit que `token_id < vocab_size`.
+    pub fn decode_step_ffn_only(&mut self, token_id: u32) -> Result<u32, LlmError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let cfg = &self.config;
+        let d = cfg.hidden_size;
+        let f = cfg.intermediate_size;
+        let v = cfg.vocab_size;
+        let gate_up_n = 2 * f;
+
+        // 1. Embed lookup → scratch.x
+        let token_id_dev = self
+            .stream
+            .memcpy_stod(&[token_id])
+            .map_err(|e| LlmError::Backend(format!("upload token_id: {e:?}")))?;
+        unsafe {
+            let (table_p, _r1) = self.token_emb.device_ptr(&self.stream);
+            let (ids_p, _r2) = token_id_dev.device_ptr(&self.stream);
+            let (out_p, _r3) = self.scratch.x.device_ptr_mut(&self.stream);
+            self.kernels
+                .embedding_lookup_bf16(&self.stream, table_p, ids_p, out_p, 1, d as i32)
+                .map_err(|e| LlmError::Backend(format!("embedding_lookup: {e:?}")))?;
+        }
+
+        // Helper : copy scratch.x → scratch.h via host roundtrip (à
+        // remplacer par memcpy_dtod kernel quand on en aura un — pour
+        // MVP on accepte le détour).
+        let copy_x_to_h = |this: &mut Self| -> Result<(), LlmError> {
+            let host: Vec<half::bf16> = this
+                .stream
+                .memcpy_dtov(&this.scratch.x)
+                .map_err(|e| LlmError::Backend(format!("dtov x: {e:?}")))?;
+            this.stream
+                .memcpy_htod(&host, &mut this.scratch.h)
+                .map_err(|e| LlmError::Backend(format!("htod h: {e:?}")))?;
+            Ok(())
+        };
+
+        // 2. Itérer sur les layers, faire le sub-bloc FFN seulement.
+        for li in 0..cfg.num_hidden_layers {
+            // x_in = x (résidu).
+            // h ← copy(x)
+            copy_x_to_h(self)?;
+
+            // RMSNorm pre-FFN sur h avec block.rms_ffn
+            let block = &self.blocks[li];
+            unsafe {
+                let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+                let (g_p, _r2) = block.rms_ffn.device_ptr(&self.stream);
+                self.kernels
+                    .rms_norm_bf16(&self.stream, h_p, g_p, cfg.rms_norm_eps, d as i32, 1)
+                    .map_err(|e| LlmError::Backend(format!("rms_ffn L{li}: {e:?}")))?;
+            }
+
+            // Fused gate+up matmul : h [1, d] · w_gate_up [d, 2*f] → gate_up [1, 2*f]
+            unsafe {
+                let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+                let (b_p, _r2) = block.w_gate_up.device_ptr(&self.stream);
+                let (c_p, _r3) = self.scratch.gate_up.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_bf16(a_p, b_p, c_p, 1, d, gate_up_n, 1.0, 0.0)
+                    .map_err(|e| LlmError::Backend(format!("gate_up L{li}: {e:?}")))?;
+            }
+
+            // SwiGLU : ffn_inter[i] = silu(gate_up[i]) * gate_up[f + i]
+            // gate_up est layouté en col-major (output cublasLt) [1 × 2f]
+            // donc en mémoire : [gate_0, ..., gate_f-1, up_0, ..., up_f-1]
+            // (les premiers f éléments = gate, les suivants f = up).
+            unsafe {
+                let (gu_p, _r1) = self.scratch.gate_up.device_ptr(&self.stream);
+                let up_p = gu_p + (f as u64) * 2; // BF16 = 2 bytes
+                let (out_p, _r2) = self.scratch.ffn_inter.device_ptr_mut(&self.stream);
+                self.kernels
+                    .swiglu_bf16(&self.stream, gu_p, up_p, out_p, f as i32)
+                    .map_err(|e| LlmError::Backend(format!("swiglu L{li}: {e:?}")))?;
+            }
+
+            // Down proj : ffn_inter [1, f] · w_down [f, d] → block_out [1, d]
+            unsafe {
+                let (a_p, _r1) = self.scratch.ffn_inter.device_ptr(&self.stream);
+                let (b_p, _r2) = block.w_down.device_ptr(&self.stream);
+                let (c_p, _r3) = self.scratch.block_out.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_bf16(a_p, b_p, c_p, 1, f, d, 1.0, 0.0)
+                    .map_err(|e| LlmError::Backend(format!("w_down L{li}: {e:?}")))?;
+            }
+
+            // Residual : x += block_out
+            unsafe {
+                let (x_p, _r1) = self.scratch.x.device_ptr_mut(&self.stream);
+                let (b_p, _r2) = self.scratch.block_out.device_ptr(&self.stream);
+                self.kernels
+                    .add_inplace_bf16(&self.stream, x_p, b_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("residual L{li}: {e:?}")))?;
+            }
+        }
+
+        // 3. Final RMSNorm + LM head + argmax
+        copy_x_to_h(self)?;
+        unsafe {
+            let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+            let (g_p, _r2) = self.final_norm.device_ptr(&self.stream);
+            self.kernels
+                .rms_norm_bf16(&self.stream, h_p, g_p, cfg.rms_norm_eps, d as i32, 1)
+                .map_err(|e| LlmError::Backend(format!("final_norm: {e:?}")))?;
+        }
+        unsafe {
+            let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+            let (b_p, _r2) = self.lm_head.device_ptr(&self.stream);
+            let (c_p, _r3) = self.scratch.logits.device_ptr_mut(&self.stream);
+            self.session
+                .matmul_bf16(a_p, b_p, c_p, 1, d, v, 1.0, 0.0)
+                .map_err(|e| LlmError::Backend(format!("lm_head: {e:?}")))?;
+        }
+        unsafe {
+            let (l_p, _r1) = self.scratch.logits.device_ptr(&self.stream);
+            let (o_p, _r2) = self.scratch.sample_out.device_ptr_mut(&self.stream);
+            self.kernels
+                .argmax_bf16(&self.stream, l_p, o_p, v as i32)
+                .map_err(|e| LlmError::Backend(format!("argmax: {e:?}")))?;
+        }
+        let out: Vec<u32> = self
+            .stream
+            .memcpy_dtov(&self.scratch.sample_out)
+            .map_err(|e| LlmError::Backend(format!("dtov sample: {e:?}")))?;
+        Ok(out[0])
+    }
+
     /// Decode 1 token, returns next token id.
     ///
     /// MVP version (T241.4 step 1) : skip les blocks (juste embed → final
