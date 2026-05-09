@@ -274,6 +274,84 @@ fn main() -> Result<(), BenchError> {
         100.0 * fp4_tflops / 1000.0
     );
 
+    // ───────── NVFP4 + 2:4 sparsity path (T240.8h) ─────────
+    // FP4 inputs avec poids 2:4 + activation dense FP4. cuSPARSELt 0.9
+    // supporte CUDA_R_4F_E2M1 + scales VEC32_UE4M3. Note bloc=32 vs
+    // VEC16 du chemin cublasLt dense.
+    let skip_sparse_fp4 = std::env::var("RUSTORCH_SKIP_SPARSE_FP4")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !skip_sparse_fp4 {
+        println!();
+        println!("[qwen_block_bench] NVFP4 + 2:4 sparsity path (cuSPARSELt FP4)");
+        // Pre-allocate FP4 act/weight scales en VEC32 (bloc 32 pour cuSPARSELt FP4)
+        let block32 = 32usize;
+        let act_scale32: Vec<u8> = vec![0x70u8; seq * (hidden / block32)];
+        let w_qkv_scale32: Vec<u8> = vec![0x70u8; (hidden / block32) * qkv_n];
+        let w_attn_out_scale32: Vec<u8> = vec![0x70u8; (hidden / block32) * attn_out_n];
+        let w_ffn_gate_up_scale32: Vec<u8> = vec![0x70u8; (hidden / block32) * ffn_gate_up_n];
+        let w_ffn_down_scale32: Vec<u8> = vec![0x70u8; (ffn / block32) * ffn_down_n];
+        let ffn_int_scale32: Vec<u8> = vec![0x70u8; seq * (ffn / block32)];
+
+        let act_scale32_dev = stream.memcpy_stod(&act_scale32)?;
+        let w_qkv_scale32_dev = stream.memcpy_stod(&w_qkv_scale32)?;
+        let w_attn_out_scale32_dev = stream.memcpy_stod(&w_attn_out_scale32)?;
+        let w_ffn_gate_up_scale32_dev = stream.memcpy_stod(&w_ffn_gate_up_scale32)?;
+        let w_ffn_down_scale32_dev = stream.memcpy_stod(&w_ffn_down_scale32)?;
+        let ffn_int_scale32_dev = stream.memcpy_stod(&ffn_int_scale32)?;
+
+        match try_run_sparse_fp4_block(
+            &stream,
+            &act_fp4_dev,
+            &act_scale32_dev,
+            &ffn_int_fp4_dev,
+            &ffn_int_scale32_dev,
+            &w_qkv_fp4_dev,
+            &w_qkv_scale32_dev,
+            &mut out_qkv,
+            &w_attn_out_fp4_dev,
+            &w_attn_out_scale32_dev,
+            &mut out_attn,
+            &w_ffn_gate_up_fp4_dev,
+            &w_ffn_gate_up_scale32_dev,
+            &mut out_gate_up,
+            &w_ffn_down_fp4_dev,
+            &w_ffn_down_scale32_dev,
+            &mut out_down,
+            seq,
+            hidden,
+            qkv_n,
+            attn_out_n,
+            ffn_gate_up_n,
+            ffn_down_n,
+            ffn,
+            50,
+        ) {
+            Ok(sp_fp4_per_block_ms) => {
+                let sp_fp4_per_forward_ms = sp_fp4_per_block_ms * n_layers as f64;
+                let sp_fp4_tok_s = (seq as f64 / sp_fp4_per_forward_ms) * 1000.0;
+                let sp_fp4_tflops = flops_per_forward / 1e12 / (sp_fp4_per_forward_ms / 1000.0);
+                println!(
+                    "  per-block: {:.3} ms  |  per-forward (40 layers): {:.1} ms  |  prefill: {:.0} tok/s  |  effective {:.1} TFLOPS",
+                    sp_fp4_per_block_ms, sp_fp4_per_forward_ms, sp_fp4_tok_s, sp_fp4_tflops
+                );
+                println!(
+                    "[qwen_block_bench] NVFP4 → NVFP4+2:4 speedup: {:.2}× ({:.1} → {:.1} TFLOPS)",
+                    fp4_per_block_ms / sp_fp4_per_block_ms,
+                    fp4_tflops,
+                    sp_fp4_tflops
+                );
+                println!(
+                    "[qwen_block_bench] gap to advertised 1000 TOPS (FP4 sparse): {:.1}%",
+                    100.0 * sp_fp4_tflops / 1000.0
+                );
+            },
+            Err(e) => {
+                println!("  skipped: {}", e.0);
+            },
+        }
+    }
+
     // ───────── BF16 + 2:4 sparsity path (T240.8c) ─────────
     // cuSPARSELt 2:4 structured-sparse · dense matmul. Operates on BF16
     // weights pruned to 2:4 + compressed; activation stays dense BF16.
@@ -331,6 +409,123 @@ fn main() -> Result<(), BenchError> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn try_run_sparse_fp4_block(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    act_fp4: &cudarc::driver::CudaSlice<u8>,
+    act_scale: &cudarc::driver::CudaSlice<u8>,
+    ffn_int_fp4: &cudarc::driver::CudaSlice<u8>,
+    ffn_int_scale: &cudarc::driver::CudaSlice<u8>,
+    w_qkv: &cudarc::driver::CudaSlice<u8>,
+    w_qkv_scale: &cudarc::driver::CudaSlice<u8>,
+    out_qkv: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_attn_out: &cudarc::driver::CudaSlice<u8>,
+    w_attn_out_scale: &cudarc::driver::CudaSlice<u8>,
+    out_attn: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_ffn_gate_up: &cudarc::driver::CudaSlice<u8>,
+    w_ffn_gate_up_scale: &cudarc::driver::CudaSlice<u8>,
+    out_gate_up: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_ffn_down: &cudarc::driver::CudaSlice<u8>,
+    w_ffn_down_scale: &cudarc::driver::CudaSlice<u8>,
+    out_down: &mut cudarc::driver::CudaSlice<half::bf16>,
+    seq: usize,
+    hidden: usize,
+    qkv_n: usize,
+    attn_out_n: usize,
+    ffn_gate_up_n: usize,
+    ffn_down_n: usize,
+    ffn: usize,
+    iters: usize,
+) -> Result<f64, BenchError> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use rustorch_cuda::cusparse_lt::SparseLtSession;
+    use std::time::Instant;
+
+    let sparse_session = SparseLtSession::new(stream.clone())?;
+
+    println!("  prune+compress FP4 weights to 2:4 ...");
+    // Récup pointeurs scale (immuables) pour binding dans le matmul desc
+    let (sa_qkv, _r) = unsafe { w_qkv_scale.device_ptr(stream) };
+    let (sa_attn, _r) = unsafe { w_attn_out_scale.device_ptr(stream) };
+    let (sa_gu, _r) = unsafe { w_ffn_gate_up_scale.device_ptr(stream) };
+    let (sa_dn, _r) = unsafe { w_ffn_down_scale.device_ptr(stream) };
+    let (sb_act, _r) = unsafe { act_scale.device_ptr(stream) };
+    let (sb_int, _r) = unsafe { ffn_int_scale.device_ptr(stream) };
+
+    let (w_qkv_p, _r) = unsafe { w_qkv.device_ptr(stream) };
+    let mut sp_qkv =
+        unsafe { sparse_session.prune_compress_fp4(w_qkv_p, sa_qkv, sb_act, qkv_n, hidden, seq) }?;
+    let (w_attn_p, _r) = unsafe { w_attn_out.device_ptr(stream) };
+    let mut sp_attn = unsafe {
+        sparse_session.prune_compress_fp4(w_attn_p, sa_attn, sb_act, attn_out_n, hidden, seq)
+    }?;
+    let (w_gu_p, _r) = unsafe { w_ffn_gate_up.device_ptr(stream) };
+    let mut sp_gu = unsafe {
+        sparse_session.prune_compress_fp4(w_gu_p, sa_gu, sb_act, ffn_gate_up_n, hidden, seq)
+    }?;
+    let (w_dn_p, _r) = unsafe { w_ffn_down.device_ptr(stream) };
+    let mut sp_dn =
+        unsafe { sparse_session.prune_compress_fp4(w_dn_p, sa_dn, sb_int, ffn_down_n, ffn, seq) }?;
+    println!("  weights ready, running 4 sparse-FP4 matmuls per block");
+
+    // Warm-up.
+    for _ in 0..3 {
+        unsafe {
+            {
+                let (b_p, _r) = act_fp4.device_ptr(stream);
+                let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sp_qkv, b_p, c_p, 1.0, 0.0)?;
+            }
+            {
+                let (b_p, _r) = act_fp4.device_ptr(stream);
+                let (c_p, _r2) = out_attn.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sp_attn, b_p, c_p, 1.0, 0.0)?;
+            }
+            {
+                let (b_p, _r) = act_fp4.device_ptr(stream);
+                let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sp_gu, b_p, c_p, 1.0, 0.0)?;
+            }
+            {
+                let (b_p, _r) = ffn_int_fp4.device_ptr(stream);
+                let (c_p, _r2) = out_down.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sp_dn, b_p, c_p, 1.0, 0.0)?;
+            }
+        }
+    }
+    stream.synchronize()?;
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        unsafe {
+            {
+                let (b_p, _r) = act_fp4.device_ptr(stream);
+                let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sp_qkv, b_p, c_p, 1.0, 0.0)?;
+            }
+            {
+                let (b_p, _r) = act_fp4.device_ptr(stream);
+                let (c_p, _r2) = out_attn.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sp_attn, b_p, c_p, 1.0, 0.0)?;
+            }
+            {
+                let (b_p, _r) = act_fp4.device_ptr(stream);
+                let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sp_gu, b_p, c_p, 1.0, 0.0)?;
+            }
+            {
+                let (b_p, _r) = ffn_int_fp4.device_ptr(stream);
+                let (c_p, _r2) = out_down.device_ptr_mut(stream);
+                sparse_session.matmul_bf16(&mut sp_dn, b_p, c_p, 1.0, 0.0)?;
+            }
+        }
+    }
+    stream.synchronize()?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    Ok(elapsed_ms / iters as f64)
 }
 
 #[cfg(feature = "cuda")]
