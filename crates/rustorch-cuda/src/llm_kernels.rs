@@ -501,6 +501,132 @@ extern "C" __global__ void sgemv_q4k_bf16_v2(
 }
 "#;
 
+// T245.4 — sgemm_q4k_bf16_m8 : Q4_K matmul with batch M=8 (8 input tokens
+// processed in one weight pass). This is the algorithmic key for speculative
+// decoding : reads W once, produces 8 output rows simultaneously.
+//
+// Memory analysis per super-block (256 weights of W) :
+//   M=1 (sgemv_q4k_v2)    : 144 W + 512 x  = 656 bytes ; 1 acc per thread
+//   M=8 (this kernel)      : 144 W + 4096 x = 4240 bytes ; 8 acc per thread
+//   8 × M=1 (sequential)  : 8 × 656         = 5248 bytes
+//
+// Win : 5248 → 4240 bytes per super-block = 19% per-call reduction.
+// BUT for FULL decode where x reads are negligible vs W (h ∈ R^5120 fits in L1),
+// M=8 batched amortizes 14.94 GB W reads across 8 tokens →
+//   per-token bw cost : 14.94/8 = 1.87 GB/token = 84 tok/s @ 157 GB/s.
+//
+// Tile mapping (mirror of sgemv_q4k_bf16_v2) :
+//   64 threads/TG, each thread decodes 4 weights × 8 m-values = 32 macs/thread.
+//   Per thread accumulators : 8 floats (one per m).
+//   x_shmem stores [M=8, 256] BF16 per super-block iteration = 4096 bytes.
+#[cfg(feature = "cuda")]
+const SGEMM_Q4K_BF16_M8_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemm_q4k_bf16_m8(
+    const unsigned char* __restrict__ w_q4k,
+    const __nv_bfloat16* __restrict__ x,    // [M=8, K] row-major
+    __nv_bfloat16* __restrict__ y,          // [M=8, N] row-major
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = K / 256;
+    int row_offset = row * blocks_per_row * 144;
+
+    extern __shared__ float shmem[];
+    float* sc_pre = shmem;             // [8]
+    float* m_pre  = shmem + 8;         // [8]
+    float* sdata  = shmem + 16;        // [16] : 8 m × 2 warps reduction
+
+    float acc[8];
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) acc[m] = 0.0f;
+
+    int group       = tid >> 3;
+    int pos_base    = (tid & 7) << 2;
+    int pair_idx    = group >> 1;
+    int sub_in_pair = group & 1;
+    int byte_base   = (pair_idx << 5) + pos_base;
+    int low_nibble  = (sub_in_pair == 0) ? 1 : 0;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 144;
+        const unsigned char* blk = w_q4k + blk_off;
+
+        if (tid == 0) {
+            unsigned short d_bits    = blk[0] | (blk[1] << 8);
+            unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+            float d    = __half2float(__ushort_as_half(d_bits));
+            float dmin = __half2float(__ushort_as_half(dmin_bits));
+            const unsigned char* scales = blk + 4;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                unsigned char sc_i  = scales[i] & 0x3F;
+                unsigned char m_i   = scales[i + 4] & 0x3F;
+                unsigned char sc_i4 = (scales[i + 8] & 0x0F) | ((scales[i] >> 6) << 4);
+                unsigned char m_i4  = (scales[i + 8] >> 4)   | ((scales[i + 4] >> 6) << 4);
+                sc_pre[i]     = d * (float)sc_i;
+                m_pre[i]      = dmin * (float)m_i;
+                sc_pre[i + 4] = d * (float)sc_i4;
+                m_pre[i + 4]  = dmin * (float)m_i4;
+            }
+        }
+        __syncthreads();
+
+        float scale = sc_pre[group];
+        float min_v = m_pre[group];
+        const unsigned char* qs = blk + 16;
+        unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
+
+        int x_super_pos = (group << 5) + pos_base;
+        // x is [M=8, K] row-major. Read 4 BF16 from each m row directly from global.
+        // Position : x[m, b*256 + x_super_pos + i] = x[m * K + b * 256 + x_super_pos + i]
+        const __nv_bfloat16* x_block = x + b * 256 + x_super_pos;
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned char byte_i = (qbytes >> (i << 3)) & 0xFFu;
+            int nibble = low_nibble ? (byte_i & 0x0F) : (byte_i >> 4);
+            float w_val = scale * (float)nibble - min_v;
+
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                float xv = (float)x_block[m * K + i];
+                acc[m] += w_val * xv;
+            }
+        }
+    }
+
+    // Reduction : we have 8 accumulators per thread × 64 threads = 512 floats.
+    // For each m, do warp-shuffle reduction over the 64 threads (2 warps).
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        float a = acc[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xffffffff, a, offset);
+        }
+        int warp_id = tid >> 5;
+        int lane_id = tid & 31;
+        if (lane_id == 0) {
+            sdata[m * 2 + warp_id] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < 8) {
+        // tid = m. Sum the 2 warp partials.
+        int m = tid;
+        float total = sdata[m * 2] + sdata[m * 2 + 1];
+        // Output : y[m, row]
+        y[m * N + row] = (__nv_bfloat16)total;
+    }
+}
+"#;
+
 // T244.2 — sgemv_bf16_bf16 : pure-BF16 weight matmul for thin GEMV (decode).
 //
 // PROBLEM : cuBLASLt matmul_bf16 with M=1 is catastrophic on GB10. Measured
@@ -1402,6 +1528,7 @@ pub struct LlmKernels {
     transpose: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q4k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q4k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemm_q4k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q5k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -1433,6 +1560,7 @@ impl LlmKernels {
             transpose: std::sync::OnceLock::new(),
             sgemv_q4k: std::sync::OnceLock::new(),
             sgemv_q4k_v2: std::sync::OnceLock::new(),
+            sgemm_q4k_m8: std::sync::OnceLock::new(),
             sgemv_q5k: std::sync::OnceLock::new(),
             sgemv_q6k: std::sync::OnceLock::new(),
             sgemv_q6k_v2: std::sync::OnceLock::new(),
@@ -1979,6 +2107,50 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemv_q4k_bf16_v2::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T245.4 — Q4_K matmul with batch M=8 (8 input tokens processed in
+    /// one weight pass). Algorithmic key for speculative decoding :
+    /// reads W once, produces 8 output rows simultaneously.
+    ///
+    /// Inputs :
+    ///   w_q4k : [N, K] Q4_K row-major (same layout as sgemv_q4k_v2)
+    ///   x     : [M=8, K] BF16 row-major
+    ///   y     : [M=8, N] BF16 row-major (output)
+    ///
+    /// # Safety  Caller ensures pointers valid and K multiple of 256.
+    pub unsafe fn sgemm_q4k_bf16_m8(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q4k: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_q4k_bf16_m8: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemm_q4k_m8,
+            SGEMM_Q4K_BF16_M8_SRC,
+            "sgemm_q4k_bf16_m8",
+        )?;
+        // Shmem : sc_pre [8] + m_pre [8] + sdata [16] = 32 floats = 128 bytes
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 32 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q4k).arg(&x).arg(&y).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemm_q4k_bf16_m8::launch",
         })?;
         Ok(())
     }
@@ -2910,6 +3082,108 @@ mod parity_tests {
 
     /// T244.1.1 — V2 parity test : V2 must produce same output as V1
     /// (and CPU reference) within BF16 tolerance.
+    #[test]
+    /// T245.4 — sgemm_q4k_bf16_m8 parity test : 8 sequential M=1 SGEMVs must
+    /// match a single M=8 SGEMM call within BF16 tolerance.
+    #[test]
+    fn sgemm_q4k_bf16_m8_matches_8x_sgemv() {
+        use rustorch_gguf::dequant::{Q4_K_BYTES, QK_K};
+
+        let n = 32usize;
+        let k = 512usize;
+        let blocks_per_row = k / QK_K;
+        let row_bytes = blocks_per_row * Q4_K_BYTES;
+
+        let mut state: u64 = 0xc0debace;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut w_q4k_bytes = vec![0u8; n * row_bytes];
+        for b in &mut w_q4k_bytes {
+            *b = (next() & 0xFF) as u8;
+        }
+        // Sane scales.
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q4_K_BYTES;
+                let d = half::f16::from_f32(0.05).to_le_bytes();
+                let dmin = half::f16::from_f32(0.025).to_le_bytes();
+                w_q4k_bytes[off] = d[0];
+                w_q4k_bytes[off + 1] = d[1];
+                w_q4k_bytes[off + 2] = dmin[0];
+                w_q4k_bytes[off + 3] = dmin[1];
+                for i in 0..12 {
+                    w_q4k_bytes[off + 4 + i] &= 0x3F;
+                }
+            }
+        }
+        // 8 different x vectors.
+        let m_batch = 8usize;
+        let mut x_all = vec![0.0f32; m_batch * k];
+        for m in 0..m_batch {
+            for j in 0..k {
+                x_all[m * k + j] = ((m as f32 + 1.0) * (j as f32 * 0.013).sin()) * 0.3;
+            }
+        }
+        let x_bf: Vec<half::bf16> = x_all.iter().copied().map(half::bf16::from_f32).collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let w_dev = stream.memcpy_stod(&w_q4k_bytes).expect("w");
+        let x_dev = stream.memcpy_stod(&x_bf).expect("x");
+
+        // Reference : 8 sequential M=1 SGEMVs.
+        let mut y_seq = vec![half::bf16::ZERO; m_batch * n];
+        for m in 0..m_batch {
+            let xm: Vec<half::bf16> = x_bf[m * k..(m + 1) * k].to_vec();
+            let xm_dev = stream.memcpy_stod(&xm).expect("xm");
+            let mut ym_dev = stream.alloc_zeros::<half::bf16>(n).expect("ym");
+            unsafe {
+                let (w_p, _g1) = w_dev.device_ptr(&stream);
+                let (x_p, _g2) = xm_dev.device_ptr(&stream);
+                let (y_p, _g3) = ym_dev.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                    .expect("v2");
+            }
+            let ym: Vec<half::bf16> = stream.memcpy_dtov(&ym_dev).expect("dl");
+            // Store in y_seq[m, n] as M-major : y_seq[m * n + j] = ym[j]
+            for j in 0..n {
+                y_seq[m * n + j] = ym[j];
+            }
+        }
+
+        // Test : single M=8 SGEMM.
+        let mut y_m8_dev = stream.alloc_zeros::<half::bf16>(m_batch * n).expect("y_m8");
+        unsafe {
+            let (w_p, _g1) = w_dev.device_ptr(&stream);
+            let (x_p, _g2) = x_dev.device_ptr(&stream);
+            let (y_p, _g3) = y_m8_dev.device_ptr_mut(&stream);
+            kernels
+                .sgemm_q4k_bf16_m8(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                .expect("m8");
+        }
+        let y_m8: Vec<half::bf16> = stream.memcpy_dtov(&y_m8_dev).expect("dl m8");
+
+        // Compare. Layout : y_m8[m * n + j] should equal y_seq[m * n + j].
+        for m in 0..m_batch {
+            for j in 0..n {
+                let got = y_m8[m * n + j].to_f32();
+                let want = y_seq[m * n + j].to_f32();
+                let diff = (got - want).abs();
+                let tol = want.abs() * 5e-2 + 1e-2;
+                assert!(
+                    diff <= tol,
+                    "m={m} n={j}: got={got} want={want} diff={diff} tol={tol}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn sgemv_q4k_bf16_v2_matches_v1() {
         use rustorch_gguf::dequant::{Q4_K_BYTES, QK_K};
@@ -5351,6 +5625,143 @@ mod parity_tests {
             1000.0 / (v2_ms * 84.0)
         );
         eprintln!("  llama.cpp ref Qwen-7B Q4_K_M : 47.15 tok/s");
+    }
+
+    /// T245.4 — bench M=8 batched Q4K vs 8× M=1.
+    /// Validates the algorithmic win for speculative decoding : reading W
+    /// once and producing 8 outputs should be much faster than 8× sequential.
+    #[test]
+    #[ignore = "perf benchmark"]
+    fn sgemm_q4k_m8_vs_8x_sgemv_bench() {
+        use rustorch_gguf::dequant::{Q4_K_BYTES, QK_K};
+        use std::time::Instant;
+
+        let n = 18944usize;
+        let k = 3584usize;
+        let blocks_per_row = k / QK_K;
+        let row_bytes = blocks_per_row * Q4_K_BYTES;
+
+        let mut state: u64 = 0xb22cabba;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut w_q4k = vec![0u8; n * row_bytes];
+        for b in &mut w_q4k {
+            *b = (next() & 0xFF) as u8;
+        }
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q4_K_BYTES;
+                let d = half::f16::from_f32(0.05).to_le_bytes();
+                let dmin = half::f16::from_f32(0.025).to_le_bytes();
+                w_q4k[off] = d[0];
+                w_q4k[off + 1] = d[1];
+                w_q4k[off + 2] = dmin[0];
+                w_q4k[off + 3] = dmin[1];
+                for i in 0..12 {
+                    w_q4k[off + 4 + i] &= 0x3F;
+                }
+            }
+        }
+
+        let m_batch = 8usize;
+        let x_bf: Vec<half::bf16> = (0..m_batch * k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.001).sin()))
+            .collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let w_dev = stream.memcpy_stod(&w_q4k).expect("");
+        let x_dev = stream.memcpy_stod(&x_bf).expect("");
+        let mut y_m1_dev = stream.alloc_zeros::<half::bf16>(n).expect("");
+        let mut y_m8_dev = stream.alloc_zeros::<half::bf16>(m_batch * n).expect("");
+
+        let (w_p, x_p, y1_p, y8_p) = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            (
+                w_dev.device_ptr(&stream).0,
+                x_dev.device_ptr(&stream).0,
+                y_m1_dev.device_ptr_mut(&stream).0,
+                y_m8_dev.device_ptr_mut(&stream).0,
+            )
+        };
+
+        // Warm-up.
+        unsafe {
+            kernels
+                .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y1_p, n as i32, k as i32)
+                .ok();
+            kernels
+                .sgemm_q4k_bf16_m8(&stream, w_p, x_p, y8_p, n as i32, k as i32)
+                .ok();
+        }
+        stream.synchronize().ok();
+
+        let n_iters = 100;
+
+        // Bench 8× sequential M=1.
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            for m in 0..m_batch {
+                let xm_p = x_p + (m * k * 2) as u64; // BF16 = 2 bytes
+                unsafe {
+                    kernels
+                        .sgemv_q4k_bf16_v2(&stream, w_p, xm_p, y1_p, n as i32, k as i32)
+                        .ok();
+                }
+            }
+        }
+        stream.synchronize().ok();
+        let m1_seq_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+
+        // Bench M=8 batched.
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            unsafe {
+                kernels
+                    .sgemm_q4k_bf16_m8(&stream, w_p, x_p, y8_p, n as i32, k as i32)
+                    .ok();
+            }
+        }
+        stream.synchronize().ok();
+        let m8_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+
+        // Per-call also useful : single M=1.
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            unsafe {
+                kernels
+                    .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y1_p, n as i32, k as i32)
+                    .ok();
+            }
+        }
+        stream.synchronize().ok();
+        let m1_single_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+
+        let bytes_w = (n * row_bytes) as f64;
+        let m1_bw = bytes_w / (m1_single_ms * 1e-3) / 1e9;
+        let m8_bw = bytes_w / (m8_ms * 1e-3) / 1e9;
+
+        eprintln!("\n=== sgemm_q4k_m8 vs 8× sgemv_q4k_v2 ({n}x{k}) ===");
+        eprintln!("  M=1 single  : {m1_single_ms:.3} ms  ({m1_bw:.1} GB/s W-bw)");
+        eprintln!("  M=1 × 8 seq : {m1_seq_ms:.3} ms  (8 separate launches, W reread 8×)");
+        eprintln!("  M=8 batched : {m8_ms:.3} ms  ({m8_bw:.1} GB/s W-bw)");
+        let speedup_vs_seq = m1_seq_ms / m8_ms;
+        let speedup_vs_single = m8_ms / m1_single_ms;
+        eprintln!(
+            "  speedup M=8 vs 8× M=1   : {speedup_vs_seq:.2}× (less is better — 8.0× = perfect amortization)",
+        );
+        eprintln!(
+            "  ratio  M=8 / M=1 single : {speedup_vs_single:.2}× (1.0× = perfect, full bandwidth)",
+        );
+        eprintln!();
+        eprintln!("  Spec decoding implication :");
+        eprintln!("    if M=8 close to M=1 single, then 8 tokens cost ~1 token of bw =>");
+        eprintln!("    ~8× speedup on memory-bound decode (assuming all 8 tokens accepted)");
     }
 
     /// T244.3 — micro-bench sgemv_q5k_bf16 + sgemv_q6k_bf16 to compare
