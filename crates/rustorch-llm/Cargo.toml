@@ -25,6 +25,8 @@ rustorch-fusion    = { workspace = true }
 rustorch-gguf      = { workspace = true }
 serde              = { workspace = true, features = ["derive"] }
 serde_json         = { version = "1" }
+rayon              = { workspace = true }
+gemm               = { version = "0.18", default-features = false, features = ["rayon"] }
 
 # T241.3 — CUDA backend (gated by `cuda` feature).
 rustorch-cuda = { workspace = true, optional = true, features = ["cuda"] }
@@ -86,3 +88,7 @@ required-features = ["cuda"]
 name = "qwen_cuda_inference"
 path = "examples/qwen_cuda_inference.rs"
 required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_cpu_inference"
+path = "examples/qwen35_cpu_inference.rs"
