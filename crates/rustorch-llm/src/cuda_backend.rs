@@ -664,7 +664,25 @@ impl LlamaModelCuda {
     /// Construit un modèle CUDA avec des poids ZÉRO (pour benchmarks de
     /// timing pur — résultats numériques inutiles, mais le pipeline est
     /// réellement exercé).
+    ///
+    /// Si `fp4_only=true` : allocates BF16 weights as 1-element stubs
+    /// (économise mémoire, le path BF16 ne fonctionnera pas mais le path
+    /// FP4 oui). Utilisé pour Qwen-72B qui ne tient pas en BF16.
+    pub fn from_dummy_fp4_only(config: LlamaConfig, max_seq: usize) -> Result<Self, LlmError> {
+        Self::from_dummy_inner(config, max_seq, true)
+    }
+
+    /// Same as `from_dummy_fp4_only` mais alloue les BF16 weights aussi
+    /// (peut OOM sur les gros modèles).
     pub fn from_dummy(config: LlamaConfig, max_seq: usize) -> Result<Self, LlmError> {
+        Self::from_dummy_inner(config, max_seq, false)
+    }
+
+    fn from_dummy_inner(
+        config: LlamaConfig,
+        max_seq: usize,
+        fp4_only: bool,
+    ) -> Result<Self, LlmError> {
         let ctx = CudaContext::new(0).map_err(|e| LlmError::Backend(format!("ctx: {e:?}")))?;
         let stream = ctx.default_stream();
         let session = LtSession::new(stream.clone())
@@ -684,6 +702,12 @@ impl LlamaModelCuda {
                     .map_err(|e| LlmError::Backend(format!("alloc {n} bf16: {e:?}")))
             };
 
+        // Si fp4_only : skip les big BF16 layer weights (économise ~150 GB sur 72B)
+        // - Garde token_emb, lm_head, final_norm, rms_* à la vraie taille (utilisés par
+        //   les paths CUDA même en mode fp4)
+        // - Met les big matmul weights (w_qkv, w_o, w_gate_up, w_down) à 16-byte stubs
+        let stub: usize = 16;
+
         let token_emb = alloc_zeros_bf16(&stream, v * d)?;
         let final_norm = alloc_zeros_bf16(&stream, d)?;
         let lm_head = alloc_zeros_bf16(&stream, d * v)?;
@@ -691,12 +715,15 @@ impl LlamaModelCuda {
         let mut blocks: Vec<BlockWeightsCuda> = Vec::with_capacity(config.num_hidden_layers);
         for _ in 0..config.num_hidden_layers {
             blocks.push(BlockWeightsCuda {
-                rms_attn: alloc_zeros_bf16(&stream, d)?,
-                w_qkv: alloc_zeros_bf16(&stream, d * (d + 2 * kv_dim))?,
-                w_o: alloc_zeros_bf16(&stream, d * d)?,
-                rms_ffn: alloc_zeros_bf16(&stream, d)?,
-                w_gate_up: alloc_zeros_bf16(&stream, d * 2 * f)?,
-                w_down: alloc_zeros_bf16(&stream, f * d)?,
+                rms_attn: alloc_zeros_bf16(&stream, d)?, // small, always real
+                w_qkv: alloc_zeros_bf16(
+                    &stream,
+                    if fp4_only { stub } else { d * (d + 2 * kv_dim) },
+                )?,
+                w_o: alloc_zeros_bf16(&stream, if fp4_only { stub } else { d * d })?,
+                rms_ffn: alloc_zeros_bf16(&stream, d)?, // small
+                w_gate_up: alloc_zeros_bf16(&stream, if fp4_only { stub } else { d * 2 * f })?,
+                w_down: alloc_zeros_bf16(&stream, if fp4_only { stub } else { f * d })?,
                 q_norm: None,
                 k_norm: None,
             });

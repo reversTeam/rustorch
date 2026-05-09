@@ -117,9 +117,24 @@ fn main() -> Result<(), BenchErr> {
         cfg.num_hidden_layers, cfg.vocab_size, max_seq, n_decode
     );
 
-    println!("[qwen_synth_bench] allocating dummy weights on GPU...");
+    let fp4_only_mode = std::env::var("RUSTORCH_BENCH_FP4_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    println!(
+        "[qwen_synth_bench] allocating dummy weights on GPU{}...",
+        if fp4_only_mode {
+            " (FP4-only mode, skip BF16)"
+        } else {
+            ""
+        }
+    );
     let t_alloc = Instant::now();
-    let mut cuda = LlamaModelCuda::from_dummy(cfg.clone(), max_seq)?;
+    let mut cuda = if fp4_only_mode {
+        LlamaModelCuda::from_dummy_fp4_only(cfg.clone(), max_seq)?
+    } else {
+        LlamaModelCuda::from_dummy(cfg.clone(), max_seq)?
+    };
     println!(
         "[qwen_synth_bench]   alloc done in {:.2}s",
         t_alloc.elapsed().as_secs_f64()
@@ -133,15 +148,21 @@ fn main() -> Result<(), BenchErr> {
     }
     cuda.reset_kv();
 
-    // Decode bench BF16
-    println!("[qwen_synth_bench] decode timing BF16 ({n_decode} steps)...");
-    let t0 = Instant::now();
-    for i in 0..n_decode {
-        let _ = cuda.decode_step((i % cfg.vocab_size) as u32)?;
-    }
-    let elapsed_bf16 = t0.elapsed().as_secs_f64();
-    let per_step_bf16 = elapsed_bf16 * 1000.0 / n_decode as f64;
-    let tok_s_bf16 = n_decode as f64 / elapsed_bf16;
+    // Decode bench BF16 (skip si fp4_only)
+    let (per_step_bf16, tok_s_bf16) = if fp4_only_mode {
+        (-1.0, -1.0) // sentinel
+    } else {
+        println!("[qwen_synth_bench] decode timing BF16 ({n_decode} steps)...");
+        let t0 = Instant::now();
+        for i in 0..n_decode {
+            let _ = cuda.decode_step((i % cfg.vocab_size) as u32)?;
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        (
+            elapsed * 1000.0 / n_decode as f64,
+            n_decode as f64 / elapsed,
+        )
+    };
 
     // Optional FP4 path
     let do_fp4 = std::env::var("RUSTORCH_BENCH_FP4")
@@ -176,14 +197,20 @@ fn main() -> Result<(), BenchErr> {
 
     println!();
     println!("=========== Qwen-{model} CUDA decode (rustorch) ===========");
-    println!("  BF16  per-step : {per_step_bf16:>7.2} ms   tokens/s : {tok_s_bf16:>7.2}");
+    if !fp4_only_mode {
+        println!("  BF16  per-step : {per_step_bf16:>7.2} ms   tokens/s : {tok_s_bf16:>7.2}");
+    } else {
+        println!("  BF16            : skipped (fp4_only mode)");
+    }
     if let Some((p, t, _e)) = fp4_result {
-        let speedup = tok_s_bf16 / t.max(0.001) * t / tok_s_bf16; // = t / tok_s_bf16
-        let actual_speedup = t / tok_s_bf16;
-        println!(
-            "  NVFP4 per-step : {p:>7.2} ms   tokens/s : {t:>7.2}   ({actual_speedup:.2}× BF16)"
-        );
-        let _ = speedup;
+        if !fp4_only_mode && tok_s_bf16 > 0.0 {
+            let actual_speedup = t / tok_s_bf16;
+            println!(
+                "  NVFP4 per-step : {p:>7.2} ms   tokens/s : {t:>7.2}   ({actual_speedup:.2}× BF16)"
+            );
+        } else {
+            println!("  NVFP4 per-step : {p:>7.2} ms   tokens/s : {t:>7.2}");
+        }
     }
     println!("===========================================================");
     println!();
