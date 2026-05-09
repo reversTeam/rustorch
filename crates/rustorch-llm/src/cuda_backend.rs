@@ -540,7 +540,7 @@ impl LlamaModelCuda {
                 let (vc_p, _r3) = self.kv_cache_v[li].device_ptr(&self.stream);
                 let (out_p, _r4) = self.scratch.block_out.device_ptr_mut(&self.stream);
                 self.kernels
-                    .gqa_decode_naive_bf16(
+                    .gqa_decode_online_bf16(
                         &self.stream,
                         qkv_base + q_off,
                         kc_p,
@@ -971,7 +971,7 @@ impl LlamaModelCuda {
                 let (vc_p, _r3) = self.kv_cache_v[li].device_ptr(&self.stream);
                 let (out_p, _r4) = self.scratch.block_out.device_ptr_mut(&self.stream);
                 self.kernels
-                    .gqa_decode_naive_bf16(
+                    .gqa_decode_online_bf16(
                         &self.stream,
                         qkv_base + q_off,
                         kc_p,

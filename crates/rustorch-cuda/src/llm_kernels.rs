@@ -373,6 +373,91 @@ extern "C" __global__ void kv_append_bf16(
 "#;
 
 #[cfg(feature = "cuda")]
+const GQA_DECODE_ONLINE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// Online-softmax GQA decode (FlashAttention-style, single-pass).
+//
+// Au lieu du naive 3-pass (compute scores, max+exp+sum, then weighted sum),
+// on fait un seul pass à travers le KV cache :
+//   m = -inf, l = 0, o = 0
+//   for t in 0..kv_len:
+//     s_t = q · k[t] * scale
+//     new_m = max(m, s_t)
+//     correction = exp(m - new_m)
+//     o = o * correction + exp(s_t - new_m) * v[t]
+//     l = l * correction + exp(s_t - new_m)
+//     m = new_m
+//   return o / l
+//
+// Avantages : 1 lecture KV cache, pas de buffer scores, plus cache-friendly.
+// Pour single-token decode c'est très efficace si threadDim_x = head_dim
+// (chaque thread accumule un élément du output vector).
+extern "C" __global__ void gqa_decode_online_bf16(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    __nv_bfloat16* __restrict__ out,
+    int n_heads,
+    int n_kv,
+    int kv_len,
+    int head_dim,
+    int max_seq,
+    float scale
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int kv_h = h * n_kv / n_heads;
+
+    int tid = threadIdx.x;
+
+    // Each thread handles one element of head_dim
+    if (tid >= head_dim) return;
+
+    float q_i = (float)q[h * head_dim + tid];
+
+    // Online softmax state per thread
+    float m = -1e30f;
+    float l = 0.0f;
+    float o = 0.0f;
+
+    // Shared mem for cross-thread Q·K dot product reduction
+    extern __shared__ float sdata[];
+
+    for (int t = 0; t < kv_len; ++t) {
+        // Compute s_t = Q[h] · K[kv_h, t] * scale
+        // Each thread contributes q_i * k_i, then we reduce across threads
+        float k_i = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+        float partial = q_i * k_i;
+        sdata[tid] = partial;
+        __syncthreads();
+        // Tree reduction
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s && tid + s < head_dim) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+        float s_t = sdata[0] * scale;
+        __syncthreads();
+
+        // Online softmax update
+        float new_m = fmaxf(m, s_t);
+        float correction = expf(m - new_m);
+        float p = expf(s_t - new_m);
+        // Each thread updates its element of o
+        float v_i = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+        o = o * correction + p * v_i;
+        l = l * correction + p;
+        m = new_m;
+    }
+
+    // Final : out[h, tid] = o / l
+    out[h * head_dim + tid] = (__nv_bfloat16)(o / fmaxf(l, 1e-12f));
+}
+"#;
+
+#[cfg(feature = "cuda")]
 const GQA_DECODE_NAIVE_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
 
@@ -465,6 +550,7 @@ pub struct LlmKernels {
     kv_append: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     gqa_decode: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     quantize_nvfp4: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    gqa_decode_online: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -485,6 +571,7 @@ impl LlmKernels {
             kv_append: std::sync::OnceLock::new(),
             gqa_decode: std::sync::OnceLock::new(),
             quantize_nvfp4: std::sync::OnceLock::new(),
+            gqa_decode_online: std::sync::OnceLock::new(),
         }
     }
 
@@ -818,6 +905,54 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "kv_append_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// GQA decode avec online softmax (FlashAttention-style, 1-pass au
+    /// lieu de 3-pass naive). Plus efficace pour grands kv_len.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gqa_decode_online_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k_cache: u64,
+        v_cache: u64,
+        out: u64,
+        n_heads: i32,
+        n_kv: i32,
+        kv_len: i32,
+        head_dim: i32,
+        max_seq: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.gqa_decode_online,
+            GQA_DECODE_ONLINE_BF16_SRC,
+            "gqa_decode_online_bf16",
+        )?;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        // Threads = head_dim (each thread handles 1 dim)
+        let block_dim = head_dim as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * 4, // for tree reduction
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&q)
+            .arg(&k_cache)
+            .arg(&v_cache)
+            .arg(&out)
+            .arg(&n_heads)
+            .arg(&n_kv)
+            .arg(&kv_len)
+            .arg(&head_dim)
+            .arg(&max_seq)
+            .arg(&scale);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gqa_decode_online_bf16::launch",
         })?;
         Ok(())
     }
