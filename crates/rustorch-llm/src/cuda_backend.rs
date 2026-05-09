@@ -399,9 +399,9 @@ impl LlamaModelCuda {
     /// Le caller garantit que `token_id < vocab_size`.
     pub fn decode_step_minimal(&mut self, token_id: u32) -> Result<u32, LlmError> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
-        let cfg = &self.config;
-        let d = cfg.hidden_size;
-        let v = cfg.vocab_size;
+        let d = self.config.hidden_size;
+        let v = self.config.vocab_size;
+        let eps = self.config.rms_norm_eps;
 
         // 1. Embed lookup : token_emb[token_id, :] → scratch.x
         // Pour MVP on upload le token_id sur device puis lookup. On peut
