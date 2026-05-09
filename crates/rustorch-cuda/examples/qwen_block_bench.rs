@@ -575,6 +575,41 @@ fn try_run_sparse_block(
     let mut sparse_dn =
         unsafe { sparse_session.prune_compress_bf16(w_dn_p, ffn_down_n, ffn, seq) }?;
     println!("  weights ready, running 4 sparse matmuls per block (default algo; set RUSTORCH_SPARSE_AUTOTUNE=1 for cusparseLtMatmulSearch — slow!)");
+    // Diagnostic : sync après chacune pour identifier laquelle échoue
+    if std::env::var("RUSTORCH_SPARSE_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        unsafe {
+            let (b_p, _r) = act.device_ptr(stream);
+            let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
+            let r = sparse_session.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0);
+            stream.synchronize().ok();
+            println!("    [debug] qkv sparse matmul: {r:?}");
+        }
+        unsafe {
+            let (b_p, _r) = act.device_ptr(stream);
+            let (c_p, _r2) = out_attn.device_ptr_mut(stream);
+            let r = sparse_session.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0);
+            stream.synchronize().ok();
+            println!("    [debug] attn sparse matmul: {r:?}");
+        }
+        unsafe {
+            let (b_p, _r) = act.device_ptr(stream);
+            let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
+            let r = sparse_session.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0);
+            stream.synchronize().ok();
+            println!("    [debug] gate_up sparse matmul: {r:?}");
+        }
+        unsafe {
+            let (b_p, _r) = out_gate_up.device_ptr(stream);
+            let (c_p, _r2) = out_down.device_ptr_mut(stream);
+            let r = sparse_session.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0);
+            stream.synchronize().ok();
+            println!("    [debug] down sparse matmul: {r:?}");
+        }
+        return Ok(0.001);
+    }
     if std::env::var("RUSTORCH_SPARSE_AUTOTUNE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
