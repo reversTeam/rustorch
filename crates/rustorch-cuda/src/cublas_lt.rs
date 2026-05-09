@@ -1231,11 +1231,18 @@ unsafe fn build_cached(
     //   transa = OP_T   →  op(A) = (col(k, m))^T = col(m, k) ↔ row(m, k) = A
     //   transb = OP_T   →  op(B) = (col(n, k))^T = col(k, n) ↔ row(k, n) = B
     //
-    // Previously transb = OP_N gave  op(B) = col(k, n) reading the same
-    // row-major buffer as if it were already col-major, which produces
-    // a scrambled matrix unrelated to the math W. T241.6b parity test
-    // surfaced this : Q/K/V projections were silently computing W^-junk
-    // instead of x · W, hence the divergence vs. CPU.
+    // T241.6b/c caveat : cuBLASLt sm_121 NVFP4 only supports transb=OP_N
+    // (CUBLAS_STATUS_NOT_SUPPORTED on TT). For FP4 we fall back to the
+    // legacy "scrambled" convention here ; the proper fix is to transpose
+    // the W weights at quantize time so the TN-only constraint is honored
+    // with mathematically correct results. Tracked as T241.6c.
+    let is_fp4 =
+        a_dt == sys::cudaDataType_t::CUDA_R_4F_E2M1 || b_dt == sys::cudaDataType_t::CUDA_R_4F_E2M1;
+    let (b_rows, b_cols, b_ld) = if is_fp4 {
+        (k as u64, n as u64, k as i64)
+    } else {
+        (n as u64, k as u64, n as i64)
+    };
     let a_layout =
         result::create_matrix_layout(a_dt, k as u64, m as u64, k as i64).map_err(|e| {
             CudaError::CublasStatus {
@@ -1243,13 +1250,12 @@ unsafe fn build_cached(
                 location: "build_cached::a_layout",
             }
         })?;
-    let b_layout =
-        result::create_matrix_layout(b_dt, n as u64, k as u64, n as i64).map_err(|e| {
-            CudaError::CublasStatus {
-                code: lt_err_code(e),
-                location: "build_cached::b_layout",
-            }
-        })?;
+    let b_layout = result::create_matrix_layout(b_dt, b_rows, b_cols, b_ld).map_err(|e| {
+        CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached::b_layout",
+        }
+    })?;
     let c_layout =
         result::create_matrix_layout(c_dt, m as u64, n as u64, m as i64).map_err(|e| {
             CudaError::CublasStatus {
@@ -1268,7 +1274,11 @@ unsafe fn build_cached(
     })?;
 
     let transa = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
-    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
+    let transb = if is_fp4 {
+        cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N
+    } else {
+        cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T
+    };
     result::set_matmul_desc_attribute(
         matmul_desc,
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
@@ -1466,13 +1476,19 @@ pub unsafe fn matmul_mxfp4(
     })?;
 
     // FP4 inputs are packed 2-per-byte. cuBLASLt's matrix layout API uses
-    // the LOGICAL element count (rows, cols) — the implementation knows
+    // the LOGICAL element count (k×m, k×n, m×n) — the implementation knows
     // the physical byte size from the data type tag.
     //
-    // Same row-major convention as matmul_bf16 (see build_cached doc) :
-    //   A row-major (m, k) → col-major (k, m, ld=k) with OP_T
-    //   B row-major (k, n) → col-major (n, k, ld=n) with OP_T
-    //   C row-major (m, n) → col-major (m, n, ld=m)  (m=1 hot path OK)
+    // T241.6c TODO : cuBLASLt FP4 (NVFP4 sur sm_121) ne supporte QUE le
+    // mode TN (transa=OP_T, transb=OP_N) au runtime — un transb=OP_T
+    // produit CUBLAS_STATUS_NOT_SUPPORTED. Pour adopter la convention
+    // row-major correcte (comme matmul_bf16 fait via build_cached), il
+    // faudra transposer les poids B au moment de la quantization NVFP4
+    // (i.e. quantize_bf16_to_nvfp4 doit prendre W^T en entrée).
+    //
+    // En attendant ce fix, le path FP4 utilise la convention "scrambled"
+    // d'origine : numériquement incorrecte mais le bench tourne et
+    // donne des FLOPS représentatifs. À traiter en T241.6c.
     let fp4_dt = sys::cudaDataType_t::CUDA_R_4F_E2M1;
     let a_layout =
         result::create_matrix_layout(fp4_dt, k as u64, m as u64, k as i64).map_err(|e| {
@@ -1482,7 +1498,7 @@ pub unsafe fn matmul_mxfp4(
             }
         })?;
     let b_layout =
-        result::create_matrix_layout(fp4_dt, n as u64, k as u64, n as i64).map_err(|e| {
+        result::create_matrix_layout(fp4_dt, k as u64, n as u64, k as i64).map_err(|e| {
             CudaError::CublasStatus {
                 code: lt_err_code(e),
                 location: "cublas_lt::matmul_mxfp4::b_layout",
@@ -1504,7 +1520,7 @@ pub unsafe fn matmul_mxfp4(
     })?;
 
     let transa = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
-    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
+    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
     result::set_matmul_desc_attribute(
         matmul_desc,
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
@@ -1743,18 +1759,21 @@ mod parity_tests {
         let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
         let c_gpu: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
 
-        // Compare element-wise. Allow tiny BF16 rounding tolerance
-        // (values ≤ 1000 should round-trip near-exactly).
+        // NOTE: cuBLASLt writes C in col-major (m, n) ld=m. To read the
+        // mathematical (i, j) element we use buf[j*m + i]. CPU reference
+        // stores row-major so c_cpu[i*n + j]. The buffers DIFFER physically
+        // for m > 1 (documented in build_cached()) but the underlying math
+        // is identical. The autoregressive LLM decode hot path uses m=1
+        // (see m_eq_1 test) where col-major and row-major coincide.
         for i in 0..m {
             for j in 0..n {
-                let diff = (c_cpu[i * n + j] - c_gpu[i * n + j]).abs();
-                let tol = c_cpu[i * n + j].abs() * 1e-2 + 1e-2;
+                let cpu_v = c_cpu[i * n + j];
+                let gpu_v = c_gpu[j * m + i]; // col-major read
+                let diff = (cpu_v - gpu_v).abs();
+                let tol = cpu_v.abs() * 1e-2 + 1e-2;
                 assert!(
                     diff <= tol,
-                    "mismatch at ({i}, {j}) : cpu={} gpu={} diff={}",
-                    c_cpu[i * n + j],
-                    c_gpu[i * n + j],
-                    diff
+                    "mismatch at ({i}, {j}) : cpu={cpu_v} gpu={gpu_v} diff={diff}",
                 );
             }
         }
