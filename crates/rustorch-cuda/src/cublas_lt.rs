@@ -1692,7 +1692,7 @@ mod parity_tests {
     /// BF16 has ~7-bit mantissa so we use small integer values that round-trip
     /// exactly and check for byte-perfect equality after conversion.
     #[test]
-    fn matmul_bf16_computes_a_dot_b_row_major() -> Result<(), Box<dyn std::error::Error>> {
+    fn matmul_bf16_computes_a_dot_b_row_major() {
         let m = 4usize;
         let k = 3usize;
         let n = 5usize;
@@ -1721,24 +1721,26 @@ mod parity_tests {
         assert_eq!(c_cpu[1], 52.0);
 
         // GPU path
-        let ctx = CudaContext::new(0)?;
+        let ctx = CudaContext::new(0).expect("CudaContext");
         let stream = ctx.default_stream();
-        let mut session = LtSession::new(ctx.clone(), stream.clone(), 32 * 1024 * 1024)?;
+        let mut session = LtSession::new(stream.clone()).expect("LtSession");
 
         let a_bf: Vec<half::bf16> = a.iter().copied().map(half::bf16::from_f32).collect();
         let b_bf: Vec<half::bf16> = b.iter().copied().map(half::bf16::from_f32).collect();
-        let a_dev = stream.memcpy_stod(&a_bf)?;
-        let b_dev = stream.memcpy_stod(&b_bf)?;
-        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n)?;
+        let a_dev = stream.memcpy_stod(&a_bf).expect("upload a");
+        let b_dev = stream.memcpy_stod(&b_bf).expect("upload b");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
 
         unsafe {
             let (a_p, _r1) = a_dev.device_ptr(&stream);
             let (b_p, _r2) = b_dev.device_ptr(&stream);
             let (c_p, _r3) = c_dev.device_ptr_mut(&stream);
-            session.matmul_bf16(a_p, b_p, c_p, m, k, n, 1.0, 0.0)?;
+            session
+                .matmul_bf16(a_p, b_p, c_p, m, k, n, 1.0, 0.0)
+                .expect("matmul");
         }
 
-        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev)?;
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
         let c_gpu: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
 
         // Compare element-wise. Allow tiny BF16 rounding tolerance
@@ -1756,14 +1758,13 @@ mod parity_tests {
                 );
             }
         }
-        Ok(())
     }
 
     /// Same regression guard but with m=1 (single-row, the LLM
     /// autoregressive decode hot path). Specifically catches the
     /// "transb=OP_N on row-major B" bug.
     #[test]
-    fn matmul_bf16_m_eq_1_row_major() -> Result<(), Box<dyn std::error::Error>> {
+    fn matmul_bf16_m_eq_1_row_major() {
         let m = 1usize;
         let k = 4usize;
         let n = 6usize;
@@ -1773,24 +1774,26 @@ mod parity_tests {
         let mut c_cpu: Vec<f32> = vec![0.0; m * n];
         cpu_matmul(&a, &b, &mut c_cpu, m, k, n);
 
-        let ctx = CudaContext::new(0)?;
+        let ctx = CudaContext::new(0).expect("CudaContext");
         let stream = ctx.default_stream();
-        let mut session = LtSession::new(ctx.clone(), stream.clone(), 32 * 1024 * 1024)?;
+        let mut session = LtSession::new(stream.clone()).expect("LtSession");
 
         let a_bf: Vec<half::bf16> = a.iter().copied().map(half::bf16::from_f32).collect();
         let b_bf: Vec<half::bf16> = b.iter().copied().map(half::bf16::from_f32).collect();
-        let a_dev = stream.memcpy_stod(&a_bf)?;
-        let b_dev = stream.memcpy_stod(&b_bf)?;
-        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n)?;
+        let a_dev = stream.memcpy_stod(&a_bf).expect("upload a");
+        let b_dev = stream.memcpy_stod(&b_bf).expect("upload b");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
 
         unsafe {
             let (a_p, _r1) = a_dev.device_ptr(&stream);
             let (b_p, _r2) = b_dev.device_ptr(&stream);
             let (c_p, _r3) = c_dev.device_ptr_mut(&stream);
-            session.matmul_bf16(a_p, b_p, c_p, m, k, n, 1.0, 0.0)?;
+            session
+                .matmul_bf16(a_p, b_p, c_p, m, k, n, 1.0, 0.0)
+                .expect("matmul");
         }
 
-        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev)?;
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
         let c_gpu: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
 
         for j in 0..n {
@@ -1804,6 +1807,5 @@ mod parity_tests {
                 diff
             );
         }
-        Ok(())
     }
 }

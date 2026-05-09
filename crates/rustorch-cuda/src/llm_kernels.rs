@@ -1094,7 +1094,7 @@ mod parity_tests {
     /// Catches the kind of bug we'd suspect : wrong axis sum, missing eps,
     /// gamma misapplied.
     #[test]
-    fn rms_norm_bf16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    fn rms_norm_bf16_matches_cpu() {
         let n = 128usize;
         let eps = 1e-6f32;
         // Hand-picked input + gamma — odd values to detect bugs in iteration.
@@ -1104,7 +1104,7 @@ mod parity_tests {
         let mut x_cpu = x_f32.clone();
         cpu_rms_norm(&mut x_cpu, &gamma_f32, eps);
 
-        let ctx = CudaContext::new(0)?;
+        let ctx = CudaContext::new(0).expect("CudaContext");
         let stream = ctx.default_stream();
         let kernels = LlmKernels::new(ctx);
         let x_bf: Vec<half::bf16> = x_f32.iter().copied().map(half::bf16::from_f32).collect();
@@ -1113,14 +1113,16 @@ mod parity_tests {
             .copied()
             .map(half::bf16::from_f32)
             .collect();
-        let mut x_dev = stream.memcpy_stod(&x_bf)?;
-        let gamma_dev = stream.memcpy_stod(&gamma_bf)?;
+        let mut x_dev = stream.memcpy_stod(&x_bf).expect("upload");
+        let gamma_dev = stream.memcpy_stod(&gamma_bf).expect("upload");
         unsafe {
             let (x_p, _r1) = x_dev.device_ptr_mut(&stream);
             let (g_p, _r2) = gamma_dev.device_ptr(&stream);
-            kernels.rms_norm_bf16(&stream, x_p, g_p, eps, n as i32, 1)?;
+            kernels
+                .rms_norm_bf16(&stream, x_p, g_p, eps, n as i32, 1)
+                .expect("rms_norm");
         }
-        let x_host: Vec<half::bf16> = stream.memcpy_dtov(&x_dev)?;
+        let x_host: Vec<half::bf16> = stream.memcpy_dtov(&x_dev).expect("dtov");
         let x_gpu: Vec<f32> = x_host.into_iter().map(|x| x.to_f32()).collect();
 
         for i in 0..n {
@@ -1134,14 +1136,13 @@ mod parity_tests {
                 diff
             );
         }
-        Ok(())
     }
 
     /// T241.6b regression guard — CUDA `rope_half_split_bf16` matches CPU.
     /// Catches the bug we just fixed : kernel was using interleaved indexing
     /// `(2k, 2k+1)` while the CPU uses half-split `(k, k+half)`.
     #[test]
-    fn rope_half_split_bf16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    fn rope_half_split_bf16_matches_cpu() {
         let head_dim = 32usize;
         let n_heads = 4usize;
         let pos = 5usize;
@@ -1159,25 +1160,27 @@ mod parity_tests {
         let mut x_cpu = x_f32.clone();
         cpu_rope_half_split(&mut x_cpu, &inv_freq, pos, n_heads, head_dim);
 
-        let ctx = CudaContext::new(0)?;
+        let ctx = CudaContext::new(0).expect("CudaContext");
         let stream = ctx.default_stream();
         let kernels = LlmKernels::new(ctx);
         let x_bf: Vec<half::bf16> = x_f32.iter().copied().map(half::bf16::from_f32).collect();
-        let mut x_dev = stream.memcpy_stod(&x_bf)?;
-        let inv_freq_dev = stream.memcpy_stod(&inv_freq)?;
+        let mut x_dev = stream.memcpy_stod(&x_bf).expect("upload");
+        let inv_freq_dev = stream.memcpy_stod(&inv_freq).expect("upload");
         unsafe {
             let (x_p, _r1) = x_dev.device_ptr_mut(&stream);
             let (inv_p, _r2) = inv_freq_dev.device_ptr(&stream);
-            kernels.rope_half_split_bf16(
-                &stream,
-                x_p,
-                inv_p,
-                pos as i32,
-                n_heads as i32,
-                head_dim as i32,
-            )?;
+            kernels
+                .rope_half_split_bf16(
+                    &stream,
+                    x_p,
+                    inv_p,
+                    pos as i32,
+                    n_heads as i32,
+                    head_dim as i32,
+                )
+                .expect("rope");
         }
-        let x_host: Vec<half::bf16> = stream.memcpy_dtov(&x_dev)?;
+        let x_host: Vec<half::bf16> = stream.memcpy_dtov(&x_dev).expect("dtov");
         let x_gpu: Vec<f32> = x_host.into_iter().map(|x| x.to_f32()).collect();
 
         for i in 0..(n_heads * head_dim) {
@@ -1193,13 +1196,12 @@ mod parity_tests {
                 diff
             );
         }
-        Ok(())
     }
 
     /// T241.6b — embedding lookup CUDA vs CPU. Simple gather, but the test
     /// catches off-by-one strides and wrong dtype.
     #[test]
-    fn embedding_lookup_bf16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    fn embedding_lookup_bf16_matches_cpu() {
         let vocab = 16usize;
         let hidden = 8usize;
         let ids: Vec<u32> = vec![3, 7, 0, 15];
@@ -1211,7 +1213,7 @@ mod parity_tests {
             out_cpu[s * hidden..(s + 1) * hidden].copy_from_slice(&table_f32[off..off + hidden]);
         }
 
-        let ctx = CudaContext::new(0)?;
+        let ctx = CudaContext::new(0).expect("CudaContext");
         let stream = ctx.default_stream();
         let kernels = LlmKernels::new(ctx);
         let table_bf: Vec<half::bf16> = table_f32
@@ -1219,23 +1221,20 @@ mod parity_tests {
             .copied()
             .map(half::bf16::from_f32)
             .collect();
-        let table_dev = stream.memcpy_stod(&table_bf)?;
-        let ids_dev = stream.memcpy_stod(&ids)?;
-        let mut out_dev = stream.alloc_zeros::<half::bf16>(ids.len() * hidden)?;
+        let table_dev = stream.memcpy_stod(&table_bf).expect("upload");
+        let ids_dev = stream.memcpy_stod(&ids).expect("upload");
+        let mut out_dev = stream
+            .alloc_zeros::<half::bf16>(ids.len() * hidden)
+            .expect("alloc out");
         unsafe {
             let (t_p, _r1) = table_dev.device_ptr(&stream);
             let (i_p, _r2) = ids_dev.device_ptr(&stream);
             let (o_p, _r3) = out_dev.device_ptr_mut(&stream);
-            kernels.embedding_lookup_bf16(
-                &stream,
-                t_p,
-                i_p,
-                o_p,
-                ids.len() as i32,
-                hidden as i32,
-            )?;
+            kernels
+                .embedding_lookup_bf16(&stream, t_p, i_p, o_p, ids.len() as i32, hidden as i32)
+                .expect("embedding");
         }
-        let out_host: Vec<half::bf16> = stream.memcpy_dtov(&out_dev)?;
+        let out_host: Vec<half::bf16> = stream.memcpy_dtov(&out_dev).expect("dtov");
         let out_gpu: Vec<f32> = out_host.into_iter().map(|x| x.to_f32()).collect();
 
         for i in 0..(ids.len() * hidden) {
@@ -1247,7 +1246,6 @@ mod parity_tests {
                 out_gpu[i]
             );
         }
-        Ok(())
     }
 }
 
