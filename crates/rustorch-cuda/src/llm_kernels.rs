@@ -830,6 +830,110 @@ extern "C" __global__ void sgemv_q6k_bf16(
 }
 "#;
 
+// T244.4 — sgemv_q6k_bf16 V2 : warp-shuffle + 64 threads/TG + vector decode.
+// V1 measured 95 GB/s on (18944, 3584). V2 target : match Q4K V2 at ~160 GB/s.
+//
+// Tile (per super-block of 256 weights = 2 halves × 128 weights) :
+//   tid ∈ [0, 64), half = tid >> 5, l = tid & 31
+//   Each thread decodes 4 weights at positions {l, l+32, l+64, l+96} in its half.
+//   Reads : 2 ql bytes (ql[ql_base+l], ql[ql_base+l+32]) + 1 qh byte (qh[qh_base+l])
+//   The 4 nibble/2-bit decodes :
+//     q0 = (ql_a & 0x0F) | ((qh_b      & 0x03) << 4)   → position l
+//     q1 = (ql_b & 0x0F) | ((qh_b >> 2 & 0x03) << 4)   → position l+32
+//     q2 = (ql_a >> 4)   | ((qh_b >> 4 & 0x03) << 4)   → position l+64
+//     q3 = (ql_b >> 4)   | ((qh_b >> 6 & 0x03) << 4)   → position l+96
+// Scales pre-multiplied in shmem. x loads strided by 32 — still coalesced
+// across the 32 lanes of a warp.
+#[cfg(feature = "cuda")]
+const SGEMV_Q6K_BF16_V2_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemv_q6k_bf16_v2(
+    const unsigned char* __restrict__ w_q6k,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;          // 0..63
+    int blocks_per_row = K / 256;
+    int row_offset = row * blocks_per_row * 210;
+
+    extern __shared__ float shmem[];
+    float* sc_pre = shmem;          // [16]
+    float* sdata  = shmem + 16;     // [64]
+
+    float acc = 0.0f;
+
+    int half          = tid >> 5;   // 0 or 1
+    int l             = tid & 31;   // 0..31
+    int half_offset_x = half << 7;  // 0 or 128
+    int ql_base       = half << 6;  // 0 or 64
+    int qh_base       = half << 5;  // 0 or 32
+    int sb            = half << 3;  // 0 or 8
+    int l16           = l >> 4;     // 0 or 1
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 210;
+        const unsigned char* blk = w_q6k + blk_off;
+
+        if (tid == 0) {
+            unsigned short d_bits = blk[208] | (blk[209] << 8);
+            float d = __half2float(__ushort_as_half(d_bits));
+            const signed char* scales = (const signed char*)(blk + 192);
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                sc_pre[i] = d * (float)scales[i];
+            }
+        }
+        __syncthreads();
+
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+
+        unsigned char ql_a = ql[ql_base + l];
+        unsigned char ql_b = ql[ql_base + l + 32];
+        unsigned char qh_b = qh[qh_base + l];
+
+        int q0 = (ql_a & 0x0F) | (((qh_b)      & 0x03) << 4);
+        int q1 = (ql_b & 0x0F) | (((qh_b >> 2) & 0x03) << 4);
+        int q2 = (ql_a >> 4)   | (((qh_b >> 4) & 0x03) << 4);
+        int q3 = (ql_b >> 4)   | (((qh_b >> 6) & 0x03) << 4);
+
+        float w0 = sc_pre[sb + 0 + l16] * (float)(q0 - 32);
+        float w1 = sc_pre[sb + 2 + l16] * (float)(q1 - 32);
+        float w2 = sc_pre[sb + 4 + l16] * (float)(q2 - 32);
+        float w3 = sc_pre[sb + 6 + l16] * (float)(q3 - 32);
+
+        const __nv_bfloat16* x_ptr = x + b * 256 + half_offset_x;
+        float x0 = (float)x_ptr[l];
+        float x1 = (float)x_ptr[l + 32];
+        float x2 = (float)x_ptr[l + 64];
+        float x3 = (float)x_ptr[l + 96];
+
+        acc += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    if (lane_id == 0) {
+        sdata[warp_id] = acc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float total = sdata[0] + sdata[1];
+        y[row] = (__nv_bfloat16)total;
+    }
+}
+"#;
+
 // T244.3 — sgemv_q5k_bf16 — direct Q5_K matmul (Qwen 3.6 needs this:
 // 12% of weights are Q5_K, 76% Q4_K, 12% Q6_K).
 //
@@ -1300,6 +1404,7 @@ pub struct LlmKernels {
     sgemv_q4k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q5k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemv_q6k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     conv1d_depthwise: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     l2_norm_per_head: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -1330,6 +1435,7 @@ impl LlmKernels {
             sgemv_q4k_v2: std::sync::OnceLock::new(),
             sgemv_q5k: std::sync::OnceLock::new(),
             sgemv_q6k: std::sync::OnceLock::new(),
+            sgemv_q6k_v2: std::sync::OnceLock::new(),
             sgemv_bf16: std::sync::OnceLock::new(),
             conv1d_depthwise: std::sync::OnceLock::new(),
             l2_norm_per_head: std::sync::OnceLock::new(),
@@ -1908,6 +2014,44 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemv_q5k_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T244.4 — Q6_K V2 (warp-shuffle, 64 threads/TG, vector decode).
+    /// Target : match Q4K_V2 bandwidth (~165 GB/s) on Qwen-7B FFN shape.
+    ///
+    /// # Safety  Same contract.
+    pub unsafe fn sgemv_q6k_bf16_v2(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q6k: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q6k_bf16_v2: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q6k_v2,
+            SGEMV_Q6K_BF16_V2_SRC,
+            "sgemv_q6k_bf16_v2",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            // shmem : 16 sc_pre + 64 sdata = 80 floats = 320 bytes
+            shared_mem_bytes: 80 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q6k).arg(&x).arg(&y).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q6k_bf16_v2::launch",
         })?;
         Ok(())
     }
@@ -2982,6 +3126,78 @@ mod parity_tests {
                 diff,
                 tol
             );
+        }
+    }
+
+    /// T244.4 — sgemv_q6k_bf16_v2 parity test : V2 must match V1 (and CPU
+    /// reference) within BF16 tolerance.
+    #[test]
+    fn sgemv_q6k_bf16_v2_matches_v1() {
+        const QK_K: usize = 256;
+        const Q6_K_BYTES: usize = 210;
+
+        let n = 32usize;
+        let k = 512usize;
+        let blocks_per_row = k / QK_K;
+        let row_bytes = blocks_per_row * Q6_K_BYTES;
+
+        let mut state: u64 = 0xfeed6600;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut w_bytes = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q6_K_BYTES;
+                for i in 0..128 {
+                    w_bytes[off + i] = (next() & 0xFF) as u8;
+                }
+                for i in 0..64 {
+                    w_bytes[off + 128 + i] = (next() & 0xFF) as u8;
+                }
+                for i in 0..16 {
+                    let raw = (next() & 0xFF) as u8;
+                    let signed = (raw as i8) / 8;
+                    w_bytes[off + 192 + i] = signed as u8;
+                }
+                let d = half::f16::from_f32(0.05).to_le_bytes();
+                w_bytes[off + 208] = d[0];
+                w_bytes[off + 209] = d[1];
+            }
+        }
+        let x_f32: Vec<f32> = (0..k).map(|i| ((i as f32 * 0.07).cos()) * 0.4).collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let w_dev = stream.memcpy_stod(&w_bytes).expect("upload w");
+        let x_bf: Vec<half::bf16> = x_f32.iter().copied().map(half::bf16::from_f32).collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+        let mut y_v1 = stream.alloc_zeros::<half::bf16>(n).expect("alloc y1");
+        let mut y_v2 = stream.alloc_zeros::<half::bf16>(n).expect("alloc y2");
+        unsafe {
+            let (w_p, _g1) = w_dev.device_ptr(&stream);
+            let (x_p, _g2) = x_dev.device_ptr(&stream);
+            let (y1_p, _g3) = y_v1.device_ptr_mut(&stream);
+            let (y2_p, _g4) = y_v2.device_ptr_mut(&stream);
+            kernels
+                .sgemv_q6k_bf16(&stream, w_p, x_p, y1_p, n as i32, k as i32)
+                .expect("v1");
+            kernels
+                .sgemv_q6k_bf16_v2(&stream, w_p, x_p, y2_p, n as i32, k as i32)
+                .expect("v2");
+        }
+        let y1_host: Vec<half::bf16> = stream.memcpy_dtov(&y_v1).expect("dl1");
+        let y2_host: Vec<half::bf16> = stream.memcpy_dtov(&y_v2).expect("dl2");
+        for i in 0..n {
+            let a = y1_host[i].to_f32();
+            let b = y2_host[i].to_f32();
+            let diff = (a - b).abs();
+            let tol = a.abs() * 1e-2 + 1e-2;
+            assert!(diff <= tol, "row[{i}] V1={a} V2={b} diff={diff} tol={tol}");
         }
     }
 
@@ -4191,7 +4407,7 @@ mod parity_tests {
                 },
                 GgmlType::Q6_K => {
                     kernels
-                        .sgemv_q6k_bf16(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                        .sgemv_q6k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
                         .ok();
                 },
                 _ => panic!("dtype {dt:?} not supported"),
@@ -4429,7 +4645,7 @@ mod parity_tests {
                     },
                     GgmlType::Q6_K => {
                         kernels
-                            .sgemv_q6k_bf16(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                            .sgemv_q6k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
                             .ok();
                         true
                     },
@@ -5008,9 +5224,15 @@ mod parity_tests {
                 .ok();
         })
         .1;
-        let q6_ms = bench("Q6_K", &mut || unsafe {
+        let q6_ms = bench("Q6_K V1", &mut || unsafe {
             kernels
                 .sgemv_q6k_bf16(&stream, w6_p, x_p, y_p, n as i32, k as i32)
+                .ok();
+        })
+        .1;
+        let q6_v2_ms = bench("Q6_K V2", &mut || unsafe {
+            kernels
+                .sgemv_q6k_bf16_v2(&stream, w6_p, x_p, y_p, n as i32, k as i32)
                 .ok();
         })
         .1;
@@ -5018,11 +5240,16 @@ mod parity_tests {
         let q4_bw = (n * row_bytes_q4) as f64 / (q4_ms * 1e-3) / 1e9;
         let q5_bw = (n * row_bytes_q5) as f64 / (q5_ms * 1e-3) / 1e9;
         let q6_bw = (n * row_bytes_q6) as f64 / (q6_ms * 1e-3) / 1e9;
+        let q6_v2_bw = (n * row_bytes_q6) as f64 / (q6_v2_ms * 1e-3) / 1e9;
 
         eprintln!("\n=== sgemv quantized SGEMV bench ({n}x{k}) ===");
         eprintln!("  Q4_K V2 : {q4_ms:.3} ms  ({q4_bw:.1} GB/s)");
         eprintln!("  Q5_K    : {q5_ms:.3} ms  ({q5_bw:.1} GB/s)");
-        eprintln!("  Q6_K    : {q6_ms:.3} ms  ({q6_bw:.1} GB/s)");
+        eprintln!("  Q6_K V1 : {q6_ms:.3} ms  ({q6_bw:.1} GB/s)");
+        eprintln!(
+            "  Q6_K V2 : {q6_v2_ms:.3} ms  ({q6_v2_bw:.1} GB/s)  speedup vs V1 = {:.2}×",
+            q6_ms / q6_v2_ms
+        );
     }
 
     /// T244.1 — micro-bench sgemv_q4k_bf16 vs matmul_bf16 on Qwen-7B FFN size.
