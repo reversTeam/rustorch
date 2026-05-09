@@ -97,7 +97,21 @@ fn main() -> Result<(), ProbeError> {
         match res {
             Ok(_) => {
                 stream.synchronize()?;
-                println!("  {name:<22} {m:>6} {k:>6} {n:>6}    OK");
+                // Time it
+                let t0 = std::time::Instant::now();
+                for _ in 0..20 {
+                    let res2 = unsafe { session.matmul_bf16(&mut sp, b_p, c_p, 1.0, 0.0) };
+                    if res2.is_err() {
+                        println!("  {name:<22} {m:>6} {k:>6} {n:>6}    MATMUL DIED: {res2:?}");
+                        break;
+                    }
+                }
+                stream.synchronize()?;
+                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0 / 20.0;
+                let tflops = 2.0 * (*m * *k * *n) as f64 / 1e12 / (elapsed_ms / 1000.0);
+                println!(
+                    "  {name:<22} {m:>6} {k:>6} {n:>6}    OK  {elapsed_ms:>6.3} ms  {tflops:>6.1} TFLOPS"
+                );
             },
             Err(e) => {
                 println!("  {name:<22} {m:>6} {k:>6} {n:>6}    MATMUL FAIL: {e:?}");
