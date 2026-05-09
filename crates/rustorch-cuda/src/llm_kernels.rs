@@ -21,7 +21,7 @@
 use crate::error::CudaError;
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, PushKernelArg};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
