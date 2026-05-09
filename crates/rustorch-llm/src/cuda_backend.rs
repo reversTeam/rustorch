@@ -29,14 +29,13 @@
 
 #![cfg(feature = "cuda")]
 
-use std::path::Path;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use rustorch_cuda::cublas_lt::LtSession;
 use rustorch_cuda::llm_kernels::LlmKernels;
 
-use crate::{GgufWeights, LlamaConfig, LlamaModel, LlmError};
+use crate::{LlamaConfig, LlamaModel, LlmError};
 
 /// Per-layer weights resident sur device en BF16.
 struct BlockWeightsCuda {
@@ -116,22 +115,18 @@ pub struct LlamaModelCuda {
 }
 
 impl LlamaModelCuda {
-    /// Charge un modèle GGUF (Q4_K_M / Q8_0 / BF16 / F32) et upload les
-    /// weights sur le device courant en BF16.
-    ///
-    /// Pour le MVP : on délègue à [`LlamaModel::from_gguf`] le parsing
-    /// + dequant CPU vers F32, puis on convertit F32 → BF16 et on
-    /// upload. Le peak RAM transitoire = (model_size_f32 ~= 4× quant_size)
-    /// le temps du load. T241.5 ajoutera des kernels dequant CUDA pour
-    /// éviter ce détour.
-    pub fn from_gguf(path: &Path, max_seq: usize) -> Result<Self, LlmError> {
-        // 1. CPU load via la voie existante (la plus testée)
-        let cpu = LlamaModel::from_gguf(path, max_seq)?;
-        Self::from_cpu(cpu, max_seq)
-    }
-
     /// Construit la version CUDA à partir d'un [`LlamaModel`] déjà chargé
     /// (en F32). Convertit chaque tensor en BF16 et upload.
+    ///
+    /// Pour MVP, le caller charge le GGUF via la voie existante :
+    /// ```ignore
+    /// let cfg = LlamaConfig::from_hf_dir("Qwen3.6-27B/")?;
+    /// let weights = GgufWeights::from_path("model.gguf")?;
+    /// let cpu = LlamaModel::from_gguf(cfg, weights, max_seq)?;
+    /// let cuda = LlamaModelCuda::from_cpu(cpu, max_seq)?;
+    /// ```
+    /// T241.5 ajoutera un `from_gguf(path, max_seq)` direct avec dequant
+    /// kernels CUDA (sans le détour CPU).
     pub fn from_cpu(cpu: LlamaModel, max_seq: usize) -> Result<Self, LlmError> {
         let ctx = CudaContext::new(0).map_err(|e| LlmError::Backend(format!("ctx: {e:?}")))?;
         let stream = ctx.default_stream();
