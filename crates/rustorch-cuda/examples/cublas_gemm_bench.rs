@@ -299,9 +299,9 @@ fn main() -> Result<(), BenchError> {
         let scale_a_ue8m0_dev = stream.memcpy_stod(&scale_a_ue8m0)?;
         let scale_b_ue8m0_dev = stream.memcpy_stod(&scale_b_ue8m0)?;
 
-        let make_fp4_attempt = |scale_mode: rustorch_cuda::cublas_lt::Fp4ScaleMode,
-                                sa_buf: &cudarc::driver::CudaSlice<u8>,
-                                sb_buf: &cudarc::driver::CudaSlice<u8>|
+        let mut make_fp4_attempt = |scale_mode: rustorch_cuda::cublas_lt::Fp4ScaleMode,
+                                    sa_buf: &cudarc::driver::CudaSlice<u8>,
+                                    sb_buf: &cudarc::driver::CudaSlice<u8>|
          -> Result<f64, BenchError> {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
             // Warm-up.
