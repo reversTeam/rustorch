@@ -262,8 +262,14 @@ impl LlmKernels {
             return Ok((pair.0.clone(), pair.1.clone()));
         }
         // Compile via nvrtc
+        // Arch override via env (RUSTORCH_NVRTC_ARCH=sm_121a). Default :
+        // sm_121 (GB10 / DGX Spark Grace-Blackwell). Pour B200 → sm_100a,
+        // RTX 5090 → sm_120, RTX 4090 → sm_89.
+        let arch_owned: String =
+            std::env::var("RUSTORCH_NVRTC_ARCH").unwrap_or_else(|_| "sm_121".to_string());
+        let arch_static: &'static str = Box::leak(arch_owned.into_boxed_str());
         let opts = cudarc::nvrtc::CompileOptions {
-            arch: Some("compute_120"), // sm_120/121 NVFP4 capable Blackwell
+            arch: Some(arch_static),
             include_paths: vec![
                 "/usr/local/cuda/include".to_string(),
                 "/usr/local/cuda-13.2/include".to_string(),
