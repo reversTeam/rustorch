@@ -61,6 +61,10 @@ pub(crate) struct BlockWeights {
     pub(crate) q_norm: Option<Vec<f32>>,
     /// Optional Qwen3 per-head K-norm — `[head_dim]`.
     pub(crate) k_norm: Option<Vec<f32>>,
+    /// T241.6e — Fused Q+K+V bias `[D + 2*KV_DIM]`. None if model has
+    /// no biases (Llama / TinyLlama). Some(0..D) = Q bias, (D..D+KV) = K
+    /// bias, (D+KV..D+2KV) = V bias.
+    pub(crate) b_qkv: Option<Vec<f32>>,
 }
 
 /// A loaded Llama / Qwen model ready for autoregressive decode.
@@ -167,6 +171,7 @@ impl LlamaModel {
                 w_down,
                 q_norm: None,
                 k_norm: None,
+                b_qkv: None,
             });
         }
 
@@ -226,6 +231,7 @@ impl LlamaModel {
                 rms_ffn: ones(d),
                 w_gate_up: sample(d * 2 * f),
                 w_down: sample(f * d),
+                b_qkv: None,
                 q_norm: None,
                 k_norm: None,
             });
@@ -333,6 +339,28 @@ impl LlamaModel {
                 stats("w_gate_up", &w_gate_up);
             }
 
+            // T241.6e — fuse Q/K/V biases [D] [KV] [KV] → [D + 2*KV] if
+            // any present (Qwen2/2.5/3). Missing biases are filled with
+            // zeros so the fused vector is uniform.
+            let b_qkv = if b.b_q.is_some() || b.b_k.is_some() || b.b_v.is_some() {
+                let mut fused = vec![0.0f32; d + 2 * kv_dim];
+                if let Some(bq) = &b.b_q {
+                    check_len("b_q", i, bq, d)?;
+                    fused[..d].copy_from_slice(bq);
+                }
+                if let Some(bk) = &b.b_k {
+                    check_len("b_k", i, bk, kv_dim)?;
+                    fused[d..d + kv_dim].copy_from_slice(bk);
+                }
+                if let Some(bv) = &b.b_v {
+                    check_len("b_v", i, bv, kv_dim)?;
+                    fused[d + kv_dim..].copy_from_slice(bv);
+                }
+                Some(fused)
+            } else {
+                None
+            };
+
             blocks.push(BlockWeights {
                 rms_attn: attn_norm,
                 w_qkv,
@@ -342,6 +370,7 @@ impl LlamaModel {
                 w_down,
                 q_norm: b.attn_q_norm,
                 k_norm: b.attn_k_norm,
+                b_qkv,
             });
         }
 
@@ -619,6 +648,12 @@ impl LlamaModel {
                     d,
                     qkv_stride,
                 );
+                // T241.6e — add fused QKV bias if present (Qwen2/2.5/3).
+                if let Some(b) = &block.b_qkv {
+                    for (qkv_i, b_i) in scratch.qkv[..qkv_stride].iter_mut().zip(b.iter()) {
+                        *qkv_i += *b_i;
+                    }
+                }
                 scratch.q[..d].copy_from_slice(&scratch.qkv[..d]);
                 scratch.k[..kv_dim].copy_from_slice(&scratch.qkv[d..d + kv_dim]);
                 scratch.v[..kv_dim].copy_from_slice(&scratch.qkv[d + kv_dim..qkv_stride]);

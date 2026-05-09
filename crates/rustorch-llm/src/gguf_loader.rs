@@ -94,6 +94,11 @@ pub struct GgufBlockWeights {
     pub attn_q_norm: Option<Vec<f32>>,
     /// Optional Qwen3 per-head K-norm — shape `[head_dim]`.
     pub attn_k_norm: Option<Vec<f32>>,
+    /// T241.6e — Qwen2/2.5/3 use bias on Q/K/V projections.
+    /// Output Q/V have shape `[D]` and `[KV]` respectively.
+    pub b_q: Option<Vec<f32>>, // [D]
+    pub b_k: Option<Vec<f32>>, // [KV]
+    pub b_v: Option<Vec<f32>>, // [KV]
 }
 
 impl LlamaConfig {
@@ -266,6 +271,10 @@ fn load_block(file: &GgufFile, _cfg: &LlamaConfig, i: usize) -> Result<GgufBlock
     let w_down = need("ffn_down.weight")?;
     let attn_q_norm = opt("attn_q_norm.weight")?;
     let attn_k_norm = opt("attn_k_norm.weight")?;
+    // T241.6e — Qwen2/2.5/3 attention biases.
+    let b_q = opt("attn_q.bias")?;
+    let b_k = opt("attn_k.bias")?;
+    let b_v = opt("attn_v.bias")?;
 
     Ok(GgufBlockWeights {
         attn_norm,
@@ -279,6 +288,9 @@ fn load_block(file: &GgufFile, _cfg: &LlamaConfig, i: usize) -> Result<GgufBlock
         w_down,
         attn_q_norm,
         attn_k_norm,
+        b_q,
+        b_k,
+        b_v,
     })
 }
 

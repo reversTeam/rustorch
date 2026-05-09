@@ -54,6 +54,9 @@ struct BlockWeightsCuda {
     /// Optional Qwen3 per-head Q/K norms — `[head_dim]` BF16.
     q_norm: Option<CudaSlice<half::bf16>>,
     k_norm: Option<CudaSlice<half::bf16>>,
+    /// T241.6e — Optional fused QKV bias `[D + 2·KV_DIM]` BF16.
+    /// Qwen2/2.5/3 use these ; Llama/TinyLlama do not.
+    b_qkv: Option<CudaSlice<half::bf16>>,
 }
 
 /// Buffers de scratch device-resident, alloués une fois et réutilisés
@@ -211,6 +214,11 @@ impl LlamaModelCuda {
                     .transpose()?,
                 k_norm: blk
                     .k_norm
+                    .as_ref()
+                    .map(|v| upload_bf16(&stream, v))
+                    .transpose()?,
+                b_qkv: blk
+                    .b_qkv
                     .as_ref()
                     .map(|v| upload_bf16(&stream, v))
                     .transpose()?,
@@ -847,6 +855,7 @@ impl LlamaModelCuda {
                 w_down: alloc_zeros_bf16(&stream, if fp4_only { stub } else { f * d })?,
                 q_norm: None,
                 k_norm: None,
+                b_qkv: None,
             });
         }
         let inv_freq_host: Vec<f32> = (0..head_dim / 2)
@@ -997,6 +1006,16 @@ impl LlamaModelCuda {
                 self.session
                     .matmul_bf16(a_p, b_p, c_p, 1, d, qkv_n, 1.0, 0.0)
                     .map_err(|e| LlmError::Backend(format!("w_qkv L{li}: {e:?}")))?;
+            }
+            // T241.6e — add fused QKV bias if present (Qwen2/2.5/3).
+            if let Some(b_qkv) = &block.b_qkv {
+                unsafe {
+                    let (qkv_p, _r1) = self.scratch.qkv.device_ptr_mut(&self.stream);
+                    let (bias_p, _r2) = b_qkv.device_ptr(&self.stream);
+                    self.kernels
+                        .add_inplace_bf16(&self.stream, qkv_p, bias_p, qkv_n as i32)
+                        .map_err(|e| LlmError::Backend(format!("qkv_bias L{li}: {e:?}")))?;
+                }
             }
             // qkv layout (col-major output) : [q_0..q_{d-1}, k_0..k_{kv_dim-1}, v_0..v_{kv_dim-1}]
             let (q_off, k_off, v_off) = (0u64, (d as u64) * 2, ((d + kv_dim) as u64) * 2);
