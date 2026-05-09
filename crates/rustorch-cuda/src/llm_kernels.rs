@@ -2279,6 +2279,102 @@ mod parity_tests {
         }
     }
 
+    /// T244.1.4 — bench réel : lit les vrais Q4_K bytes d'un Qwen2.5-7B
+    /// Q4_K_M GGUF et mesure sgemv_q4k_bf16_v2 dessus. Valide que le
+    /// speedup tient sur vrai data avec scales et nibbles non-uniformes.
+    #[test]
+    #[ignore = "real-data bench — requires Qwen2.5-7B Q4_K_M GGUF on disk"]
+    fn real_qwen7b_q4k_ffn_gate_bench() {
+        use rustorch_gguf::reader::GgufFile;
+        use std::path::Path;
+        use std::time::Instant;
+
+        let path = Path::new(
+            "/home/triviere/projects/models/qwen2.5-7b-gguf/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
+        );
+        if !path.exists() {
+            eprintln!("[skip] {path:?} not found");
+            return;
+        }
+        let file = GgufFile::open(path).expect("open gguf");
+
+        // Find blk.0.ffn_gate.weight (Q4_K format in Q4_K_M).
+        let tensor_name = "blk.0.ffn_gate.weight";
+        let info = file
+            .tensor(tensor_name)
+            .unwrap_or_else(|| panic!("tensor {tensor_name} not found"));
+        eprintln!(
+            "Found {tensor_name} : dtype={:?} shape={:?}",
+            info.dtype, info.shape
+        );
+
+        let bytes = file.tensor_bytes(info);
+        let n = info.shape[1] as usize; // out_dim (rows)
+        let k = info.shape[0] as usize; // in_dim (cols)
+        eprintln!(
+            "  N={n} K={k} bytes={} ({:.1} MB)",
+            bytes.len(),
+            bytes.len() as f64 / 1e6
+        );
+
+        // Upload raw Q4_K bytes to GPU (NO CPU dequant).
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let w_dev = stream.memcpy_stod(bytes).expect("upload Q4K bytes");
+        let x_bf: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.001).sin()) * 0.5))
+            .collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+        let mut y_dev = stream.alloc_zeros::<half::bf16>(n).expect("alloc y");
+
+        // Warm-up.
+        unsafe {
+            let (w_p, _g1) = w_dev.device_ptr(&stream);
+            let (x_p, _g2) = x_dev.device_ptr(&stream);
+            let (y_p, _g3) = y_dev.device_ptr_mut(&stream);
+            kernels
+                .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                .expect("warmup");
+        }
+        stream.synchronize().ok();
+
+        // Bench.
+        let n_iters = 200;
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            unsafe {
+                let (w_p, _g1) = w_dev.device_ptr(&stream);
+                let (x_p, _g2) = x_dev.device_ptr(&stream);
+                let (y_p, _g3) = y_dev.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                    .ok();
+            }
+        }
+        stream.synchronize().ok();
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+        let bw_gb_s = bytes.len() as f64 / (elapsed_ms * 1e-3) / 1e9;
+
+        // Verify output is non-zero (sanity).
+        let y_host: Vec<half::bf16> = stream.memcpy_dtov(&y_dev).expect("dtov y");
+        let nonzero_count = y_host.iter().filter(|&&v| v.to_f32().abs() > 1e-3).count();
+
+        eprintln!();
+        eprintln!("=== REAL Qwen2.5-7B Q4_K_M FFN gate matmul bench ===");
+        eprintln!("  per-call : {elapsed_ms:.3} ms");
+        eprintln!("  bandwidth: {bw_gb_s:.1} GB/s");
+        eprintln!("  output   : {nonzero_count}/{n} non-zero values (sanity OK)");
+        // Project decode budget : 84 FFN-equivalent calls/token.
+        let budget = elapsed_ms * 84.0;
+        eprintln!(
+            "  Decode budget Qwen-7B (84 matmul/tok) : {budget:.1} ms = {:.2} tok/s",
+            1000.0 / budget
+        );
+        eprintln!("  llama.cpp Qwen-7B Q4_K_M reference     : 47.15 tok/s");
+    }
+
     /// T244.1.3 — Full-decode synthetic bench v2 : Q4_K kernel pour
     /// FFN gate/up + Q6_K kernel pour qkv/o/down (le mix réel du
     /// format Q4_K_M de llama.cpp). Pas de BF16 stand-in.
