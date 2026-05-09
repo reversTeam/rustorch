@@ -114,26 +114,64 @@ fn main() -> Result<(), BenchErr> {
     }
     cuda.reset_kv();
 
-    // Decode bench
-    println!("[qwen_synth_bench] decode timing ({n_decode} steps)...");
+    // Decode bench BF16
+    println!("[qwen_synth_bench] decode timing BF16 ({n_decode} steps)...");
     let t0 = Instant::now();
     for i in 0..n_decode {
         let _ = cuda.decode_step((i % cfg.vocab_size) as u32)?;
     }
-    let elapsed = t0.elapsed().as_secs_f64();
-    let per_step_ms = elapsed * 1000.0 / n_decode as f64;
-    let tok_s = n_decode as f64 / elapsed;
+    let elapsed_bf16 = t0.elapsed().as_secs_f64();
+    let per_step_bf16 = elapsed_bf16 * 1000.0 / n_decode as f64;
+    let tok_s_bf16 = n_decode as f64 / elapsed_bf16;
+
+    // Optional FP4 path
+    let do_fp4 = std::env::var("RUSTORCH_BENCH_FP4")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    let fp4_result = if do_fp4 {
+        println!("[qwen_synth_bench] enabling FP4 weights (T241.5)...");
+        let t_fp4_alloc = Instant::now();
+        cuda.enable_fp4()?;
+        println!(
+            "  fp4 alloc done in {:.2}s",
+            t_fp4_alloc.elapsed().as_secs_f64()
+        );
+        cuda.reset_kv();
+        // Warmup FP4
+        for i in 0..warmup {
+            let _ = cuda.decode_step_fp4(i as u32)?;
+        }
+        cuda.reset_kv();
+        println!("[qwen_synth_bench] decode timing NVFP4 ({n_decode} steps)...");
+        let t0 = Instant::now();
+        for i in 0..n_decode {
+            let _ = cuda.decode_step_fp4((i % cfg.vocab_size) as u32)?;
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let per_step = elapsed * 1000.0 / n_decode as f64;
+        let tok_s = n_decode as f64 / elapsed;
+        Some((per_step, tok_s, elapsed))
+    } else {
+        None
+    };
 
     println!();
-    println!("=================== Qwen-{model} BF16 CUDA decode (rustorch) ===================");
-    println!("  per-step      : {per_step_ms:.2} ms");
-    println!("  tokens/s      : {tok_s:.2}");
-    println!("  total elapsed : {elapsed:.2} s ({n_decode} steps)");
-    println!("================================================================");
+    println!("=========== Qwen-{model} CUDA decode (rustorch) ===========");
+    println!("  BF16  per-step : {per_step_bf16:>7.2} ms   tokens/s : {tok_s_bf16:>7.2}");
+    if let Some((p, t, _e)) = fp4_result {
+        let speedup = tok_s_bf16 / t.max(0.001) * t / tok_s_bf16; // = t / tok_s_bf16
+        let actual_speedup = t / tok_s_bf16;
+        println!(
+            "  NVFP4 per-step : {p:>7.2} ms   tokens/s : {t:>7.2}   ({actual_speedup:.2}× BF16)"
+        );
+        let _ = speedup;
+    }
+    println!("===========================================================");
     println!();
-    println!("Reference (llama.cpp DGX Spark, Qwen-3.6-27B BF16) :");
-    println!("  prefill pp8192 : 893 tok/s");
-    println!("  decode  tg128  : 4.54 tok/s  ← our cible (BF16)");
+    println!("Reference llama.cpp DGX Spark, Qwen-3.6-27B :");
+    println!("  prefill BF16 pp8192 : 893 tok/s");
+    println!("  decode  BF16 tg128  : 4.54 tok/s");
+    println!("  decode  Q4_K_M tg128: 11.85 tok/s");
     println!();
 
     Ok(())

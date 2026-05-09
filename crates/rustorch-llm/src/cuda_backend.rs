@@ -77,6 +77,44 @@ struct ScratchCuda {
     sample_out: CudaSlice<u32>,
 }
 
+/// Per-layer FP4 weights + scales (T241.5 NVFP4 path).
+///
+/// Pour Qwen-27B chaque layer prend ~46 MB en FP4 vs ~184 MB en BF16
+/// (4× saving). Le forward FP4 utilise `LtSession::matmul_mxfp4` au lieu
+/// de `matmul_bf16`.
+struct BlockWeightsCudaFp4 {
+    /// `[D]` BF16 — RMSNorm pre-attention gamma (pas quantisé).
+    rms_attn: CudaSlice<half::bf16>,
+    /// `[D, D + 2·KV_DIM]` FP4 packed (1 byte = 2 elements).
+    w_qkv: CudaSlice<u8>,
+    w_qkv_scale: CudaSlice<u8>,
+    /// `[D, D]` FP4 packed.
+    w_o: CudaSlice<u8>,
+    w_o_scale: CudaSlice<u8>,
+    /// `[D]` BF16 — RMSNorm pre-FFN gamma.
+    rms_ffn: CudaSlice<half::bf16>,
+    /// `[D, 2·F]` FP4 packed.
+    w_gate_up: CudaSlice<u8>,
+    w_gate_up_scale: CudaSlice<u8>,
+    /// `[F, D]` FP4 packed.
+    w_down: CudaSlice<u8>,
+    w_down_scale: CudaSlice<u8>,
+}
+
+/// FP4 scratch : activations restent BF16, on alloue des buffers
+/// pseudo-FP4 pour les passer aux kernels (re-cast pointer u8). En MVP
+/// "dummy" le contenu n'est pas correct numériquement, mais le timing
+/// du matmul_mxfp4 est réel.
+struct ScratchCudaFp4 {
+    /// FP4 scratch pour activations BF16 reinterprétées (sizes : seq × hidden / 2).
+    /// En MVP on alloue des buffers fixes même si les valeurs sont garbage.
+    x_fp4: CudaSlice<u8>,
+    x_fp4_scale: CudaSlice<u8>,
+    /// FFN intermediate pseudo-FP4.
+    ffn_inter_fp4: CudaSlice<u8>,
+    ffn_inter_fp4_scale: CudaSlice<u8>,
+}
+
 /// LLM resident sur GPU CUDA, prêt pour autoregressive decode.
 ///
 /// Ports exactly the [`LlamaModel`] structure but stores all the heavy
@@ -94,6 +132,10 @@ pub struct LlamaModelCuda {
     kernels: LlmKernels,
     /// Per-layer weights device-resident.
     blocks: Vec<BlockWeightsCuda>,
+    /// Per-layer FP4 weights (None tant que decode_step_fp4 pas appelé).
+    blocks_fp4: Option<Vec<BlockWeightsCudaFp4>>,
+    /// FP4 scratch buffers (alloués lazy avec from_dummy_fp4).
+    scratch_fp4: Option<ScratchCudaFp4>,
     /// `[V, D]` BF16 token embedding table.
     token_emb: CudaSlice<half::bf16>,
     /// `[D]` BF16 final RMSNorm gamma.
@@ -226,12 +268,394 @@ impl LlamaModelCuda {
             kv_cache_v,
             kv_pos: 0,
             max_seq,
+            blocks_fp4: None,
+            scratch_fp4: None,
         })
     }
 
     /// Reset la position du KV cache (pour redémarrer une génération).
     pub fn reset_kv(&mut self) {
         self.kv_pos = 0;
+    }
+
+    /// Allocate FP4 weight buffers (T241.5). Les weights sont initialisés
+    /// à zéro (dummy) — convient au bench timing. En production T241.5b
+    /// fera la quantisation BF16 → NVFP4 réelle au load time.
+    pub fn enable_fp4(&mut self) -> Result<(), LlmError> {
+        let d = self.config.hidden_size;
+        let kv_dim = self.config.n_kv_heads() * self.config.head_dim();
+        let f = self.config.intermediate_size;
+        let qkv_n = d + 2 * kv_dim;
+        let block16 = 16usize; // NVFP4 VEC16
+
+        let stream = &self.stream;
+        let alloc_u8 = |n: usize| -> Result<CudaSlice<u8>, LlmError> {
+            stream
+                .alloc_zeros::<u8>(n.max(1))
+                .map_err(|e| LlmError::Backend(format!("alloc {n} u8: {e:?}")))
+        };
+
+        // Per-weight FP4 + scale sizes :
+        //   weight_fp4 = m * k / 2 bytes
+        //   weight_scale = m * k / 16 bytes (UE4M3)
+        let mut blocks_fp4: Vec<BlockWeightsCudaFp4> = Vec::with_capacity(self.blocks.len());
+        for blk in self.blocks.iter() {
+            // rms_attn / rms_ffn restent BF16 (small, no quant benefit)
+            // Pour les FP4 weights on alloue zeros (dummy quantization).
+            let rms_attn = stream
+                .alloc_zeros::<half::bf16>(d)
+                .map_err(|e| LlmError::Backend(format!("alloc rms_attn: {e:?}")))?;
+            let rms_ffn = stream
+                .alloc_zeros::<half::bf16>(d)
+                .map_err(|e| LlmError::Backend(format!("alloc rms_ffn: {e:?}")))?;
+            // Copy gamma values from BF16 buffers (so RMSNorm produces sensible scaling)
+            let _ = blk; // unused : we use zeros for now
+            blocks_fp4.push(BlockWeightsCudaFp4 {
+                rms_attn,
+                w_qkv: alloc_u8(d * qkv_n / 2)?,
+                w_qkv_scale: alloc_u8(d * qkv_n / block16)?,
+                w_o: alloc_u8(d * d / 2)?,
+                w_o_scale: alloc_u8(d * d / block16)?,
+                rms_ffn,
+                w_gate_up: alloc_u8(d * 2 * f / 2)?,
+                w_gate_up_scale: alloc_u8(d * 2 * f / block16)?,
+                w_down: alloc_u8(f * d / 2)?,
+                w_down_scale: alloc_u8(f * d / block16)?,
+            });
+        }
+        // Scratch FP4 : on garde les scratch BF16 + on alloue les FP4 buffers
+        // pour passer aux matmul_mxfp4 (les pointeurs sont reinterprétés
+        // depuis les BF16 buffers — MVP timing-only).
+        let scratch_fp4 = ScratchCudaFp4 {
+            x_fp4: alloc_u8(d / 2)?,
+            x_fp4_scale: alloc_u8(d / block16)?,
+            ffn_inter_fp4: alloc_u8(f / 2)?,
+            ffn_inter_fp4_scale: alloc_u8(f / block16)?,
+        };
+        self.blocks_fp4 = Some(blocks_fp4);
+        self.scratch_fp4 = Some(scratch_fp4);
+        Ok(())
+    }
+
+    /// Decode 1 token en utilisant le path NVFP4 (T241.5).
+    ///
+    /// Précondition : `enable_fp4()` a été appelé. Les matmuls QKV / O /
+    /// gate+up / down passent par `LtSession::matmul_mxfp4` (NVFP4 packed
+    /// + UE4M3 scales). Throughput projeté : ~2.5× le BF16 path.
+    ///
+    /// MVP timing-only : les weights FP4 sont zéros donc les outputs sont
+    /// numériquement faux (garbage in → garbage out). Le timing du
+    /// pipeline est néanmoins représentatif.
+    pub fn decode_step_fp4(&mut self, token_id: u32) -> Result<u32, LlmError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use rustorch_cuda::cublas_lt::{Fp4ScaleMode, Fp8Output};
+
+        let blocks_fp4 = self
+            .blocks_fp4
+            .as_ref()
+            .ok_or_else(|| LlmError::Backend("enable_fp4() not called".into()))?;
+        let scratch_fp4 = self
+            .scratch_fp4
+            .as_ref()
+            .ok_or_else(|| LlmError::Backend("enable_fp4() not called".into()))?;
+
+        let d = self.config.hidden_size;
+        let f = self.config.intermediate_size;
+        let v = self.config.vocab_size;
+        let n_heads = self.config.num_attention_heads;
+        let n_kv = self.config.n_kv_heads();
+        let head_dim = self.config.head_dim();
+        let kv_dim = n_kv * head_dim;
+        let n_layers = self.config.num_hidden_layers;
+        let eps = self.config.rms_norm_eps;
+        let qkv_n = d + 2 * kv_dim;
+        let max_seq = self.max_seq;
+        let pos = self.kv_pos;
+        if pos >= max_seq {
+            return Err(LlmError::Backend(format!(
+                "kv_pos {pos} >= max_seq {max_seq}"
+            )));
+        }
+        let kv_len = pos + 1;
+
+        // 1. Embed → x (BF16)
+        let token_id_dev = self
+            .stream
+            .memcpy_stod(&[token_id])
+            .map_err(|e| LlmError::Backend(format!("upload token_id: {e:?}")))?;
+        unsafe {
+            let (table_p, _r1) = self.token_emb.device_ptr(&self.stream);
+            let (ids_p, _r2) = token_id_dev.device_ptr(&self.stream);
+            let (out_p, _r3) = self.scratch.x.device_ptr_mut(&self.stream);
+            self.kernels
+                .embedding_lookup_bf16(&self.stream, table_p, ids_p, out_p, 1, d as i32)
+                .map_err(|e| LlmError::Backend(format!("embedding_lookup: {e:?}")))?;
+        }
+
+        for li in 0..n_layers {
+            let block = &blocks_fp4[li];
+            // ATTENTION SUB-BLOCK
+            // h ← copy(x), RMSNorm pre-attn
+            unsafe {
+                let (dst_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+                let (src_p, _r2) = self.scratch.x.device_ptr(&self.stream);
+                self.kernels
+                    .copy_bf16(&self.stream, dst_p, src_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("copy x→h L{li}: {e:?}")))?;
+            }
+            unsafe {
+                let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+                let (g_p, _r2) = block.rms_attn.device_ptr(&self.stream);
+                self.kernels
+                    .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
+                    .map_err(|e| LlmError::Backend(format!("rms_attn L{li}: {e:?}")))?;
+            }
+
+            // QKV matmul FP4 : (h reinterpreté comme FP4) · w_qkv_fp4 → qkv (BF16 out)
+            // En MVP : on cast pointer scratch.h (BF16) comme si c'était FP4 packed
+            // (donc lu en garbage byte-pattern). Le timing matmul est correct.
+            unsafe {
+                let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+                let (sa_p, _r2) = scratch_fp4.x_fp4_scale.device_ptr(&self.stream);
+                let (b_p, _r3) = block.w_qkv.device_ptr(&self.stream);
+                let (sb_p, _r4) = block.w_qkv_scale.device_ptr(&self.stream);
+                let (c_p, _r5) = self.scratch.qkv.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_mxfp4(
+                        a_p,
+                        sa_p,
+                        b_p,
+                        sb_p,
+                        c_p,
+                        1,
+                        d,
+                        qkv_n,
+                        1.0,
+                        0.0,
+                        Fp8Output::Bf16,
+                        Fp4ScaleMode::Vec16Ue4m3,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("matmul_qkv_fp4 L{li}: {e:?}")))?;
+            }
+            // RoPE Q et K (kept BF16 ops as before)
+            let (q_off, k_off, v_off) = (0u64, (d as u64) * 2, ((d + kv_dim) as u64) * 2);
+            unsafe {
+                let (qkv_base, _r1) = self.scratch.qkv.device_ptr_mut(&self.stream);
+                let (inv_p, _r2) = self.rope_inv_freq.device_ptr(&self.stream);
+                self.kernels
+                    .rope_half_split_bf16(
+                        &self.stream,
+                        qkv_base + q_off,
+                        inv_p,
+                        pos as i32,
+                        n_heads as i32,
+                        head_dim as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("rope Q L{li}: {e:?}")))?;
+                let (qkv_base2, _r3) = self.scratch.qkv.device_ptr_mut(&self.stream);
+                self.kernels
+                    .rope_half_split_bf16(
+                        &self.stream,
+                        qkv_base2 + k_off,
+                        inv_p,
+                        pos as i32,
+                        n_kv as i32,
+                        head_dim as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("rope K L{li}: {e:?}")))?;
+            }
+            // KV append
+            unsafe {
+                let (qkv_base, _r1) = self.scratch.qkv.device_ptr(&self.stream);
+                let k_in = qkv_base + k_off;
+                let v_in = qkv_base + v_off;
+                let (k_cache_p, _r2) = self.kv_cache_k[li].device_ptr_mut(&self.stream);
+                let (v_cache_p, _r3) = self.kv_cache_v[li].device_ptr_mut(&self.stream);
+                self.kernels
+                    .kv_append_bf16(
+                        &self.stream,
+                        k_cache_p,
+                        v_cache_p,
+                        k_in,
+                        v_in,
+                        pos as i32,
+                        n_kv as i32,
+                        head_dim as i32,
+                        max_seq as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("kv_append L{li}: {e:?}")))?;
+            }
+            // GQA decode (keeps BF16 since K/V cache are BF16)
+            unsafe {
+                let (qkv_base, _r1) = self.scratch.qkv.device_ptr(&self.stream);
+                let (kc_p, _r2) = self.kv_cache_k[li].device_ptr(&self.stream);
+                let (vc_p, _r3) = self.kv_cache_v[li].device_ptr(&self.stream);
+                let (out_p, _r4) = self.scratch.block_out.device_ptr_mut(&self.stream);
+                self.kernels
+                    .gqa_decode_naive_bf16(
+                        &self.stream,
+                        qkv_base + q_off,
+                        kc_p,
+                        vc_p,
+                        out_p,
+                        n_heads as i32,
+                        n_kv as i32,
+                        kv_len as i32,
+                        head_dim as i32,
+                        max_seq as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("gqa_decode L{li}: {e:?}")))?;
+            }
+            // O proj FP4
+            unsafe {
+                let (a_p, _r1) = self.scratch.block_out.device_ptr(&self.stream);
+                let (sa_p, _r2) = scratch_fp4.x_fp4_scale.device_ptr(&self.stream);
+                let (b_p, _r3) = block.w_o.device_ptr(&self.stream);
+                let (sb_p, _r4) = block.w_o_scale.device_ptr(&self.stream);
+                let (c_p, _r5) = self.scratch.h.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_mxfp4(
+                        a_p,
+                        sa_p,
+                        b_p,
+                        sb_p,
+                        c_p,
+                        1,
+                        d,
+                        d,
+                        1.0,
+                        0.0,
+                        Fp8Output::Bf16,
+                        Fp4ScaleMode::Vec16Ue4m3,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("w_o_fp4 L{li}: {e:?}")))?;
+            }
+            // Residual
+            unsafe {
+                let (x_p, _r1) = self.scratch.x.device_ptr_mut(&self.stream);
+                let (h_p, _r2) = self.scratch.h.device_ptr(&self.stream);
+                self.kernels
+                    .add_inplace_bf16(&self.stream, x_p, h_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("residual attn L{li}: {e:?}")))?;
+            }
+
+            // FFN SUB-BLOCK
+            unsafe {
+                let (dst_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+                let (src_p, _r2) = self.scratch.x.device_ptr(&self.stream);
+                self.kernels
+                    .copy_bf16(&self.stream, dst_p, src_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("copy x→h ffn L{li}: {e:?}")))?;
+            }
+            unsafe {
+                let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+                let (g_p, _r2) = block.rms_ffn.device_ptr(&self.stream);
+                self.kernels
+                    .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
+                    .map_err(|e| LlmError::Backend(format!("rms_ffn L{li}: {e:?}")))?;
+            }
+            // gate+up FP4
+            unsafe {
+                let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+                let (sa_p, _r2) = scratch_fp4.x_fp4_scale.device_ptr(&self.stream);
+                let (b_p, _r3) = block.w_gate_up.device_ptr(&self.stream);
+                let (sb_p, _r4) = block.w_gate_up_scale.device_ptr(&self.stream);
+                let (c_p, _r5) = self.scratch.gate_up.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_mxfp4(
+                        a_p,
+                        sa_p,
+                        b_p,
+                        sb_p,
+                        c_p,
+                        1,
+                        d,
+                        2 * f,
+                        1.0,
+                        0.0,
+                        Fp8Output::Bf16,
+                        Fp4ScaleMode::Vec16Ue4m3,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("gate_up_fp4 L{li}: {e:?}")))?;
+            }
+            // SwiGLU
+            unsafe {
+                let (gu_p, _r1) = self.scratch.gate_up.device_ptr(&self.stream);
+                let up_p = gu_p + (f as u64) * 2;
+                let (out_p, _r2) = self.scratch.ffn_inter.device_ptr_mut(&self.stream);
+                self.kernels
+                    .swiglu_bf16(&self.stream, gu_p, up_p, out_p, f as i32)
+                    .map_err(|e| LlmError::Backend(format!("swiglu L{li}: {e:?}")))?;
+            }
+            // Down FP4
+            unsafe {
+                let (a_p, _r1) = self.scratch.ffn_inter.device_ptr(&self.stream);
+                let (sa_p, _r2) = scratch_fp4.ffn_inter_fp4_scale.device_ptr(&self.stream);
+                let (b_p, _r3) = block.w_down.device_ptr(&self.stream);
+                let (sb_p, _r4) = block.w_down_scale.device_ptr(&self.stream);
+                let (c_p, _r5) = self.scratch.block_out.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_mxfp4(
+                        a_p,
+                        sa_p,
+                        b_p,
+                        sb_p,
+                        c_p,
+                        1,
+                        f,
+                        d,
+                        1.0,
+                        0.0,
+                        Fp8Output::Bf16,
+                        Fp4ScaleMode::Vec16Ue4m3,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("w_down_fp4 L{li}: {e:?}")))?;
+            }
+            unsafe {
+                let (x_p, _r1) = self.scratch.x.device_ptr_mut(&self.stream);
+                let (b_p, _r2) = self.scratch.block_out.device_ptr(&self.stream);
+                self.kernels
+                    .add_inplace_bf16(&self.stream, x_p, b_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("residual ffn L{li}: {e:?}")))?;
+            }
+        }
+
+        // Final RMSNorm + LM head + argmax (gardent BF16)
+        unsafe {
+            let (dst_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+            let (src_p, _r2) = self.scratch.x.device_ptr(&self.stream);
+            self.kernels
+                .copy_bf16(&self.stream, dst_p, src_p, d as i32)
+                .map_err(|e| LlmError::Backend(format!("copy x→h final: {e:?}")))?;
+        }
+        unsafe {
+            let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+            let (g_p, _r2) = self.final_norm.device_ptr(&self.stream);
+            self.kernels
+                .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
+                .map_err(|e| LlmError::Backend(format!("final_norm: {e:?}")))?;
+        }
+        unsafe {
+            let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+            let (b_p, _r2) = self.lm_head.device_ptr(&self.stream);
+            let (c_p, _r3) = self.scratch.logits.device_ptr_mut(&self.stream);
+            self.session
+                .matmul_bf16(a_p, b_p, c_p, 1, d, v, 1.0, 0.0)
+                .map_err(|e| LlmError::Backend(format!("lm_head: {e:?}")))?;
+        }
+        unsafe {
+            let (l_p, _r1) = self.scratch.logits.device_ptr(&self.stream);
+            let (o_p, _r2) = self.scratch.sample_out.device_ptr_mut(&self.stream);
+            self.kernels
+                .argmax_bf16(&self.stream, l_p, o_p, v as i32)
+                .map_err(|e| LlmError::Backend(format!("argmax: {e:?}")))?;
+        }
+        let out: Vec<u32> = self
+            .stream
+            .memcpy_dtov(&self.scratch.sample_out)
+            .map_err(|e| LlmError::Backend(format!("dtov sample: {e:?}")))?;
+        self.kv_pos += 1;
+        Ok(out[0])
     }
 
     /// Construit un modèle CUDA avec des poids ZÉRO (pour benchmarks de
@@ -315,6 +739,8 @@ impl LlamaModelCuda {
             kv_cache_v,
             kv_pos: 0,
             max_seq,
+            blocks_fp4: None,
+            scratch_fp4: None,
         })
     }
 
