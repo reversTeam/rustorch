@@ -71,3 +71,8 @@ required-features = []
 name = "kernel_microbench"
 path = "examples/kernel_microbench.rs"
 required-features = []
+
+[[example]]
+name = "qwen_synth_bench"
+path = "examples/qwen_synth_bench.rs"
+required-features = ["cuda"]

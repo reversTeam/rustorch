@@ -234,6 +234,90 @@ impl LlamaModelCuda {
         self.kv_pos = 0;
     }
 
+    /// Construit un modèle CUDA avec des poids ZÉRO (pour benchmarks de
+    /// timing pur — résultats numériques inutiles, mais le pipeline est
+    /// réellement exercé).
+    pub fn from_dummy(config: LlamaConfig, max_seq: usize) -> Result<Self, LlmError> {
+        let ctx = CudaContext::new(0).map_err(|e| LlmError::Backend(format!("ctx: {e:?}")))?;
+        let stream = ctx.default_stream();
+        let session = LtSession::new(stream.clone())
+            .map_err(|e| LlmError::Backend(format!("LtSession: {e:?}")))?;
+        let kernels = LlmKernels::new(ctx.clone());
+
+        let d = config.hidden_size;
+        let kv_dim = config.n_kv_heads() * config.head_dim();
+        let f = config.intermediate_size;
+        let head_dim = config.head_dim();
+        let v = config.vocab_size;
+
+        let alloc_zeros_bf16 =
+            |stream: &Arc<CudaStream>, n: usize| -> Result<CudaSlice<half::bf16>, LlmError> {
+                stream
+                    .alloc_zeros::<half::bf16>(n)
+                    .map_err(|e| LlmError::Backend(format!("alloc {n} bf16: {e:?}")))
+            };
+
+        let token_emb = alloc_zeros_bf16(&stream, v * d)?;
+        let final_norm = alloc_zeros_bf16(&stream, d)?;
+        let lm_head = alloc_zeros_bf16(&stream, d * v)?;
+
+        let mut blocks: Vec<BlockWeightsCuda> = Vec::with_capacity(config.num_hidden_layers);
+        for _ in 0..config.num_hidden_layers {
+            blocks.push(BlockWeightsCuda {
+                rms_attn: alloc_zeros_bf16(&stream, d)?,
+                w_qkv: alloc_zeros_bf16(&stream, d * (d + 2 * kv_dim))?,
+                w_o: alloc_zeros_bf16(&stream, d * d)?,
+                rms_ffn: alloc_zeros_bf16(&stream, d)?,
+                w_gate_up: alloc_zeros_bf16(&stream, d * 2 * f)?,
+                w_down: alloc_zeros_bf16(&stream, f * d)?,
+                q_norm: None,
+                k_norm: None,
+            });
+        }
+        let inv_freq_host: Vec<f32> = (0..head_dim / 2)
+            .map(|i| (config.rope_theta as f32).powf(-(2.0 * i as f32) / head_dim as f32))
+            .collect();
+        let rope_inv_freq = stream
+            .memcpy_stod(&inv_freq_host)
+            .map_err(|e| LlmError::Backend(format!("rope_inv_freq: {e:?}")))?;
+
+        let scratch = ScratchCuda {
+            x: alloc_zeros_bf16(&stream, d)?,
+            h: alloc_zeros_bf16(&stream, d)?,
+            qkv: alloc_zeros_bf16(&stream, d + 2 * kv_dim)?,
+            gate_up: alloc_zeros_bf16(&stream, 2 * f)?,
+            ffn_inter: alloc_zeros_bf16(&stream, f)?,
+            block_out: alloc_zeros_bf16(&stream, d)?,
+            logits: alloc_zeros_bf16(&stream, v)?,
+            sample_out: stream
+                .alloc_zeros::<u32>(1)
+                .map_err(|e| LlmError::Backend(format!("alloc sample: {e:?}")))?,
+        };
+        let mut kv_cache_k = Vec::with_capacity(config.num_hidden_layers);
+        let mut kv_cache_v = Vec::with_capacity(config.num_hidden_layers);
+        for _ in 0..config.num_hidden_layers {
+            kv_cache_k.push(alloc_zeros_bf16(&stream, max_seq * kv_dim)?);
+            kv_cache_v.push(alloc_zeros_bf16(&stream, max_seq * kv_dim)?);
+        }
+        Ok(Self {
+            config,
+            stream,
+            ctx,
+            session,
+            kernels,
+            blocks,
+            token_emb,
+            final_norm,
+            lm_head,
+            rope_inv_freq,
+            scratch,
+            kv_cache_k,
+            kv_cache_v,
+            kv_pos: 0,
+            max_seq,
+        })
+    }
+
     /// Dimension hidden du modèle.
     pub fn hidden(&self) -> usize {
         self.config.hidden_size
