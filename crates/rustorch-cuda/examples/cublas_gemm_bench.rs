@@ -212,7 +212,7 @@ fn main() -> Result<(), BenchError> {
         // result memory layout differs from the f32/bf16 paths (this is a
         // transposed problem), but for throughput measurement that's fine —
         // we don't validate FP8 output values.
-        let fp8_attempt = || -> Result<f64, BenchError> {
+        let mut fp8_attempt = || -> Result<f64, BenchError> {
             // Warm-up: 5 calls.
             for _ in 0..5 {
                 // SAFETY: gemm_ex contract — pointers and types match cfg,
