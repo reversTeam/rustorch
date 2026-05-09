@@ -877,6 +877,7 @@ version = "0.17.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf99ab37ee7072d64d906aa2dada9a3422f1d975cdf8c8055a573bc84897ed8"
 dependencies = [
+ "half",
  "libloading",
 ]
 
@@ -3735,6 +3736,7 @@ name = "rustorch-cuda"
 version = "0.0.1"
 dependencies = [
  "cudarc",
+ "half",
  "proptest",
 ]
 

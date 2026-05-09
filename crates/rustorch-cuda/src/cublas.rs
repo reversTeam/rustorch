@@ -414,6 +414,170 @@ fn gemv_f32_cuda(
     Ok(())
 }
 
+/// `c = alpha * a @ b + beta * c` for **BF16** row-major buffers.
+///
+/// Inputs and outputs are `bf16` for compute density (TensorCore-native);
+/// alpha/beta + internal accumulation are `f32` for numerical stability.
+/// This is the standard "BF16 mixed precision" gemm used in modern training
+/// (Ampere+) and matches what PyTorch's autocast emits.
+///
+/// Without `--features cuda`, scalar fallback going through f32 conversion.
+pub fn gemm_bf16(
+    a: &[half::bf16],
+    b: &[half::bf16],
+    c: &mut [half::bf16],
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), CudaError> {
+    if a.len() != m * k {
+        return Err(CudaError::Unsupported {
+            msg: format!("a expected {}, got {}", m * k, a.len()),
+        });
+    }
+    if b.len() != k * n {
+        return Err(CudaError::Unsupported {
+            msg: format!("b expected {}, got {}", k * n, b.len()),
+        });
+    }
+    if c.len() != m * n {
+        return Err(CudaError::Unsupported {
+            msg: format!("c expected {}, got {}", m * n, c.len()),
+        });
+    }
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if k == 0 {
+        let beta_b = half::bf16::from_f32(beta);
+        for v in c.iter_mut() {
+            *v = half::bf16::from_f32(v.to_f32() * beta_b.to_f32());
+        }
+        return Ok(());
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        return gemm_bf16_cuda(a, b, c, m, k, n, alpha, beta);
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        gemm_bf16_scalar(a, b, c, m, k, n, alpha, beta);
+        Ok(())
+    }
+}
+
+/// Scalar BF16 fallback. Performs the math in f32 (BF16 ALU is rare on CPU)
+/// and rounds back to bf16 once per output element.
+#[allow(dead_code)]
+fn gemm_bf16_scalar(
+    a: &[half::bf16],
+    b: &[half::bf16],
+    c: &mut [half::bf16],
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) {
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f32;
+            for kk in 0..k {
+                acc += a[row * k + kk].to_f32() * b[kk * n + col].to_f32();
+            }
+            let prev = c[row * n + col].to_f32();
+            c[row * n + col] = half::bf16::from_f32(alpha * acc + beta * prev);
+        }
+    }
+}
+
+/// CUDA-backed BF16 gemm via `cublasGemmEx` (CUDA_R_16BF inputs,
+/// CUBLAS_COMPUTE_32F accumulation). Same row→col-major arg-swap as the
+/// f32 path. TensorCores are engaged automatically by cublasGemmEx for
+/// BF16 inputs.
+#[cfg(feature = "cuda")]
+fn gemm_bf16_cuda(
+    a: &[half::bf16],
+    b: &[half::bf16],
+    c: &mut [half::bf16],
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), CudaError> {
+    use cudarc::cublas::{sys, CudaBlas, Gemm, GemmConfig};
+    use cudarc::driver::CudaContext;
+
+    let ctx = CudaContext::new(0).map_err(|e| CudaError::Driver {
+        code: hash_diag(&format!("{e:?}")),
+        location: "cublas::gemm_bf16_cuda::CudaContext::new",
+    })?;
+    let stream = ctx.default_stream();
+    let blas = CudaBlas::new(stream.clone()).map_err(|e| CudaError::CublasStatus {
+        code: hash_diag(&format!("{e:?}")),
+        location: "cublas::gemm_bf16_cuda::CudaBlas::new",
+    })?;
+    // BF16 path is already TensorCore-native; setting math mode is a
+    // no-op but harmless. Keep it for consistency with the f32 path.
+    unsafe {
+        let _ = cudarc::cublas::sys::cublasSetMathMode(
+            *blas.handle(),
+            cudarc::cublas::sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
+        );
+    }
+
+    let a_dev = stream
+        .memcpy_stod(a)
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_bf16_cuda::h2d_a"))?;
+    let b_dev = stream
+        .memcpy_stod(b)
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_bf16_cuda::h2d_b"))?;
+    let mut c_dev = if beta == 0.0 {
+        stream
+            .alloc_zeros::<half::bf16>(c.len())
+            .map_err(|e| map_driver_err(&e, "cublas::gemm_bf16_cuda::alloc_c"))?
+    } else {
+        stream
+            .memcpy_stod(c)
+            .map_err(|e| map_driver_err(&e, "cublas::gemm_bf16_cuda::h2d_c"))?
+    };
+
+    let cfg = GemmConfig::<half::bf16> {
+        transa: sys::cublasOperation_t::CUBLAS_OP_N,
+        transb: sys::cublasOperation_t::CUBLAS_OP_N,
+        m: n as i32,
+        n: m as i32,
+        k: k as i32,
+        alpha: half::bf16::from_f32(alpha),
+        lda: n as i32,
+        ldb: k as i32,
+        beta: half::bf16::from_f32(beta),
+        ldc: n as i32,
+    };
+    // SAFETY: shapes validated upstream; buffers freshly alloc'd to match.
+    unsafe {
+        blas.gemm(cfg, &b_dev, &a_dev, &mut c_dev)
+            .map_err(|e| CudaError::CublasStatus {
+                code: hash_diag(&format!("{e:?}")),
+                location: "cublas::gemm_bf16_cuda::blas.gemm",
+            })?;
+    }
+
+    stream
+        .memcpy_dtoh(&c_dev, c)
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_bf16_cuda::d2h_c"))?;
+    stream
+        .synchronize()
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_bf16_cuda::sync"))?;
+
+    Ok(())
+}
+
 /// Batched gemm: `C[b] = alpha * A[b] @ B[b] + beta * C[b]` for B=batch.
 ///
 /// Without `--features cuda`, loops over the scalar reference. With cuda,
@@ -713,6 +877,36 @@ mod tests {
         let mut c = vec![0.0f32; 2];
         gemm_batched_f32(&a, &b, &mut c, batch, m, k, n, 1.0, 0.0).unwrap();
         assert_eq!(c, vec![8.0, 15.0]);
+    }
+
+    #[test]
+    fn gemm_bf16_3x4x2_matches_f32_reference() {
+        // Same shape as the f32 parity test but in BF16. Tolerance widened
+        // to 1e-2 because BF16 mantissa is 7 bits + accumulation rounding.
+        use half::bf16;
+        let a: Vec<bf16> = (0..12)
+            .map(|i| bf16::from_f32(i as f32 * 0.5 - 1.0))
+            .collect();
+        let b: Vec<bf16> = (0..8)
+            .map(|i| bf16::from_f32((i as f32 - 3.0) * 0.25))
+            .collect();
+        let mut c_cuda: Vec<bf16> = vec![bf16::from_f32(0.5); 6];
+        // Reference in f32 for ground truth.
+        let a_f32: Vec<f32> = a.iter().map(|x| x.to_f32()).collect();
+        let b_f32: Vec<f32> = b.iter().map(|x| x.to_f32()).collect();
+        let mut c_ref = vec![0.5f32; 6];
+
+        gemm_bf16(&a, &b, &mut c_cuda, 3, 4, 2, 0.7, 0.3).unwrap();
+        gemm_f32_scalar(&a_f32, &b_f32, &mut c_ref, 3, 4, 2, 0.7, 0.3);
+
+        for i in 0..6 {
+            let cuda = c_cuda[i].to_f32();
+            let r = c_ref[i];
+            assert!(
+                (cuda - r).abs() < 1e-2,
+                "elem {i}: bf16_cuda={cuda} f32_ref={r}"
+            );
+        }
     }
 
     #[test]

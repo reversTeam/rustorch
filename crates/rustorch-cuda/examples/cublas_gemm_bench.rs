@@ -84,13 +84,13 @@ fn main() -> Result<(), BenchError> {
         }
     }
 
-    println!("[cublas_gemm_bench] device ready (TF32 math mode), running sgemm sweep");
+    println!("[cublas_gemm_bench] device ready, sweeping (TF32 sgemm + BF16 gemm)");
     println!();
     println!(
-        "  {:>5} {:>10} {:>14} {:>10} {:>12}",
-        "M=N=K", "iters", "wall (ms)", "ms/iter", "TFLOPS f32"
+        "  {:>5} {:>10} {:>14} {:>10} {:>10} {:>10}",
+        "M=N=K", "iters", "wall (ms)", "ms/iter", "TF32 TFL", "BF16 TFL"
     );
-    println!("  {}", "─".repeat(60));
+    println!("  {}", "─".repeat(72));
 
     // Square shape sweep. Shapes chosen to span small (cache-resident-ish)
     // up to 4096² which is the typical "large dense gemm" sweet spot.
@@ -146,15 +146,50 @@ fn main() -> Result<(), BenchError> {
             }
         }
         stream.synchronize()?;
-        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let ms_per_iter = wall_ms / n_iters as f64;
+        let wall_ms_tf32 = t0.elapsed().as_secs_f64() * 1000.0;
+        let ms_per_iter_tf32 = wall_ms_tf32 / n_iters as f64;
         // FLOPS for a sgemm: 2 · M · N · K (mul + add per element).
         let flops_per_iter = 2.0 * (m as f64) * (n as f64) * (k as f64);
-        let tflops = flops_per_iter / (ms_per_iter / 1000.0) / 1e12;
+        let tf32_tflops = flops_per_iter / (ms_per_iter_tf32 / 1000.0) / 1e12;
+
+        // ───────── BF16 path: same sweep, fresh buffers in bf16 ─────────
+        let a_bf16: Vec<half::bf16> = a_host.iter().map(|x| half::bf16::from_f32(*x)).collect();
+        let b_bf16: Vec<half::bf16> = b_host.iter().map(|x| half::bf16::from_f32(*x)).collect();
+        let a_dev_bf16 = stream.memcpy_stod(&a_bf16)?;
+        let b_dev_bf16 = stream.memcpy_stod(&b_bf16)?;
+        let mut c_dev_bf16 = stream.alloc_zeros::<half::bf16>(m * n)?;
+        let cfg_bf16 = cudarc::cublas::GemmConfig::<half::bf16> {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: half::bf16::from_f32(1.0),
+            lda: n as i32,
+            ldb: k as i32,
+            beta: half::bf16::from_f32(0.0),
+            ldc: n as i32,
+        };
+        for _ in 0..5 {
+            unsafe {
+                blas.gemm(cfg_bf16, &b_dev_bf16, &a_dev_bf16, &mut c_dev_bf16)?;
+            }
+        }
+        stream.synchronize()?;
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            unsafe {
+                blas.gemm(cfg_bf16, &b_dev_bf16, &a_dev_bf16, &mut c_dev_bf16)?;
+            }
+        }
+        stream.synchronize()?;
+        let wall_ms_bf16 = t0.elapsed().as_secs_f64() * 1000.0;
+        let ms_per_iter_bf16 = wall_ms_bf16 / n_iters as f64;
+        let bf16_tflops = flops_per_iter / (ms_per_iter_bf16 / 1000.0) / 1e12;
 
         println!(
-            "  {:>5} {:>10} {:>14.2} {:>10.3} {:>12.2}",
-            dim, n_iters, wall_ms, ms_per_iter, tflops
+            "  {:>5} {:>10} {:>14.2} {:>10.3} {:>10.2} {:>10.2}",
+            dim, n_iters, wall_ms_tf32, ms_per_iter_tf32, tf32_tflops, bf16_tflops
         );
     }
 

@@ -26,7 +26,10 @@ cuda-allocator = ["cuda"]
 # `driver` feature gives us CudaDevice/CudaStream/DevicePtr; `cublas`
 # wraps cuBLAS for gemm/gemv. `dynamic-loading` postpones linking to
 # runtime so the toolkit version can vary at install time.
-cudarc = { version = "0.17", default-features = false, features = ["driver", "cublas", "dynamic-loading", "cuda-version-from-build-system"], optional = true }
+cudarc = { version = "0.17", default-features = false, features = ["driver", "cublas", "dynamic-loading", "cuda-version-from-build-system", "f16"], optional = true }
+# `half` crate provides f16 / bf16 types used by the BF16 gemm path. Needed
+# always (not just under cuda feature) so the scalar fallback can fmt bf16.
+half = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
