@@ -2,6 +2,31 @@
 //!
 //! Without `--features cuda`, ops fall back to a scalar f32 reference
 //! so call sites stay portable and tests can exercise the math.
+//!
+//! With `--features cuda`, ops route to `cublasGemmEx`/`cublasSgemm` via
+//! the safe wrappers in `cudarc::cublas`. The current Stage-A path copies
+//! host slices to device on every call (H2D + GEMM + D2H + sync); the
+//! perf focus here is correctness + wiring, not zero-copy. Device-resident
+//! tensors land in T240.2 once `Tensor::cuda()` is plumbed through
+//! rustorch-core.
+//!
+//! ## Row-major → cuBLAS column-major mapping
+//!
+//! cuBLAS is column-major. To compute the row-major product
+//!     C_rm[m×n] = alpha · A_rm[m×k] · B_rm[k×n] + beta · C_rm
+//! we exploit `(A·B)ᵀ = Bᵀ·Aᵀ` and feed cuBLAS the operands swapped:
+//!     cublas computes  Bᵀ · Aᵀ  (in column-major land)
+//!                  =  (A·B)ᵀ
+//!                  =  Cᵀ
+//!     and a column-major Cᵀ shares the same byte layout as a row-major C.
+//! Concrete arg mapping:
+//!     transa=N, transb=N
+//!     cublas.m = n_rm   cublas.n = m_rm   cublas.k = k_rm
+//!     cublas.A_buffer = b_rm   cublas.lda = n_rm
+//!     cublas.B_buffer = a_rm   cublas.ldb = k_rm
+//!     cublas.C_buffer = c_rm   cublas.ldc = n_rm
+//! See https://docs.nvidia.com/cuda/cublas/#cublas-t-gemm for the
+//! authoritative reference.
 
 #![allow(clippy::needless_range_loop)]
 
@@ -51,7 +76,8 @@ impl HandleCache {
 /// `c = alpha * a @ b + beta * c` for f32 row-major buffers.
 ///
 /// Without `--features cuda`, runs a scalar reference implementation.
-/// With cuda, dispatches to `cublasGemmEx` with auto-TF32 on sm_80+.
+/// With `--features cuda`, dispatches to `cublasSgemm` on the primary
+/// CUDA context's default stream.
 pub fn gemm_f32(
     a: &[f32],
     b: &[f32],
@@ -88,8 +114,32 @@ pub fn gemm_f32(
         }
         return Ok(());
     }
-    // Scalar fallback. Real cuda path replaces this with
-    // cublasGemmEx + handle from the cache.
+
+    #[cfg(feature = "cuda")]
+    {
+        return gemm_f32_cuda(a, b, c, m, k, n, alpha, beta);
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        gemm_f32_scalar(a, b, c, m, k, n, alpha, beta);
+        Ok(())
+    }
+}
+
+/// Scalar fallback used both as a reference (when cuda feature is off)
+/// and for parity tests under `--features cuda`.
+#[allow(dead_code)]
+fn gemm_f32_scalar(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) {
     for row in 0..m {
         for col in 0..n {
             let mut acc = 0.0f32;
@@ -99,7 +149,108 @@ pub fn gemm_f32(
             c[row * n + col] = alpha * acc + beta * c[row * n + col];
         }
     }
+}
+
+/// CUDA-backed gemm via cuBLAS. Allocates device buffers, copies a/b/c,
+/// runs `cublasSgemm`, copies the result back. Stage-A simple path:
+/// pays H2D + D2H per call. Optimised away once tensors are device-resident.
+#[cfg(feature = "cuda")]
+fn gemm_f32_cuda(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), CudaError> {
+    use cudarc::cublas::{sys, CudaBlas, Gemm, GemmConfig};
+    use cudarc::driver::CudaContext;
+
+    let ctx = CudaContext::new(0).map_err(|e| CudaError::Driver {
+        code: hash_diag(&format!("{e:?}")),
+        location: "cublas::gemm_f32_cuda::CudaContext::new",
+    })?;
+    let stream = ctx.default_stream();
+    let blas = CudaBlas::new(stream.clone()).map_err(|e| CudaError::CublasStatus {
+        code: hash_diag(&format!("{e:?}")),
+        location: "cublas::gemm_f32_cuda::CudaBlas::new",
+    })?;
+
+    // H2D for a, b and (when beta != 0) c. Even when beta == 0 we still
+    // need a device-side buffer for c — allocate zeros to keep the path
+    // uniform.
+    let a_dev = stream
+        .memcpy_stod(a)
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_f32_cuda::h2d_a"))?;
+    let b_dev = stream
+        .memcpy_stod(b)
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_f32_cuda::h2d_b"))?;
+    let mut c_dev = if beta == 0.0 {
+        // Skip H2D when beta == 0 — initial c values won't be read.
+        stream
+            .alloc_zeros::<f32>(c.len())
+            .map_err(|e| map_driver_err(&e, "cublas::gemm_f32_cuda::alloc_c"))?
+    } else {
+        stream
+            .memcpy_stod(c)
+            .map_err(|e| map_driver_err(&e, "cublas::gemm_f32_cuda::h2d_c"))?
+    };
+
+    // Row-major → column-major arg swap (see module docs).
+    let cfg = GemmConfig::<f32> {
+        transa: sys::cublasOperation_t::CUBLAS_OP_N,
+        transb: sys::cublasOperation_t::CUBLAS_OP_N,
+        m: n as i32,
+        n: m as i32,
+        k: k as i32,
+        alpha,
+        lda: n as i32,
+        ldb: k as i32,
+        beta,
+        ldc: n as i32,
+    };
+    // SAFETY: shapes were validated at the top of `gemm_f32`. Both input
+    // slices have the right length, the device buffers were just freshly
+    // allocated with matching size, and `cfg` exactly mirrors them.
+    unsafe {
+        blas.gemm(cfg, &b_dev, &a_dev, &mut c_dev)
+            .map_err(|e| CudaError::CublasStatus {
+                code: hash_diag(&format!("{e:?}")),
+                location: "cublas::gemm_f32_cuda::blas.gemm",
+            })?;
+    }
+
+    stream
+        .memcpy_dtoh(&c_dev, c)
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_f32_cuda::d2h_c"))?;
+    stream
+        .synchronize()
+        .map_err(|e| map_driver_err(&e, "cublas::gemm_f32_cuda::sync"))?;
+
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn map_driver_err(e: &cudarc::driver::DriverError, location: &'static str) -> CudaError {
+    CudaError::Driver {
+        code: hash_diag(&format!("{e:?}")),
+        location,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn hash_diag(s: &str) -> i32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    let v = (h.finish() & 0x7FFF_FFFF) as i32;
+    if v == 0 {
+        1
+    } else {
+        v
+    }
 }
 
 /// `y = alpha * A @ x + beta * y` for f32 buffers.
@@ -130,6 +281,8 @@ pub fn gemv_f32(
     if m == 0 {
         return Ok(());
     }
+    // T240.1 keeps gemv on the scalar fallback. cuBLAS gemv lands in T240.2
+    // when device-resident vectors are wired.
     for row in 0..m {
         let mut acc = 0.0f32;
         for col in 0..n {
@@ -238,6 +391,28 @@ mod tests {
         let mut c = vec![0.0f32; 4];
         let err = gemm_f32(&[1.0; 3], &[1.0; 4], &mut c, 2, 2, 2, 1.0, 0.0).unwrap_err();
         assert!(matches!(err, CudaError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn gemm_3x4x2_matches_scalar_reference() {
+        // 3×4 @ 4×2 = 3×2. Random-ish values, exercise the row/col-major
+        // swap on a non-square shape so any transpose bug surfaces.
+        let a: Vec<f32> = (0..12).map(|i| i as f32 * 0.5 - 1.0).collect();
+        let b: Vec<f32> = (0..8).map(|i| (i as f32 - 3.0) * 0.25).collect();
+        let mut c_cuda = vec![0.5f32; 6];
+        let mut c_ref = c_cuda.clone();
+
+        gemm_f32(&a, &b, &mut c_cuda, 3, 4, 2, 0.7, 0.3).unwrap();
+        gemm_f32_scalar(&a, &b, &mut c_ref, 3, 4, 2, 0.7, 0.3);
+
+        for i in 0..6 {
+            assert!(
+                (c_cuda[i] - c_ref[i]).abs() < 1e-4,
+                "elem {i}: cuda={} ref={}",
+                c_cuda[i],
+                c_ref[i]
+            );
+        }
     }
 
     #[test]
