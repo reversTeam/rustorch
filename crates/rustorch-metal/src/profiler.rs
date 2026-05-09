@@ -352,7 +352,13 @@ unsafe impl Sync for MetalProfiler {}
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    // These imports are only consumed by tests gated behind the
+    // `gpu-tests` feature; without that feature the items below are
+    // dead code but keeping the imports here means the test module
+    // stays compilable when the feature flips on.
+    #[allow(unused_imports)]
     use super::*;
+    #[allow(unused_imports)]
     use crate::backend_singleton::metal_backend;
 
     /// T181 sanity test — DISABLED. Counter sampling on M4 Max via

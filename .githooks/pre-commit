@@ -25,12 +25,25 @@ if ! echo "${STAGED_RS}" | xargs cargo fmt -- --check 2>/dev/null; then
     exit 1
 fi
 
-# 2. clippy on the whole workspace, but only when Rust files actually changed.
-#    --no-deps avoids re-checking transitive deps; uses cached metadata.
-if ! cargo clippy --workspace --all-targets --all-features -- -D warnings >/dev/null 2>&1; then
+# 2. clippy on the whole workspace.
+#    --all-features pulls in --features cuda which requires nvcc to be on
+#    PATH (cudarc's build script invokes it). On hosts without a CUDA
+#    toolkit (typical dev macOS), use a feature set that skips cuda.
+#    The CUDA paths are exercised by a separate CI job on a GPU host.
+if command -v nvcc >/dev/null 2>&1; then
+    CLIPPY_FEATURE_FLAGS=(--all-features)
+    CLIPPY_HINT="cargo clippy --workspace --all-targets --all-features"
+else
+    # No nvcc: skip the cuda feature to avoid cudarc build failure.
+    # Other features still get covered.
+    CLIPPY_FEATURE_FLAGS=()
+    CLIPPY_HINT="cargo clippy --workspace --all-targets   # nvcc not found, cuda feature skipped"
+fi
+
+if ! cargo clippy --workspace --all-targets "${CLIPPY_FEATURE_FLAGS[@]}" -- -D warnings >/dev/null 2>&1; then
     echo
     echo "  clippy reported warnings (treated as errors)."
-    echo "  Run for details:  cargo clippy --workspace --all-targets --all-features"
+    echo "  Run for details:  ${CLIPPY_HINT}"
     echo "  Auto-fix where possible:  cargo clippy --workspace --all-targets --fix"
     exit 1
 fi
