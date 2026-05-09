@@ -243,6 +243,81 @@ impl LlamaModelCuda {
     pub fn vocab_size(&self) -> usize {
         self.config.vocab_size
     }
+
+    /// Decode 1 token, returns next token id.
+    ///
+    /// MVP version (T241.4 step 1) : skip les blocks (juste embed → final
+    /// norm → LM head → argmax). Sert de smoke test pour valider la chaîne
+    /// complete sans la complexité de l'attention. Production decode_step
+    /// arrive en step 2/3 (ajout layers + attention).
+    ///
+    /// # Safety
+    /// Le caller garantit que `token_id < vocab_size`.
+    pub fn decode_step_minimal(&mut self, token_id: u32) -> Result<u32, LlmError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let cfg = &self.config;
+        let d = cfg.hidden_size;
+        let v = cfg.vocab_size;
+
+        // 1. Embed lookup : token_emb[token_id, :] → scratch.x
+        // Pour MVP on upload le token_id sur device puis lookup. On peut
+        // optimiser plus tard avec un buffer cached.
+        let token_id_dev = self
+            .stream
+            .memcpy_stod(&[token_id])
+            .map_err(|e| LlmError::Backend(format!("upload token_id: {e:?}")))?;
+
+        unsafe {
+            let (table_p, _r1) = self.token_emb.device_ptr(&self.stream);
+            let (ids_p, _r2) = token_id_dev.device_ptr(&self.stream);
+            let (out_p, _r3) = self.scratch.x.device_ptr_mut(&self.stream);
+            self.kernels
+                .embedding_lookup_bf16(&self.stream, table_p, ids_p, out_p, 1, d as i32)
+                .map_err(|e| LlmError::Backend(format!("embedding_lookup: {e:?}")))?;
+        }
+
+        // 2. Final RMSNorm : x → h (gamma = self.final_norm)
+        // On copie x → h d'abord (rms_norm_bf16 est inplace).
+        // Pour MVP on fait via dtoh→htod : à optimiser avec un kernel copy.
+        let x_host: Vec<half::bf16> = self
+            .stream
+            .memcpy_dtov(&self.scratch.x)
+            .map_err(|e| LlmError::Backend(format!("dtov x: {e:?}")))?;
+        self.stream
+            .memcpy_htod(&x_host, &mut self.scratch.h)
+            .map_err(|e| LlmError::Backend(format!("htod h: {e:?}")))?;
+        unsafe {
+            let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+            let (g_p, _r2) = self.final_norm.device_ptr(&self.stream);
+            self.kernels
+                .rms_norm_bf16(&self.stream, h_p, g_p, cfg.rms_norm_eps, d as i32, 1)
+                .map_err(|e| LlmError::Backend(format!("rms_norm: {e:?}")))?;
+        }
+
+        // 3. LM head matmul : h [1, d] · lm_head [d, v] → logits [1, v]
+        unsafe {
+            let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+            let (b_p, _r2) = self.lm_head.device_ptr(&self.stream);
+            let (c_p, _r3) = self.scratch.logits.device_ptr_mut(&self.stream);
+            self.session
+                .matmul_bf16(a_p, b_p, c_p, 1, d, v, 1.0, 0.0)
+                .map_err(|e| LlmError::Backend(format!("lm_head matmul: {e:?}")))?;
+        }
+
+        // 4. argmax sur logits
+        unsafe {
+            let (l_p, _r1) = self.scratch.logits.device_ptr(&self.stream);
+            let (o_p, _r2) = self.scratch.sample_out.device_ptr_mut(&self.stream);
+            self.kernels
+                .argmax_bf16(&self.stream, l_p, o_p, v as i32)
+                .map_err(|e| LlmError::Backend(format!("argmax: {e:?}")))?;
+        }
+        let out: Vec<u32> = self
+            .stream
+            .memcpy_dtov(&self.scratch.sample_out)
+            .map_err(|e| LlmError::Backend(format!("dtov sample: {e:?}")))?;
+        Ok(out[0])
+    }
 }
 
 // Suppress dead_code warnings on fields used only at runtime by future kernels.
