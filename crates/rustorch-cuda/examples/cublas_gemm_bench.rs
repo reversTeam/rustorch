@@ -95,9 +95,13 @@ fn main() -> Result<(), BenchError> {
     let mut session = rustorch_cuda::cublas_lt::LtSession::new(stream.clone())
         .map_err(|e| BenchError(format!("LtSession::new: {e}")))?;
 
-    // Square shape sweep. Shapes chosen to span small (cache-resident-ish)
-    // up to 4096² which is the typical "large dense gemm" sweet spot.
-    let shapes = [128usize, 256, 512, 1024, 2048, 4096];
+    // Square shape sweep. Goes up to 8192² to give the compute paths
+    // (BF16/FP8/FP4) enough work to saturate the TensorCores on GB10.
+    // 16384² is opt-in via env BENCH_HUGE=1 (allocates ~4 GiB per matrix).
+    let mut shapes: Vec<usize> = vec![128, 256, 512, 1024, 2048, 4096, 8192];
+    if std::env::var("BENCH_HUGE").is_ok() {
+        shapes.push(16384);
+    }
 
     for &dim in &shapes {
         let m = dim;
@@ -107,8 +111,10 @@ fn main() -> Result<(), BenchError> {
             200
         } else if dim <= 2048 {
             50
-        } else {
+        } else if dim <= 4096 {
             10
+        } else {
+            3
         };
 
         // Allocate device buffers once. Filled with deterministic small
