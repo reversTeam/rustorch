@@ -2279,6 +2279,158 @@ mod parity_tests {
         }
     }
 
+    /// T244.1.5 — full-decode bench réel : charge tous les Q4_K + Q6_K
+    /// matmul tensors d'un Qwen2.5-7B Q4_K_M GGUF (28 layers × 5 matmul =
+    /// 140 calls/token), upload sur GPU, et bench un decode complet.
+    #[test]
+    #[ignore = "real-data full decode bench"]
+    fn real_qwen7b_full_decode_bench() {
+        use rustorch_gguf::reader::GgufFile;
+        use rustorch_gguf::tensor::GgmlType;
+        use std::path::Path;
+        use std::time::Instant;
+
+        let path = Path::new(
+            "/home/triviere/projects/models/qwen2.5-7b-gguf/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
+        );
+        if !path.exists() {
+            eprintln!("[skip] {path:?} not found");
+            return;
+        }
+        let file = GgufFile::open(path).expect("open gguf");
+
+        let n_layers = 28usize;
+        let d = 3584usize;
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let mut h_dev = stream.alloc_zeros::<half::bf16>(d).expect("alloc h");
+        let mut buf_d = stream.alloc_zeros::<half::bf16>(d).expect("alloc buf_d");
+        let mut buf_qkv = stream.alloc_zeros::<half::bf16>(4096).expect("alloc qkv");
+        let mut buf_f = stream.alloc_zeros::<half::bf16>(18944).expect("alloc f");
+
+        // Per-layer (q, o, gate, up, down) tensor info.
+        struct L {
+            ptr: u64,
+            n: usize,
+            k: usize,
+            dt: GgmlType,
+        }
+        let mut layers: Vec<[L; 5]> = Vec::with_capacity(n_layers);
+        let mut weight_buffers: Vec<cudarc::driver::CudaSlice<u8>> = Vec::new();
+
+        let total_t0 = Instant::now();
+        for li in 0..n_layers {
+            let mut load = |name: String| -> L {
+                let info = file
+                    .tensor(&name)
+                    .unwrap_or_else(|| panic!("{name} not found"));
+                let bytes = file.tensor_bytes(info);
+                let n = info.shape[1] as usize;
+                let k = info.shape[0] as usize;
+                let buf = stream.memcpy_stod(bytes).expect("upload");
+                let ptr = unsafe {
+                    use cudarc::driver::DevicePtr;
+                    let (p, _g) = buf.device_ptr(&stream);
+                    p
+                };
+                weight_buffers.push(buf);
+                L {
+                    ptr,
+                    n,
+                    k,
+                    dt: info.dtype,
+                }
+            };
+            let q = load(format!("blk.{li}.attn_q.weight"));
+            let o = load(format!("blk.{li}.attn_output.weight"));
+            let g = load(format!("blk.{li}.ffn_gate.weight"));
+            let u = load(format!("blk.{li}.ffn_up.weight"));
+            let down = load(format!("blk.{li}.ffn_down.weight"));
+            layers.push([q, o, g, u, down]);
+        }
+        let load_secs = total_t0.elapsed().as_secs_f64();
+        eprintln!("Upload {n_layers} layers in {load_secs:.2}s");
+
+        let dispatch = |w_p: u64, dt: GgmlType, x_p: u64, y_p: u64, n: usize, k: usize| unsafe {
+            match dt {
+                GgmlType::Q4_K => {
+                    kernels
+                        .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                        .ok();
+                },
+                GgmlType::Q6_K => {
+                    kernels
+                        .sgemv_q6k_bf16(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                        .ok();
+                },
+                _ => panic!("dtype {dt:?} not supported"),
+            };
+        };
+
+        // Warm-up.
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let l0 = &layers[0];
+            let (h_p, _g1) = h_dev.device_ptr(&stream);
+            let (b_p, _g2) = buf_qkv.device_ptr_mut(&stream);
+            dispatch(l0[0].ptr, l0[0].dt, h_p, b_p, l0[0].n, d);
+            let (f_p, _g3) = buf_f.device_ptr_mut(&stream);
+            dispatch(l0[2].ptr, l0[2].dt, h_p, f_p, l0[2].n, d);
+        }
+        stream.synchronize().ok();
+
+        // Pre-extract device pointers (drop guards immediately ; pointers
+        // remain valid as long as the slices live).
+        let (h_p, qkv_p, d_p, f_p) = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a, _g1) = h_dev.device_ptr(&stream);
+            let (b, _g2) = buf_qkv.device_ptr_mut(&stream);
+            let (c, _g3) = buf_d.device_ptr_mut(&stream);
+            let (e, _g4) = buf_f.device_ptr_mut(&stream);
+            (a, b, c, e)
+        };
+
+        let n_iters = 30;
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            for l in &layers {
+                dispatch(l[0].ptr, l[0].dt, h_p, qkv_p, l[0].n, d);
+                dispatch(l[1].ptr, l[1].dt, h_p, d_p, l[1].n, d);
+                dispatch(l[2].ptr, l[2].dt, h_p, f_p, l[2].n, d);
+                dispatch(l[3].ptr, l[3].dt, h_p, f_p, l[3].n, d);
+                dispatch(l[4].ptr, l[4].dt, f_p, d_p, l[4].n, l[4].k);
+            }
+        }
+        stream.synchronize().ok();
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+        let tok_s = 1000.0 / elapsed_ms;
+
+        let total_bytes: usize = weight_buffers.iter().map(|b| b.len()).sum();
+        let bw_gb_s = total_bytes as f64 / (elapsed_ms * 1e-3) / 1e9;
+
+        eprintln!();
+        eprintln!("=== REAL Qwen2.5-7B Q4_K_M FULL DECODE BENCH ===");
+        eprintln!(
+            "  {n_layers} layers × 5 matmul = {} calls/token",
+            n_layers * 5
+        );
+        eprintln!("  total weights GPU : {:.2} GB", total_bytes as f64 / 1e9);
+        eprintln!("  per-token : {elapsed_ms:.2} ms = {tok_s:.2} tok/s");
+        eprintln!("  effective bandwidth: {bw_gb_s:.1} GB/s");
+        eprintln!();
+        eprintln!("  rustorch real Q4K+Q6K     : {tok_s:.2} tok/s");
+        eprintln!("  llama.cpp Q4_K_M Qwen-7B  : 47.15 tok/s");
+        eprintln!("  rustorch BF16 actuel      : 11.20 tok/s");
+        let r = tok_s / 47.15;
+        eprintln!(
+            "  ratio rustorch/llama.cpp  : {r:.2}× ({})",
+            if r >= 1.0 { "FASTER ✓" } else { "slower" }
+        );
+    }
+
     /// T244.1.4 — bench réel : lit les vrais Q4_K bytes d'un Qwen2.5-7B
     /// Q4_K_M GGUF et mesure sgemv_q4k_bf16_v2 dessus. Valide que le
     /// speedup tient sur vrai data avec scales et nibbles non-uniformes.
