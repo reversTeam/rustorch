@@ -277,6 +277,69 @@ fn main() -> Result<(), BenchError> {
         100.0 * fp4_tflops / 1000.0
     );
 
+    // ───────── NVFP4 + CUDA Graph (T240.8k) ─────────
+    // Capture les 4 matmuls FP4 en un CUDA Graph et replay N fois.
+    // Élimine totalement l'overhead de kernel launch (~5-10 µs × 4 matmuls
+    // × 50 iters = 1-2 ms qu'on peut récupérer). Sur les workloads FP4 où
+    // chaque matmul prend ~1 ms, ce sont des % gros à grappiller.
+    let skip_graph = std::env::var("RUSTORCH_SKIP_GRAPH")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !skip_graph {
+        println!();
+        println!("[qwen_block_bench] NVFP4 + CUDA Graph (T240.8k)");
+        match try_run_fp4_graph(
+            &ctx,
+            &act_fp4_dev,
+            &act_scale_dev,
+            &ffn_int_fp4_dev,
+            &ffn_int_scale_dev,
+            &w_qkv_fp4_dev,
+            &w_qkv_scale_dev,
+            &w_attn_out_fp4_dev,
+            &w_attn_out_scale_dev,
+            &w_ffn_gate_up_fp4_dev,
+            &w_ffn_gate_up_scale_dev,
+            &w_ffn_down_fp4_dev,
+            &w_ffn_down_scale_dev,
+            seq,
+            hidden,
+            qkv_n,
+            attn_out_n,
+            ffn_gate_up_n,
+            ffn_down_n,
+            ffn,
+            Fp4ScaleMode::Vec16Ue4m3,
+            Fp8Output::Bf16,
+            50,
+        ) {
+            Ok(graph_per_block_ms) => {
+                let g_per_forward = graph_per_block_ms * n_layers as f64;
+                let g_tok_s = (seq as f64 / g_per_forward) * 1000.0;
+                let g_tflops = flops_per_forward / 1e12 / (g_per_forward / 1000.0);
+                println!(
+                    "  per-block: {:.3} ms  |  per-forward (40 layers): {:.1} ms  |  prefill: {:.0} tok/s  |  effective {:.1} TFLOPS",
+                    graph_per_block_ms, g_per_forward, g_tok_s, g_tflops
+                );
+                println!(
+                    "[qwen_block_bench] FP4 → FP4+graph speedup: {:.2}× ({:.1} → {:.1} TFLOPS)",
+                    fp4_per_block_ms / graph_per_block_ms,
+                    fp4_tflops,
+                    g_tflops
+                );
+                println!(
+                    "[qwen_block_bench] gap to GB10 FP4-dense ceiling 427 TFLOPS: {:.1}%",
+                    100.0 * g_tflops / 427.0
+                );
+                println!(
+                    "[qwen_block_bench] gap to advertised 1000 TOPS: {:.1}%",
+                    100.0 * g_tflops / 1000.0
+                );
+            },
+            Err(e) => println!("  skipped: {}", e.0),
+        }
+    }
+
     // ───────── NVFP4 multi-stream (T240.8i) ─────────
     // Lancer N forwards concurrents sur N streams pour exploiter mieux les
     // SMs (workload = continuous batching prod). Throughput agrégé devrait
@@ -677,6 +740,184 @@ fn main() -> Result<(), BenchError> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn try_run_fp4_graph(
+    ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+    act_fp4: &cudarc::driver::CudaSlice<u8>,
+    act_scale: &cudarc::driver::CudaSlice<u8>,
+    ffn_int_fp4: &cudarc::driver::CudaSlice<u8>,
+    ffn_int_scale: &cudarc::driver::CudaSlice<u8>,
+    w_qkv: &cudarc::driver::CudaSlice<u8>,
+    w_qkv_scale: &cudarc::driver::CudaSlice<u8>,
+    w_attn_out: &cudarc::driver::CudaSlice<u8>,
+    w_attn_out_scale: &cudarc::driver::CudaSlice<u8>,
+    w_ffn_gate_up: &cudarc::driver::CudaSlice<u8>,
+    w_ffn_gate_up_scale: &cudarc::driver::CudaSlice<u8>,
+    w_ffn_down: &cudarc::driver::CudaSlice<u8>,
+    w_ffn_down_scale: &cudarc::driver::CudaSlice<u8>,
+    seq: usize,
+    hidden: usize,
+    qkv_n: usize,
+    attn_out_n: usize,
+    ffn_gate_up_n: usize,
+    ffn_down_n: usize,
+    ffn: usize,
+    scale_mode: rustorch_cuda::cublas_lt::Fp4ScaleMode,
+    out_dtype: rustorch_cuda::cublas_lt::Fp8Output,
+    iters: usize,
+) -> Result<f64, BenchError> {
+    use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use rustorch_cuda::cublas_lt::LtSession;
+    use std::time::Instant;
+
+    // Stream dédié pour la capture (le default stream peut ne pas l'accepter).
+    let cap_stream = ctx.new_stream()?;
+    let mut session = LtSession::new(cap_stream.clone())?;
+
+    // Output buffers locaux (pour ne pas interférer avec les paths déjà mesurés).
+    let mut out_qkv = cap_stream.alloc_zeros::<half::bf16>(seq * qkv_n)?;
+    let mut out_attn = cap_stream.alloc_zeros::<half::bf16>(seq * attn_out_n)?;
+    let mut out_gu = cap_stream.alloc_zeros::<half::bf16>(seq * ffn_gate_up_n)?;
+    let mut out_dn = cap_stream.alloc_zeros::<half::bf16>(seq * ffn_down_n)?;
+
+    // Warm-up : construit le cache cublasLt avant la capture (sinon le
+    // premier call alloue/builde des descripteurs qui ne sont pas
+    // capturables proprement).
+    for _ in 0..3 {
+        unsafe {
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(&cap_stream);
+                let (sa_p, _r2) = act_scale.device_ptr(&cap_stream);
+                let (b_p, _r3) = w_qkv.device_ptr(&cap_stream);
+                let (sb_p, _r4) = w_qkv_scale.device_ptr(&cap_stream);
+                let (c_p, _r5) = out_qkv.device_ptr_mut(&cap_stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, qkv_n, 1.0, 0.0, out_dtype, scale_mode,
+                )?;
+            }
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(&cap_stream);
+                let (sa_p, _r2) = act_scale.device_ptr(&cap_stream);
+                let (b_p, _r3) = w_attn_out.device_ptr(&cap_stream);
+                let (sb_p, _r4) = w_attn_out_scale.device_ptr(&cap_stream);
+                let (c_p, _r5) = out_attn.device_ptr_mut(&cap_stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, attn_out_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
+            }
+            {
+                let (a_p, _r1) = act_fp4.device_ptr(&cap_stream);
+                let (sa_p, _r2) = act_scale.device_ptr(&cap_stream);
+                let (b_p, _r3) = w_ffn_gate_up.device_ptr(&cap_stream);
+                let (sb_p, _r4) = w_ffn_gate_up_scale.device_ptr(&cap_stream);
+                let (c_p, _r5) = out_gu.device_ptr_mut(&cap_stream);
+                session.matmul_mxfp4(
+                    a_p,
+                    sa_p,
+                    b_p,
+                    sb_p,
+                    c_p,
+                    seq,
+                    hidden,
+                    ffn_gate_up_n,
+                    1.0,
+                    0.0,
+                    out_dtype,
+                    scale_mode,
+                )?;
+            }
+            {
+                let (a_p, _r1) = ffn_int_fp4.device_ptr(&cap_stream);
+                let (sa_p, _r2) = ffn_int_scale.device_ptr(&cap_stream);
+                let (b_p, _r3) = w_ffn_down.device_ptr(&cap_stream);
+                let (sb_p, _r4) = w_ffn_down_scale.device_ptr(&cap_stream);
+                let (c_p, _r5) = out_dn.device_ptr_mut(&cap_stream);
+                session.matmul_mxfp4(
+                    a_p, sa_p, b_p, sb_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0, out_dtype,
+                    scale_mode,
+                )?;
+            }
+        }
+    }
+    cap_stream.synchronize()?;
+
+    // Capture de UN bloc (4 matmuls). On replay ce bloc 50 fois.
+    cap_stream
+        .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+        .map_err(|e| BenchError(format!("begin_capture: {e:?}")))?;
+    unsafe {
+        {
+            let (a_p, _r1) = act_fp4.device_ptr(&cap_stream);
+            let (sa_p, _r2) = act_scale.device_ptr(&cap_stream);
+            let (b_p, _r3) = w_qkv.device_ptr(&cap_stream);
+            let (sb_p, _r4) = w_qkv_scale.device_ptr(&cap_stream);
+            let (c_p, _r5) = out_qkv.device_ptr_mut(&cap_stream);
+            session.matmul_mxfp4(
+                a_p, sa_p, b_p, sb_p, c_p, seq, hidden, qkv_n, 1.0, 0.0, out_dtype, scale_mode,
+            )?;
+        }
+        {
+            let (a_p, _r1) = act_fp4.device_ptr(&cap_stream);
+            let (sa_p, _r2) = act_scale.device_ptr(&cap_stream);
+            let (b_p, _r3) = w_attn_out.device_ptr(&cap_stream);
+            let (sb_p, _r4) = w_attn_out_scale.device_ptr(&cap_stream);
+            let (c_p, _r5) = out_attn.device_ptr_mut(&cap_stream);
+            session.matmul_mxfp4(
+                a_p, sa_p, b_p, sb_p, c_p, seq, hidden, attn_out_n, 1.0, 0.0, out_dtype, scale_mode,
+            )?;
+        }
+        {
+            let (a_p, _r1) = act_fp4.device_ptr(&cap_stream);
+            let (sa_p, _r2) = act_scale.device_ptr(&cap_stream);
+            let (b_p, _r3) = w_ffn_gate_up.device_ptr(&cap_stream);
+            let (sb_p, _r4) = w_ffn_gate_up_scale.device_ptr(&cap_stream);
+            let (c_p, _r5) = out_gu.device_ptr_mut(&cap_stream);
+            session.matmul_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                seq,
+                hidden,
+                ffn_gate_up_n,
+                1.0,
+                0.0,
+                out_dtype,
+                scale_mode,
+            )?;
+        }
+        {
+            let (a_p, _r1) = ffn_int_fp4.device_ptr(&cap_stream);
+            let (sa_p, _r2) = ffn_int_scale.device_ptr(&cap_stream);
+            let (b_p, _r3) = w_ffn_down.device_ptr(&cap_stream);
+            let (sb_p, _r4) = w_ffn_down_scale.device_ptr(&cap_stream);
+            let (c_p, _r5) = out_dn.device_ptr_mut(&cap_stream);
+            session.matmul_mxfp4(
+                a_p, sa_p, b_p, sb_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0, out_dtype, scale_mode,
+            )?;
+        }
+    }
+    let graph = cap_stream
+        .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+        .map_err(|e| BenchError(format!("end_capture: {e:?}")))?
+        .ok_or_else(|| BenchError("graph empty".into()))?;
+
+    // Replay timed
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        graph
+            .launch()
+            .map_err(|e| BenchError(format!("graph_launch: {e:?}")))?;
+    }
+    cap_stream.synchronize()?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    Ok(elapsed_ms / iters as f64)
 }
 
 #[cfg(feature = "cuda")]
