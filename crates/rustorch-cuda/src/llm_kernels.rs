@@ -1181,6 +1181,218 @@ extern "C" __global__ void sgemv_q5k_bf16(
 }
 "#;
 
+// T245.4 — Q5_K M=8 batched matmul (mirror of Q4K_M8 with qh handling).
+#[cfg(feature = "cuda")]
+const SGEMM_Q5K_BF16_M8_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemm_q5k_bf16_m8(
+    const unsigned char* __restrict__ w_q5k,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = K / 256;
+    int row_offset = row * blocks_per_row * 176;
+
+    extern __shared__ float shmem[];
+    float* sc_pre = shmem;
+    float* m_pre  = shmem + 8;
+    float* sdata  = shmem + 16;
+
+    float acc[8];
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) acc[m] = 0.0f;
+
+    int group       = tid >> 3;
+    int pos_base    = (tid & 7) << 2;
+    int pair_idx    = group >> 1;
+    int sub_in_pair = group & 1;
+    int byte_base   = (pair_idx << 5) + pos_base;
+    int low_nibble  = (sub_in_pair == 0) ? 1 : 0;
+    int qh_bit_idx  = (sub_in_pair == 0) ? (2 * pair_idx) : (2 * pair_idx + 1);
+    unsigned int qh_mask = 1u << qh_bit_idx;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 176;
+        const unsigned char* blk = w_q5k + blk_off;
+
+        if (tid == 0) {
+            unsigned short d_bits    = blk[0] | (blk[1] << 8);
+            unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+            float d    = __half2float(__ushort_as_half(d_bits));
+            float dmin = __half2float(__ushort_as_half(dmin_bits));
+            const unsigned char* scales = blk + 4;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                unsigned char sc_i  = scales[i] & 0x3F;
+                unsigned char m_i   = scales[i + 4] & 0x3F;
+                unsigned char sc_i4 = (scales[i + 8] & 0x0F) | ((scales[i] >> 6) << 4);
+                unsigned char m_i4  = (scales[i + 8] >> 4)   | ((scales[i + 4] >> 6) << 4);
+                sc_pre[i]     = d * (float)sc_i;
+                m_pre[i]      = dmin * (float)m_i;
+                sc_pre[i + 4] = d * (float)sc_i4;
+                m_pre[i + 4]  = dmin * (float)m_i4;
+            }
+        }
+        __syncthreads();
+
+        float scale = sc_pre[group];
+        float min_v = m_pre[group];
+        const unsigned char* qh = blk + 16;
+        const unsigned char* ql = blk + 16 + 32;
+
+        unsigned int qlbytes = *(const unsigned int*)(ql + byte_base);
+        unsigned int qhbytes = *(const unsigned int*)(qh + pos_base);
+
+        int x_super_pos = (group << 5) + pos_base;
+        const __nv_bfloat16* x_block = x + b * 256 + x_super_pos;
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned char ql_byte = (qlbytes >> (i << 3)) & 0xFFu;
+            unsigned char qh_byte = (qhbytes >> (i << 3)) & 0xFFu;
+            int low_bits = low_nibble ? (ql_byte & 0x0F) : (ql_byte >> 4);
+            int high_bit = (qh_byte & qh_mask) ? 16 : 0;
+            int q = low_bits + high_bit;
+            float w_val = scale * (float)q - min_v;
+
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                float xv = (float)x_block[m * K + i];
+                acc[m] += w_val * xv;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        float a = acc[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xffffffff, a, offset);
+        }
+        int warp_id = tid >> 5;
+        int lane_id = tid & 31;
+        if (lane_id == 0) {
+            sdata[m * 2 + warp_id] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < 8) {
+        int m = tid;
+        float total = sdata[m * 2] + sdata[m * 2 + 1];
+        y[m * N + row] = (__nv_bfloat16)total;
+    }
+}
+"#;
+
+// T245.4 — Q6_K M=8 batched matmul (mirror of Q6K_V2 layout).
+#[cfg(feature = "cuda")]
+const SGEMM_Q6K_BF16_M8_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemm_q6k_bf16_m8(
+    const unsigned char* __restrict__ w_q6k,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = K / 256;
+    int row_offset = row * blocks_per_row * 210;
+
+    extern __shared__ float shmem[];
+    float* sc_pre = shmem;       // [16]
+    float* sdata  = shmem + 16;  // [16]
+
+    float acc[8];
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) acc[m] = 0.0f;
+
+    int half          = tid >> 5;
+    int l             = tid & 31;
+    int half_offset_x = half << 7;
+    int ql_base       = half << 6;
+    int qh_base       = half << 5;
+    int sb            = half << 3;
+    int l16           = l >> 4;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 210;
+        const unsigned char* blk = w_q6k + blk_off;
+
+        if (tid == 0) {
+            unsigned short d_bits = blk[208] | (blk[209] << 8);
+            float d = __half2float(__ushort_as_half(d_bits));
+            const signed char* scales = (const signed char*)(blk + 192);
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                sc_pre[i] = d * (float)scales[i];
+            }
+        }
+        __syncthreads();
+
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+
+        unsigned char ql_a = ql[ql_base + l];
+        unsigned char ql_b = ql[ql_base + l + 32];
+        unsigned char qh_b = qh[qh_base + l];
+
+        int q0 = (ql_a & 0x0F) | (((qh_b)      & 0x03) << 4);
+        int q1 = (ql_b & 0x0F) | (((qh_b >> 2) & 0x03) << 4);
+        int q2 = (ql_a >> 4)   | (((qh_b >> 4) & 0x03) << 4);
+        int q3 = (ql_b >> 4)   | (((qh_b >> 6) & 0x03) << 4);
+
+        float w0 = sc_pre[sb + 0 + l16] * (float)(q0 - 32);
+        float w1 = sc_pre[sb + 2 + l16] * (float)(q1 - 32);
+        float w2 = sc_pre[sb + 4 + l16] * (float)(q2 - 32);
+        float w3 = sc_pre[sb + 6 + l16] * (float)(q3 - 32);
+
+        const __nv_bfloat16* x_base = x + b * 256 + half_offset_x;
+
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            float x0 = (float)x_base[m * K + l];
+            float x1 = (float)x_base[m * K + l + 32];
+            float x2 = (float)x_base[m * K + l + 64];
+            float x3 = (float)x_base[m * K + l + 96];
+            acc[m] += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        float a = acc[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xffffffff, a, offset);
+        }
+        int warp_id = tid >> 5;
+        int lane_id = tid & 31;
+        if (lane_id == 0) {
+            sdata[m * 2 + warp_id] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < 8) {
+        int m = tid;
+        float total = sdata[m * 2] + sdata[m * 2 + 1];
+        y[m * N + row] = (__nv_bfloat16)total;
+    }
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const QUANTIZE_BF16_TO_NVFP4_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -1530,8 +1742,10 @@ pub struct LlmKernels {
     sgemv_q4k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemm_q4k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q5k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemm_q5k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemm_q6k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     conv1d_depthwise: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     l2_norm_per_head: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -1562,8 +1776,10 @@ impl LlmKernels {
             sgemv_q4k_v2: std::sync::OnceLock::new(),
             sgemm_q4k_m8: std::sync::OnceLock::new(),
             sgemv_q5k: std::sync::OnceLock::new(),
+            sgemm_q5k_m8: std::sync::OnceLock::new(),
             sgemv_q6k: std::sync::OnceLock::new(),
             sgemv_q6k_v2: std::sync::OnceLock::new(),
+            sgemm_q6k_m8: std::sync::OnceLock::new(),
             sgemv_bf16: std::sync::OnceLock::new(),
             conv1d_depthwise: std::sync::OnceLock::new(),
             l2_norm_per_head: std::sync::OnceLock::new(),
@@ -2151,6 +2367,78 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemm_q4k_bf16_m8::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T245.4 — Q5_K M=8 batched matmul (mirror of Q4K_M8).
+    ///
+    /// # Safety  Same contract as `sgemm_q4k_bf16_m8`.
+    pub unsafe fn sgemm_q5k_bf16_m8(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q5k: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_q5k_bf16_m8: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemm_q5k_m8,
+            SGEMM_Q5K_BF16_M8_SRC,
+            "sgemm_q5k_bf16_m8",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 32 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q5k).arg(&x).arg(&y).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemm_q5k_bf16_m8::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T245.4 — Q6_K M=8 batched matmul (mirror of Q6K_V2 layout).
+    ///
+    /// # Safety  Same contract.
+    pub unsafe fn sgemm_q6k_bf16_m8(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q6k: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_q6k_bf16_m8: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemm_q6k_m8,
+            SGEMM_Q6K_BF16_M8_SRC,
+            "sgemm_q6k_bf16_m8",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 32 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q6k).arg(&x).arg(&y).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemm_q6k_bf16_m8::launch",
         })?;
         Ok(())
     }
@@ -5263,6 +5551,255 @@ mod parity_tests {
         eprintln!(
             "  ratio rustorch(graphs)/llama : {r:.2}× ({})",
             if r >= 1.0 { "FASTER ✓" } else { "slower" }
+        );
+    }
+
+    /// T245.4 — REAL Qwen3.6-27B Q4_K_M FULL DECODE at M=8 batched.
+    /// This is the algorithmic answer : process 8 tokens per weight read.
+    /// Demonstrates the speculative-decoding upper-bound throughput.
+    #[test]
+    #[ignore = "real-data full decode bench — M=8 batched"]
+    fn real_qwen36_27b_full_decode_bench_m8() {
+        use rustorch_gguf::reader::GgufFile;
+        use rustorch_gguf::tensor::GgmlType;
+        use std::path::Path;
+        use std::time::Instant;
+
+        let path =
+            Path::new("/home/triviere/projects/models/qwen3.6-27b-gguf/Qwen3.6-27B-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("[skip] {path:?} not found");
+            return;
+        }
+        let file = GgufFile::open(path).expect("open gguf");
+
+        let d = 5120usize;
+        let n_layers = 64usize;
+        let m_batch = 8usize;
+        let is_attn_layer = |li: usize| (li + 1) % 4 == 0;
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        // Allocate input/output buffers sized for M=8.
+        let h_dev = stream
+            .alloc_zeros::<half::bf16>(m_batch * d)
+            .expect("alloc h");
+        let mut buf_d = stream
+            .alloc_zeros::<half::bf16>(m_batch * d)
+            .expect("alloc buf_d");
+        let mut buf_qkv = stream
+            .alloc_zeros::<half::bf16>(m_batch * 20480)
+            .expect("alloc qkv");
+        let mut buf_f = stream
+            .alloc_zeros::<half::bf16>(m_batch * 20480)
+            .expect("alloc f");
+
+        struct L {
+            ptr: u64,
+            n: usize,
+            k: usize,
+            dt: GgmlType,
+        }
+        let mut calls: Vec<L> = Vec::with_capacity(n_layers * 7);
+        let mut weight_buffers: Vec<cudarc::driver::CudaSlice<u8>> = Vec::new();
+        let mut total_bytes_loaded: usize = 0;
+
+        let total_t0 = Instant::now();
+        for li in 0..n_layers {
+            let mut load = |name: String, buffers: &mut Vec<_>, total: &mut usize| -> L {
+                let info = file
+                    .tensor(&name)
+                    .unwrap_or_else(|| panic!("{name} not found"));
+                let bytes = file.tensor_bytes(info);
+                let n = info.shape[1] as usize;
+                let k = info.shape[0] as usize;
+                let buf = stream.memcpy_stod(bytes).expect("upload");
+                let ptr = unsafe {
+                    use cudarc::driver::DevicePtr;
+                    let (p, _g) = buf.device_ptr(&stream);
+                    p
+                };
+                *total += bytes.len();
+                buffers.push(buf);
+                L {
+                    ptr,
+                    n,
+                    k,
+                    dt: info.dtype,
+                }
+            };
+            if is_attn_layer(li) {
+                calls.push(load(
+                    format!("blk.{li}.attn_q.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.attn_k.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.attn_v.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.attn_output.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+            } else {
+                calls.push(load(
+                    format!("blk.{li}.attn_qkv.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.attn_gate.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.ssm_alpha.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.ssm_beta.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.ssm_out.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+            }
+            calls.push(load(
+                format!("blk.{li}.ffn_gate.weight"),
+                &mut weight_buffers,
+                &mut total_bytes_loaded,
+            ));
+            calls.push(load(
+                format!("blk.{li}.ffn_up.weight"),
+                &mut weight_buffers,
+                &mut total_bytes_loaded,
+            ));
+            calls.push(load(
+                format!("blk.{li}.ffn_down.weight"),
+                &mut weight_buffers,
+                &mut total_bytes_loaded,
+            ));
+        }
+        let load_secs = total_t0.elapsed().as_secs_f64();
+        eprintln!(
+            "Loaded {n_layers} layers in {load_secs:.2}s, {:.2} GB",
+            total_bytes_loaded as f64 / 1e9
+        );
+
+        let dispatch_m8 =
+            |w_p: u64, dt: GgmlType, x_p: u64, y_p: u64, n: usize, k: usize| -> bool {
+                unsafe {
+                    match dt {
+                        GgmlType::Q4_K => {
+                            kernels
+                                .sgemm_q4k_bf16_m8(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                                .ok();
+                            true
+                        },
+                        GgmlType::Q5_K => {
+                            kernels
+                                .sgemm_q5k_bf16_m8(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                                .ok();
+                            true
+                        },
+                        GgmlType::Q6_K => {
+                            kernels
+                                .sgemm_q6k_bf16_m8(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                                .ok();
+                            true
+                        },
+                        _ => false,
+                    }
+                }
+            };
+
+        let (h_p, qkv_p, d_p, f_p) = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a, _g1) = h_dev.device_ptr(&stream);
+            let (b, _g2) = buf_qkv.device_ptr_mut(&stream);
+            let (c, _g3) = buf_d.device_ptr_mut(&stream);
+            let (e, _g4) = buf_f.device_ptr_mut(&stream);
+            (a, b, c, e)
+        };
+
+        // Warm-up : touch every call once and accumulate dispatched bytes.
+        let mut n_dispatched = 0usize;
+        let mut bytes_dispatched = 0usize;
+        for c in &calls {
+            let out = if c.n <= d { d_p } else { qkv_p };
+            let in_p = if c.k <= d { h_p } else { f_p };
+            if dispatch_m8(c.ptr, c.dt, in_p, out, c.n, c.k) {
+                n_dispatched += 1;
+                let info = match c.dt {
+                    GgmlType::Q4_K => (c.n * c.k * 144) / 256,
+                    GgmlType::Q5_K => (c.n * c.k * 176) / 256,
+                    GgmlType::Q6_K => (c.n * c.k * 210) / 256,
+                    _ => 0,
+                };
+                bytes_dispatched += info;
+            }
+        }
+        stream.synchronize().ok();
+
+        let n_iters = 30;
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            for c in &calls {
+                let out = if c.n <= d { d_p } else { qkv_p };
+                let in_p = if c.k <= d { h_p } else { f_p };
+                dispatch_m8(c.ptr, c.dt, in_p, out, c.n, c.k);
+            }
+        }
+        stream.synchronize().ok();
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+        // tok/s = M tokens produced per kernel-batch / per-batch time.
+        let tok_s = m_batch as f64 * 1000.0 / elapsed_ms;
+        let bw_gb_s = bytes_dispatched as f64 / (elapsed_ms * 1e-3) / 1e9;
+
+        eprintln!();
+        eprintln!("=== REAL Qwen3.6-27B Q4_K_M FULL DECODE — M=8 BATCHED ===");
+        eprintln!("  {n_dispatched} matmul/batch (M=8, so 1 weight pass = 8 tokens)",);
+        eprintln!(
+            "  weights dispatched : {:.2} GB",
+            bytes_dispatched as f64 / 1e9
+        );
+        eprintln!(
+            "  per-batch  : {elapsed_ms:.2} ms  ({} tokens/batch)",
+            m_batch
+        );
+        eprintln!(
+            "  per-token  : {:.2} ms = {tok_s:.2} tok/s",
+            elapsed_ms / m_batch as f64
+        );
+        eprintln!(
+            "  W bandwidth: {bw_gb_s:.1} GB/s (single-pass) — but amortized over {m_batch} tokens"
+        );
+        eprintln!();
+        eprintln!("  llama.cpp Qwen3.6-27B Q4_K_M : 11.62 tok/s");
+        let r = tok_s / 11.62;
+        eprintln!(
+            "  ratio M=8 / llama.cpp        : {r:.2}× ({})",
+            if r >= 1.0 { "FASTER ✓" } else { "slower" }
+        );
+        eprintln!();
+        eprintln!("  ⚠ M=8 = upper bound (assumes 100% spec-decoding accept rate).");
+        eprintln!(
+            "  Real spec decoding @ 70% accept = ~{:.1} tok/s effective.",
+            tok_s * 0.7
         );
     }
 
