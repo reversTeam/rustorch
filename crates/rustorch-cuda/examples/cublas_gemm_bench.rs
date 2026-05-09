@@ -201,7 +201,7 @@ fn main() -> Result<(), BenchError> {
         let workspace_size = 32 * 1024 * 1024usize;
         let workspace_dev = stream.alloc_zeros::<u8>(workspace_size)?;
 
-        let fp8_attempt = || -> Result<f64, BenchError> {
+        let mut fp8_attempt = || -> Result<f64, BenchError> {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
             // Warm-up.
             for _ in 0..5 {
