@@ -433,6 +433,10 @@ impl LtSession {
     /// # Safety
     /// Caller must ensure the dtype tags + shapes match the buffers it
     /// will pass to `dispatch`.
+    /// `seed_a_scale` / `seed_b_scale` only matter on first build (must be
+    /// non-null when `scale_mode` is set, so the heuristic search can
+    /// validate the desc). Real per-call pointers are bound by the matmul
+    /// methods via `set_matmul_desc_attribute`.
     #[allow(clippy::too_many_arguments)]
     unsafe fn get_or_build(
         &mut self,
@@ -443,6 +447,8 @@ impl LtSession {
         b_dt: sys::cudaDataType_t,
         c_dt: sys::cudaDataType_t,
         scale_mode: Option<Fp4ScaleMode>,
+        seed_a_scale: u64,
+        seed_b_scale: u64,
     ) -> Result<&CachedMatmul, CudaError> {
         let key = ConfigKey {
             m: m as u32,
@@ -471,6 +477,8 @@ impl LtSession {
                 c_dt,
                 scale_mode,
                 self.workspace_bytes,
+                seed_a_scale,
+                seed_b_scale,
             )?;
             self.cache.insert(key, cached);
         }
@@ -508,6 +516,8 @@ impl LtSession {
             kind.cuda_type(),
             out.cuda_type(),
             None,
+            0,
+            0,
         )? as *const CachedMatmul; // SAFETY-borrow workaround for self.workspace
         let cached = &*cached;
         let workspace_ptr = {
@@ -578,6 +588,8 @@ impl LtSession {
             sys::cudaDataType_t::CUDA_R_4F_E2M1,
             out.cuda_type(),
             Some(scale_mode),
+            a_scale_dev,
+            b_scale_dev,
         )? as *const CachedMatmul;
         let cached = &*cached;
 
@@ -660,6 +672,8 @@ unsafe fn build_cached(
     c_dt: sys::cudaDataType_t,
     scale_mode: Option<Fp4ScaleMode>,
     workspace_bytes: usize,
+    seed_a_scale: u64,
+    seed_b_scale: u64,
 ) -> Result<CachedMatmul, CudaError> {
     let a_layout =
         result::create_matrix_layout(a_dt, k as u64, m as u64, k as i64).map_err(|e| {
@@ -737,6 +751,31 @@ unsafe fn build_cached(
             code: lt_err_code(e),
             location: "build_cached::set_b_scale_mode",
         })?;
+        // Seed scale pointers — heuristic search rejects desc with NULL
+        // scale pointers when a scale mode is set. Real per-call pointers
+        // are rebound by the matmul method before each dispatch.
+        result::set_matmul_desc_attribute(
+            matmul_desc,
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            (&seed_a_scale) as *const _ as *const _,
+            std::mem::size_of::<u64>(),
+        )
+        .map_err(|e| CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached::set_a_scale_ptr_seed",
+        })?;
+        result::set_matmul_desc_attribute(
+            matmul_desc,
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            (&seed_b_scale) as *const _ as *const _,
+            std::mem::size_of::<u64>(),
+        )
+        .map_err(|e| CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached::set_b_scale_ptr_seed",
+        })?;
+    } else {
+        let _ = (seed_a_scale, seed_b_scale);
     }
 
     let pref = result::create_matmul_pref().map_err(|e| CudaError::CublasStatus {
