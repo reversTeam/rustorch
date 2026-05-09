@@ -211,6 +211,100 @@ fn run_bf16_block(
     // measures the dense compute envelope of one Qwen-style block.
     let _ = ffn_gate_n;
 
+    // T240.8b — opt-in multi-algo autotune. Set RUSTORCH_CUBLASLT_AUTOTUNE=1
+    // to query top-N candidate algos for each shape and pick the fastest.
+    // Adds ~100-300 ms one-time cost up front; pays back in the timed loop.
+    let autotune = std::env::var("RUSTORCH_CUBLASLT_AUTOTUNE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if autotune {
+        let n_candidates: u32 = std::env::var("RUSTORCH_CUBLASLT_AUTOTUNE_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let n_passes: u32 = 5;
+        unsafe {
+            let (a_p, _r1) = act.device_ptr(stream);
+            let (b_qkv, _r2) = w_qkv.device_ptr(stream);
+            let (c_qkv, _r3) = out_qkv.device_ptr_mut(stream);
+            let ms_qkv = session.autotune_bf16(
+                a_p,
+                b_qkv,
+                c_qkv,
+                seq,
+                hidden,
+                qkv_n,
+                n_candidates,
+                n_passes,
+            )?;
+            println!("[autotune]   QKV proj  m={seq} k={hidden} n={qkv_n}   best={ms_qkv:.3} ms");
+        }
+        unsafe {
+            let (a_p, _r1) = act.device_ptr(stream);
+            let (b_p, _r2) = w_attn_out.device_ptr(stream);
+            let (c_p, _r3) = out_attn.device_ptr_mut(stream);
+            let ms = session.autotune_bf16(
+                a_p,
+                b_p,
+                c_p,
+                seq,
+                hidden,
+                attn_out_n,
+                n_candidates,
+                n_passes,
+            )?;
+            println!("[autotune]   Attn out  m={seq} k={hidden} n={attn_out_n}   best={ms:.3} ms");
+        }
+        unsafe {
+            let (a_p, _r1) = act.device_ptr(stream);
+            let (b_p, _r2) = w_ffn_up.device_ptr(stream);
+            let (c_p, _r3) = out_up.device_ptr_mut(stream);
+            let ms = session.autotune_bf16(
+                a_p,
+                b_p,
+                c_p,
+                seq,
+                hidden,
+                ffn_up_n,
+                n_candidates,
+                n_passes,
+            )?;
+            println!("[autotune]   FFN up    m={seq} k={hidden} n={ffn_up_n}   best={ms:.3} ms");
+        }
+        unsafe {
+            let (a_p, _r1) = act.device_ptr(stream);
+            let (b_p, _r2) = w_ffn_gate.device_ptr(stream);
+            let (c_p, _r3) = out_gate.device_ptr_mut(stream);
+            let ms = session.autotune_bf16(
+                a_p,
+                b_p,
+                c_p,
+                seq,
+                hidden,
+                ffn_up_n,
+                n_candidates,
+                n_passes,
+            )?;
+            println!("[autotune]   FFN gate  m={seq} k={hidden} n={ffn_up_n}   best={ms:.3} ms");
+        }
+        unsafe {
+            let (a_p, _r1) = out_up.device_ptr(stream);
+            let (b_p, _r2) = w_ffn_down.device_ptr(stream);
+            let (c_p, _r3) = out_down.device_ptr_mut(stream);
+            let ms = session.autotune_bf16(
+                a_p,
+                b_p,
+                c_p,
+                seq,
+                ffn,
+                ffn_down_n,
+                n_candidates,
+                n_passes,
+            )?;
+            println!("[autotune]   FFN down  m={seq} k={ffn} n={ffn_down_n}   best={ms:.3} ms");
+        }
+    }
+
     // Warm-up.
     for _ in 0..3 {
         unsafe {

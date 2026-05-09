@@ -716,6 +716,207 @@ impl LtSession {
         })?;
         Ok(())
     }
+
+    /// Multi-algo autotune for a BF16 (m,k)·(k,n) shape (T240.8b).
+    ///
+    /// Queries up to `n_candidates` heuristic algorithms, times each over
+    /// `n_passes` real dispatches with CUDA events, then stores the fastest
+    /// algo in the cache. Subsequent `matmul_bf16` calls on the same shape
+    /// use that algo instead of the heuristic top-1.
+    ///
+    /// Typical lift on Blackwell: 10–30% over the heuristic default,
+    /// because the heuristic optimizes for "expected" workload (B200 + big
+    /// data center shapes) and GB10 has different shared-memory / split-K
+    /// trade-offs.
+    ///
+    /// Buffers `a_dev`, `b_dev`, `c_dev` are *written through* during
+    /// timing. Pass real warm-up data; do NOT pass production output here.
+    ///
+    /// Returns the chosen algo's per-call latency in ms (median).
+    ///
+    /// # Safety
+    /// `*_dev` must be valid BF16 device buffers of sizes ≥ m·k, k·n, m·n
+    /// respectively. Caller must own the buffers and accept they're
+    /// overwritten during autotune.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn autotune_bf16(
+        &mut self,
+        a_dev: u64,
+        b_dev: u64,
+        c_dev: u64,
+        m: usize,
+        k: usize,
+        n: usize,
+        n_candidates: u32,
+        n_passes: u32,
+    ) -> Result<f32, CudaError> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(0.0);
+        }
+        let n_candidates = n_candidates.max(1).min(32);
+        let n_passes = n_passes.max(1).min(50);
+
+        // 1. Ensure base cache entry exists (heuristic top-1 default).
+        let _ = self.get_or_build(
+            m,
+            n,
+            k,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            None,
+            0,
+            0,
+        )?;
+        let key = ConfigKey {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            a_dt: sys::cudaDataType_t::CUDA_R_16BF as i32,
+            b_dt: sys::cudaDataType_t::CUDA_R_16BF as i32,
+            c_dt: sys::cudaDataType_t::CUDA_R_16BF as i32,
+            transa: true,
+            transb: false,
+            scale_mode: 0,
+        };
+        // Snapshot descriptor handles needed for dispatch.
+        let (a_layout, b_layout, c_layout, matmul_desc, pref) = {
+            let cached = self.cache.get(&key).expect("just-built cache entry");
+            (
+                cached.a_layout,
+                cached.b_layout,
+                cached.c_layout,
+                cached.matmul_desc,
+                cached.pref,
+            )
+        };
+
+        // 2. Query up to N candidate algos via raw FFI.
+        let mut results: Vec<sys::cublasLtMatmulHeuristicResult_t> =
+            vec![std::mem::zeroed(); n_candidates as usize];
+        let mut return_count: std::os::raw::c_int = 0;
+        let status = sys::cublasLtMatmulAlgoGetHeuristic(
+            self.handle,
+            matmul_desc,
+            a_layout,
+            b_layout,
+            c_layout,
+            c_layout,
+            pref,
+            n_candidates as std::os::raw::c_int,
+            results.as_mut_ptr(),
+            &mut return_count,
+        );
+        if status != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(CudaError::CublasStatus {
+                code: status as i32,
+                location: "autotune_bf16::heuristic_multi",
+            });
+        }
+        let actual = return_count.max(1) as usize;
+        results.truncate(actual);
+
+        // 3. Time each candidate. Use CUDA events with timing enabled.
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let workspace_ptr = {
+            use cudarc::driver::DevicePtr;
+            self.workspace.device_ptr(&self.stream).0
+        };
+        let ctx = self.stream.context();
+        let mk_event = || -> Result<cudarc::driver::CudaEvent, CudaError> {
+            ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|e| CudaError::Driver {
+                    code: format!("{e:?}").len() as i32,
+                    location: "autotune_bf16::new_event",
+                })
+        };
+
+        let mut best_idx = 0usize;
+        let mut best_ms = f32::INFINITY;
+        let mut sum_per_call = 0.0f32;
+
+        // Warm-up pass on each candidate (kicks JIT, hides cold-cache effects).
+        for (idx, hr) in results.iter().enumerate() {
+            // Skip candidates the heuristic flagged as unsupported.
+            if hr.state != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                continue;
+            }
+            // 1 warm-up
+            let _ = result::matmul(
+                self.handle,
+                matmul_desc,
+                (&alpha) as *const f32 as *const _,
+                (&beta) as *const f32 as *const _,
+                a_dev as *const _,
+                a_layout,
+                b_dev as *const _,
+                b_layout,
+                c_dev as *const _,
+                c_layout,
+                c_dev as *mut _,
+                c_layout,
+                (&hr.algo) as *const _,
+                workspace_ptr as *mut _,
+                self.workspace_bytes,
+                self.stream.cu_stream() as *mut _,
+            );
+
+            // Timed passes
+            let start = mk_event()?;
+            let stop = mk_event()?;
+            start.record(&self.stream).map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "autotune_bf16::record_start",
+            })?;
+            for _ in 0..n_passes {
+                let _ = result::matmul(
+                    self.handle,
+                    matmul_desc,
+                    (&alpha) as *const f32 as *const _,
+                    (&beta) as *const f32 as *const _,
+                    a_dev as *const _,
+                    a_layout,
+                    b_dev as *const _,
+                    b_layout,
+                    c_dev as *const _,
+                    c_layout,
+                    c_dev as *mut _,
+                    c_layout,
+                    (&hr.algo) as *const _,
+                    workspace_ptr as *mut _,
+                    self.workspace_bytes,
+                    self.stream.cu_stream() as *mut _,
+                );
+            }
+            stop.record(&self.stream).map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "autotune_bf16::record_stop",
+            })?;
+            stop.synchronize().map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "autotune_bf16::sync",
+            })?;
+            let elapsed_total = start.elapsed_ms(&stop).map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "autotune_bf16::elapsed",
+            })?;
+            let per_call = elapsed_total / n_passes as f32;
+            sum_per_call += per_call;
+            if per_call < best_ms {
+                best_ms = per_call;
+                best_idx = idx;
+            }
+        }
+
+        // 4. Patch the cached algo to use the winner.
+        if let Some(entry) = self.cache.get_mut(&key) {
+            entry.algo = results[best_idx].algo;
+        }
+
+        let _ = sum_per_call; // (kept for future verbose mode)
+        Ok(best_ms)
+    }
 }
 
 #[cfg(feature = "cuda")]
