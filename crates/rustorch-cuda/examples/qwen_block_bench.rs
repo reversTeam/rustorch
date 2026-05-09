@@ -73,7 +73,11 @@ fn main() -> Result<(), BenchError> {
     let n_kv = 2usize;
     let head_dim = 256usize;
     let n_layers = 40usize;
-    let seq = 2048usize;
+    // Override seq via RUSTORCH_BENCH_SEQ to test scaling (1024/2048/4096/8192).
+    let seq = std::env::var("RUSTORCH_BENCH_SEQ")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2048);
 
     let qkv_n = n_heads * head_dim + 2 * n_kv * head_dim; // 16*256 + 2*2*256 = 5120
     let attn_out_n = hidden;
