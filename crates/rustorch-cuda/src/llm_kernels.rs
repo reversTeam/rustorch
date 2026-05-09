@@ -497,6 +497,167 @@ extern "C" __global__ void sgemv_q4k_bf16_v2(
 "#;
 
 #[cfg(feature = "cuda")]
+const CONV1D_DEPTHWISE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// T243.2 — depth-wise 1-D convolution for Qwen3.5/3.6 SSM block.
+//
+// For each channel c, compute :
+//   out[c] = sum_{t=0..K-1} weight[t, c] * window[t, c]
+// where window = (kernel-1) past inputs (state) + current input (qkv_mixed).
+// State is rolled : new state = window[1..K-1] then current input at last slot.
+//
+// Layout :
+//   weight   : [kernel_size, conv_dim] row-major
+//   state    : [(kernel_size - 1), conv_dim] (rolling history)
+//   input    : [conv_dim] (current step)
+//   out      : [conv_dim]
+//
+// This is a per-channel reduction — block dim = conv_dim, 1 thread per channel.
+extern "C" __global__ void conv1d_depthwise_bf16(
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ state,        // (kernel-1, conv_dim) ring buffer
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ out,
+    int conv_dim,
+    int kernel_size
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+
+    float acc = 0.0f;
+    // Window: state[0..K-2] then input at slot K-1.
+    for (int t = 0; t < kernel_size - 1; ++t) {
+        float v = (float)state[t * conv_dim + c];
+        float w = (float)weight[t * conv_dim + c];
+        acc += v * w;
+    }
+    float v = (float)input[c];
+    float w = (float)weight[(kernel_size - 1) * conv_dim + c];
+    acc += v * w;
+    out[c] = (__nv_bfloat16)acc;
+
+    // Update state: shift left by 1 timestep, append input at last slot.
+    if (kernel_size >= 2) {
+        for (int t = 0; t < kernel_size - 2; ++t) {
+            state[t * conv_dim + c] = state[(t + 1) * conv_dim + c];
+        }
+        state[(kernel_size - 2) * conv_dim + c] = input[c];
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const L2_NORM_PER_HEAD_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// T243.2 — per-head L2 normalization for Q/K in Qwen3.5/3.6 SSM.
+// x : [n_heads, head_dim] BF16, normalized in-place per head.
+// Each TG = one head. Within TG, head_dim threads cooperate on sum-of-squares
+// reduction, then each thread normalizes its element.
+extern "C" __global__ void l2_norm_per_head_bf16(
+    __nv_bfloat16* __restrict__ x,
+    int n_heads,
+    int head_dim,
+    float eps
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+
+    extern __shared__ float sdata[];
+
+    // Load value + compute square.
+    float v = (float)x[h * head_dim + tid];
+    float vsq = v * v;
+    sdata[tid] = vsq;
+    __syncthreads();
+
+    // Tree reduction over head_dim threads.
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < head_dim) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float inv_norm = rsqrtf(sdata[0] + eps);
+    x[h * head_dim + tid] = (__nv_bfloat16)(v * inv_norm);
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const DELTA_NET_STEP_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// T243.2 — Qwen3.5/3.6 Gated DeltaNet recurrent step.
+//
+// For each head h in 0..n_heads :
+//   state[h] = exp(g[h]) * state[h] + beta[h] * outer(v[h], k[h])
+//   out[h]   = state[h] @ q[h]
+// where state[h] is a [head_dim × head_dim] matrix.
+//
+// Layout (single token decode) :
+//   q, k, v : [n_heads, head_dim] BF16
+//   gate, beta : [n_heads] BF16 (per-head scalar gates)
+//   state : [n_heads, head_dim, head_dim] BF16 (rolling state, mutated)
+//   out : [n_heads, head_dim] BF16
+//
+// Each TG handles ONE head, with head_dim threads each handling ONE row r
+// of the state[h] matrix (r ∈ 0..head_dim).
+//
+// Within thread r :
+//   for c in 0..head_dim :
+//     state[h, r, c] = g_exp * state[h, r, c] + beta * v_h[r] * k_h[c]
+//     out_acc += state[h, r, c] * q_h[c]
+//   out[h, r] = out_acc
+//
+// Compute per head : O(head_dim²). For Qwen3.6 head_dim=128 → 16K ops/head.
+// 48 heads × 64 layers × 16K = 50M ops/token = negligible vs matmul.
+extern "C" __global__ void delta_net_step_bf16(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ gate,    // [n_heads]
+    const __nv_bfloat16* __restrict__ beta,    // [n_heads]
+    __nv_bfloat16* __restrict__ state,          // [n_heads, head_dim, head_dim]
+    __nv_bfloat16* __restrict__ out,
+    int n_heads,
+    int head_dim
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int r = threadIdx.x;
+    if (r >= head_dim) return;
+
+    float g_exp = expf((float)gate[h]);
+    float b = (float)beta[h];
+    float v_r = (float)v[h * head_dim + r];
+
+    int s_off = h * head_dim * head_dim + r * head_dim;
+    float out_acc = 0.0f;
+
+    // Load q[h] into shmem for fast broadcast across threads in this TG.
+    extern __shared__ float q_shared[];
+    if (r < head_dim) {
+        q_shared[r] = (float)q[h * head_dim + r];
+    }
+    __syncthreads();
+
+    for (int c = 0; c < head_dim; ++c) {
+        float k_c = (float)k[h * head_dim + c];
+        float old = (float)state[s_off + c];
+        float updated = g_exp * old + b * v_r * k_c;
+        state[s_off + c] = (__nv_bfloat16)updated;
+        out_acc += updated * q_shared[c];
+    }
+
+    out[h * head_dim + r] = (__nv_bfloat16)out_acc;
+}
+"#;
+
+#[cfg(feature = "cuda")]
 const SGEMV_Q6K_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -934,6 +1095,9 @@ pub struct LlmKernels {
     sgemv_q4k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q4k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    conv1d_depthwise: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    l2_norm_per_head: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    delta_net_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -959,6 +1123,9 @@ impl LlmKernels {
             sgemv_q4k: std::sync::OnceLock::new(),
             sgemv_q4k_v2: std::sync::OnceLock::new(),
             sgemv_q6k: std::sync::OnceLock::new(),
+            conv1d_depthwise: std::sync::OnceLock::new(),
+            l2_norm_per_head: std::sync::OnceLock::new(),
+            delta_net_step: std::sync::OnceLock::new(),
         }
     }
 
@@ -1522,6 +1689,121 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemv_q6k_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T243.2 — Depth-wise 1-D conv (Qwen3.5/3.6 SSM block).
+    ///
+    /// # Safety  Caller ensures pointers valid for shapes.
+    pub unsafe fn conv1d_depthwise_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        weight: u64, // [kernel, conv_dim] BF16
+        state: u64,  // [kernel-1, conv_dim] BF16 (mutated)
+        input: u64,  // [conv_dim] BF16
+        out: u64,    // [conv_dim] BF16
+        conv_dim: i32,
+        kernel_size: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.conv1d_depthwise,
+            CONV1D_DEPTHWISE_BF16_SRC,
+            "conv1d_depthwise_bf16",
+        )?;
+        let block = 256u32;
+        let grid = (conv_dim as u32).div_ceil(block);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&weight)
+            .arg(&state)
+            .arg(&input)
+            .arg(&out)
+            .arg(&conv_dim)
+            .arg(&kernel_size);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "conv1d_depthwise_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T243.2 — Per-head L2 normalization (Qwen3.5/3.6 SSM Q/K).
+    ///
+    /// # Safety  Caller ensures `head_dim` is power of 2 (for tree reduction).
+    pub unsafe fn l2_norm_per_head_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: u64, // [n_heads, head_dim] BF16, in/out
+        n_heads: i32,
+        head_dim: i32,
+        eps: f32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.l2_norm_per_head,
+            L2_NORM_PER_HEAD_BF16_SRC,
+            "l2_norm_per_head_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: (head_dim as u32) * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&x).arg(&n_heads).arg(&head_dim).arg(&eps);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "l2_norm_per_head_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T243.2 — Gated DeltaNet recurrent step (Qwen3.5/3.6 SSM mixer).
+    ///
+    /// # Safety  Caller ensures pointers valid for shapes ; state is `[n_heads × head_dim²]`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn delta_net_step_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k: u64,
+        v: u64,
+        gate: u64,
+        beta: u64,
+        state: u64,
+        out: u64,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.delta_net_step,
+            DELTA_NET_STEP_BF16_SRC,
+            "delta_net_step_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: (head_dim as u32) * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&q)
+            .arg(&k)
+            .arg(&v)
+            .arg(&gate)
+            .arg(&beta)
+            .arg(&state)
+            .arg(&out)
+            .arg(&n_heads)
+            .arg(&head_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "delta_net_step_bf16::launch",
         })?;
         Ok(())
     }
@@ -2276,6 +2558,189 @@ mod parity_tests {
                 diff,
                 tol
             );
+        }
+    }
+
+    /// T243.2 — l2_norm_per_head_bf16 parity vs CPU.
+    #[test]
+    fn l2_norm_per_head_bf16_matches_cpu() {
+        let n_heads = 4usize;
+        let head_dim = 64usize;
+        let eps = 1e-6f32;
+        let x_f32: Vec<f32> = (0..(n_heads * head_dim))
+            .map(|i| ((i as f32 * 0.13).sin()) * 0.7)
+            .collect();
+        let mut cpu = x_f32.clone();
+        for h in 0..n_heads {
+            let off = h * head_dim;
+            let sumsq: f32 = cpu[off..off + head_dim].iter().map(|v| v * v).sum();
+            let inv = 1.0 / (sumsq + eps).sqrt();
+            for v in &mut cpu[off..off + head_dim] {
+                *v *= inv;
+            }
+        }
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let bf: Vec<half::bf16> = x_f32.iter().copied().map(half::bf16::from_f32).collect();
+        let mut dev = stream.memcpy_stod(&bf).expect("upload");
+        unsafe {
+            let (p, _g) = dev.device_ptr_mut(&stream);
+            kernels
+                .l2_norm_per_head_bf16(&stream, p, n_heads as i32, head_dim as i32, eps)
+                .expect("l2");
+        }
+        let host: Vec<half::bf16> = stream.memcpy_dtov(&dev).expect("dtov");
+        let gpu: Vec<f32> = host.into_iter().map(|v| v.to_f32()).collect();
+        for i in 0..(n_heads * head_dim) {
+            let diff = (cpu[i] - gpu[i]).abs();
+            let tol = cpu[i].abs() * 1e-1 + 1e-2;
+            assert!(diff <= tol, "[{i}] cpu={} gpu={}", cpu[i], gpu[i]);
+        }
+    }
+
+    /// T243.2 — conv1d_depthwise_bf16 parity vs CPU.
+    #[test]
+    fn conv1d_depthwise_bf16_matches_cpu() {
+        let conv_dim = 32usize;
+        let kernel_size = 4usize;
+        let w_f32: Vec<f32> = (0..(kernel_size * conv_dim))
+            .map(|i| ((i as f32 * 0.05).cos()) * 0.3)
+            .collect();
+        let st_f32: Vec<f32> = (0..((kernel_size - 1) * conv_dim))
+            .map(|i| ((i as f32 * 0.07).sin()) * 0.2)
+            .collect();
+        let in_f32: Vec<f32> = (0..conv_dim)
+            .map(|i| ((i as f32 * 0.11).sin()) * 0.5)
+            .collect();
+        let mut cpu_out = vec![0.0f32; conv_dim];
+        for c in 0..conv_dim {
+            let mut acc = 0.0f32;
+            for t in 0..(kernel_size - 1) {
+                acc += st_f32[t * conv_dim + c] * w_f32[t * conv_dim + c];
+            }
+            acc += in_f32[c] * w_f32[(kernel_size - 1) * conv_dim + c];
+            cpu_out[c] = acc;
+        }
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let to_bf = |v: &[f32]| -> Vec<half::bf16> {
+            v.iter().copied().map(half::bf16::from_f32).collect()
+        };
+        let w_dev = stream.memcpy_stod(&to_bf(&w_f32)).expect("up w");
+        let mut s_dev = stream.memcpy_stod(&to_bf(&st_f32)).expect("up s");
+        let in_dev = stream.memcpy_stod(&to_bf(&in_f32)).expect("up in");
+        let mut out_dev = stream
+            .alloc_zeros::<half::bf16>(conv_dim)
+            .expect("alloc out");
+        unsafe {
+            let (w_p, _g1) = w_dev.device_ptr(&stream);
+            let (s_p, _g2) = s_dev.device_ptr_mut(&stream);
+            let (i_p, _g3) = in_dev.device_ptr(&stream);
+            let (o_p, _g4) = out_dev.device_ptr_mut(&stream);
+            kernels
+                .conv1d_depthwise_bf16(
+                    &stream,
+                    w_p,
+                    s_p,
+                    i_p,
+                    o_p,
+                    conv_dim as i32,
+                    kernel_size as i32,
+                )
+                .expect("conv");
+        }
+        let host: Vec<half::bf16> = stream.memcpy_dtov(&out_dev).expect("dtov");
+        let gpu: Vec<f32> = host.into_iter().map(|v| v.to_f32()).collect();
+        for c in 0..conv_dim {
+            let diff = (cpu_out[c] - gpu[c]).abs();
+            let tol = cpu_out[c].abs() * 5e-2 + 1e-2;
+            assert!(diff <= tol, "[{c}] cpu={} gpu={}", cpu_out[c], gpu[c]);
+        }
+    }
+
+    /// T243.2 — delta_net_step_bf16 parity vs CPU.
+    #[test]
+    fn delta_net_step_bf16_matches_cpu() {
+        let n_heads = 2usize;
+        let head_dim = 16usize;
+        let q: Vec<f32> = (0..(n_heads * head_dim))
+            .map(|i| ((i as f32 * 0.13).sin()) * 0.4)
+            .collect();
+        let k: Vec<f32> = (0..(n_heads * head_dim))
+            .map(|i| ((i as f32 * 0.07).cos()) * 0.4)
+            .collect();
+        let v: Vec<f32> = (0..(n_heads * head_dim))
+            .map(|i| ((i as f32 * 0.09).sin()) * 0.4)
+            .collect();
+        let gate: Vec<f32> = (0..n_heads).map(|h| -0.5 - 0.1 * h as f32).collect();
+        let beta: Vec<f32> = (0..n_heads).map(|h| 0.6 + 0.05 * h as f32).collect();
+        let st0: Vec<f32> = (0..(n_heads * head_dim * head_dim))
+            .map(|i| ((i as f32 * 0.03).cos()) * 0.1)
+            .collect();
+        let mut cs = st0.clone();
+        let mut cpu_out = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let g_exp = gate[h].exp();
+            let b = beta[h];
+            let s_off = h * head_dim * head_dim;
+            for r in 0..head_dim {
+                let v_r = v[h * head_dim + r];
+                let mut acc = 0.0f32;
+                for c in 0..head_dim {
+                    let k_c = k[h * head_dim + c];
+                    let updated = g_exp * cs[s_off + r * head_dim + c] + b * v_r * k_c;
+                    cs[s_off + r * head_dim + c] = updated;
+                    acc += updated * q[h * head_dim + c];
+                }
+                cpu_out[h * head_dim + r] = acc;
+            }
+        }
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let to_bf = |v: &[f32]| -> Vec<half::bf16> {
+            v.iter().copied().map(half::bf16::from_f32).collect()
+        };
+        let q_dev = stream.memcpy_stod(&to_bf(&q)).expect("up q");
+        let k_dev = stream.memcpy_stod(&to_bf(&k)).expect("up k");
+        let v_dev = stream.memcpy_stod(&to_bf(&v)).expect("up v");
+        let g_dev = stream.memcpy_stod(&to_bf(&gate)).expect("up g");
+        let b_dev = stream.memcpy_stod(&to_bf(&beta)).expect("up b");
+        let mut s_dev = stream.memcpy_stod(&to_bf(&st0)).expect("up s");
+        let mut out_dev = stream
+            .alloc_zeros::<half::bf16>(n_heads * head_dim)
+            .expect("alloc");
+        unsafe {
+            let (qp, _g1) = q_dev.device_ptr(&stream);
+            let (kp, _g2) = k_dev.device_ptr(&stream);
+            let (vp, _g3) = v_dev.device_ptr(&stream);
+            let (gp, _g4) = g_dev.device_ptr(&stream);
+            let (bp, _g5) = b_dev.device_ptr(&stream);
+            let (sp, _g6) = s_dev.device_ptr_mut(&stream);
+            let (op, _g7) = out_dev.device_ptr_mut(&stream);
+            kernels
+                .delta_net_step_bf16(
+                    &stream,
+                    qp,
+                    kp,
+                    vp,
+                    gp,
+                    bp,
+                    sp,
+                    op,
+                    n_heads as i32,
+                    head_dim as i32,
+                )
+                .expect("delta_net");
+        }
+        let oh: Vec<half::bf16> = stream.memcpy_dtov(&out_dev).expect("dtov");
+        let go: Vec<f32> = oh.into_iter().map(|v| v.to_f32()).collect();
+        for i in 0..(n_heads * head_dim) {
+            let diff = (cpu_out[i] - go[i]).abs();
+            let tol = cpu_out[i].abs() * 1e-1 + 5e-2;
+            assert!(diff <= tol, "[{i}] cpu={} gpu={}", cpu_out[i], go[i]);
         }
     }
 
