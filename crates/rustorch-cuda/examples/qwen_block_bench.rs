@@ -56,8 +56,7 @@ impl From<rustorch_cuda::error::CudaError> for BenchError {
 #[cfg(feature = "cuda")]
 fn main() -> Result<(), BenchError> {
     use cudarc::driver::CudaContext;
-    use rustorch_cuda::cublas_lt::{Fp4ScaleMode, Fp8Kind, Fp8Output, LtSession};
-    use std::time::Instant;
+    use rustorch_cuda::cublas_lt::LtSession;
 
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
