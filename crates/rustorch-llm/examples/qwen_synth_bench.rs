@@ -140,13 +140,15 @@ fn main() -> Result<(), BenchErr> {
         t_alloc.elapsed().as_secs_f64()
     );
 
-    // Warmup
-    println!("[qwen_synth_bench] warmup ({warmup} decode steps)...");
-    cuda.reset_kv();
-    for i in 0..warmup {
-        let _ = cuda.decode_step(i as u32)?;
+    // Warmup BF16 (skip si fp4_only mode car les stubs invalident le path BF16)
+    if !fp4_only_mode {
+        println!("[qwen_synth_bench] warmup ({warmup} decode steps)...");
+        cuda.reset_kv();
+        for i in 0..warmup {
+            let _ = cuda.decode_step(i as u32)?;
+        }
+        cuda.reset_kv();
     }
-    cuda.reset_kv();
 
     // Decode bench BF16 (skip si fp4_only)
     let (per_step_bf16, tok_s_bf16) = if fp4_only_mode {
