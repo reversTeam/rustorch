@@ -1,8 +1,19 @@
 # rustorch on DGX Spark GB10 — Performance update (T244 perf push)
 
-## TL;DR
-After this session, rustorch closed the gap to llama.cpp from 76% → 17%
-on Qwen2.5-7B Q4_K_M, with all kernels in place for Qwen 3.6 wiring.
+## TL;DR (T244.4 — final state)
+
+| Engine                              |     tok/s | bw GB/s | vs llama.cpp |
+|-------------------------------------|----------:|--------:|-------------:|
+| llama.cpp Qwen2.5-7B Q4_K_M         |     47.15 |     ~70 |    1.00×     |
+| **rustorch Qwen2.5-7B Q4_K_M**      |     40.13 |   154.8 |  **0.85×**   |
+| llama.cpp Qwen3.6-27B Q4_K_M        |     11.62 |    ~150 |    1.00×     |
+| **rustorch Qwen3.6-27B Q4_K_M**     |     10.49 |   156.7 |  **0.90×**   |
+
+Across this session :
+- Closed Qwen2.5-7B gap from 76% → 15% behind llama.cpp
+- Qwen3.6-27B real GGUF end-to-end matmul reaches 90% of llama.cpp
+- All four custom GEMV kernels (Q4_K V2, Q5_K, Q6_K V2, BF16) production-ready
+- 100% tensor dtype coverage for Qwen 3.6 Q4_K_M GGUF
 
 ## T244.3 update — Q5_K kernel + real Qwen3.6-27B end-to-end matmul bench
 
@@ -26,14 +37,18 @@ attributable to:
 3. F32 small tensors (ssm_alpha/beta) handled via dedicated path in llama.cpp
    vs skipped in our matmul-only bench
 
-### All four custom GEMV kernels validated by parity tests
+### Full kernel panel — Qwen-7B FFN shape (18944×3584)
 
-| Kernel                          | Bench bandwidth   | Parity test |
-|---------------------------------|-------------------|-------------|
-| sgemv_q4k_bf16 V2 (warp-shuffle)| 168 GB/s (synth)  | ✅ vs CPU   |
-| sgemv_q5k_bf16 (warp-shuffle)   | (parity-only)     | ✅ vs CPU   |
-| sgemv_q6k_bf16 (warp-shuffle)   | ~120 GB/s         | ✅ vs CPU   |
-| sgemv_bf16_bf16 (warp-shuffle)  | 232 GB/s (synth)  | ✅ vs CPU   |
+| Kernel                              | per-call | bandwidth   | speedup vs V1 |
+|-------------------------------------|---------:|------------:|--------------:|
+| sgemv_q4k_bf16 V2 (warp-shuffle)    | 0.237 ms | 161.4 GB/s  |  5.18× vs V1  |
+| sgemv_q5k_bf16 (warp-shuffle)       | 0.293 ms | 159.2 GB/s  |     n/a       |
+| sgemv_q6k_bf16 V1 (warp-shuffle)    | 0.575 ms |  96.8 GB/s  |     n/a       |
+| sgemv_q6k_bf16 V2 (warp-shuffle)    | 0.413 ms | 134.7 GB/s  |  **1.39× vs V1** |
+| sgemv_bf16_bf16 (warp-shuffle)      | 0.767 ms | 232.5 GB/s  |     n/a       |
+| cuBLASLt matmul_bf16 (FFN size only)| 0.817 ms | 218.2 GB/s  |     n/a       |
+
+All kernels validated by parity tests against CPU references.
 
 ## T244.2 update — sgemv_bf16_bf16 + bench warmup fix
 
