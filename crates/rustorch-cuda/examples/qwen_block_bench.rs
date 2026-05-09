@@ -848,7 +848,7 @@ fn try_run_fp4_graph(
 
     // Capture de UN bloc (4 matmuls). On replay ce bloc 50 fois.
     cap_stream
-        .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+        .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
         .map_err(|e| BenchError(format!("begin_capture: {e:?}")))?;
     unsafe {
         {
