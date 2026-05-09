@@ -482,16 +482,21 @@ extern "C" __global__ void sgemv_q4k_bf16_v2(
         }
     }
 
-    // Reduction over 64 threads.
-    sdata[tid] = acc;
-    __syncthreads();
+    // T244.1.1.1 — Warp-shuffle reduction over 64 threads = 2 warps.
+    // Eliminates 5 of 6 __syncthreads of the tree reduction.
     #pragma unroll
-    for (int s = 32; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
     }
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    if (lane_id == 0) {
+        sdata[warp_id] = acc;
+    }
+    __syncthreads();
     if (tid == 0) {
-        y[row] = (__nv_bfloat16)sdata[0];
+        float total = sdata[0] + sdata[1];
+        y[row] = (__nv_bfloat16)total;
     }
 }
 "#;
