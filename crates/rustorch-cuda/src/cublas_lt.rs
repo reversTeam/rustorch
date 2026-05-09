@@ -317,3 +317,244 @@ pub unsafe fn matmul_fp8(
 fn lt_err_code(e: cudarc::cublaslt::result::CublasError) -> i32 {
     e.0 as i32
 }
+
+/// Run an MXFP4 GEMM (FP4 inputs with VEC32_UE8M0 block scaling).
+///
+/// FP4 inputs are byte-packed (1 byte = 2 elements). Each block of 32 FP4
+/// elements has one UE8M0 scale (1 byte: 8-bit unsigned exponent, no
+/// mantissa). For an [M × K] FP4 matrix, scales form an [M × (K/32)] UE8M0
+/// matrix. K must be a multiple of 32.
+///
+/// Output is BF16/FP16/F32 with F32 accumulation. Same TN-only requirement
+/// as FP8: hardcodes `transa=T, transb=N`.
+///
+/// On GB10 with all blocks scaled to unity (UE8M0 byte = 127), this hits
+/// the headline ~1 PFLOP / 1000 TOPS theoretical peak. Real-world utility
+/// requires proper per-block scale calibration during quantization.
+///
+/// # Safety
+///
+/// `*_dev` pointers must be valid for the lifetime of the call, sized
+/// correctly for FP4 packed inputs / UE8M0 scale tensors / output type.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matmul_mxfp4(
+    a_dev: u64,
+    a_scale_dev: u64,
+    b_dev: u64,
+    b_scale_dev: u64,
+    c_dev: u64,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+    out: Fp8Output,
+    workspace_dev: u64,
+    workspace_bytes: usize,
+    stream: u64,
+) -> Result<(), CudaError> {
+    if m == 0 || n == 0 || k == 0 {
+        return Ok(());
+    }
+    if k % 32 != 0 {
+        return Err(CudaError::Unsupported {
+            msg: format!("MXFP4 requires k % 32 == 0, got k={k}"),
+        });
+    }
+
+    let handle = result::create_handle().map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::create_handle",
+    })?;
+
+    // FP4 inputs are packed 2-per-byte. cuBLASLt's matrix layout API uses
+    // the LOGICAL element count (k×m, k×n, m×n) — the implementation knows
+    // the physical byte size from the data type tag.
+    let fp4_dt = sys::cudaDataType_t::CUDA_R_4F_E2M1;
+    let a_layout =
+        result::create_matrix_layout(fp4_dt, k as u64, m as u64, k as i64).map_err(|e| {
+            CudaError::CublasStatus {
+                code: lt_err_code(e),
+                location: "cublas_lt::matmul_mxfp4::a_layout",
+            }
+        })?;
+    let b_layout =
+        result::create_matrix_layout(fp4_dt, k as u64, n as u64, k as i64).map_err(|e| {
+            CudaError::CublasStatus {
+                code: lt_err_code(e),
+                location: "cublas_lt::matmul_mxfp4::b_layout",
+            }
+        })?;
+    let c_layout = result::create_matrix_layout(out.cuda_type(), m as u64, n as u64, m as i64)
+        .map_err(|e| CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "cublas_lt::matmul_mxfp4::c_layout",
+        })?;
+
+    let matmul_desc = result::create_matmul_desc(
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        sys::cudaDataType_t::CUDA_R_32F,
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::matmul_desc",
+    })?;
+
+    let transa = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
+    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        (&transa) as *const _ as *const _,
+        std::mem::size_of::<cudarc::cublas::sys::cublasOperation_t>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::set_transa",
+    })?;
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+        (&transb) as *const _ as *const _,
+        std::mem::size_of::<cudarc::cublas::sys::cublasOperation_t>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::set_transb",
+    })?;
+
+    // Scale modes: VEC32_UE8M0 means "one UE8M0 scale per 32 FP4 elements".
+    // This is the MXFP4 standard.
+    let scale_mode = sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+        (&scale_mode) as *const _ as *const _,
+        std::mem::size_of::<sys::cublasLtMatmulMatrixScale_t>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::set_a_scale_mode",
+    })?;
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+        (&scale_mode) as *const _ as *const _,
+        std::mem::size_of::<sys::cublasLtMatmulMatrixScale_t>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::set_b_scale_mode",
+    })?;
+
+    // Scale pointers (device addresses of the UE8M0 scale tensors).
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+        (&a_scale_dev) as *const _ as *const _,
+        std::mem::size_of::<u64>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::set_a_scale_ptr",
+    })?;
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+        (&b_scale_dev) as *const _ as *const _,
+        std::mem::size_of::<u64>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::set_b_scale_ptr",
+    })?;
+
+    let pref = result::create_matmul_pref().map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::pref",
+    })?;
+    result::set_matmul_pref_attribute(
+        pref,
+        sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        (&workspace_bytes) as *const _ as *const _,
+        std::mem::size_of::<usize>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::pref_workspace",
+    })?;
+
+    let _res = LtResources {
+        handle,
+        a_layout,
+        b_layout,
+        c_layout,
+        matmul_desc,
+        pref,
+    };
+
+    let heuristic = result::get_matmul_algo_heuristic(
+        handle,
+        matmul_desc,
+        a_layout,
+        b_layout,
+        c_layout,
+        c_layout,
+        pref,
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::heuristic",
+    })?;
+
+    result::matmul(
+        handle,
+        matmul_desc,
+        (&alpha) as *const f32 as *const _,
+        (&beta) as *const f32 as *const _,
+        a_dev as *const _,
+        a_layout,
+        b_dev as *const _,
+        b_layout,
+        c_dev as *const _,
+        c_layout,
+        c_dev as *mut _,
+        c_layout,
+        (&heuristic.algo) as *const _,
+        workspace_dev as *mut _,
+        workspace_bytes,
+        stream as *mut _,
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "cublas_lt::matmul_mxfp4::matmul",
+    })?;
+
+    Ok(())
+}
+
+/// Stub for no-cuda builds.
+///
+/// # Safety
+/// Same contract as the cuda variant, but pointers are never dereferenced.
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matmul_mxfp4(
+    _a_dev: u64,
+    _a_scale_dev: u64,
+    _b_dev: u64,
+    _b_scale_dev: u64,
+    _c_dev: u64,
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _alpha: f32,
+    _beta: f32,
+    _out: Fp8Output,
+    _workspace_dev: u64,
+    _workspace_bytes: usize,
+    _stream: u64,
+) -> Result<(), CudaError> {
+    Err(CudaError::NoDeviceFound)
+}

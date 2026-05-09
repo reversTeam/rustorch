@@ -84,13 +84,13 @@ fn main() -> Result<(), BenchError> {
         }
     }
 
-    println!("[cublas_gemm_bench] device ready, sweeping (TF32 + BF16 + FP8 E4M3)");
+    println!("[cublas_gemm_bench] device ready, sweeping (TF32 + BF16 + FP8 + MXFP4)");
     println!();
     println!(
-        "  {:>5} {:>8} {:>10} {:>10} {:>10}",
-        "M=N=K", "iters", "TF32 TFL", "BF16 TFL", "FP8 TFL"
+        "  {:>5} {:>8} {:>10} {:>10} {:>10} {:>10}",
+        "M=N=K", "iters", "TF32 TFL", "BF16 TFL", "FP8 TFL", "FP4 TFL"
     );
-    println!("  {}", "─".repeat(56));
+    println!("  {}", "─".repeat(68));
 
     // Square shape sweep. Shapes chosen to span small (cache-resident-ish)
     // up to 4096² which is the typical "large dense gemm" sweet spot.
@@ -270,9 +270,106 @@ fn main() -> Result<(), BenchError> {
             },
         };
 
+        // ───────── MXFP4 (E2M1, VEC32_UE8M0) via matmul_mxfp4 ─────────
+        // FP4 is 4 bits per element → 2 elements per byte, so the input
+        // buffer is m*k/2 bytes. Scale tensor is m*k/32 UE8M0 bytes (one
+        // scale per 32 FP4 elements). We fill scales with byte 127 (UE8M0
+        // exponent 0 = 1.0) so the matmul produces unscaled bytes.
+        let fp4_a_bytes = m * k / 2;
+        let fp4_b_bytes = k * n / 2;
+        let scale_a_bytes = m * (k / 32);
+        let scale_b_bytes = (k / 32) * n;
+        let a_fp4: Vec<u8> = (0..fp4_a_bytes)
+            .map(|i| (i as u8).wrapping_mul(11))
+            .collect();
+        let b_fp4: Vec<u8> = (0..fp4_b_bytes)
+            .map(|i| (i as u8).wrapping_mul(13))
+            .collect();
+        let scale_a_unity: Vec<u8> = vec![127u8; scale_a_bytes];
+        let scale_b_unity: Vec<u8> = vec![127u8; scale_b_bytes];
+        let a_dev_fp4 = stream.memcpy_stod(&a_fp4)?;
+        let b_dev_fp4 = stream.memcpy_stod(&b_fp4)?;
+        let mut c_dev_fp4 = stream.alloc_zeros::<half::bf16>(m * n)?;
+        let scale_a_dev = stream.memcpy_stod(&scale_a_unity)?;
+        let scale_b_dev = stream.memcpy_stod(&scale_b_unity)?;
+
+        let mut fp4_attempt = || -> Result<f64, BenchError> {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            for _ in 0..5 {
+                unsafe {
+                    let (a_p, _r1) = a_dev_fp4.device_ptr(&stream);
+                    let (b_p, _r2) = b_dev_fp4.device_ptr(&stream);
+                    let (c_p, _r3) = c_dev_fp4.device_ptr_mut(&stream);
+                    let (sa_p, _r4) = scale_a_dev.device_ptr(&stream);
+                    let (sb_p, _r5) = scale_b_dev.device_ptr(&stream);
+                    let (w_p, _r6) = workspace_dev.device_ptr(&stream);
+                    rustorch_cuda::cublas_lt::matmul_mxfp4(
+                        a_p,
+                        sa_p,
+                        b_p,
+                        sb_p,
+                        c_p,
+                        m,
+                        k,
+                        n,
+                        1.0,
+                        0.0,
+                        rustorch_cuda::cublas_lt::Fp8Output::Bf16,
+                        w_p,
+                        workspace_size,
+                        stream.cu_stream() as u64,
+                    )
+                    .map_err(|e| BenchError(format!("matmul_mxfp4: {e}")))?;
+                }
+            }
+            stream.synchronize()?;
+            let t0 = Instant::now();
+            for _ in 0..n_iters {
+                unsafe {
+                    let (a_p, _r1) = a_dev_fp4.device_ptr(&stream);
+                    let (b_p, _r2) = b_dev_fp4.device_ptr(&stream);
+                    let (c_p, _r3) = c_dev_fp4.device_ptr_mut(&stream);
+                    let (sa_p, _r4) = scale_a_dev.device_ptr(&stream);
+                    let (sb_p, _r5) = scale_b_dev.device_ptr(&stream);
+                    let (w_p, _r6) = workspace_dev.device_ptr(&stream);
+                    rustorch_cuda::cublas_lt::matmul_mxfp4(
+                        a_p,
+                        sa_p,
+                        b_p,
+                        sb_p,
+                        c_p,
+                        m,
+                        k,
+                        n,
+                        1.0,
+                        0.0,
+                        rustorch_cuda::cublas_lt::Fp8Output::Bf16,
+                        w_p,
+                        workspace_size,
+                        stream.cu_stream() as u64,
+                    )
+                    .map_err(|e| BenchError(format!("matmul_mxfp4: {e}")))?;
+                }
+            }
+            stream.synchronize()?;
+            Ok(t0.elapsed().as_secs_f64() * 1000.0)
+        };
+        let fp4_tflops = match fp4_attempt() {
+            Ok(wall_ms_fp4) => {
+                let ms_per_iter_fp4 = wall_ms_fp4 / n_iters as f64;
+                flops_per_iter / (ms_per_iter_fp4 / 1000.0) / 1e12
+            },
+            Err(e) => {
+                if dim == 128 {
+                    eprintln!("[cublas_gemm_bench] FP4 path skipped — {e}");
+                }
+                f64::NAN
+            },
+        };
+
         println!(
-            "  {:>5} {:>8} {:>10.2} {:>10.2} {:>10.2}",
-            dim, n_iters, tf32_tflops, bf16_tflops, fp8_tflops
+            "  {:>5} {:>8} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+            dim, n_iters, tf32_tflops, bf16_tflops, fp8_tflops, fp4_tflops
         );
     }
 
