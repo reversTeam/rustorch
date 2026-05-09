@@ -110,28 +110,28 @@ fn main() -> Result<(), BenchError> {
     let act_bf16 = vec![half::bf16::from_f32(0.01); seq * hidden];
     let act_dev_bf16 = stream.memcpy_stod(&act_bf16)?;
 
-    // Weights (one set per matmul, reused across layers — same shapes).
+    // Weights — production trick (T240.8f): fuse FFN gate + up into a single
+    // weight (hidden × 2·ffn), running them as ONE matmul instead of two.
+    // Real Qwen / LLaMA / Mixtral all do this in inference.
+    let ffn_gate_up_n = ffn_up_n + ffn_gate_n; // = 2 · ffn
     let w_qkv_bf16 = vec![half::bf16::from_f32(0.01); hidden * qkv_n];
     let w_attn_out_bf16 = vec![half::bf16::from_f32(0.01); hidden * attn_out_n];
-    let w_ffn_up_bf16 = vec![half::bf16::from_f32(0.01); hidden * ffn_up_n];
-    let w_ffn_gate_bf16 = vec![half::bf16::from_f32(0.01); hidden * ffn_gate_n];
+    let w_ffn_gate_up_bf16 = vec![half::bf16::from_f32(0.01); hidden * ffn_gate_up_n];
     let w_ffn_down_bf16 = vec![half::bf16::from_f32(0.01); ffn * ffn_down_n];
 
     let w_qkv_dev = stream.memcpy_stod(&w_qkv_bf16)?;
     let w_attn_out_dev = stream.memcpy_stod(&w_attn_out_bf16)?;
-    let w_ffn_up_dev = stream.memcpy_stod(&w_ffn_up_bf16)?;
-    let w_ffn_gate_dev = stream.memcpy_stod(&w_ffn_gate_bf16)?;
+    let w_ffn_gate_up_dev = stream.memcpy_stod(&w_ffn_gate_up_bf16)?;
     let w_ffn_down_dev = stream.memcpy_stod(&w_ffn_down_bf16)?;
 
     // Outputs (intermediate buffers).
     let mut out_qkv = stream.alloc_zeros::<half::bf16>(seq * qkv_n)?;
     let mut out_attn = stream.alloc_zeros::<half::bf16>(seq * attn_out_n)?;
-    let mut out_up = stream.alloc_zeros::<half::bf16>(seq * ffn_up_n)?;
-    let mut out_gate = stream.alloc_zeros::<half::bf16>(seq * ffn_gate_n)?;
+    let mut out_gate_up = stream.alloc_zeros::<half::bf16>(seq * ffn_gate_up_n)?;
     let mut out_down = stream.alloc_zeros::<half::bf16>(seq * ffn_down_n)?;
 
-    // ───────── BF16 path ─────────
-    println!("[qwen_block_bench] BF16 path (TensorCore native)");
+    // ───────── BF16 path (T240.8f: fused gate+up) ─────────
+    println!("[qwen_block_bench] BF16 path (TensorCore native, fused gate+up)");
     let bf16_per_block_ms = run_bf16_block(
         &mut session,
         &stream,
@@ -140,18 +140,15 @@ fn main() -> Result<(), BenchError> {
         &mut out_qkv,
         &w_attn_out_dev,
         &mut out_attn,
-        &w_ffn_up_dev,
-        &mut out_up,
-        &w_ffn_gate_dev,
-        &mut out_gate,
+        &w_ffn_gate_up_dev,
+        &mut out_gate_up,
         &w_ffn_down_dev,
         &mut out_down,
         seq,
         hidden,
         qkv_n,
         attn_out_n,
-        ffn_up_n,
-        ffn_gate_n,
+        ffn_gate_up_n,
         ffn_down_n,
         ffn,
         50,
@@ -173,8 +170,7 @@ fn main() -> Result<(), BenchError> {
     let block = 16usize; // NVFP4 block size
     assert!(hidden % block == 0 && ffn % block == 0);
 
-    // FP4 packed: 1 byte per 2 elements. Activation buffers, weight
-    // buffers, FFN intermediate buffer.
+    // FP4 packed: 1 byte per 2 elements. Fused gate+up weight (T240.8f).
     let act_fp4: Vec<u8> = (0..seq * hidden / 2)
         .map(|i| (i as u8).wrapping_mul(11))
         .collect();
@@ -187,44 +183,38 @@ fn main() -> Result<(), BenchError> {
     let w_attn_out_fp4: Vec<u8> = (0..hidden * attn_out_n / 2)
         .map(|i| (i as u8).wrapping_mul(19))
         .collect();
-    let w_ffn_up_fp4: Vec<u8> = (0..hidden * ffn_up_n / 2)
+    // Fused gate+up: hidden × 2·ffn FP4 packed (1 byte = 2 elements)
+    let w_ffn_gate_up_fp4: Vec<u8> = (0..hidden * ffn_gate_up_n / 2)
         .map(|i| (i as u8).wrapping_mul(23))
-        .collect();
-    let w_ffn_gate_fp4: Vec<u8> = (0..hidden * ffn_gate_n / 2)
-        .map(|i| (i as u8).wrapping_mul(29))
         .collect();
     let w_ffn_down_fp4: Vec<u8> = (0..ffn * ffn_down_n / 2)
         .map(|i| (i as u8).wrapping_mul(31))
         .collect();
 
-    // Scales (UE4M3 byte 0x70 ≈ 1.0). Sized per FP4 layout convention:
-    // for an [M × K] matrix, scale tensor is M × (K/block_size).
+    // Scales (UE4M3 byte 0x70 ≈ 1.0). M × (K/block_size) per FP4 matrix.
     let act_scale: Vec<u8> = vec![0x70u8; seq * (hidden / block)];
     let ffn_int_scale: Vec<u8> = vec![0x70u8; seq * (ffn / block)];
     let w_qkv_scale: Vec<u8> = vec![0x70u8; (hidden / block) * qkv_n];
     let w_attn_out_scale: Vec<u8> = vec![0x70u8; (hidden / block) * attn_out_n];
-    let w_ffn_up_scale: Vec<u8> = vec![0x70u8; (hidden / block) * ffn_up_n];
-    let w_ffn_gate_scale: Vec<u8> = vec![0x70u8; (hidden / block) * ffn_gate_n];
+    let w_ffn_gate_up_scale: Vec<u8> = vec![0x70u8; (hidden / block) * ffn_gate_up_n];
     let w_ffn_down_scale: Vec<u8> = vec![0x70u8; (ffn / block) * ffn_down_n];
 
     let act_fp4_dev = stream.memcpy_stod(&act_fp4)?;
     let ffn_int_fp4_dev = stream.memcpy_stod(&ffn_int_fp4)?;
     let w_qkv_fp4_dev = stream.memcpy_stod(&w_qkv_fp4)?;
     let w_attn_out_fp4_dev = stream.memcpy_stod(&w_attn_out_fp4)?;
-    let w_ffn_up_fp4_dev = stream.memcpy_stod(&w_ffn_up_fp4)?;
-    let w_ffn_gate_fp4_dev = stream.memcpy_stod(&w_ffn_gate_fp4)?;
+    let w_ffn_gate_up_fp4_dev = stream.memcpy_stod(&w_ffn_gate_up_fp4)?;
     let w_ffn_down_fp4_dev = stream.memcpy_stod(&w_ffn_down_fp4)?;
 
     let act_scale_dev = stream.memcpy_stod(&act_scale)?;
     let ffn_int_scale_dev = stream.memcpy_stod(&ffn_int_scale)?;
     let w_qkv_scale_dev = stream.memcpy_stod(&w_qkv_scale)?;
     let w_attn_out_scale_dev = stream.memcpy_stod(&w_attn_out_scale)?;
-    let w_ffn_up_scale_dev = stream.memcpy_stod(&w_ffn_up_scale)?;
-    let w_ffn_gate_scale_dev = stream.memcpy_stod(&w_ffn_gate_scale)?;
+    let w_ffn_gate_up_scale_dev = stream.memcpy_stod(&w_ffn_gate_up_scale)?;
     let w_ffn_down_scale_dev = stream.memcpy_stod(&w_ffn_down_scale)?;
 
     println!();
-    println!("[qwen_block_bench] NVFP4 path (Vec16Ue4m3, native on GB10)");
+    println!("[qwen_block_bench] NVFP4 path (Vec16Ue4m3, native on GB10, fused g+up)");
 
     let fp4_per_block_ms = run_fp4_block(
         &mut session,
@@ -239,12 +229,9 @@ fn main() -> Result<(), BenchError> {
         &w_attn_out_fp4_dev,
         &w_attn_out_scale_dev,
         &mut out_attn,
-        &w_ffn_up_fp4_dev,
-        &w_ffn_up_scale_dev,
-        &mut out_up,
-        &w_ffn_gate_fp4_dev,
-        &w_ffn_gate_scale_dev,
-        &mut out_gate,
+        &w_ffn_gate_up_fp4_dev,
+        &w_ffn_gate_up_scale_dev,
+        &mut out_gate_up,
         &w_ffn_down_fp4_dev,
         &w_ffn_down_scale_dev,
         &mut out_down,
@@ -252,8 +239,7 @@ fn main() -> Result<(), BenchError> {
         hidden,
         qkv_n,
         attn_out_n,
-        ffn_up_n,
-        ffn_gate_n,
+        ffn_gate_up_n,
         ffn_down_n,
         ffn,
         Fp4ScaleMode::Vec16Ue4m3,
@@ -297,18 +283,15 @@ fn run_bf16_block(
     out_qkv: &mut cudarc::driver::CudaSlice<half::bf16>,
     w_attn_out: &cudarc::driver::CudaSlice<half::bf16>,
     out_attn: &mut cudarc::driver::CudaSlice<half::bf16>,
-    w_ffn_up: &cudarc::driver::CudaSlice<half::bf16>,
-    out_up: &mut cudarc::driver::CudaSlice<half::bf16>,
-    w_ffn_gate: &cudarc::driver::CudaSlice<half::bf16>,
-    out_gate: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_ffn_gate_up: &cudarc::driver::CudaSlice<half::bf16>, // T240.8f fused
+    out_gate_up: &mut cudarc::driver::CudaSlice<half::bf16>,
     w_ffn_down: &cudarc::driver::CudaSlice<half::bf16>,
     out_down: &mut cudarc::driver::CudaSlice<half::bf16>,
     seq: usize,
     hidden: usize,
     qkv_n: usize,
     attn_out_n: usize,
-    ffn_up_n: usize,
-    ffn_gate_n: usize,
+    ffn_gate_up_n: usize, // = 2·ffn
     ffn_down_n: usize,
     ffn: usize,
     iters: usize,
@@ -316,13 +299,13 @@ fn run_bf16_block(
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use std::time::Instant;
 
-    // 5 matmuls per block, reused weights, reused activation. Total time
-    // measures the dense compute envelope of one Qwen-style block.
-    let _ = ffn_gate_n;
+    // T240.8f — 4 matmuls per block (was 5): fused FFN gate+up via single
+    // (hidden × 2·ffn) matmul. Real Qwen / LLaMA / Mixtral all do this.
+    // Out_gate_up is (seq × 2·ffn) column-major — first ffn columns = "up"
+    // partition (used as input to FFN-down), next ffn columns = "gate"
+    // (would feed SwiGLU activation in real model).
 
-    // T240.8b — opt-in multi-algo autotune. Set RUSTORCH_CUBLASLT_AUTOTUNE=1
-    // to query top-N candidate algos for each shape and pick the fastest.
-    // Adds ~100-300 ms one-time cost up front; pays back in the timed loop.
+    // T240.8b — opt-in multi-algo autotune.
     let autotune = std::env::var("RUSTORCH_CUBLASLT_AUTOTUNE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -346,7 +329,9 @@ fn run_bf16_block(
                 n_candidates,
                 n_passes,
             )?;
-            println!("[autotune]   QKV proj  m={seq} k={hidden} n={qkv_n}   best={ms_qkv:.3} ms");
+            println!(
+                "[autotune]   QKV proj   m={seq} k={hidden} n={qkv_n}        best={ms_qkv:.3} ms"
+            );
         }
         unsafe {
             let (a_p, _r1) = act.device_ptr(stream);
@@ -362,42 +347,30 @@ fn run_bf16_block(
                 n_candidates,
                 n_passes,
             )?;
-            println!("[autotune]   Attn out  m={seq} k={hidden} n={attn_out_n}   best={ms:.3} ms");
+            println!(
+                "[autotune]   Attn out   m={seq} k={hidden} n={attn_out_n}        best={ms:.3} ms"
+            );
         }
         unsafe {
             let (a_p, _r1) = act.device_ptr(stream);
-            let (b_p, _r2) = w_ffn_up.device_ptr(stream);
-            let (c_p, _r3) = out_up.device_ptr_mut(stream);
+            let (b_p, _r2) = w_ffn_gate_up.device_ptr(stream);
+            let (c_p, _r3) = out_gate_up.device_ptr_mut(stream);
             let ms = session.autotune_bf16(
                 a_p,
                 b_p,
                 c_p,
                 seq,
                 hidden,
-                ffn_up_n,
+                ffn_gate_up_n,
                 n_candidates,
                 n_passes,
             )?;
-            println!("[autotune]   FFN up    m={seq} k={hidden} n={ffn_up_n}   best={ms:.3} ms");
+            println!(
+                "[autotune]   FFN g+up   m={seq} k={hidden} n={ffn_gate_up_n}    best={ms:.3} ms"
+            );
         }
         unsafe {
-            let (a_p, _r1) = act.device_ptr(stream);
-            let (b_p, _r2) = w_ffn_gate.device_ptr(stream);
-            let (c_p, _r3) = out_gate.device_ptr_mut(stream);
-            let ms = session.autotune_bf16(
-                a_p,
-                b_p,
-                c_p,
-                seq,
-                hidden,
-                ffn_up_n,
-                n_candidates,
-                n_passes,
-            )?;
-            println!("[autotune]   FFN gate  m={seq} k={hidden} n={ffn_up_n}   best={ms:.3} ms");
-        }
-        unsafe {
-            let (a_p, _r1) = out_up.device_ptr(stream);
+            let (a_p, _r1) = out_gate_up.device_ptr(stream);
             let (b_p, _r2) = w_ffn_down.device_ptr(stream);
             let (c_p, _r3) = out_down.device_ptr_mut(stream);
             let ms = session.autotune_bf16(
@@ -410,54 +383,14 @@ fn run_bf16_block(
                 n_candidates,
                 n_passes,
             )?;
-            println!("[autotune]   FFN down  m={seq} k={ffn} n={ffn_down_n}   best={ms:.3} ms");
+            println!(
+                "[autotune]   FFN down   m={seq} k={ffn} n={ffn_down_n}        best={ms:.3} ms"
+            );
         }
     }
 
     // Warm-up.
     for _ in 0..3 {
-        unsafe {
-            // QKV proj : (seq × hidden) @ (hidden × qkv_n) = (seq × qkv_n)
-            {
-                let (a_p, _r1) = act.device_ptr(stream);
-                let (b_p, _r2) = w_qkv.device_ptr(stream);
-                let (c_p, _r3) = out_qkv.device_ptr_mut(stream);
-                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, qkv_n, 1.0, 0.0)?;
-            }
-            // Attn out
-            {
-                let (a_p, _r1) = act.device_ptr(stream);
-                let (b_p, _r2) = w_attn_out.device_ptr(stream);
-                let (c_p, _r3) = out_attn.device_ptr_mut(stream);
-                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, attn_out_n, 1.0, 0.0)?;
-            }
-            // FFN up
-            {
-                let (a_p, _r1) = act.device_ptr(stream);
-                let (b_p, _r2) = w_ffn_up.device_ptr(stream);
-                let (c_p, _r3) = out_up.device_ptr_mut(stream);
-                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0)?;
-            }
-            // FFN gate
-            {
-                let (a_p, _r1) = act.device_ptr(stream);
-                let (b_p, _r2) = w_ffn_gate.device_ptr(stream);
-                let (c_p, _r3) = out_gate.device_ptr_mut(stream);
-                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0)?;
-            }
-            // FFN down (uses out_up as input shape (seq × ffn))
-            {
-                let (a_p, _r1) = out_up.device_ptr(stream);
-                let (b_p, _r2) = w_ffn_down.device_ptr(stream);
-                let (c_p, _r3) = out_down.device_ptr_mut(stream);
-                session.matmul_bf16(a_p, b_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0)?;
-            }
-        }
-    }
-    stream.synchronize()?;
-
-    let t0 = Instant::now();
-    for _ in 0..iters {
         unsafe {
             // QKV proj
             {
@@ -473,23 +406,47 @@ fn run_bf16_block(
                 let (c_p, _r3) = out_attn.device_ptr_mut(stream);
                 session.matmul_bf16(a_p, b_p, c_p, seq, hidden, attn_out_n, 1.0, 0.0)?;
             }
-            // FFN up
+            // FFN gate+up fused (T240.8f)
             {
                 let (a_p, _r1) = act.device_ptr(stream);
-                let (b_p, _r2) = w_ffn_up.device_ptr(stream);
-                let (c_p, _r3) = out_up.device_ptr_mut(stream);
-                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0)?;
+                let (b_p, _r2) = w_ffn_gate_up.device_ptr(stream);
+                let (c_p, _r3) = out_gate_up.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_gate_up_n, 1.0, 0.0)?;
             }
-            // FFN gate
+            // FFN down — uses first ffn columns of out_gate_up (the "up" partition)
+            {
+                let (a_p, _r1) = out_gate_up.device_ptr(stream);
+                let (b_p, _r2) = w_ffn_down.device_ptr(stream);
+                let (c_p, _r3) = out_down.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0)?;
+            }
+        }
+    }
+    stream.synchronize()?;
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        unsafe {
             {
                 let (a_p, _r1) = act.device_ptr(stream);
-                let (b_p, _r2) = w_ffn_gate.device_ptr(stream);
-                let (c_p, _r3) = out_gate.device_ptr_mut(stream);
-                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0)?;
+                let (b_p, _r2) = w_qkv.device_ptr(stream);
+                let (c_p, _r3) = out_qkv.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, qkv_n, 1.0, 0.0)?;
             }
-            // FFN down (uses out_up as input shape (seq × ffn))
             {
-                let (a_p, _r1) = out_up.device_ptr(stream);
+                let (a_p, _r1) = act.device_ptr(stream);
+                let (b_p, _r2) = w_attn_out.device_ptr(stream);
+                let (c_p, _r3) = out_attn.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, attn_out_n, 1.0, 0.0)?;
+            }
+            {
+                let (a_p, _r1) = act.device_ptr(stream);
+                let (b_p, _r2) = w_ffn_gate_up.device_ptr(stream);
+                let (c_p, _r3) = out_gate_up.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_gate_up_n, 1.0, 0.0)?;
+            }
+            {
+                let (a_p, _r1) = out_gate_up.device_ptr(stream);
                 let (b_p, _r2) = w_ffn_down.device_ptr(stream);
                 let (c_p, _r3) = out_down.device_ptr_mut(stream);
                 session.matmul_bf16(a_p, b_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0)?;
@@ -516,12 +473,9 @@ fn run_fp4_block(
     w_attn_out: &cudarc::driver::CudaSlice<u8>,
     w_attn_out_scale: &cudarc::driver::CudaSlice<u8>,
     out_attn: &mut cudarc::driver::CudaSlice<half::bf16>,
-    w_ffn_up: &cudarc::driver::CudaSlice<u8>,
-    w_ffn_up_scale: &cudarc::driver::CudaSlice<u8>,
-    out_up: &mut cudarc::driver::CudaSlice<half::bf16>,
-    w_ffn_gate: &cudarc::driver::CudaSlice<u8>,
-    w_ffn_gate_scale: &cudarc::driver::CudaSlice<u8>,
-    out_gate: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_ffn_gate_up: &cudarc::driver::CudaSlice<u8>, // T240.8f fused
+    w_ffn_gate_up_scale: &cudarc::driver::CudaSlice<u8>,
+    out_gate_up: &mut cudarc::driver::CudaSlice<half::bf16>,
     w_ffn_down: &cudarc::driver::CudaSlice<u8>,
     w_ffn_down_scale: &cudarc::driver::CudaSlice<u8>,
     out_down: &mut cudarc::driver::CudaSlice<half::bf16>,
@@ -529,8 +483,7 @@ fn run_fp4_block(
     hidden: usize,
     qkv_n: usize,
     attn_out_n: usize,
-    ffn_up_n: usize,
-    ffn_gate_n: usize,
+    ffn_gate_up_n: usize,
     ffn_down_n: usize,
     ffn: usize,
     scale_mode: rustorch_cuda::cublas_lt::Fp4ScaleMode,
@@ -540,12 +493,12 @@ fn run_fp4_block(
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use std::time::Instant;
 
-    let _ = ffn_gate_n;
+    // T240.8f — 4 matmuls per block (was 5): fused FFN gate+up.
 
     // Warm-up.
     for _ in 0..3 {
         unsafe {
-            // QKV proj : (seq × hidden) FP4 @ (hidden × qkv_n) FP4 → (seq × qkv_n) BF16
+            // QKV proj
             {
                 let (a_p, _r1) = act_fp4.device_ptr(stream);
                 let (sa_p, _r2) = act_scale.device_ptr(stream);
@@ -568,27 +521,25 @@ fn run_fp4_block(
                     scale_mode,
                 )?;
             }
-            // FFN up
+            // FFN gate+up fused
             {
                 let (a_p, _r1) = act_fp4.device_ptr(stream);
                 let (sa_p, _r2) = act_scale.device_ptr(stream);
-                let (b_p, _r3) = w_ffn_up.device_ptr(stream);
-                let (sb_p, _r4) = w_ffn_up_scale.device_ptr(stream);
-                let (c_p, _r5) = out_up.device_ptr_mut(stream);
+                let (b_p, _r3) = w_ffn_gate_up.device_ptr(stream);
+                let (sb_p, _r4) = w_ffn_gate_up_scale.device_ptr(stream);
+                let (c_p, _r5) = out_gate_up.device_ptr_mut(stream);
                 session.matmul_mxfp4(
-                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0, out_dtype,
-                    scale_mode,
-                )?;
-            }
-            // FFN gate
-            {
-                let (a_p, _r1) = act_fp4.device_ptr(stream);
-                let (sa_p, _r2) = act_scale.device_ptr(stream);
-                let (b_p, _r3) = w_ffn_gate.device_ptr(stream);
-                let (sb_p, _r4) = w_ffn_gate_scale.device_ptr(stream);
-                let (c_p, _r5) = out_gate.device_ptr_mut(stream);
-                session.matmul_mxfp4(
-                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0, out_dtype,
+                    a_p,
+                    sa_p,
+                    b_p,
+                    sb_p,
+                    c_p,
+                    seq,
+                    hidden,
+                    ffn_gate_up_n,
+                    1.0,
+                    0.0,
+                    out_dtype,
                     scale_mode,
                 )?;
             }
@@ -635,22 +586,21 @@ fn run_fp4_block(
             {
                 let (a_p, _r1) = act_fp4.device_ptr(stream);
                 let (sa_p, _r2) = act_scale.device_ptr(stream);
-                let (b_p, _r3) = w_ffn_up.device_ptr(stream);
-                let (sb_p, _r4) = w_ffn_up_scale.device_ptr(stream);
-                let (c_p, _r5) = out_up.device_ptr_mut(stream);
+                let (b_p, _r3) = w_ffn_gate_up.device_ptr(stream);
+                let (sb_p, _r4) = w_ffn_gate_up_scale.device_ptr(stream);
+                let (c_p, _r5) = out_gate_up.device_ptr_mut(stream);
                 session.matmul_mxfp4(
-                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0, out_dtype,
-                    scale_mode,
-                )?;
-            }
-            {
-                let (a_p, _r1) = act_fp4.device_ptr(stream);
-                let (sa_p, _r2) = act_scale.device_ptr(stream);
-                let (b_p, _r3) = w_ffn_gate.device_ptr(stream);
-                let (sb_p, _r4) = w_ffn_gate_scale.device_ptr(stream);
-                let (c_p, _r5) = out_gate.device_ptr_mut(stream);
-                session.matmul_mxfp4(
-                    a_p, sa_p, b_p, sb_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0, out_dtype,
+                    a_p,
+                    sa_p,
+                    b_p,
+                    sb_p,
+                    c_p,
+                    seq,
+                    hidden,
+                    ffn_gate_up_n,
+                    1.0,
+                    0.0,
+                    out_dtype,
                     scale_mode,
                 )?;
             }
