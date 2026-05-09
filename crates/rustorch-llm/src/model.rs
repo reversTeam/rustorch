@@ -38,45 +38,45 @@ use rustorch_nn::sampling::{sample_next, SamplingConfig};
 /// Per-block weights extracted from the HF weight map and stored
 /// as raw `Vec<f32>` for the hot-path kernel (no Tensor wrapping
 /// across step boundaries).
-struct BlockWeights {
-    rms_attn: Vec<f32>, // [D]
+pub(crate) struct BlockWeights {
+    pub(crate) rms_attn: Vec<f32>, // [D]
     /// Fused Q || K || V projection — single matmul amortises the
     /// memory loads of `h` across all three projections (Q, K, V
     /// share the same input). Layout: row-major `[D, D + 2*KV_DIM]`.
     /// Output is sliced into `q[..D]`, `k[..KV_DIM]`, `v[..KV_DIM]`.
     /// Inspired by vLLM / llama.cpp `attn_qkv.weight`. Shrinks
     /// `qkv_proj` profile time by ~30% on M4 Max.
-    w_qkv: Vec<f32>,
-    w_o: Vec<f32>,     // [D, D]
-    rms_ffn: Vec<f32>, // [D]
+    pub(crate) w_qkv: Vec<f32>,
+    pub(crate) w_o: Vec<f32>,     // [D, D]
+    pub(crate) rms_ffn: Vec<f32>, // [D]
     /// Fused SwiGLU gate || up projection. Layout: row-major
     /// `[D, 2*F]`. Output sliced into `gate[..F]`, `up[..F]`.
     /// Same fusion trick as `w_qkv`. Shrinks `gate_up_proj`
     /// profile time by ~30%.
-    w_gate_up: Vec<f32>,
+    pub(crate) w_gate_up: Vec<f32>,
     /// SwiGLU down projection: [F, D].
-    w_down: Vec<f32>,
+    pub(crate) w_down: Vec<f32>,
     /// Optional Qwen3 per-head Q-norm — `[head_dim]`. Applied after
     /// the Q projection, before RoPE, to each query head independently.
-    q_norm: Option<Vec<f32>>,
+    pub(crate) q_norm: Option<Vec<f32>>,
     /// Optional Qwen3 per-head K-norm — `[head_dim]`.
-    k_norm: Option<Vec<f32>>,
+    pub(crate) k_norm: Option<Vec<f32>>,
 }
 
 /// A loaded Llama / Qwen model ready for autoregressive decode.
 pub struct LlamaModel {
     pub config: LlamaConfig,
-    blocks: Vec<BlockWeights>,
+    pub(crate) blocks: Vec<BlockWeights>,
     /// `[V, D]` token embedding lookup table flattened row-major.
-    token_emb: Vec<f32>,
+    pub(crate) token_emb: Vec<f32>,
     /// `[D]` final RMSNorm gamma.
-    final_norm: Vec<f32>,
+    pub(crate) final_norm: Vec<f32>,
     /// `[D, V]` LM head weight (or alias of `token_emb` if
     /// `tie_word_embeddings == true`).
-    lm_head: Vec<f32>,
+    pub(crate) lm_head: Vec<f32>,
     /// Pre-computed RoPE cos/sin tables sized to
     /// `min(config.max_position_embeddings, max_seq)`.
-    rope: RoPE,
+    pub(crate) rope: RoPE,
 }
 
 impl LlamaModel {

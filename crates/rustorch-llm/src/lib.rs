@@ -43,10 +43,14 @@ use std::path::{Path, PathBuf};
 use rustorch_core::tensor::tensor_impl::Tensor;
 use serde::Deserialize;
 
+#[cfg(feature = "cuda")]
+pub mod cuda_backend;
 pub mod gguf_loader;
 pub mod model;
 pub mod qwen35;
 pub mod qwen35_cpu;
+#[cfg(feature = "cuda")]
+pub use cuda_backend::LlamaModelCuda;
 pub use gguf_loader::{GgufBlockWeights, GgufWeights};
 pub use model::LlamaModel;
 pub use qwen35::{
@@ -67,6 +71,8 @@ pub enum LlmError {
     MissingWeight(String),
     /// Filesystem error.
     Io(String),
+    /// CUDA backend error (T241.3 — gated by `cuda` feature).
+    Backend(String),
 }
 
 impl std::fmt::Display for LlmError {
@@ -77,6 +83,7 @@ impl std::fmt::Display for LlmError {
             LlmError::Index(s) => write!(f, "index: {s}"),
             LlmError::MissingWeight(s) => write!(f, "missing weight: {s}"),
             LlmError::Io(s) => write!(f, "io: {s}"),
+            LlmError::Backend(s) => write!(f, "backend: {s}"),
         }
     }
 }
