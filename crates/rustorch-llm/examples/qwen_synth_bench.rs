@@ -43,13 +43,32 @@ fn main() -> Result<(), BenchErr> {
 
     // Qwen-3.6 reference shapes
     let cfg = match model.as_str() {
-        "27b" | "35b" => LlamaConfig {
+        "27b" => LlamaConfig {
+            // Qwen-3.6-27B dense
             hidden_size: 2048,
             num_attention_heads: 16,
             num_key_value_heads: Some(2),
             intermediate_size: 11008,
             num_hidden_layers: 40,
             vocab_size: 152064,
+            max_position_embeddings: 8192,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            tie_word_embeddings: false,
+        },
+        "35b-a3b" | "35b" => LlamaConfig {
+            // Qwen-3.6-35B-A3B MoE proxy : FFN = 9 active experts × 512 dim
+            // = dense équivalent 4608, même hidden/n_layers que 27B.
+            // Note : on n'implémente pas le router MoE actuellement, donc
+            // c'est juste une estimation timing du compute FFN actif. Pas
+            // les Gated DeltaNet layers (3/4 des layers) — ces layers SSM
+            // ont un compute différent qu'on n'a pas modélisé.
+            hidden_size: 2048,
+            num_attention_heads: 32,
+            num_key_value_heads: Some(4),
+            intermediate_size: 4608, // = 9 active experts × 512
+            num_hidden_layers: 40,
+            vocab_size: 248320, // padded
             max_position_embeddings: 8192,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
@@ -69,7 +88,7 @@ fn main() -> Result<(), BenchErr> {
         },
         other => {
             return Err(BenchErr(format!(
-                "unknown model `{other}`, use 27b|35b|72b"
+                "unknown model `{other}`, use 27b|35b-a3b|72b"
             )))
         },
     };
