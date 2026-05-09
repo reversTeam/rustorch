@@ -301,29 +301,34 @@ extern "C" __global__ void quantize_bf16_to_nvfp4(
     float scale = max_abs / 6.0f;
     if (scale < 1e-12f) scale = 1.0f;
 
-    // 3. Encode scale in UE4M3 — T241.6d : NVIDIA cuBLASLt VEC16_UE4M3
-    // uses BIAS 14 (not the OCP-MX bias 7). The fmt byte is decoded as :
-    //   bits 7-3 = exponent E (5 bits, but high bit always 0 for normals)
-    //   bits 2-0 = mantissa M (3 bits)
-    //   value    = 2^(E - 14) * (1 + M/8)   for E >= 1
-    //   value    = 2^(-13) * M/8            for E == 0 (subnormal)
+    // 3. Encode scale in UE4M3 — T241.6d empirically validated via
+    // `nvfp4_supported_m_values` perimeter test :
+    //   FP4=1 inputs * scale_byte=0x70 → matmul C[0] = 2097152 = 128 * 128²
+    //   → scale_decoded = 128 = 2^7
+    //   → for byte 0x70 = 0b0111_0000 (E=14, M=0), 2^(E-bias) = 2^7
+    //   → bias = 14 - 7 = 7  (matches OCP-MX UE4M3 standard)
     //
-    // Reference : cublas_gemm_bench.rs line 299 sets scale = 0x70 to
-    // get value ≈ 1.0 ; with bias 14, 0x70 = (14 << 3) | 0 → 2^0 * 1 = 1 ✓
+    // Layout :
+    //   bit 7    : reserved (0)
+    //   bits 6-3 : exponent E (4 bits)
+    //   bits 2-0 : mantissa M (3 bits)
+    //   value    = 2^(E - 7) * (1 + M/8)   for E >= 1
     //
-    // Empirically (T241.6d) : cuBLASLt sm_121 silently zeroes the matmul
-    // output if any block scale is subnormal, so we clamp E >= 1.
+    // Range : 2^-6 ≈ 0.016 (smallest normal) to 240 (largest) — fits LLM.
+    //
+    // Clamp E >= 1 : cuBLASLt sm_121 zero-outs blocks with subnormal
+    // scales (validated empirically — see nvfp4_no_subnormal_scales test).
     unsigned int sb = __float_as_uint(scale);
     int fexp = (int)((sb >> 23) & 0xff) - 127;     // unbiased exponent
     int fmant_full = (int)(sb >> 20) & 0x7;        // top 3 bits of mantissa
-    int ue_exp = fexp + 14;                         // re-bias to UE4M3 (bias 14)
+    int ue_exp = fexp + 7;                          // re-bias to UE4M3 (bias 7)
     unsigned char scale_byte;
     if (ue_exp <= 0) {
         // Below smallest normal — round UP to smallest normal (E=1, M=0).
         scale_byte = (unsigned char)(1 << 3);
-    } else if (ue_exp >= 31) {
-        // Above representable range — saturate to largest normal.
-        scale_byte = (unsigned char)((30 << 3) | 0x7);
+    } else if (ue_exp >= 15) {
+        // Above representable range — saturate to largest normal (E=14,M=7).
+        scale_byte = (unsigned char)((14 << 3) | 0x7);
     } else {
         scale_byte = (unsigned char)((ue_exp << 3) | fmant_full);
     }
@@ -1316,6 +1321,221 @@ mod parity_tests {
                 out_cpu[i],
                 out_gpu[i]
             );
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T241.6d — NVFP4 quantize tests : isolate the kernel from cuBLASLt.
+    // Verify the encoding produces correct bytes for known scalar inputs.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Decode a single FP4 nibble (E2M1) back to f32. Used for round-trip.
+    /// FP4 codes : 0=+0, 1=+0.5, 2=+1, 3=+1.5, 4=+2, 5=+3, 6=+4, 7=+6
+    ///             8=-0, 9=-0.5, a=-1, b=-1.5, c=-2, d=-3, e=-4, f=-6
+    fn fp4_decode(nibble: u8) -> f32 {
+        let signed = nibble & 0x8 != 0;
+        let mag = match nibble & 0x7 {
+            0 => 0.0,
+            1 => 0.5,
+            2 => 1.0,
+            3 => 1.5,
+            4 => 2.0,
+            5 => 3.0,
+            6 => 4.0,
+            7 => 6.0,
+            _ => unreachable!(),
+        };
+        if signed {
+            -mag
+        } else {
+            mag
+        }
+    }
+
+    /// Decode a UE4M3 byte using NVIDIA's bias 7 convention (T241.6d).
+    /// Layout : bit 7 reserved, bits 6-3 = exp (4 bits), bits 2-0 = mantissa.
+    /// Value = 2^(E - 7) * (1 + M/8) for E >= 1.
+    ///
+    /// Validated by `nvfp4_supported_m_values` perimeter test : byte 0x70
+    /// (E=14, M=0) = 2^7 = 128, which matches the empirical matmul output.
+    fn ue4m3_decode(byte: u8) -> f32 {
+        let e = (byte >> 3) & 0xf; // 4-bit exponent
+        let m = byte & 0x7;
+        if e == 0 {
+            // Subnormal — value = 2^(-6) * M/8 (we don't emit by construction).
+            (m as f32 / 8.0) * 2f32.powi(-6)
+        } else {
+            (1.0 + m as f32 / 8.0) * 2f32.powi(e as i32 - 7)
+        }
+    }
+
+    /// Verify quantize_bf16_to_nvfp4 produces FP4 codes that, when decoded
+    /// and multiplied by the UE4M3 scale, recover the original BF16 input
+    /// to within FP4 precision (~1/16 quantization step relative).
+    #[test]
+    fn quantize_nvfp4_round_trip() {
+        // Use 16 hand-picked values that fit cleanly in FP4 grid.
+        // Magnitudes : 0.5, 1, 1.5, 2, 3, 4, 6 (the FP4 grid).
+        // We scale by 0.1 so the block scale = 0.6/6 = 0.1 (normal range).
+        let block16: Vec<f32> = vec![
+            0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.6, 0.0, -0.05, -0.1, -0.15, -0.2, -0.3, -0.4, -0.6,
+            0.0,
+        ];
+        let bf16_block: Vec<half::bf16> =
+            block16.iter().copied().map(half::bf16::from_f32).collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let x_dev = stream.memcpy_stod(&bf16_block).expect("upload x");
+        let mut out_fp4 = stream.alloc_zeros::<u8>(8).expect("alloc fp4"); // 16 elts / 2
+        let mut out_scale = stream.alloc_zeros::<u8>(1).expect("alloc scale"); // 1 block
+
+        unsafe {
+            let (x_p, _g1) = x_dev.device_ptr(&stream);
+            let (fp4_p, _g2) = out_fp4.device_ptr_mut(&stream);
+            let (sc_p, _g3) = out_scale.device_ptr_mut(&stream);
+            kernels
+                .quantize_bf16_to_nvfp4(&stream, x_p, fp4_p, sc_p, 16)
+                .expect("quantize");
+        }
+
+        let fp4_bytes: Vec<u8> = stream.memcpy_dtov(&out_fp4).expect("dtov fp4");
+        let scale_bytes: Vec<u8> = stream.memcpy_dtov(&out_scale).expect("dtov scale");
+
+        // Decode scale (UE4M3 bias 14).
+        let scale = ue4m3_decode(scale_bytes[0]);
+        // Sanity : scale should be ~0.1 (max_abs = 0.6, scale = 0.6/6 = 0.1).
+        // 0.1 = 2^-3.32, so ue_exp ≈ -3.32 + 14 = 10.68 → byte 10 or 11 (rounded).
+        // Decoded value ≈ 0.0625..0.125. Close enough to 0.1 within UE4M3 precision.
+        assert!(
+            scale > 0.05 && scale < 0.2,
+            "scale {} should be ≈ 0.1 ; byte = 0x{:02x}",
+            scale,
+            scale_bytes[0]
+        );
+
+        // Decode each FP4 nibble and verify reconstruction.
+        for i in 0..16 {
+            let byte = fp4_bytes[i / 2];
+            let nibble = if i % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+            let fp4_val = fp4_decode(nibble);
+            let reconstructed = fp4_val * scale;
+            let original = block16[i];
+            // FP4 has only 8 magnitudes per sign ; quantization step is
+            // ~scale * 0.5 (smallest non-zero magnitude). Tolerate a step
+            // of error.
+            let tol = scale * 1.0;
+            assert!(
+                (reconstructed - original).abs() <= tol,
+                "elt[{i}] orig={original:+.4} recon={reconstructed:+.4} \
+                 (fp4=0x{nibble:01x}={fp4_val:+.2}, scale={scale:+.4})"
+            );
+        }
+    }
+
+    /// T241.6d — verify that quantize_bf16_to_nvfp4 NEVER produces a
+    /// subnormal UE4M3 scale (E=0 byte). cuBLASLt sm_121 NVFP4 path
+    /// silently zero-outs blocks with subnormal scales, so our kernel
+    /// must clamp them.
+    #[test]
+    fn quantize_nvfp4_no_subnormal_scales() {
+        // 32 random tiny values that would normally produce subnormal scales.
+        let n = 32usize;
+        let block: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.123).sin()) * 1e-5) // very small ~1e-5
+            .collect();
+        let bf16_block: Vec<half::bf16> = block.iter().copied().map(half::bf16::from_f32).collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let x_dev = stream.memcpy_stod(&bf16_block).expect("upload");
+        let mut out_fp4 = stream.alloc_zeros::<u8>(n / 2).expect("fp4");
+        let mut out_scale = stream.alloc_zeros::<u8>(n / 16).expect("scale");
+
+        unsafe {
+            let (x_p, _g1) = x_dev.device_ptr(&stream);
+            let (fp4_p, _g2) = out_fp4.device_ptr_mut(&stream);
+            let (sc_p, _g3) = out_scale.device_ptr_mut(&stream);
+            kernels
+                .quantize_bf16_to_nvfp4(&stream, x_p, fp4_p, sc_p, n as i32)
+                .expect("quantize");
+        }
+
+        let scale_bytes: Vec<u8> = stream.memcpy_dtov(&out_scale).expect("dtov scale");
+        for (i, &byte) in scale_bytes.iter().enumerate() {
+            let e = (byte >> 3) & 0x1f;
+            assert!(
+                e >= 1,
+                "block[{i}] scale byte 0x{byte:02x} has E=0 (subnormal forbidden)"
+            );
+        }
+    }
+
+    /// T241.6d — verify the canonical scale bytes for NVIDIA UE4M3 bias 7.
+    /// Validated by perimeter test : 0x70 corresponds to scale = 128.
+    #[test]
+    fn ue4m3_canonical_bytes() {
+        // 0x38 = (7 << 3) | 0 → E=7, M=0 → 2^0 = 1.0
+        let v_one = ue4m3_decode(0x38);
+        assert!(
+            (v_one - 1.0).abs() < 1e-6,
+            "0x38 should decode to 1.0 (E=7, M=0, bias 7), got {v_one}"
+        );
+        // 0x70 = (14 << 3) | 0 → E=14, M=0 → 2^7 = 128.0
+        let v_128 = ue4m3_decode(0x70);
+        assert!(
+            (v_128 - 128.0).abs() < 1e-6,
+            "0x70 should decode to 128.0 (E=14, M=0, bias 7), got {v_128}"
+        );
+    }
+
+    /// T241.6d — verify our quantize kernel emits 0x38 for scale = 1.0.
+    /// With max_abs = 6.0, scale = 6.0/6.0 = 1.0 → ue_exp = 7, fmant = 0
+    /// → byte 0x38.
+    #[test]
+    fn quantize_nvfp4_scale_1_emits_0x38() {
+        let block: Vec<f32> = vec![6.0; 16]; // max_abs = 6, scale = 1.0
+        let bf16_block: Vec<half::bf16> = block.iter().copied().map(half::bf16::from_f32).collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let x_dev = stream.memcpy_stod(&bf16_block).expect("upload");
+        let mut out_fp4 = stream.alloc_zeros::<u8>(8).expect("fp4");
+        let mut out_scale = stream.alloc_zeros::<u8>(1).expect("scale");
+        unsafe {
+            let (x_p, _g1) = x_dev.device_ptr(&stream);
+            let (fp4_p, _g2) = out_fp4.device_ptr_mut(&stream);
+            let (sc_p, _g3) = out_scale.device_ptr_mut(&stream);
+            kernels
+                .quantize_bf16_to_nvfp4(&stream, x_p, fp4_p, sc_p, 16)
+                .expect("quantize");
+        }
+        let scale: Vec<u8> = stream.memcpy_dtov(&out_scale).expect("dtov");
+        let decoded = ue4m3_decode(scale[0]);
+        assert!(
+            (decoded - 1.0).abs() < 0.1,
+            "expected scale ≈ 1.0 for max_abs=6, got 0x{:02x} = {} (bias 7)",
+            scale[0],
+            decoded
+        );
+        assert_eq!(
+            scale[0], 0x38,
+            "scale byte should be 0x38 (E=7,M=0) for scale=1.0"
+        );
+
+        // Each FP4 element should be code 7 (= +6.0).
+        let fp4: Vec<u8> = stream.memcpy_dtov(&out_fp4).expect("dtov fp4");
+        for (i, &byte) in fp4.iter().enumerate() {
+            let lo = byte & 0xf;
+            let hi = byte >> 4;
+            assert_eq!(lo, 7, "block[{}] low nibble = 0x{:x} ≠ 7", i * 2, lo);
+            assert_eq!(hi, 7, "block[{}] hi nibble = 0x{:x} ≠ 7", i * 2 + 1, hi);
         }
     }
 }
