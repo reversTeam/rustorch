@@ -4,6 +4,40 @@
 After this session, rustorch closed the gap to llama.cpp from 76% → 17%
 on Qwen2.5-7B Q4_K_M, with all kernels in place for Qwen 3.6 wiring.
 
+## T244.2 update — sgemv_bf16_bf16 + bench warmup fix
+
+A new kernel (`sgemv_bf16_bf16`, warp-shuffle SGEMV) replaces cuBLASLt for
+M=1 thin GEMV decode. With proper warmup (every distinct shape) the Qwen3.6-27B
+synth bench projection improves dramatically:
+
+| Variant                                     | tok/s | bw GB/s | proj. Q4K_M  | vs llama.cpp 11.62 |
+|---------------------------------------------|------:|--------:|-------------:|-------------------:|
+| Old qwen36_27b bench (bad warmup, cuBLASLt) |  0.40 |    19.3 |        ~1.4  |       0.12× ✗      |
+| Fixed warmup, cuBLASLt baseline             |  4.48 |   218.0 |       ~16.0  |       1.38× ✓      |
+| Fixed warmup, custom sgemv_bf16_bf16        |  4.68 |   227.8 |       ~16.7  |       1.44× ✓      |
+
+Note: synth bench uses zero buffers ⇒ L2 cache hit rate is artificially high.
+On real GGUF data the kernel hits ~140 GB/s instead of 220 GB/s (35% gap from
+L2 effects). Real-world Qwen3.6-27B Q4_K_M projection is therefore tighter.
+
+### Single-shape sgemv_bf16_bf16 vs cuBLASLt (Qwen3.6 FFN gate, 17408×5120)
+
+| Path                                | per-call | bandwidth |
+|-------------------------------------|---------:|----------:|
+| sgemv_bf16_bf16 (warp-shuffle)      |  0.767 ms| 232.5 GB/s|
+| cuBLASLt matmul_bf16                |  0.817 ms| 218.2 GB/s|
+| **speedup custom vs cuBLASLt**      |          |  **1.07×**|
+
+### DGX Spark CUDA env gotcha
+
+`/usr/local/cuda` symlinked to CUDA 13.2 toolkit but driver 580.142 only
+supports CUDA 13.0 PTX → all kernel loads fail with
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. Workaround:
+```
+LD_LIBRARY_PATH=/usr/local/cuda-13.0/targets/sbsa-linux/lib:$LD_LIBRARY_PATH cargo test ...
+```
+or use `scripts/dgx-env.sh` wrapper.
+
 ## Real bench measurements (DGX Spark GB10, sm_121)
 
 ### Qwen2.5-7B Q4_K_M (real GGUF, 28 layers, 7.62B params)
