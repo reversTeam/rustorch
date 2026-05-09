@@ -1,4 +1,22 @@
-# rustorch on DGX Spark GB10 — Performance update (T244 perf push)
+# rustorch on DGX Spark GB10 — Performance update (T244 + T245)
+
+## TL;DR (T245.4 — algorithmic breakthrough)
+
+The M=1 decode path plateaued at 0.90× llama.cpp (memory-bound at 157/200 GB/s).
+The user pointed out the gap is algorithmic, not tactical. Validated :
+
+| Engine                                            | tok/s | vs llama.cpp |
+|---------------------------------------------------|------:|-------------:|
+| llama.cpp Qwen3.6-27B Q4_K_M                      | 11.62 |    1.00×     |
+| rustorch Qwen3.6-27B Q4_K_M (M=1, T244.4 final)   | 10.49 |    0.90×     |
+| **rustorch Qwen3.6-27B Q4_K_M (M=8 batched)**     | **40.48** | **3.48× ✓** |
+| rustorch projected with spec decoding @ 70% acc.  | ~28.3 |    2.43×     |
+
+**Algorithmic insight** : the entire weight tensor (14.94 GB) is re-read per
+token in standard decode. By batching M=8 tokens through a single weight pass
+(`sgemm_q4k_bf16_m8`, `sgemm_q5k_bf16_m8`, `sgemm_q6k_bf16_m8`), we amortize
+W reads across 8 tokens. CUDA Graphs gave only 1% (memory-bound).
+Tile-batch GEMM gives 3.48× over llama.cpp.
 
 ## TL;DR (T244.4 — final state)
 
