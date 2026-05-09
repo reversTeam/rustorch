@@ -198,7 +198,7 @@ fn main() -> Result<(), BenchError> {
             .map(|i| 0x10u8.wrapping_add(((i as u8) % 0x60u8)))
             .collect();
         let b_fp8: Vec<u8> = (0..k * n)
-            .map(|i| 0x10u8.wrapping_add(((i.wrapping_mul(7) as u8) % 0x60u8)))
+            .map(|i| 0x10u8.wrapping_add((i.wrapping_mul(7) as u8) % 0x60u8))
             .collect();
         let a_dev_fp8 = stream.memcpy_stod(&a_fp8)?;
         let b_dev_fp8 = stream.memcpy_stod(&b_fp8)?;
@@ -206,74 +206,88 @@ fn main() -> Result<(), BenchError> {
         let alpha_f32: f32 = 1.0;
         let beta_f32: f32 = 0.0;
 
-        // Warm-up: 5 calls.
-        for _ in 0..5 {
-            // SAFETY: shapes match cfg, buffers freshly alloc'd to right
-            // sizes. raw pointers extracted via cudarc DevicePtr helpers,
-            // valid for the duration of the call.
-            unsafe {
-                use cudarc::driver::{DevicePtr, DevicePtrMut};
-                let (a_ptr, _r1) = a_dev_fp8.device_ptr(&stream);
-                let (b_ptr, _r2) = b_dev_fp8.device_ptr(&stream);
-                let (c_ptr, _r3) = c_dev_fp8_out.device_ptr_mut(&stream);
-                cudarc::cublas::result::gemm_ex(
-                    *blas.handle(),
-                    sys::cublasOperation_t::CUBLAS_OP_N,
-                    sys::cublasOperation_t::CUBLAS_OP_N,
-                    n as i32,
-                    m as i32,
-                    k as i32,
-                    (&alpha_f32) as *const f32 as *const _,
-                    a_ptr as *const _,
-                    sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                    n as i32,
-                    b_ptr as *const _,
-                    sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                    k as i32,
-                    (&beta_f32) as *const f32 as *const _,
-                    c_ptr as *mut _,
-                    sys::cudaDataType_t::CUDA_R_16BF,
-                    n as i32,
-                    sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                )?;
+        // FP8 GEMM via cublasGemmEx requires transa=T, transb=N (TN pattern)
+        // on Hopper+. We call gemm_ex with that combo, plus k must be aligned
+        // to 16 (always true here since dim ∈ {128, 256, 512, ...}). The
+        // result memory layout differs from the f32/bf16 paths (this is a
+        // transposed problem), but for throughput measurement that's fine —
+        // we don't validate FP8 output values.
+        let fp8_attempt = || -> Result<f64, BenchError> {
+            // Warm-up: 5 calls.
+            for _ in 0..5 {
+                // SAFETY: gemm_ex contract — pointers and types match cfg,
+                // shapes validated, alpha/beta are f32 scalars matching the
+                // CUBLAS_COMPUTE_32F compute type.
+                unsafe {
+                    use cudarc::driver::{DevicePtr, DevicePtrMut};
+                    let (a_ptr, _r1) = a_dev_fp8.device_ptr(&stream);
+                    let (b_ptr, _r2) = b_dev_fp8.device_ptr(&stream);
+                    let (c_ptr, _r3) = c_dev_fp8_out.device_ptr_mut(&stream);
+                    cudarc::cublas::result::gemm_ex(
+                        *blas.handle(),
+                        sys::cublasOperation_t::CUBLAS_OP_T,
+                        sys::cublasOperation_t::CUBLAS_OP_N,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        (&alpha_f32) as *const f32 as *const _,
+                        a_ptr as *const _,
+                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                        k as i32,
+                        b_ptr as *const _,
+                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                        k as i32,
+                        (&beta_f32) as *const f32 as *const _,
+                        c_ptr as *mut _,
+                        sys::cudaDataType_t::CUDA_R_16BF,
+                        m as i32,
+                        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    )?;
+                }
             }
-        }
-        stream.synchronize()?;
-        let t0 = Instant::now();
-        for _ in 0..n_iters {
-            unsafe {
-                use cudarc::driver::{DevicePtr, DevicePtrMut};
-                let (a_ptr, _r1) = a_dev_fp8.device_ptr(&stream);
-                let (b_ptr, _r2) = b_dev_fp8.device_ptr(&stream);
-                let (c_ptr, _r3) = c_dev_fp8_out.device_ptr_mut(&stream);
-                cudarc::cublas::result::gemm_ex(
-                    *blas.handle(),
-                    sys::cublasOperation_t::CUBLAS_OP_N,
-                    sys::cublasOperation_t::CUBLAS_OP_N,
-                    n as i32,
-                    m as i32,
-                    k as i32,
-                    (&alpha_f32) as *const f32 as *const _,
-                    a_ptr as *const _,
-                    sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                    n as i32,
-                    b_ptr as *const _,
-                    sys::cudaDataType_t::CUDA_R_8F_E4M3,
-                    k as i32,
-                    (&beta_f32) as *const f32 as *const _,
-                    c_ptr as *mut _,
-                    sys::cudaDataType_t::CUDA_R_16BF,
-                    n as i32,
-                    sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                )?;
+            stream.synchronize()?;
+            let t0 = Instant::now();
+            for _ in 0..n_iters {
+                unsafe {
+                    use cudarc::driver::{DevicePtr, DevicePtrMut};
+                    let (a_ptr, _r1) = a_dev_fp8.device_ptr(&stream);
+                    let (b_ptr, _r2) = b_dev_fp8.device_ptr(&stream);
+                    let (c_ptr, _r3) = c_dev_fp8_out.device_ptr_mut(&stream);
+                    cudarc::cublas::result::gemm_ex(
+                        *blas.handle(),
+                        sys::cublasOperation_t::CUBLAS_OP_T,
+                        sys::cublasOperation_t::CUBLAS_OP_N,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        (&alpha_f32) as *const f32 as *const _,
+                        a_ptr as *const _,
+                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                        k as i32,
+                        b_ptr as *const _,
+                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                        k as i32,
+                        (&beta_f32) as *const f32 as *const _,
+                        c_ptr as *mut _,
+                        sys::cudaDataType_t::CUDA_R_16BF,
+                        m as i32,
+                        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    )?;
+                }
             }
-        }
-        stream.synchronize()?;
-        let wall_ms_fp8 = t0.elapsed().as_secs_f64() * 1000.0;
-        let ms_per_iter_fp8 = wall_ms_fp8 / n_iters as f64;
-        let fp8_tflops = flops_per_iter / (ms_per_iter_fp8 / 1000.0) / 1e12;
+            stream.synchronize()?;
+            Ok(t0.elapsed().as_secs_f64() * 1000.0)
+        };
+
+        let fp8_tflops = match fp8_attempt() {
+            Ok(wall_ms_fp8) => {
+                let ms_per_iter_fp8 = wall_ms_fp8 / n_iters as f64;
+                flops_per_iter / (ms_per_iter_fp8 / 1000.0) / 1e12
+            },
+            Err(_) => f64::NAN, // FP8 unsupported on this hardware/driver
+        };
 
         println!(
             "  {:>5} {:>8} {:>10.2} {:>10.2} {:>10.2}",
