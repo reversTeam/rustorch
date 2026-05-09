@@ -332,25 +332,20 @@ impl SparseLtSession {
         k: usize,
         n: usize,
     ) -> Result<SparseWeight, CudaError> {
-        let order = CusparseOrder::Col;
         let value = cudaDataType_t::CUDA_R_16BF;
         let alignment: u32 = 16;
         let stream_ptr = self.stream.cu_stream() as *mut std::ffi::c_void;
 
-        // Descriptors. We use:
-        //   A = sparse weight  (m × k)  — but in our matmul we want
-        //   sparse-on-B (the weight), so for cuBLAS-style A·B we set
-        //   A=activation (dense), B=weight (sparse). cuSPARSELt API
-        //   currently supports sparse-A only with structured-on-A. We
-        //   model the matmul as B=weight·A (i.e., result is weight·act).
-        //   For a weight of shape (k_w × n_w) being applied to an
-        //   activation of shape (k_a × m_a) we have:
-        //     m = n_w     (output rows = weight cols)
-        //     k = k_w     (inner = weight rows)
-        //     n = m_a     (output cols = activation cols)
-        //   In cuSPARSELt's convention "sparse A" means the sparse op is
-        //   the one with structured rows. We thus call it sparse-A with
-        //   shape (m, k).
+        // Layout: weight tensor is (m × k) row-major as PyTorch stores it
+        // (out_dim × in_dim, the contracting dim is the second one — that's
+        // where the 2:4 structure lives). Activation is (k × n) col-major
+        // (matches our cublasLt path where act is (seq × hidden) row-major
+        //  = (hidden × seq) col-major). Output C is (m × n) col-major.
+        //
+        // The matmul we run: C = α · A_sparse · B + β · C
+        //   A=(m × k) row-major (= weight)
+        //   B=(k × n) col-major (= activation)
+        //   C=(m × n) col-major (= output)
 
         let mut a_desc = CusparseLtMatDescriptor { _data: [0u8; 512] };
         let mut b_desc = CusparseLtMatDescriptor { _data: [0u8; 512] };
@@ -359,22 +354,22 @@ impl SparseLtSession {
         let mut alg_sel = CusparseLtMatmulAlgSelection { _data: [0u8; 512] };
         let mut plan = CusparseLtMatmulPlan { _data: [0u8; 512] };
 
-        // Sparse A: (m × k), col-major, ld=m
+        // Sparse A: (m × k) row-major, ld=k (matches PyTorch weight storage)
         check(
             cusparseLtStructuredDescriptorInit(
                 &self.handle,
                 &mut a_desc,
                 m as i64,
                 k as i64,
-                m as i64,
+                k as i64,
                 alignment,
                 value,
-                order,
+                CusparseOrder::Row,
                 CusparseLtSparsity::Sparsity50Percent,
             ),
             "structured_desc_a",
         )?;
-        // Dense B: (k × n), col-major, ld=k
+        // Dense B: (k × n) col-major, ld=k
         check(
             cusparseLtDenseDescriptorInit(
                 &self.handle,
@@ -384,11 +379,11 @@ impl SparseLtSession {
                 k as i64,
                 alignment,
                 value,
-                order,
+                CusparseOrder::Col,
             ),
             "dense_desc_b",
         )?;
-        // Dense C: (m × n), col-major, ld=m
+        // Dense C: (m × n) col-major, ld=m
         check(
             cusparseLtDenseDescriptorInit(
                 &self.handle,
@@ -398,7 +393,7 @@ impl SparseLtSession {
                 m as i64,
                 alignment,
                 value,
-                order,
+                CusparseOrder::Col,
             ),
             "dense_desc_c",
         )?;
