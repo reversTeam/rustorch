@@ -301,21 +301,29 @@ extern "C" __global__ void quantize_bf16_to_nvfp4(
     float scale = max_abs / 6.0f;
     if (scale < 1e-12f) scale = 1.0f;
 
-    // 3. Encode scale in UE4M3 — simplified : compute log2 + mantissa
-    // float bits : sign(1) exp(8 bias 127) mantissa(23)
-    // We want UE4M3 : exp(4 bias 7) mantissa(3)
+    // 3. Encode scale in UE4M3 — T241.6d : clamp ue_exp >= 1 to avoid
+    // subnormal scales (cuBLASLt sm_121 NVFP4 path appears to treat
+    // subnormal-scale blocks as 0, which broke the entire matmul output
+    // when typical LLM block max_abs was small).
+    //
+    // Layout (NVIDIA UE4M3) : bit 7 reserved=0, bits 6-3 exponent E (4-bit
+    // bias 7), bits 2-0 mantissa M. Normal value = 2^(E-7) * (1 + M/8).
+    //
+    // For scale < 2^-6 (ue_exp would be 0 or negative), we round UP to the
+    // smallest normal value 2^-6 = 0.015625 (E=1, M=0). This over-quantizes
+    // tiny blocks (their FP4 values become 0) but keeps the matmul valid.
     unsigned int sb = __float_as_uint(scale);
     int fexp = (int)((sb >> 23) & 0xff) - 127;     // unbiased exponent
-    int fmant = (int)(sb >> 20) & 0x7;             // top 3 bits of mantissa
+    int fmant_full = (int)(sb >> 20) & 0x7;        // top 3 bits of mantissa
     int ue_exp = fexp + 7;                          // re-bias to UE4M3
     unsigned char scale_byte;
     if (ue_exp <= 0) {
-        // subnormal or underflow → encode 0 (effectively scale=0, but we floored above)
-        scale_byte = (unsigned char)(fmant);
+        // Round up to smallest normal : E=1, M=0 → value = 2^-6
+        scale_byte = (unsigned char)(1 << 3);
     } else if (ue_exp >= 15) {
-        scale_byte = 0xf0 | 0x7;  // saturate
+        scale_byte = (unsigned char)((14 << 3) | 0x7);  // largest normal
     } else {
-        scale_byte = (unsigned char)((ue_exp << 3) | fmant);
+        scale_byte = (unsigned char)((ue_exp << 3) | fmant_full);
     }
     out_scale[blk] = scale_byte;
 
