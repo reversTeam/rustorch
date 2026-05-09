@@ -270,38 +270,48 @@ fn main() -> Result<(), BenchError> {
             },
         };
 
-        // ───────── MXFP4 (E2M1, VEC32_UE8M0) via matmul_mxfp4 ─────────
-        // FP4 is 4 bits per element → 2 elements per byte, so the input
-        // buffer is m*k/2 bytes. Scale tensor is m*k/32 UE8M0 bytes (one
-        // scale per 32 FP4 elements). We fill scales with byte 127 (UE8M0
-        // exponent 0 = 1.0) so the matmul produces unscaled bytes.
+        // ───────── FP4 (E2M1) — try NVFP4 first, MXFP4 fallback ─────────
+        // GB10 (sm_121, Grace-Blackwell) supports NVFP4 with VEC16_UE4M3
+        // scaling. Datacenter Blackwell + Hopper take MXFP4 with VEC32_UE8M0.
+        // We try NVFP4 first since GB10 is our target hardware. UE4M3 byte
+        // 0x70 and UE8M0 byte 127 both decode to ≈1.0, giving an unscaled
+        // matmul.
         let fp4_a_bytes = m * k / 2;
         let fp4_b_bytes = k * n / 2;
-        let scale_a_bytes = m * (k / 32);
-        let scale_b_bytes = (k / 32) * n;
+        // Allocate scale tensors at the smaller block (16) so both modes fit.
+        let scale_max_bytes = m * (k / 16);
+        let scale_max_b_bytes = (k / 16) * n;
         let a_fp4: Vec<u8> = (0..fp4_a_bytes)
             .map(|i| (i as u8).wrapping_mul(11))
             .collect();
         let b_fp4: Vec<u8> = (0..fp4_b_bytes)
             .map(|i| (i as u8).wrapping_mul(13))
             .collect();
-        let scale_a_unity: Vec<u8> = vec![127u8; scale_a_bytes];
-        let scale_b_unity: Vec<u8> = vec![127u8; scale_b_bytes];
+        let scale_a_ue4m3: Vec<u8> = vec![0x70u8; scale_max_bytes];
+        let scale_b_ue4m3: Vec<u8> = vec![0x70u8; scale_max_b_bytes];
+        let scale_a_ue8m0: Vec<u8> = vec![127u8; scale_max_bytes];
+        let scale_b_ue8m0: Vec<u8> = vec![127u8; scale_max_b_bytes];
         let a_dev_fp4 = stream.memcpy_stod(&a_fp4)?;
         let b_dev_fp4 = stream.memcpy_stod(&b_fp4)?;
         let mut c_dev_fp4 = stream.alloc_zeros::<half::bf16>(m * n)?;
-        let scale_a_dev = stream.memcpy_stod(&scale_a_unity)?;
-        let scale_b_dev = stream.memcpy_stod(&scale_b_unity)?;
+        let scale_a_ue4m3_dev = stream.memcpy_stod(&scale_a_ue4m3)?;
+        let scale_b_ue4m3_dev = stream.memcpy_stod(&scale_b_ue4m3)?;
+        let scale_a_ue8m0_dev = stream.memcpy_stod(&scale_a_ue8m0)?;
+        let scale_b_ue8m0_dev = stream.memcpy_stod(&scale_b_ue8m0)?;
 
-        let mut fp4_attempt = || -> Result<f64, BenchError> {
+        let make_fp4_attempt = |scale_mode: rustorch_cuda::cublas_lt::Fp4ScaleMode,
+                                sa_buf: &cudarc::driver::CudaSlice<u8>,
+                                sb_buf: &cudarc::driver::CudaSlice<u8>|
+         -> Result<f64, BenchError> {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
-            for _ in 0..5 {
+            // Warm-up.
+            for _ in 0..3 {
                 unsafe {
                     let (a_p, _r1) = a_dev_fp4.device_ptr(&stream);
                     let (b_p, _r2) = b_dev_fp4.device_ptr(&stream);
                     let (c_p, _r3) = c_dev_fp4.device_ptr_mut(&stream);
-                    let (sa_p, _r4) = scale_a_dev.device_ptr(&stream);
-                    let (sb_p, _r5) = scale_b_dev.device_ptr(&stream);
+                    let (sa_p, _r4) = sa_buf.device_ptr(&stream);
+                    let (sb_p, _r5) = sb_buf.device_ptr(&stream);
                     let (w_p, _r6) = workspace_dev.device_ptr(&stream);
                     rustorch_cuda::cublas_lt::matmul_mxfp4(
                         a_p,
@@ -315,11 +325,12 @@ fn main() -> Result<(), BenchError> {
                         1.0,
                         0.0,
                         rustorch_cuda::cublas_lt::Fp8Output::Bf16,
+                        scale_mode,
                         w_p,
                         workspace_size,
                         stream.cu_stream() as u64,
                     )
-                    .map_err(|e| BenchError(format!("matmul_mxfp4: {e}")))?;
+                    .map_err(|e| BenchError(format!("matmul_mxfp4 ({scale_mode:?}): {e}")))?;
                 }
             }
             stream.synchronize()?;
@@ -329,8 +340,8 @@ fn main() -> Result<(), BenchError> {
                     let (a_p, _r1) = a_dev_fp4.device_ptr(&stream);
                     let (b_p, _r2) = b_dev_fp4.device_ptr(&stream);
                     let (c_p, _r3) = c_dev_fp4.device_ptr_mut(&stream);
-                    let (sa_p, _r4) = scale_a_dev.device_ptr(&stream);
-                    let (sb_p, _r5) = scale_b_dev.device_ptr(&stream);
+                    let (sa_p, _r4) = sa_buf.device_ptr(&stream);
+                    let (sb_p, _r5) = sb_buf.device_ptr(&stream);
                     let (w_p, _r6) = workspace_dev.device_ptr(&stream);
                     rustorch_cuda::cublas_lt::matmul_mxfp4(
                         a_p,
@@ -344,26 +355,44 @@ fn main() -> Result<(), BenchError> {
                         1.0,
                         0.0,
                         rustorch_cuda::cublas_lt::Fp8Output::Bf16,
+                        scale_mode,
                         w_p,
                         workspace_size,
                         stream.cu_stream() as u64,
                     )
-                    .map_err(|e| BenchError(format!("matmul_mxfp4: {e}")))?;
+                    .map_err(|e| BenchError(format!("matmul_mxfp4 ({scale_mode:?}): {e}")))?;
                 }
             }
             stream.synchronize()?;
             Ok(t0.elapsed().as_secs_f64() * 1000.0)
         };
-        let fp4_tflops = match fp4_attempt() {
-            Ok(wall_ms_fp4) => {
-                let ms_per_iter_fp4 = wall_ms_fp4 / n_iters as f64;
-                flops_per_iter / (ms_per_iter_fp4 / 1000.0) / 1e12
-            },
-            Err(e) => {
-                if dim == 128 {
-                    eprintln!("[cublas_gemm_bench] FP4 path skipped — {e}");
-                }
-                f64::NAN
+
+        // Try NVFP4 (VEC16_UE4M3) first, then MXFP4 (VEC32_UE8M0).
+        let fp4_tflops = match make_fp4_attempt(
+            rustorch_cuda::cublas_lt::Fp4ScaleMode::Vec16Ue4m3,
+            &scale_a_ue4m3_dev,
+            &scale_b_ue4m3_dev,
+        ) {
+            Ok(wall) => flops_per_iter / ((wall / n_iters as f64) / 1000.0) / 1e12,
+            Err(e_nvfp4) => match make_fp4_attempt(
+                rustorch_cuda::cublas_lt::Fp4ScaleMode::Vec32Ue8m0,
+                &scale_a_ue8m0_dev,
+                &scale_b_ue8m0_dev,
+            ) {
+                Ok(wall) => {
+                    if dim == 128 {
+                        eprintln!("[cublas_gemm_bench] NVFP4 unsupported ({e_nvfp4}); MXFP4 used.");
+                    }
+                    flops_per_iter / ((wall / n_iters as f64) / 1000.0) / 1e12
+                },
+                Err(e_mxfp4) => {
+                    if dim == 128 {
+                        eprintln!("[cublas_gemm_bench] FP4 unsupported on this GPU");
+                        eprintln!("  NVFP4: {e_nvfp4}");
+                        eprintln!("  MXFP4: {e_mxfp4}");
+                    }
+                    f64::NAN
+                },
             },
         };
 

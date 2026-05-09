@@ -318,12 +318,47 @@ fn lt_err_code(e: cudarc::cublaslt::result::CublasError) -> i32 {
     e.0 as i32
 }
 
-/// Run an MXFP4 GEMM (FP4 inputs with VEC32_UE8M0 block scaling).
+/// FP4 block-scale flavour. Hardware support varies:
+/// - **MXFP4** (VEC32_UE8M0): industry standard. Hopper / Blackwell datacenter.
+/// - **NVFP4** (VEC16_UE4M3): NVIDIA proprietary, more aggressive blocking.
+///   Used on Grace-Blackwell (GB10/GB200). Smaller blocks → more scales →
+///   slightly more memory but better quantization quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp4ScaleMode {
+    /// 32-element blocks with UE8M0 (8-bit exponent) scales — MXFP4 standard.
+    Vec32Ue8m0,
+    /// 16-element blocks with UE4M3 (4-bit exp, 3-bit mantissa) scales — NVFP4.
+    Vec16Ue4m3,
+}
+
+#[cfg(feature = "cuda")]
+impl Fp4ScaleMode {
+    fn cuda_value(self) -> sys::cublasLtMatmulMatrixScale_t {
+        match self {
+            Self::Vec32Ue8m0 => {
+                sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0
+            },
+            Self::Vec16Ue4m3 => {
+                sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3
+            },
+        }
+    }
+
+    /// Block size — number of FP4 elements per scale.
+    pub fn block_size(self) -> usize {
+        match self {
+            Self::Vec32Ue8m0 => 32,
+            Self::Vec16Ue4m3 => 16,
+        }
+    }
+}
+
+/// Run an MXFP4 / NVFP4 GEMM (FP4 inputs with block-scaled quantization).
 ///
-/// FP4 inputs are byte-packed (1 byte = 2 elements). Each block of 32 FP4
-/// elements has one UE8M0 scale (1 byte: 8-bit unsigned exponent, no
-/// mantissa). For an [M × K] FP4 matrix, scales form an [M × (K/32)] UE8M0
-/// matrix. K must be a multiple of 32.
+/// FP4 inputs are byte-packed (1 byte = 2 elements). Each block of N FP4
+/// elements has one byte of scale (UE8M0 or UE4M3 depending on `scale_mode`).
+/// For an [M × K] FP4 matrix, scales form an [M × (K / block_size)] tensor.
+/// K must be a multiple of `scale_mode.block_size()`.
 ///
 /// Output is BF16/FP16/F32 with F32 accumulation. Same TN-only requirement
 /// as FP8: hardcodes `transa=T, transb=N`.
@@ -350,6 +385,7 @@ pub unsafe fn matmul_mxfp4(
     alpha: f32,
     beta: f32,
     out: Fp8Output,
+    scale_mode: Fp4ScaleMode,
     workspace_dev: u64,
     workspace_bytes: usize,
     stream: u64,
@@ -357,9 +393,10 @@ pub unsafe fn matmul_mxfp4(
     if m == 0 || n == 0 || k == 0 {
         return Ok(());
     }
-    if k % 32 != 0 {
+    let block = scale_mode.block_size();
+    if k % block != 0 {
         return Err(CudaError::Unsupported {
-            msg: format!("MXFP4 requires k % 32 == 0, got k={k}"),
+            msg: format!("FP4 requires k % {block} == 0, got k={k}"),
         });
     }
 
@@ -424,13 +461,11 @@ pub unsafe fn matmul_mxfp4(
         location: "cublas_lt::matmul_mxfp4::set_transb",
     })?;
 
-    // Scale modes: VEC32_UE8M0 means "one UE8M0 scale per 32 FP4 elements".
-    // This is the MXFP4 standard.
-    let scale_mode = sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    let scale_mode_val = scale_mode.cuda_value();
     result::set_matmul_desc_attribute(
         matmul_desc,
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
-        (&scale_mode) as *const _ as *const _,
+        (&scale_mode_val) as *const _ as *const _,
         std::mem::size_of::<sys::cublasLtMatmulMatrixScale_t>(),
     )
     .map_err(|e| CudaError::CublasStatus {
@@ -440,7 +475,7 @@ pub unsafe fn matmul_mxfp4(
     result::set_matmul_desc_attribute(
         matmul_desc,
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
-        (&scale_mode) as *const _ as *const _,
+        (&scale_mode_val) as *const _ as *const _,
         std::mem::size_of::<sys::cublasLtMatmulMatrixScale_t>(),
     )
     .map_err(|e| CudaError::CublasStatus {
@@ -552,6 +587,7 @@ pub unsafe fn matmul_mxfp4(
     _alpha: f32,
     _beta: f32,
     _out: Fp8Output,
+    _scale_mode: Fp4ScaleMode,
     _workspace_dev: u64,
     _workspace_bytes: usize,
     _stream: u64,
