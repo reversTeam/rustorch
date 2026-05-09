@@ -186,6 +186,65 @@ impl LlamaModel {
         })
     }
 
+    /// Build a runnable model with deterministic random weights for
+    /// testing (T241.6b parity tests). Uses a simple xorshift64 PRNG
+    /// seeded with `seed`. Weights are scaled to ~N(0, 0.02) which is
+    /// the typical init range for pre-trained Qwen / Llama checkpoints.
+    pub fn from_random(config: LlamaConfig, max_seq: usize, seed: u64) -> Self {
+        let d = config.hidden_size;
+        let kv_dim = config.n_kv_heads() * config.head_dim();
+        let f = config.intermediate_size;
+        let v = config.vocab_size;
+
+        // Simple xorshift64 RNG → uniform [0,1) → scaled [-σ, σ]
+        let mut state = seed.max(1);
+        let mut next_unit = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 8) as f32) / ((u64::MAX >> 8) as f32)
+        };
+        let sigma = 0.02f32;
+        let mut sample =
+            |n: usize| -> Vec<f32> { (0..n).map(|_| (next_unit() * 2.0 - 1.0) * sigma).collect() };
+        // RMSNorm gamma initialized to 1.0 (standard)
+        let ones = |n: usize| -> Vec<f32> { vec![1.0f32; n] };
+
+        let token_emb = sample(v * d);
+        let final_norm = ones(d);
+        let lm_head = if config.tie_word_embeddings {
+            transpose_2d(&token_emb, v, d)
+        } else {
+            sample(d * v)
+        };
+        let mut blocks: Vec<BlockWeights> = Vec::with_capacity(config.num_hidden_layers);
+        for _ in 0..config.num_hidden_layers {
+            blocks.push(BlockWeights {
+                rms_attn: ones(d),
+                w_qkv: sample(d * (d + 2 * kv_dim)),
+                w_o: sample(d * d),
+                rms_ffn: ones(d),
+                w_gate_up: sample(d * 2 * f),
+                w_down: sample(f * d),
+                q_norm: None,
+                k_norm: None,
+            });
+        }
+        let rope = RoPE::new(
+            config.head_dim(),
+            max_seq.min(config.max_position_embeddings),
+            config.rope_theta,
+        );
+        LlamaModel {
+            config,
+            blocks,
+            token_emb,
+            final_norm,
+            lm_head,
+            rope,
+        }
+    }
+
     /// Build a runnable model from a parsed config and a fully
     /// dequantized [`GgufWeights`] bundle. GGUF stores linear weights
     /// in the same `[out, in]` row-major layout as HF safetensors —
