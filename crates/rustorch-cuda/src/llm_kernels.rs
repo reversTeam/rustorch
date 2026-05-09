@@ -223,6 +223,109 @@ extern "C" __global__ void add_inplace_bf16(
 "#;
 
 #[cfg(feature = "cuda")]
+const QUANTIZE_BF16_TO_NVFP4_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// BF16 → NVFP4 (E2M1) avec scales VEC16_UE4M3.
+//
+// Inputs:
+//   x_bf16  : [n] BF16 input
+// Outputs:
+//   out_fp4 : [n/2] u8 packed (1 byte = 2 FP4 elements, low nibble = even index)
+//   out_scale : [n/16] u8 UE4M3 (1 byte par bloc de 16 elements)
+//
+// FP4 E2M1 format : signe 1 bit, exp 2 bits (bias 1), mantissa 1 bit
+// Valeurs représentables : ±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6
+//   (les magnitudes sont 0, 0.5, 1, 1.5, 2, 3, 4, 6 — max = 6.0)
+//
+// Algorithme :
+//   1. Pour chaque bloc de 16 BF16 :
+//      a. max_abs = max(|x_i|) sur le bloc
+//      b. scale = max_abs / 6.0  (si 0 → scale = 1)
+//      c. encode scale en UE4M3 byte
+//      d. pour chaque x_i : x_q = round_to_fp4(x_i / scale)
+//   2. Pack 2 FP4 par byte
+//
+// UE4M3 encoding (8-bit unsigned, exp 4 bits bias 7, mantissa 3 bits) :
+//   value = 2^(E - 7) * (1 + M/8) si E != 0
+//   value = 2^(-6) * M/8         si E == 0 (subnormal)
+//   max value ≈ 240, ~1.0 == 0x70 (E=7, M=0)
+extern "C" __global__ void quantize_bf16_to_nvfp4(
+    const __nv_bfloat16* __restrict__ x,
+    unsigned char* __restrict__ out_fp4,
+    unsigned char* __restrict__ out_scale,
+    int n
+) {
+    int blk = blockIdx.x;
+    int block_off = blk * 16;
+    if (block_off >= n) return;
+
+    // 1. find max abs in 16 elements
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        if (block_off + i >= n) break;
+        float v = fabsf((float)x[block_off + i]);
+        if (v > max_abs) max_abs = v;
+    }
+
+    // 2. scale = max_abs / 6.0  (FP4 max = 6)
+    float scale = max_abs / 6.0f;
+    if (scale < 1e-12f) scale = 1.0f;
+
+    // 3. Encode scale in UE4M3 — simplified : compute log2 + mantissa
+    // float bits : sign(1) exp(8 bias 127) mantissa(23)
+    // We want UE4M3 : exp(4 bias 7) mantissa(3)
+    unsigned int sb = __float_as_uint(scale);
+    int fexp = (int)((sb >> 23) & 0xff) - 127;     // unbiased exponent
+    int fmant = (int)(sb >> 20) & 0x7;             // top 3 bits of mantissa
+    int ue_exp = fexp + 7;                          // re-bias to UE4M3
+    unsigned char scale_byte;
+    if (ue_exp <= 0) {
+        // subnormal or underflow → encode 0 (effectively scale=0, but we floored above)
+        scale_byte = (unsigned char)(fmant);
+    } else if (ue_exp >= 15) {
+        scale_byte = 0xf0 | 0x7;  // saturate
+    } else {
+        scale_byte = (unsigned char)((ue_exp << 3) | fmant);
+    }
+    out_scale[blk] = scale_byte;
+
+    // 4. quantize 16 BF16 → 8 packed bytes (FP4 each = 4 bits)
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if (block_off + 2*i >= n) break;
+        float a = (float)x[block_off + 2*i] / scale;
+        float b = (block_off + 2*i + 1 < n) ? (float)x[block_off + 2*i + 1] / scale : 0.0f;
+
+        // round-to-nearest FP4 E2M1 (signe 1, exp 2, mant 1)
+        // Code des valeurs FP4 (4 bits) :
+        //   0=+0, 1=+0.5, 2=+1, 3=+1.5, 4=+2, 5=+3, 6=+4, 7=+6
+        //   8=-0, 9=-0.5, a=-1, b=-1.5, c=-2, d=-3, e=-4, f=-6
+        auto encode = [](float x_norm) -> unsigned int {
+            unsigned int sign = (x_norm < 0.0f) ? 8u : 0u;
+            float ax = fabsf(x_norm);
+            // Map ax ∈ [0, 6+ε] to one of [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+            unsigned int code;
+            if (ax < 0.25f) code = 0;
+            else if (ax < 0.75f) code = 1;
+            else if (ax < 1.25f) code = 2;
+            else if (ax < 1.75f) code = 3;
+            else if (ax < 2.5f)  code = 4;
+            else if (ax < 3.5f)  code = 5;
+            else if (ax < 5.0f)  code = 6;
+            else code = 7;
+            return sign | code;
+        };
+
+        unsigned int qa = encode(a);
+        unsigned int qb = encode(b);
+        out_fp4[blk * 8 + i] = (unsigned char)((qa & 0xf) | ((qb & 0xf) << 4));
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
 const COPY_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
 
@@ -361,6 +464,7 @@ pub struct LlmKernels {
     copy: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     kv_append: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     gqa_decode: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    quantize_nvfp4: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -380,6 +484,7 @@ impl LlmKernels {
             copy: std::sync::OnceLock::new(),
             kv_append: std::sync::OnceLock::new(),
             gqa_decode: std::sync::OnceLock::new(),
+            quantize_nvfp4: std::sync::OnceLock::new(),
         }
     }
 
@@ -713,6 +818,37 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "kv_append_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Quantize BF16 → NVFP4 (E2M1) avec scales VEC16_UE4M3.
+    /// `out_fp4` doit être de taille n/2 bytes, `out_scale` n/16 bytes.
+    pub unsafe fn quantize_bf16_to_nvfp4(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: u64,
+        out_fp4: u64,
+        out_scale: u64,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.quantize_nvfp4,
+            QUANTIZE_BF16_TO_NVFP4_SRC,
+            "quantize_bf16_to_nvfp4",
+        )?;
+        // 1 block par bloc de 16 elements
+        let n_blocks = (n + 15) / 16;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks as u32, 1, 1),
+            block_dim: (1, 1, 1), // sequential per block
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&x).arg(&out_fp4).arg(&out_scale).arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "quantize_bf16_to_nvfp4::launch",
         })?;
         Ok(())
     }
