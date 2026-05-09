@@ -1466,8 +1466,13 @@ pub unsafe fn matmul_mxfp4(
     })?;
 
     // FP4 inputs are packed 2-per-byte. cuBLASLt's matrix layout API uses
-    // the LOGICAL element count (k×m, k×n, m×n) — the implementation knows
+    // the LOGICAL element count (rows, cols) — the implementation knows
     // the physical byte size from the data type tag.
+    //
+    // Same row-major convention as matmul_bf16 (see build_cached doc) :
+    //   A row-major (m, k) → col-major (k, m, ld=k) with OP_T
+    //   B row-major (k, n) → col-major (n, k, ld=n) with OP_T
+    //   C row-major (m, n) → col-major (m, n, ld=m)  (m=1 hot path OK)
     let fp4_dt = sys::cudaDataType_t::CUDA_R_4F_E2M1;
     let a_layout =
         result::create_matrix_layout(fp4_dt, k as u64, m as u64, k as i64).map_err(|e| {
@@ -1477,7 +1482,7 @@ pub unsafe fn matmul_mxfp4(
             }
         })?;
     let b_layout =
-        result::create_matrix_layout(fp4_dt, k as u64, n as u64, k as i64).map_err(|e| {
+        result::create_matrix_layout(fp4_dt, n as u64, k as u64, n as i64).map_err(|e| {
             CudaError::CublasStatus {
                 code: lt_err_code(e),
                 location: "cublas_lt::matmul_mxfp4::b_layout",
@@ -1499,7 +1504,7 @@ pub unsafe fn matmul_mxfp4(
     })?;
 
     let transa = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
-    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
     result::set_matmul_desc_attribute(
         matmul_desc,
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
