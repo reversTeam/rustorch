@@ -212,34 +212,40 @@ fn run_bf16_block(
     for _ in 0..3 {
         unsafe {
             // QKV proj : (seq × hidden) @ (hidden × qkv_n) = (seq × qkv_n)
-            let (a_p, _r1) = act.device_ptr(stream);
-            let (b_p, _r2) = w_qkv.device_ptr(stream);
-            let (c_p, _r3) = out_qkv.device_ptr_mut(stream);
-            session.matmul_bf16(a_p, b_p, c_p, seq, hidden, qkv_n, 1.0, 0.0)?;
-
-            // Attn out : (seq × hidden) @ (hidden × hidden) = (seq × hidden)
-            let (a_p, _r1) = act.device_ptr(stream);
-            let (b_p, _r2) = w_attn_out.device_ptr(stream);
-            let (c_p, _r3) = out_attn.device_ptr_mut(stream);
-            session.matmul_bf16(a_p, b_p, c_p, seq, hidden, attn_out_n, 1.0, 0.0)?;
-
+            {
+                let (a_p, _r1) = act.device_ptr(stream);
+                let (b_p, _r2) = w_qkv.device_ptr(stream);
+                let (c_p, _r3) = out_qkv.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, qkv_n, 1.0, 0.0)?;
+            }
+            // Attn out
+            {
+                let (a_p, _r1) = act.device_ptr(stream);
+                let (b_p, _r2) = w_attn_out.device_ptr(stream);
+                let (c_p, _r3) = out_attn.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, attn_out_n, 1.0, 0.0)?;
+            }
             // FFN up
-            let (a_p, _r1) = act.device_ptr(stream);
-            let (b_p, _r2) = w_ffn_up.device_ptr(stream);
-            let (c_p, _r3) = out_up.device_ptr_mut(stream);
-            session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0)?;
-
+            {
+                let (a_p, _r1) = act.device_ptr(stream);
+                let (b_p, _r2) = w_ffn_up.device_ptr(stream);
+                let (c_p, _r3) = out_up.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0)?;
+            }
             // FFN gate
-            let (a_p, _r1) = act.device_ptr(stream);
-            let (b_p, _r2) = w_ffn_gate.device_ptr(stream);
-            let (c_p, _r3) = out_gate.device_ptr_mut(stream);
-            session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0)?;
-
-            // FFN down  (uses out_up as input shape (seq × ffn))
-            let (a_p, _r1) = out_up.device_ptr(stream);
-            let (b_p, _r2) = w_ffn_down.device_ptr(stream);
-            let (c_p, _r3) = out_down.device_ptr_mut(stream);
-            session.matmul_bf16(a_p, b_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0)?;
+            {
+                let (a_p, _r1) = act.device_ptr(stream);
+                let (b_p, _r2) = w_ffn_gate.device_ptr(stream);
+                let (c_p, _r3) = out_gate.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, hidden, ffn_up_n, 1.0, 0.0)?;
+            }
+            // FFN down (uses out_up as input shape (seq × ffn))
+            {
+                let (a_p, _r1) = out_up.device_ptr(stream);
+                let (b_p, _r2) = w_ffn_down.device_ptr(stream);
+                let (c_p, _r3) = out_down.device_ptr_mut(stream);
+                session.matmul_bf16(a_p, b_p, c_p, seq, ffn, ffn_down_n, 1.0, 0.0)?;
+            }
         }
     }
     stream.synchronize()?;
