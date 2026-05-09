@@ -379,29 +379,34 @@ fn try_run_sparse_block(
     let (w_dn_p, _r) = unsafe { w_ffn_down.device_ptr(stream) };
     let mut sparse_dn =
         unsafe { sparse_session.prune_compress_bf16(w_dn_p, ffn_down_n, ffn, seq) }?;
-    println!("  weights ready, autotuning sparse plans ...");
-    // cusparseLtMatmulSearch picks the best algorithm config per plan.
-    unsafe {
-        let (b_p, _r) = act.device_ptr(stream);
-        let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
-        sparse_session.autotune(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
+    println!("  weights ready, running 4 sparse matmuls per block (default algo; set RUSTORCH_SPARSE_AUTOTUNE=1 for cusparseLtMatmulSearch — slow!)");
+    if std::env::var("RUSTORCH_SPARSE_AUTOTUNE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        println!("  autotuning sparse plans (this can take minutes per shape) ...");
+        unsafe {
+            let (b_p, _r) = act.device_ptr(stream);
+            let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
+            sparse_session.autotune(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
+        }
+        unsafe {
+            let (b_p, _r) = act.device_ptr(stream);
+            let (c_p, _r2) = out_attn.device_ptr_mut(stream);
+            sparse_session.autotune(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
+        }
+        unsafe {
+            let (b_p, _r) = act.device_ptr(stream);
+            let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
+            sparse_session.autotune(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
+        }
+        unsafe {
+            let (b_p, _r3) = out_gate_up.device_ptr(stream);
+            let (c_p, _r2) = out_down.device_ptr_mut(stream);
+            sparse_session.autotune(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
+        }
+        println!("  autotune done");
     }
-    unsafe {
-        let (b_p, _r) = act.device_ptr(stream);
-        let (c_p, _r2) = out_attn.device_ptr_mut(stream);
-        sparse_session.autotune(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
-    }
-    unsafe {
-        let (b_p, _r) = act.device_ptr(stream);
-        let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
-        sparse_session.autotune(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
-    }
-    unsafe {
-        let (b_p, _r3) = out_gate_up.device_ptr(stream);
-        let (c_p, _r2) = out_down.device_ptr_mut(stream);
-        sparse_session.autotune(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
-    }
-    println!("  autotune done, running 4 sparse matmuls per block");
 
     // Warm-up.
     for _ in 0..3 {
