@@ -739,15 +739,26 @@ extern "C" __global__ void sgemv_q6k_bf16(
         acc += w_val * x_val;
     }
 
-    sdata[tid] = acc;
-    __syncthreads();
+    // T244.1.3.1 — Warp-shuffle reduction over 256 threads = 8 warps.
+    // Each warp shuffle-reduces (5 instr no sync), lane 0 writes warp sum
+    // to shmem, then thread 0 sums the 8 warp sums.
     #pragma unroll
-    for (int s = 128; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
     }
+    int warp_id = tid >> 5;     // 0..8
+    int lane_id = tid & 31;
+    if (lane_id == 0) {
+        sdata[warp_id] = acc;
+    }
+    __syncthreads();
     if (tid == 0) {
-        y[row] = (__nv_bfloat16)sdata[0];
+        float total = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            total += sdata[i];
+        }
+        y[row] = (__nv_bfloat16)total;
     }
 }
 "#;
