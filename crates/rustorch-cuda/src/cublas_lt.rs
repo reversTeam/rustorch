@@ -2002,6 +2002,163 @@ mod parity_tests {
         eprintln!("CACHED FP4 all-ones : {} / {} match k", n_match, n);
     }
 
+    /// T241.6d — try Vec32Ue8m0 mode (MXFP4 standard, simpler scale).
+    /// UE8M0 = pure power-of-2 (8 bits all exponent, bias 127).
+    /// Byte 127 = 2^0 = 1.0. If this mode works while VEC16_UE4M3 has
+    /// the c[1..]=64 layout bug, switch to MXFP4.
+    #[test]
+    fn nvfp4_vec32_ue8m0_all_ones() {
+        let m = 1usize;
+        let k = 128usize; // must be multiple of 32 for VEC32
+        let n = 128usize;
+        // Block size = 32 for Vec32Ue8m0.
+        let a_fp4: Vec<u8> = vec![0x22u8; m * k / 2];
+        let b_fp4: Vec<u8> = vec![0x22u8; k * n / 2];
+        // UE8M0 byte 127 = 2^0 = 1.0.
+        let scale_a: Vec<u8> = vec![127u8; m * (k / 32)];
+        let scale_b: Vec<u8> = vec![127u8; n * (k / 32)];
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let a_dev = stream.memcpy_stod(&a_fp4).expect("upload");
+        let b_dev = stream.memcpy_stod(&b_fp4).expect("upload");
+        let sa_dev = stream.memcpy_stod(&scale_a).expect("upload");
+        let sb_dev = stream.memcpy_stod(&scale_b).expect("upload");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+        let workspace = stream.alloc_zeros::<u8>(32 * 1024 * 1024).expect("ws");
+
+        let res = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (sa_p, _r3) = sa_dev.device_ptr(&stream);
+            let (sb_p, _r4) = sb_dev.device_ptr(&stream);
+            let (c_p, _r5) = c_dev.device_ptr_mut(&stream);
+            let (w_p, _r6) = workspace.device_ptr(&stream);
+            crate::cublas_lt::matmul_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                m,
+                k,
+                n,
+                1.0,
+                0.0,
+                Fp8Output::Bf16,
+                Fp4ScaleMode::Vec32Ue8m0,
+                w_p,
+                32 * 1024 * 1024,
+                stream.cu_stream() as u64,
+            )
+        };
+        match res {
+            Ok(_) => {
+                let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
+                let c: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+                let n_match = c.iter().filter(|&&v| (v - k as f32).abs() < 1.0).count();
+                eprintln!(
+                    "VEC32_UE8M0 result : c[0]={} ; {}/{} match k={k}",
+                    c[0], n_match, n
+                );
+                assert!(
+                    (c[0] - k as f32).abs() < 1.0,
+                    "Vec32Ue8m0 c[0] = {} (expected {})",
+                    c[0],
+                    k
+                );
+            },
+            Err(e) => {
+                eprintln!("VEC32_UE8M0 not supported on this device : {e}");
+            },
+        }
+    }
+
+    /// T241.6d — write distinct values in scale_B to map the layout.
+    /// Scale_B[0] = 0x40 (= 2.0), all others = 0x38 (= 1.0). If c[0] = 256,
+    /// scale_B[0] is read for c[0]. We then check which c[j] also doubles
+    /// to identify the layout.
+    #[test]
+    fn nvfp4_scale_b_layout_probe() {
+        let m = 1usize;
+        let k = 128usize;
+        let n = 128usize;
+        let a_fp4: Vec<u8> = vec![0x22u8; m * k / 2];
+        let b_fp4: Vec<u8> = vec![0x22u8; k * n / 2];
+        let scale_a: Vec<u8> = vec![0x38u8; m * (k / 16)];
+        let mut scale_b: Vec<u8> = vec![0x38u8; n * (k / 16)];
+        // Mark distinct positions.
+        scale_b[0] = 0x40; // first byte → some c[j] doubles
+        let probe_pos = scale_b.len() / 2;
+        scale_b[probe_pos] = 0x48; // mid-buffer → some c[j] gets 4x
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let a_dev = stream.memcpy_stod(&a_fp4).expect("upload");
+        let b_dev = stream.memcpy_stod(&b_fp4).expect("upload");
+        let sa_dev = stream.memcpy_stod(&scale_a).expect("upload");
+        let sb_dev = stream.memcpy_stod(&scale_b).expect("upload");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+        let workspace = stream.alloc_zeros::<u8>(32 * 1024 * 1024).expect("ws");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (sa_p, _r3) = sa_dev.device_ptr(&stream);
+            let (sb_p, _r4) = sb_dev.device_ptr(&stream);
+            let (c_p, _r5) = c_dev.device_ptr_mut(&stream);
+            let (w_p, _r6) = workspace.device_ptr(&stream);
+            crate::cublas_lt::matmul_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                m,
+                k,
+                n,
+                1.0,
+                0.0,
+                Fp8Output::Bf16,
+                Fp4ScaleMode::Vec16Ue4m3,
+                w_p,
+                32 * 1024 * 1024,
+                stream.cu_stream() as u64,
+            )
+            .expect("matmul probe");
+        }
+
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
+        let c: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+
+        // Find which c[j] != base value (which would be 128 in expected case).
+        // With c[0]=128, c[1..]=64 baseline, we want to see which c[j] now
+        // shows 256 (= 2x base) or 64 (no change).
+        let baseline = c[1]; // = 64 typically
+        eprintln!("scale_B[0]=0x40 (2.0), scale_B[{probe_pos}]=0x48 (4.0), others 0x38 (1.0)");
+        eprintln!("baseline c[1] = {baseline} ; reading c[0..16] :");
+        for j in 0..16 {
+            let ratio = c[j] / baseline;
+            eprintln!("  c[{j}] = {} (ratio vs baseline = {ratio:.2})", c[j]);
+        }
+        // Find c[j] with ratio > 1.5 (the 0x40 effect).
+        let mut doubled: Vec<usize> = Vec::new();
+        let mut quadrupled: Vec<usize> = Vec::new();
+        for (j, &v) in c.iter().enumerate() {
+            let r = v / baseline;
+            if r > 1.5 && r < 2.5 {
+                doubled.push(j);
+            }
+            if r > 3.5 && r < 5.0 {
+                quadrupled.push(j);
+            }
+        }
+        eprintln!("c[j] with 2× baseline (scale_B[0] effect) : {doubled:?}");
+        eprintln!("c[j] with 4× baseline (scale_B[mid] effect) : {quadrupled:?}");
+    }
+
     /// T241.6d — perimeter test : try multiple m values to identify the
     /// minimum supported by cuBLASLt FP4 sm_121. The LLM hot path uses m=1
     /// (autoregressive decode) ; if the minimum is > 1, FP4 path is
