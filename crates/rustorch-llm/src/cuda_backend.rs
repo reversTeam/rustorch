@@ -102,6 +102,9 @@ struct BlockWeightsCudaFp4 {
     /// `[F, D]` FP4 packed.
     w_down: CudaSlice<u8>,
     w_down_scale: CudaSlice<u8>,
+    /// T241.6e — Optional fused QKV bias `[D + 2*KV_DIM]` BF16
+    /// (Qwen2/2.5/3) — applied after the FP4 matmul, in BF16.
+    b_qkv: Option<CudaSlice<half::bf16>>,
 }
 
 /// FP4 scratch : activations restent BF16, on alloue des buffers
@@ -403,6 +406,29 @@ impl LlamaModelCuda {
             let (w_gate_up, w_gate_up_scale) = quantize_transposed(d, 2 * f, gu_p)?;
             let (w_down, w_down_scale) = quantize_transposed(f, d, dn_p)?;
 
+            // T241.6e — copy fused QKV bias from BF16 block (if present) to
+            // a fresh BF16 buffer for the FP4 path. The bias itself is not
+            // quantized — it's added in BF16 after the FP4 matmul.
+            let b_qkv = if let Some(bf16_bias) = &self.blocks[blocks_fp4.len()].b_qkv {
+                let qkv_n = d + 2 * (self.config.n_kv_heads() * self.config.head_dim());
+                let mut dst = stream
+                    .alloc_zeros::<half::bf16>(qkv_n)
+                    .map_err(|e| LlmError::Backend(format!("alloc b_qkv fp4: {e:?}")))?;
+                if !skip_quant {
+                    use cudarc::driver::DevicePtrMut;
+                    unsafe {
+                        let (src, _g1) = bf16_bias.device_ptr(stream);
+                        let (d_p, _g2) = dst.device_ptr_mut(stream);
+                        self.kernels
+                            .copy_bf16(stream, d_p, src, qkv_n as i32)
+                            .map_err(|e| LlmError::Backend(format!("copy b_qkv fp4: {e:?}")))?;
+                    }
+                }
+                Some(dst)
+            } else {
+                None
+            };
+
             blocks_fp4.push(BlockWeightsCudaFp4 {
                 rms_attn,
                 w_qkv,
@@ -414,6 +440,7 @@ impl LlamaModelCuda {
                 w_gate_up_scale,
                 w_down,
                 w_down_scale,
+                b_qkv,
             });
         }
         // Scratch FP4 : on garde les scratch BF16 + on alloue les FP4 buffers
@@ -544,6 +571,16 @@ impl LlamaModelCuda {
                         Fp4ScaleMode::Vec16Ue4m3,
                     )
                     .map_err(|e| LlmError::Backend(format!("matmul_qkv_fp4 L{li}: {e:?}")))?;
+            }
+            // T241.6e — add QKV bias (Qwen2/2.5/3) in BF16 post-matmul.
+            if let Some(b_qkv) = &block.b_qkv {
+                unsafe {
+                    let (qkv_p, _r1) = self.scratch.qkv.device_ptr_mut(&self.stream);
+                    let (bias_p, _r2) = b_qkv.device_ptr(&self.stream);
+                    self.kernels
+                        .add_inplace_bf16(&self.stream, qkv_p, bias_p, qkv_n as i32)
+                        .map_err(|e| LlmError::Backend(format!("qkv_bias fp4 L{li}: {e:?}")))?;
+                }
             }
             // RoPE Q et K (kept BF16 ops as before)
             let (q_off, k_off, v_off) = (0u64, (d as u64) * 2, ((d + kv_dim) as u64) * 2);
