@@ -34,6 +34,7 @@
 pub mod allocator;
 pub mod context;
 pub mod cublas;
+pub mod cublas_lt;
 pub mod cudnn;
 pub mod curand;
 pub mod cusparse;
