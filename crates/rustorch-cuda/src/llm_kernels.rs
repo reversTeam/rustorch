@@ -2660,6 +2660,148 @@ mod parity_tests {
         }
     }
 
+    /// T243.2.1 — full SSM block bench at Qwen3.6-27B dimensions.
+    #[test]
+    #[ignore = "perf benchmark"]
+    fn ssm_block_full_bench() {
+        use std::time::Instant;
+
+        let head_kv = 128usize;
+        let n_k = 16usize;
+        let n_v = 48usize;
+        let key_dim = head_kv * n_k;
+        let value_dim = head_kv * n_v;
+        let conv_dim = 2 * key_dim + value_dim;
+        let conv_kernel = 4usize;
+        let n_layers_ssm = 48usize;
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let conv_w = stream
+            .alloc_zeros::<half::bf16>(conv_kernel * conv_dim)
+            .expect("");
+        let mut conv_state = stream
+            .alloc_zeros::<half::bf16>((conv_kernel - 1) * conv_dim)
+            .expect("");
+        let conv_input = stream.alloc_zeros::<half::bf16>(conv_dim).expect("");
+        let mut conv_out = stream.alloc_zeros::<half::bf16>(conv_dim).expect("");
+        let mut q_dev = stream.alloc_zeros::<half::bf16>(key_dim).expect("");
+        let mut k_dev = stream.alloc_zeros::<half::bf16>(key_dim).expect("");
+        let q_v_dev = stream.alloc_zeros::<half::bf16>(value_dim).expect("");
+        let k_v_dev = stream.alloc_zeros::<half::bf16>(value_dim).expect("");
+        let v_dev = stream.alloc_zeros::<half::bf16>(value_dim).expect("");
+        let gate_dev = stream.alloc_zeros::<half::bf16>(n_v).expect("");
+        let beta_dev = stream.alloc_zeros::<half::bf16>(n_v).expect("");
+        let mut state_dev = stream
+            .alloc_zeros::<half::bf16>(n_v * head_kv * head_kv)
+            .expect("");
+        let mut sm_out = stream.alloc_zeros::<half::bf16>(n_v * head_kv).expect("");
+
+        let (cw_p, cs_p, ci_p, co_p, q_p, k_p, qv_p, kv_p, v_p, g_p, b_p, st_p, smo_p) = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            (
+                conv_w.device_ptr(&stream).0,
+                conv_state.device_ptr_mut(&stream).0,
+                conv_input.device_ptr(&stream).0,
+                conv_out.device_ptr_mut(&stream).0,
+                q_dev.device_ptr_mut(&stream).0,
+                k_dev.device_ptr_mut(&stream).0,
+                q_v_dev.device_ptr(&stream).0,
+                k_v_dev.device_ptr(&stream).0,
+                v_dev.device_ptr(&stream).0,
+                gate_dev.device_ptr(&stream).0,
+                beta_dev.device_ptr(&stream).0,
+                state_dev.device_ptr_mut(&stream).0,
+                sm_out.device_ptr_mut(&stream).0,
+            )
+        };
+
+        // Warm-up.
+        unsafe {
+            kernels
+                .conv1d_depthwise_bf16(
+                    &stream,
+                    cw_p,
+                    cs_p,
+                    ci_p,
+                    co_p,
+                    conv_dim as i32,
+                    conv_kernel as i32,
+                )
+                .ok();
+            kernels
+                .l2_norm_per_head_bf16(&stream, q_p, n_k as i32, head_kv as i32, 1e-6)
+                .ok();
+            kernels
+                .delta_net_step_bf16(
+                    &stream,
+                    qv_p,
+                    kv_p,
+                    v_p,
+                    g_p,
+                    b_p,
+                    st_p,
+                    smo_p,
+                    n_v as i32,
+                    head_kv as i32,
+                )
+                .ok();
+        }
+        stream.synchronize().ok();
+
+        let n_iters = 50;
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            for _ in 0..n_layers_ssm {
+                unsafe {
+                    kernels
+                        .conv1d_depthwise_bf16(
+                            &stream,
+                            cw_p,
+                            cs_p,
+                            ci_p,
+                            co_p,
+                            conv_dim as i32,
+                            conv_kernel as i32,
+                        )
+                        .ok();
+                    kernels
+                        .l2_norm_per_head_bf16(&stream, q_p, n_k as i32, head_kv as i32, 1e-6)
+                        .ok();
+                    kernels
+                        .l2_norm_per_head_bf16(&stream, k_p, n_k as i32, head_kv as i32, 1e-6)
+                        .ok();
+                    kernels
+                        .delta_net_step_bf16(
+                            &stream,
+                            qv_p,
+                            kv_p,
+                            v_p,
+                            g_p,
+                            b_p,
+                            st_p,
+                            smo_p,
+                            n_v as i32,
+                            head_kv as i32,
+                        )
+                        .ok();
+                }
+            }
+        }
+        stream.synchronize().ok();
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+
+        eprintln!();
+        eprintln!("=== SSM BLOCK FULL BENCH (Qwen3.6-27B dim, 48 SSM layers) ===");
+        eprintln!(
+            "  per-token (SSM only): {elapsed_ms:.2} ms = {:.2} tok/s ceiling",
+            1000.0 / elapsed_ms
+        );
+        eprintln!("  llama.cpp Qwen3.6-27B Q4_K_M ref : 11.62 tok/s");
+    }
+
     /// T243.2 — delta_net_step_bf16 parity vs CPU.
     #[test]
     fn delta_net_step_bf16_matches_cpu() {
