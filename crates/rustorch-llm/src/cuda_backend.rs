@@ -308,29 +308,45 @@ impl LlamaModelCuda {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        // Helper : quantize un buffer BF16 → (FP4 packed, UE4M3 scale)
-        let quantize_or_alloc =
-            |size_bf16: usize, src_bf16: u64| -> Result<(CudaSlice<u8>, CudaSlice<u8>), LlmError> {
-                let fp4_bytes = size_bf16 / 2;
-                let scale_bytes = size_bf16 / block16;
-                let mut fp4 = stream
-                    .alloc_zeros::<u8>(fp4_bytes.max(1))
-                    .map_err(|e| LlmError::Backend(format!("alloc fp4: {e:?}")))?;
-                let mut scale = stream
-                    .alloc_zeros::<u8>(scale_bytes.max(1))
-                    .map_err(|e| LlmError::Backend(format!("alloc scale: {e:?}")))?;
-                if !skip_quant {
-                    use cudarc::driver::DevicePtrMut;
-                    unsafe {
-                        let (fp4_p, _r1) = fp4.device_ptr_mut(stream);
-                        let (sc_p, _r2) = scale.device_ptr_mut(stream);
-                        self.kernels
-                            .quantize_bf16_to_nvfp4(stream, src_bf16, fp4_p, sc_p, size_bf16 as i32)
-                            .map_err(|e| LlmError::Backend(format!("quantize: {e:?}")))?;
-                    }
+        // T241.6c : helper qui transpose row-major (rows, cols) → row-major
+        // (cols, rows) AVANT la quantization NVFP4. cuBLASLt FP4 sm_121 ne
+        // supporte que TN ; pour que op(B) = B (col-major) corresponde à W
+        // mathématiquement, il faut que le buffer FP4 soit le contenu de W
+        // en col-major (= W^T en row-major). Le transpose ici fait ça.
+        let quantize_transposed = |rows: usize,
+                                   cols: usize,
+                                   src_bf16: u64|
+         -> Result<(CudaSlice<u8>, CudaSlice<u8>), LlmError> {
+            let n = rows * cols;
+            let fp4_bytes = n / 2;
+            let scale_bytes = n / block16;
+            let mut fp4 = stream
+                .alloc_zeros::<u8>(fp4_bytes.max(1))
+                .map_err(|e| LlmError::Backend(format!("alloc fp4: {e:?}")))?;
+            let mut scale = stream
+                .alloc_zeros::<u8>(scale_bytes.max(1))
+                .map_err(|e| LlmError::Backend(format!("alloc scale: {e:?}")))?;
+            if !skip_quant {
+                use cudarc::driver::DevicePtrMut;
+                // Tampon temporaire BF16 pour la transposition.
+                let mut tmp = stream
+                    .alloc_zeros::<half::bf16>(n)
+                    .map_err(|e| LlmError::Backend(format!("alloc tmp transpose: {e:?}")))?;
+                unsafe {
+                    let (tmp_p, _r0) = tmp.device_ptr_mut(stream);
+                    self.kernels
+                        .transpose_bf16(stream, src_bf16, tmp_p, rows as i32, cols as i32)
+                        .map_err(|e| LlmError::Backend(format!("transpose: {e:?}")))?;
+                    let (fp4_p, _r1) = fp4.device_ptr_mut(stream);
+                    let (sc_p, _r2) = scale.device_ptr_mut(stream);
+                    let (tmp_p2, _r3) = tmp.device_ptr(stream);
+                    self.kernels
+                        .quantize_bf16_to_nvfp4(stream, tmp_p2, fp4_p, sc_p, n as i32)
+                        .map_err(|e| LlmError::Backend(format!("quantize: {e:?}")))?;
                 }
-                Ok((fp4, scale))
-            };
+            }
+            Ok((fp4, scale))
+        };
 
         // Per-weight FP4 + scale (vraie quantization si BF16 weights real).
         let mut blocks_fp4: Vec<BlockWeightsCudaFp4> = Vec::with_capacity(self.blocks.len());
@@ -350,10 +366,12 @@ impl LlamaModelCuda {
             let (gu_p, _r3) = unsafe { blk.w_gate_up.device_ptr(stream) };
             let (dn_p, _r4) = unsafe { blk.w_down.device_ptr(stream) };
 
-            let (w_qkv, w_qkv_scale) = quantize_or_alloc(d * qkv_n, qkv_p)?;
-            let (w_o, w_o_scale) = quantize_or_alloc(d * d, o_p)?;
-            let (w_gate_up, w_gate_up_scale) = quantize_or_alloc(d * 2 * f, gu_p)?;
-            let (w_down, w_down_scale) = quantize_or_alloc(f * d, dn_p)?;
+            // W shapes row-major : w_qkv[d, qkv_n], w_o[d, d],
+            // w_gate_up[d, 2f], w_down[f, d].
+            let (w_qkv, w_qkv_scale) = quantize_transposed(d, qkv_n, qkv_p)?;
+            let (w_o, w_o_scale) = quantize_transposed(d, d, o_p)?;
+            let (w_gate_up, w_gate_up_scale) = quantize_transposed(d, 2 * f, gu_p)?;
+            let (w_down, w_down_scale) = quantize_transposed(f, d, dn_p)?;
 
             blocks_fp4.push(BlockWeightsCudaFp4 {
                 rms_attn,

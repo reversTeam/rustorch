@@ -153,6 +153,23 @@ fn main() -> Result<(), PErr> {
         cuda_logits.push(logits);
     }
 
+    // ===== CUDA path NVFP4 : T241.6c — re-enable_fp4 then re-run =====
+    println!("[qwen_parity_test] enabling NVFP4 path...");
+    cuda.enable_fp4()?;
+    cuda.reset_kv();
+    let mut fp4_logits: Vec<Vec<f32>> = Vec::with_capacity(prompt.len() + max_new);
+    for &tok in &prompt {
+        let _ = cuda.decode_step_fp4(tok)?;
+        fp4_logits.push(cuda.last_logits()?);
+    }
+    let mut last = argmax(fp4_logits.last().unwrap());
+    for _ in 0..max_new {
+        let _ = cuda.decode_step_fp4(last)?;
+        let logits = cuda.last_logits()?;
+        last = argmax(&logits);
+        fp4_logits.push(logits);
+    }
+
     // ===== Compare per-step =====
     println!();
     println!("============== Per-step parity report ==============");
@@ -189,19 +206,33 @@ fn main() -> Result<(), PErr> {
     // ===== Greedy token sequences =====
     let cpu_tokens: Vec<u32> = cpu_logits.iter().map(|l| argmax(l)).collect();
     let cuda_tokens: Vec<u32> = cuda_logits.iter().map(|l| argmax(l)).collect();
-    println!("CPU  argmax sequence : {cpu_tokens:?}");
-    println!("CUDA argmax sequence : {cuda_tokens:?}");
+    let fp4_tokens: Vec<u32> = fp4_logits.iter().map(|l| argmax(l)).collect();
+    println!("CPU       argmax sequence : {cpu_tokens:?}");
+    println!("CUDA-BF16 argmax sequence : {cuda_tokens:?}");
+    println!("CUDA-FP4  argmax sequence : {fp4_tokens:?}");
 
     let bf16_top1_match = cpu_tokens
         .iter()
         .zip(cuda_tokens.iter())
         .take_while(|(a, b)| a == b)
         .count();
+    let fp4_top1_match = cpu_tokens
+        .iter()
+        .zip(fp4_tokens.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // FP4 cosine similarity step 0 — best signal for "FP4 is mathematically sane".
+    let fp4_step0_cos = cosine(&cpu_logits[0], &fp4_logits[0]);
 
     println!();
     println!("================ Final Result ================");
     println!(
         "  CPU vs CUDA-BF16 : full_match={all_match} prefix_match={bf16_top1_match}/{}",
+        cpu_tokens.len()
+    );
+    println!(
+        "  CPU vs CUDA-FP4  : prefix_match={fp4_top1_match}/{}  cos(step0)={fp4_step0_cos:.4}",
         cpu_tokens.len()
     );
     println!("==============================================");

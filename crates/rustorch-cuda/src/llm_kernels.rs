@@ -228,6 +228,29 @@ extern "C" __global__ void add_inplace_bf16(
 "#;
 
 #[cfg(feature = "cuda")]
+const TRANSPOSE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// Transpose row-major [rows, cols] → row-major [cols, rows].
+//   src[i, j] = src_buf[i*cols + j]    →    dst[j, i] = dst_buf[j*rows + i]
+//
+// T241.6c — used to convert row-major W → col-major-equivalent layout
+// before NVFP4 quantization, so that cuBLASLt FP4 (TN-only on sm_121)
+// reads the buffer as the correct mathematical W.
+extern "C" __global__ void transpose_bf16(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16* __restrict__ dst,
+    int rows,
+    int cols
+) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows || j >= cols) return;
+    dst[j * rows + i] = src[i * cols + j];
+}
+"#;
+
+#[cfg(feature = "cuda")]
 const QUANTIZE_BF16_TO_NVFP4_SRC: &str = r#"
 #include <cuda_bf16.h>
 
@@ -556,6 +579,7 @@ pub struct LlmKernels {
     gqa_decode: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     quantize_nvfp4: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     gqa_decode_online: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    transpose: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -577,6 +601,7 @@ impl LlmKernels {
             gqa_decode: std::sync::OnceLock::new(),
             quantize_nvfp4: std::sync::OnceLock::new(),
             gqa_decode_online: std::sync::OnceLock::new(),
+            transpose: std::sync::OnceLock::new(),
         }
     }
 
@@ -989,6 +1014,42 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "quantize_bf16_to_nvfp4::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Transpose BF16 row-major [rows, cols] → [cols, rows].
+    ///
+    /// T241.6c — utilisé pour convertir les poids row-major vers une
+    /// disposition équivalente col-major avant la quantization NVFP4,
+    /// pour que cuBLASLt FP4 (TN-only sur sm_121) lise le bon W.
+    ///
+    /// # Safety
+    /// `src` et `dst` doivent être valides pour `rows*cols` BF16 chacun.
+    pub unsafe fn transpose_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: u64,
+        dst: u64,
+        rows: i32,
+        cols: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) =
+            self.compile_or_get(&self.transpose, TRANSPOSE_BF16_SRC, "transpose_bf16")?;
+        let bx = 16u32;
+        let by = 16u32;
+        let gx = ((cols as u32) + bx - 1) / bx;
+        let gy = ((rows as u32) + by - 1) / by;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (gx, gy, 1),
+            block_dim: (bx, by, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&src).arg(&dst).arg(&rows).arg(&cols);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "transpose_bf16::launch",
         })?;
         Ok(())
     }
