@@ -1,0 +1,119 @@
+//! `cublas_gemm_bench` — measure cuBLAS gemm throughput on the active device.
+//!
+//! Runs `cublasSgemm` over a sweep of square shapes, allocating device
+//! buffers once and looping many gemm calls so the measurement isolates
+//! compute (no H2D/D2H per iteration). Reports wall-time and TFLOPS.
+//!
+//! ## Usage
+//!
+//! ```bash
+//! # On DGX (with CUDA toolkit on PATH):
+//! cargo run --release -p rustorch-cuda --features cuda --example cublas_gemm_bench
+//!
+//! # Optional: pick the device index (default 0)
+//! cargo run --release -p rustorch-cuda --features cuda --example cublas_gemm_bench -- 0
+//! ```
+//!
+//! Without `--features cuda`, prints a notice and exits cleanly so CI
+//! can build the example on any host without failing.
+
+#[cfg(not(feature = "cuda"))]
+fn main() {
+    println!("[cublas_gemm_bench] cuda feature is OFF — nothing to bench.");
+    println!("[cublas_gemm_bench] Re-run with: cargo run --release -p rustorch-cuda --features cuda --example cublas_gemm_bench");
+}
+
+#[cfg(feature = "cuda")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use cudarc::cublas::{sys, CudaBlas, Gemm, GemmConfig};
+    use cudarc::driver::CudaContext;
+    use std::time::Instant;
+
+    let device_index: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    println!("[cublas_gemm_bench] initialising CUDA on device {device_index}");
+    let ctx = CudaContext::new(device_index)?;
+    let stream = ctx.default_stream();
+    let blas = CudaBlas::new(stream.clone())?;
+
+    println!("[cublas_gemm_bench] device ready, running sgemm sweep");
+    println!();
+    println!(
+        "  {:>5} {:>10} {:>14} {:>10} {:>12}",
+        "M=N=K", "iters", "wall (ms)", "ms/iter", "TFLOPS f32"
+    );
+    println!("  {}", "─".repeat(60));
+
+    // Square shape sweep. Shapes chosen to span small (cache-resident-ish)
+    // up to 4096² which is the typical "large dense gemm" sweet spot.
+    let shapes = [128usize, 256, 512, 1024, 2048, 4096];
+
+    for &dim in &shapes {
+        let m = dim;
+        let n = dim;
+        let k = dim;
+        let n_iters = if dim <= 512 {
+            200
+        } else if dim <= 2048 {
+            50
+        } else {
+            10
+        };
+
+        // Allocate device buffers once. Filled with deterministic small
+        // values so any later checksum is stable run-to-run.
+        let a_host: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.001).sin()).collect();
+        let b_host: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.001).cos()).collect();
+
+        let a_dev = stream.memcpy_stod(&a_host)?;
+        let b_dev = stream.memcpy_stod(&b_host)?;
+        let mut c_dev = stream.alloc_zeros::<f32>(m * n)?;
+
+        let cfg = GemmConfig::<f32> {
+            transa: sys::cublasOperation_t::CUBLAS_OP_N,
+            transb: sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0,
+            lda: n as i32,
+            ldb: k as i32,
+            beta: 0.0,
+            ldc: n as i32,
+        };
+
+        // Warm-up: 5 calls to amortize first-launch JIT / handle setup.
+        for _ in 0..5 {
+            // SAFETY: shapes match cfg, a/b/c are alloc'd to the right sizes.
+            unsafe {
+                blas.gemm(cfg, &b_dev, &a_dev, &mut c_dev)?;
+            }
+        }
+        stream.synchronize()?;
+
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            unsafe {
+                blas.gemm(cfg, &b_dev, &a_dev, &mut c_dev)?;
+            }
+        }
+        stream.synchronize()?;
+        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let ms_per_iter = wall_ms / n_iters as f64;
+        // FLOPS for a sgemm: 2 · M · N · K (mul + add per element).
+        let flops_per_iter = 2.0 * (m as f64) * (n as f64) * (k as f64);
+        let tflops = flops_per_iter / (ms_per_iter / 1000.0) / 1e12;
+
+        println!(
+            "  {:>5} {:>10} {:>14.2} {:>10.3} {:>12.2}",
+            dim, n_iters, wall_ms, ms_per_iter, tflops
+        );
+    }
+
+    println!();
+    println!("[cublas_gemm_bench] done");
+    Ok(())
+}
