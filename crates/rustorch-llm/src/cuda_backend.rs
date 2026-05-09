@@ -278,9 +278,17 @@ impl LlamaModelCuda {
         self.kv_pos = 0;
     }
 
-    /// Allocate FP4 weight buffers (T241.5). Les weights sont initialisés
-    /// à zéro (dummy) — convient au bench timing. En production T241.5b
-    /// fera la quantisation BF16 → NVFP4 réelle au load time.
+    /// Allocate FP4 weight buffers et quantize les BF16 weights existants
+    /// vers NVFP4 (T241.5b).
+    ///
+    /// Si les BF16 weights sont real (chargés via from_cpu) : vraie
+    /// quantization device-side via le kernel `quantize_bf16_to_nvfp4`.
+    /// Si dummy zeros : la quantization donne aussi des zeros (ok pour
+    /// timing bench).
+    ///
+    /// Note : sur Qwen-72B en mode `from_dummy_fp4_only`, les BF16
+    /// weights sont des stubs 16-byte ; le quantize ne peut pas être
+    /// appelé (skip via `RUSTORCH_BENCH_SKIP_QUANT=1`).
     pub fn enable_fp4(&mut self) -> Result<(), LlmError> {
         let d = self.config.hidden_size;
         let kv_dim = self.config.n_kv_heads() * self.config.head_dim();
@@ -295,32 +303,69 @@ impl LlamaModelCuda {
                 .map_err(|e| LlmError::Backend(format!("alloc {n} u8: {e:?}")))
         };
 
-        // Per-weight FP4 + scale sizes :
-        //   weight_fp4 = m * k / 2 bytes
-        //   weight_scale = m * k / 16 bytes (UE4M3)
+        // Skip quantize si BF16 weights sont stubs (mode fp4_only)
+        let skip_quant = std::env::var("RUSTORCH_BENCH_SKIP_QUANT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // Helper : quantize un buffer BF16 → (FP4 packed, UE4M3 scale)
+        let quantize_or_alloc =
+            |size_bf16: usize, src_bf16: u64| -> Result<(CudaSlice<u8>, CudaSlice<u8>), LlmError> {
+                let fp4_bytes = size_bf16 / 2;
+                let scale_bytes = size_bf16 / block16;
+                let mut fp4 = stream
+                    .alloc_zeros::<u8>(fp4_bytes.max(1))
+                    .map_err(|e| LlmError::Backend(format!("alloc fp4: {e:?}")))?;
+                let mut scale = stream
+                    .alloc_zeros::<u8>(scale_bytes.max(1))
+                    .map_err(|e| LlmError::Backend(format!("alloc scale: {e:?}")))?;
+                if !skip_quant {
+                    use cudarc::driver::DevicePtrMut;
+                    unsafe {
+                        let (fp4_p, _r1) = fp4.device_ptr_mut(stream);
+                        let (sc_p, _r2) = scale.device_ptr_mut(stream);
+                        self.kernels
+                            .quantize_bf16_to_nvfp4(stream, src_bf16, fp4_p, sc_p, size_bf16 as i32)
+                            .map_err(|e| LlmError::Backend(format!("quantize: {e:?}")))?;
+                    }
+                }
+                Ok((fp4, scale))
+            };
+
+        // Per-weight FP4 + scale (vraie quantization si BF16 weights real).
         let mut blocks_fp4: Vec<BlockWeightsCudaFp4> = Vec::with_capacity(self.blocks.len());
         for blk in self.blocks.iter() {
-            // rms_attn / rms_ffn restent BF16 (small, no quant benefit)
-            // Pour les FP4 weights on alloue zeros (dummy quantization).
+            // rms_attn / rms_ffn restent BF16 — copy depuis les blocks existants
+            // pour que RMSNorm marche correctement.
             let rms_attn = stream
                 .alloc_zeros::<half::bf16>(d)
                 .map_err(|e| LlmError::Backend(format!("alloc rms_attn: {e:?}")))?;
             let rms_ffn = stream
                 .alloc_zeros::<half::bf16>(d)
                 .map_err(|e| LlmError::Backend(format!("alloc rms_ffn: {e:?}")))?;
-            // Copy gamma values from BF16 buffers (so RMSNorm produces sensible scaling)
-            let _ = blk; // unused : we use zeros for now
+
+            use cudarc::driver::DevicePtr;
+            let (qkv_p, _r1) = unsafe { blk.w_qkv.device_ptr(stream) };
+            let (o_p, _r2) = unsafe { blk.w_o.device_ptr(stream) };
+            let (gu_p, _r3) = unsafe { blk.w_gate_up.device_ptr(stream) };
+            let (dn_p, _r4) = unsafe { blk.w_down.device_ptr(stream) };
+
+            let (w_qkv, w_qkv_scale) = quantize_or_alloc(d * qkv_n, qkv_p)?;
+            let (w_o, w_o_scale) = quantize_or_alloc(d * d, o_p)?;
+            let (w_gate_up, w_gate_up_scale) = quantize_or_alloc(d * 2 * f, gu_p)?;
+            let (w_down, w_down_scale) = quantize_or_alloc(f * d, dn_p)?;
+
             blocks_fp4.push(BlockWeightsCudaFp4 {
                 rms_attn,
-                w_qkv: alloc_u8(d * qkv_n / 2)?,
-                w_qkv_scale: alloc_u8(d * qkv_n / block16)?,
-                w_o: alloc_u8(d * d / 2)?,
-                w_o_scale: alloc_u8(d * d / block16)?,
+                w_qkv,
+                w_qkv_scale,
+                w_o,
+                w_o_scale,
                 rms_ffn,
-                w_gate_up: alloc_u8(d * 2 * f / 2)?,
-                w_gate_up_scale: alloc_u8(d * 2 * f / block16)?,
-                w_down: alloc_u8(f * d / 2)?,
-                w_down_scale: alloc_u8(f * d / block16)?,
+                w_gate_up,
+                w_gate_up_scale,
+                w_down,
+                w_down_scale,
             });
         }
         // Scratch FP4 : on garde les scratch BF16 + on alloue les FP4 buffers
