@@ -251,6 +251,21 @@ extern "C" {
         streams: *mut *mut std::ffi::c_void,
         num_streams: i32,
     ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn cusparseLtMatmulSearch(
+        handle: *const CusparseLtHandle,
+        plan: *mut CusparseLtMatmulPlan,
+        alpha: *const std::ffi::c_void,
+        d_a: *const std::ffi::c_void,
+        d_b: *const std::ffi::c_void,
+        beta: *const std::ffi::c_void,
+        d_c: *const std::ffi::c_void,
+        d_d: *mut std::ffi::c_void,
+        workspace: *mut std::ffi::c_void,
+        streams: *mut *mut std::ffi::c_void,
+        num_streams: i32,
+    ) -> i32;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -538,6 +553,50 @@ impl SparseLtSession {
             workspace_size,
             workspace,
         })
+    }
+
+    /// Run cusparseLtMatmulSearch — autotune the sparse plan for the
+    /// actual buffers. Picks the fastest algorithm config and stores it
+    /// in the plan. Should be called once before the first matmul_bf16.
+    ///
+    /// # Safety
+    /// Same as matmul_bf16. `b_dev` / `c_dev` are written through during
+    /// the search.
+    pub unsafe fn autotune(
+        &self,
+        sparse: &mut SparseWeight,
+        b_dev: u64,
+        c_dev: u64,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), CudaError> {
+        let stream_ptr = self.stream.cu_stream() as *mut std::ffi::c_void;
+        let mut streams_array = [stream_ptr];
+        let workspace_ptr = {
+            use cudarc::driver::DevicePtrMut;
+            sparse.workspace.device_ptr_mut(&self.stream).0 as *mut std::ffi::c_void
+        };
+        let compressed_ptr = {
+            use cudarc::driver::DevicePtr;
+            sparse.compressed.device_ptr(&self.stream).0 as *const std::ffi::c_void
+        };
+        check(
+            cusparseLtMatmulSearch(
+                &self.handle,
+                &mut sparse.plan,
+                (&alpha) as *const f32 as *const _,
+                compressed_ptr,
+                b_dev as *const std::ffi::c_void,
+                (&beta) as *const f32 as *const _,
+                c_dev as *const std::ffi::c_void,
+                c_dev as *mut std::ffi::c_void,
+                workspace_ptr,
+                streams_array.as_mut_ptr(),
+                1,
+            ),
+            "matmul_search",
+        )?;
+        Ok(())
     }
 
     /// Sparse · dense BF16 matmul.
