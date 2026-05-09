@@ -6,7 +6,35 @@ fn main() {
 }
 
 #[cfg(feature = "cuda")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug)]
+struct TestErr(String);
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Display for TestErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl std::error::Error for TestErr {}
+
+#[cfg(feature = "cuda")]
+impl From<cudarc::driver::DriverError> for TestErr {
+    fn from(e: cudarc::driver::DriverError) -> Self {
+        Self(format!("driver: {e:?}"))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl From<rustorch_cuda::error::CudaError> for TestErr {
+    fn from(e: rustorch_cuda::error::CudaError) -> Self {
+        Self(format!("cuda: {e:?}"))
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn main() -> Result<(), TestErr> {
     use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
     use rustorch_cuda::llm_kernels::LlmKernels;
 
