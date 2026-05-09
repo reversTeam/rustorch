@@ -4878,6 +4878,153 @@ mod parity_tests {
         eprintln!("  llama.cpp ref Qwen-7B Q4_K_M : 47.15 tok/s");
     }
 
+    /// T244.3 — micro-bench sgemv_q5k_bf16 + sgemv_q6k_bf16 to compare
+    /// per-call bandwidth across all our quantized SGEMV kernels.
+    /// Run with `cargo test --release -- --ignored --nocapture sgemv_quant_bench`.
+    #[test]
+    #[ignore = "perf benchmark"]
+    fn sgemv_quant_bench() {
+        use rustorch_gguf::dequant::{Q4_K_BYTES, Q5_K_BYTES, Q6_K_BYTES, QK_K};
+        use std::time::Instant;
+
+        let n = 18944usize; // Qwen-7B FFN row count.
+        let k = 3584usize;
+        let blocks_per_row = k / QK_K;
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let mut state: u64 = 0xdeadbeefcafe;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        };
+
+        let row_bytes_q4 = blocks_per_row * Q4_K_BYTES;
+        let row_bytes_q5 = blocks_per_row * Q5_K_BYTES;
+        let row_bytes_q6 = blocks_per_row * Q6_K_BYTES;
+
+        let mut w_q4 = vec![0u8; n * row_bytes_q4];
+        let mut w_q5 = vec![0u8; n * row_bytes_q5];
+        let mut w_q6 = vec![0u8; n * row_bytes_q6];
+        for b in &mut w_q4 {
+            *b = next();
+        }
+        for b in &mut w_q5 {
+            *b = next();
+        }
+        for b in &mut w_q6 {
+            *b = next();
+        }
+        // Make scales sane.
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off4 = row * row_bytes_q4 + blk * Q4_K_BYTES;
+                let d4 = half::f16::from_f32(0.05).to_le_bytes();
+                w_q4[off4] = d4[0];
+                w_q4[off4 + 1] = d4[1];
+                let dmin4 = half::f16::from_f32(0.025).to_le_bytes();
+                w_q4[off4 + 2] = dmin4[0];
+                w_q4[off4 + 3] = dmin4[1];
+                for i in 0..12 {
+                    w_q4[off4 + 4 + i] &= 0x3F;
+                }
+                let off5 = row * row_bytes_q5 + blk * Q5_K_BYTES;
+                w_q5[off5] = d4[0];
+                w_q5[off5 + 1] = d4[1];
+                w_q5[off5 + 2] = dmin4[0];
+                w_q5[off5 + 3] = dmin4[1];
+                for i in 0..12 {
+                    w_q5[off5 + 4 + i] &= 0x3F;
+                }
+                let off6 = row * row_bytes_q6 + blk * Q6_K_BYTES;
+                let d6 = half::f16::from_f32(0.04).to_le_bytes();
+                // Q6 layout : ql 128 + qh 64 + scales (16 i8) + d (f16).
+                w_q6[off6 + 208] = d6[0];
+                w_q6[off6 + 209] = d6[1];
+                for i in 0..16 {
+                    w_q6[off6 + 192 + i] = (next() as i8 / 8) as u8;
+                }
+            }
+        }
+
+        let w_q4_dev = stream.memcpy_stod(&w_q4).expect("");
+        let w_q5_dev = stream.memcpy_stod(&w_q5).expect("");
+        let w_q6_dev = stream.memcpy_stod(&w_q6).expect("");
+        let x_bf: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.001).cos()))
+            .collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("");
+        let mut y_dev = stream.alloc_zeros::<half::bf16>(n).expect("");
+
+        let (w4_p, w5_p, w6_p, x_p, y_p) = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            (
+                w_q4_dev.device_ptr(&stream).0,
+                w_q5_dev.device_ptr(&stream).0,
+                w_q6_dev.device_ptr(&stream).0,
+                x_dev.device_ptr(&stream).0,
+                y_dev.device_ptr_mut(&stream).0,
+            )
+        };
+
+        // Warm-up.
+        unsafe {
+            kernels
+                .sgemv_q4k_bf16_v2(&stream, w4_p, x_p, y_p, n as i32, k as i32)
+                .ok();
+            kernels
+                .sgemv_q5k_bf16(&stream, w5_p, x_p, y_p, n as i32, k as i32)
+                .ok();
+            kernels
+                .sgemv_q6k_bf16(&stream, w6_p, x_p, y_p, n as i32, k as i32)
+                .ok();
+        }
+        stream.synchronize().ok();
+
+        let n_iters = 200;
+        let bench = |label: &str, run: &mut dyn FnMut()| {
+            let t0 = Instant::now();
+            for _ in 0..n_iters {
+                run();
+            }
+            stream.synchronize().ok();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters as f64;
+            (label.to_string(), ms)
+        };
+
+        let q4_ms = bench("Q4_K V2", &mut || unsafe {
+            kernels
+                .sgemv_q4k_bf16_v2(&stream, w4_p, x_p, y_p, n as i32, k as i32)
+                .ok();
+        })
+        .1;
+        let q5_ms = bench("Q5_K", &mut || unsafe {
+            kernels
+                .sgemv_q5k_bf16(&stream, w5_p, x_p, y_p, n as i32, k as i32)
+                .ok();
+        })
+        .1;
+        let q6_ms = bench("Q6_K", &mut || unsafe {
+            kernels
+                .sgemv_q6k_bf16(&stream, w6_p, x_p, y_p, n as i32, k as i32)
+                .ok();
+        })
+        .1;
+
+        let q4_bw = (n * row_bytes_q4) as f64 / (q4_ms * 1e-3) / 1e9;
+        let q5_bw = (n * row_bytes_q5) as f64 / (q5_ms * 1e-3) / 1e9;
+        let q6_bw = (n * row_bytes_q6) as f64 / (q6_ms * 1e-3) / 1e9;
+
+        eprintln!("\n=== sgemv quantized SGEMV bench ({n}x{k}) ===");
+        eprintln!("  Q4_K V2 : {q4_ms:.3} ms  ({q4_bw:.1} GB/s)");
+        eprintln!("  Q5_K    : {q5_ms:.3} ms  ({q5_bw:.1} GB/s)");
+        eprintln!("  Q6_K    : {q6_ms:.3} ms  ({q6_bw:.1} GB/s)");
+    }
+
     /// T244.1 — micro-bench sgemv_q4k_bf16 vs matmul_bf16 on Qwen-7B FFN size.
     /// Run with `cargo test --release -- --nocapture sgemv_q4k_bench`.
     /// Compares wall-clock per matmul to validate the memory bandwidth gain.
