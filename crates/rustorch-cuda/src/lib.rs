@@ -38,6 +38,7 @@ pub mod cublas_lt;
 pub mod cudnn;
 pub mod curand;
 pub mod cusparse;
+pub mod cusparse_lt;
 pub mod device;
 pub mod error;
 pub mod event;

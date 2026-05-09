@@ -274,7 +274,149 @@ fn main() -> Result<(), BenchError> {
         100.0 * fp4_tflops / 1000.0
     );
 
+    // ───────── BF16 + 2:4 sparsity path (T240.8c) ─────────
+    // cuSPARSELt 2:4 structured-sparse · dense matmul. Operates on BF16
+    // weights pruned to 2:4 + compressed; activation stays dense BF16.
+    // Community-measured gain on GB10: ~1.79× vs dense BF16 at large M.
+    // Skip if RUSTORCH_SKIP_SPARSE=1 (e.g. host without cuSPARSELt installed).
+    let skip_sparse = std::env::var("RUSTORCH_SKIP_SPARSE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !skip_sparse {
+        println!();
+        println!("[qwen_block_bench] BF16 + 2:4 sparsity path (cuSPARSELt)");
+        match try_run_sparse_block(
+            &stream,
+            &act_dev_bf16,
+            &w_qkv_dev,
+            &mut out_qkv,
+            &w_attn_out_dev,
+            &mut out_attn,
+            &w_ffn_gate_up_dev,
+            &mut out_gate_up,
+            &w_ffn_down_dev,
+            &mut out_down,
+            seq,
+            hidden,
+            qkv_n,
+            attn_out_n,
+            ffn_gate_up_n,
+            ffn_down_n,
+            ffn,
+            50,
+        ) {
+            Ok(sparse_per_block_ms) => {
+                let sparse_per_forward_ms = sparse_per_block_ms * n_layers as f64;
+                let sparse_tok_s = (seq as f64 / sparse_per_forward_ms) * 1000.0;
+                let sparse_tflops = flops_per_forward / 1e12 / (sparse_per_forward_ms / 1000.0);
+                println!(
+                    "  per-block: {:.3} ms  |  per-forward (40 layers): {:.1} ms  |  prefill: {:.0} tok/s  |  effective {:.1} TFLOPS",
+                    sparse_per_block_ms, sparse_per_forward_ms, sparse_tok_s, sparse_tflops
+                );
+                println!(
+                    "[qwen_block_bench] BF16 → BF16+2:4 speedup: {:.2}× ({:.1} → {:.1} TFLOPS)",
+                    bf16_per_block_ms / sparse_per_block_ms,
+                    bf16_tflops,
+                    sparse_tflops
+                );
+                println!(
+                    "[qwen_block_bench] gap to advertised 1000 TOPS: {:.1}%",
+                    100.0 * sparse_tflops / 1000.0
+                );
+            },
+            Err(e) => {
+                println!("  skipped: {}", e.0);
+            },
+        }
+    }
+
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn try_run_sparse_block(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    act: &cudarc::driver::CudaSlice<half::bf16>,
+    w_qkv: &cudarc::driver::CudaSlice<half::bf16>,
+    out_qkv: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_attn_out: &cudarc::driver::CudaSlice<half::bf16>,
+    out_attn: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_ffn_gate_up: &cudarc::driver::CudaSlice<half::bf16>,
+    out_gate_up: &mut cudarc::driver::CudaSlice<half::bf16>,
+    w_ffn_down: &cudarc::driver::CudaSlice<half::bf16>,
+    out_down: &mut cudarc::driver::CudaSlice<half::bf16>,
+    seq: usize,
+    hidden: usize,
+    qkv_n: usize,
+    attn_out_n: usize,
+    ffn_gate_up_n: usize,
+    ffn_down_n: usize,
+    ffn: usize,
+    iters: usize,
+) -> Result<f64, BenchError> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use rustorch_cuda::cusparse_lt::SparseLtSession;
+    use std::time::Instant;
+
+    let sparse_session = SparseLtSession::new(stream.clone())?;
+
+    // Build SparseWeight for each Qwen weight (one-time, like model loading).
+    // cuSPARSELt convention: sparse-A. We model the matmul as
+    //   C = W_sparse · X    (weight on the left, activation on the right)
+    // where W has shape (n × hidden) and X has shape (hidden × seq).
+    // For QKV: m=qkv_n, k=hidden, n=seq.
+    println!("  pruning + compressing weights to 2:4 ...");
+    let (w_qkv_p, _r) = unsafe { w_qkv.device_ptr(stream) };
+    let mut sparse_qkv =
+        unsafe { sparse_session.prune_compress_bf16(w_qkv_p, qkv_n, hidden, seq) }?;
+    let (w_attn_p, _r) = unsafe { w_attn_out.device_ptr(stream) };
+    let mut sparse_attn =
+        unsafe { sparse_session.prune_compress_bf16(w_attn_p, attn_out_n, hidden, seq) }?;
+    let (w_gu_p, _r) = unsafe { w_ffn_gate_up.device_ptr(stream) };
+    let mut sparse_gu =
+        unsafe { sparse_session.prune_compress_bf16(w_gu_p, ffn_gate_up_n, hidden, seq) }?;
+    let (w_dn_p, _r) = unsafe { w_ffn_down.device_ptr(stream) };
+    let mut sparse_dn =
+        unsafe { sparse_session.prune_compress_bf16(w_dn_p, ffn_down_n, ffn, seq) }?;
+    println!("  weights ready, running 4 sparse matmuls per block");
+
+    // Warm-up.
+    for _ in 0..3 {
+        unsafe {
+            let (b_p, _r) = act.device_ptr(stream);
+            let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
+            sparse_session.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
+            let (c_p, _r2) = out_attn.device_ptr_mut(stream);
+            sparse_session.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
+            let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
+            sparse_session.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
+            // FFN-down takes the (k=ffn, n=seq) slice of out_gate_up
+            let (b_p, _r3) = out_gate_up.device_ptr(stream);
+            let (c_p, _r2) = out_down.device_ptr_mut(stream);
+            sparse_session.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
+        }
+    }
+    stream.synchronize()?;
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        unsafe {
+            let (b_p, _r) = act.device_ptr(stream);
+            let (c_p, _r2) = out_qkv.device_ptr_mut(stream);
+            sparse_session.matmul_bf16(&mut sparse_qkv, b_p, c_p, 1.0, 0.0)?;
+            let (c_p, _r2) = out_attn.device_ptr_mut(stream);
+            sparse_session.matmul_bf16(&mut sparse_attn, b_p, c_p, 1.0, 0.0)?;
+            let (c_p, _r2) = out_gate_up.device_ptr_mut(stream);
+            sparse_session.matmul_bf16(&mut sparse_gu, b_p, c_p, 1.0, 0.0)?;
+            let (b_p, _r3) = out_gate_up.device_ptr(stream);
+            let (c_p, _r2) = out_down.device_ptr_mut(stream);
+            sparse_session.matmul_bf16(&mut sparse_dn, b_p, c_p, 1.0, 0.0)?;
+        }
+    }
+    stream.synchronize()?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    Ok(elapsed_ms / iters as f64)
 }
 
 #[cfg(feature = "cuda")]
