@@ -261,10 +261,13 @@ impl LlamaModelCuda {
     /// Le caller garantit que `token_id < vocab_size`.
     pub fn decode_step_ffn_only(&mut self, token_id: u32) -> Result<u32, LlmError> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
-        let cfg = &self.config;
-        let d = cfg.hidden_size;
-        let f = cfg.intermediate_size;
-        let v = cfg.vocab_size;
+        // Snapshot config en locals (évite borrow `&self.config` dans la
+        // loop qui entrerait en conflit avec les `&mut self.scratch`).
+        let d = self.config.hidden_size;
+        let f = self.config.intermediate_size;
+        let v = self.config.vocab_size;
+        let n_layers = self.config.num_hidden_layers;
+        let eps = self.config.rms_norm_eps;
         let gate_up_n = 2 * f;
 
         // 1. Embed lookup → scratch.x
@@ -296,7 +299,7 @@ impl LlamaModelCuda {
         };
 
         // 2. Itérer sur les layers, faire le sub-bloc FFN seulement.
-        for li in 0..cfg.num_hidden_layers {
+        for li in 0..n_layers {
             // x_in = x (résidu).
             // h ← copy(x)
             copy_x_to_h(self)?;
@@ -307,7 +310,7 @@ impl LlamaModelCuda {
                 let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
                 let (g_p, _r2) = block.rms_ffn.device_ptr(&self.stream);
                 self.kernels
-                    .rms_norm_bf16(&self.stream, h_p, g_p, cfg.rms_norm_eps, d as i32, 1)
+                    .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
                     .map_err(|e| LlmError::Backend(format!("rms_ffn L{li}: {e:?}")))?;
             }
 
@@ -360,7 +363,7 @@ impl LlamaModelCuda {
             let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
             let (g_p, _r2) = self.final_norm.device_ptr(&self.stream);
             self.kernels
-                .rms_norm_bf16(&self.stream, h_p, g_p, cfg.rms_norm_eps, d as i32, 1)
+                .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
                 .map_err(|e| LlmError::Backend(format!("final_norm: {e:?}")))?;
         }
         unsafe {
@@ -431,7 +434,7 @@ impl LlamaModelCuda {
             let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
             let (g_p, _r2) = self.final_norm.device_ptr(&self.stream);
             self.kernels
-                .rms_norm_bf16(&self.stream, h_p, g_p, cfg.rms_norm_eps, d as i32, 1)
+                .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
                 .map_err(|e| LlmError::Backend(format!("rms_norm: {e:?}")))?;
         }
 
