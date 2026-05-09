@@ -1048,6 +1048,210 @@ impl LlmKernels {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Parity tests — kernel CUDA vs reference CPU
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "cuda"))]
+mod parity_tests {
+    use super::*;
+    use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
+
+    /// CPU RMSNorm reference (matches `rms_norm_inplace` in rustorch-llm).
+    fn cpu_rms_norm(x: &mut [f32], gamma: &[f32], eps: f32) {
+        let n = x.len();
+        let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+        let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+        for (xi, gi) in x.iter_mut().zip(gamma.iter()) {
+            *xi = *xi * inv_rms * *gi;
+        }
+    }
+
+    /// CPU RoPE half-split reference (matches `apply_inplace_half_split`).
+    /// inv_freq[k] = base^(-2k/D), pos = position offset.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_rope_half_split(
+        x: &mut [f32],
+        inv_freq: &[f32],
+        pos: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) {
+        let half = head_dim / 2;
+        for h in 0..n_heads {
+            let row = h * head_dim;
+            for k in 0..half {
+                let theta = inv_freq[k] * pos as f32;
+                let (sin_k, cos_k) = theta.sin_cos();
+                let a = x[row + k];
+                let b = x[row + k + half];
+                x[row + k] = a * cos_k - b * sin_k;
+                x[row + k + half] = a * sin_k + b * cos_k;
+            }
+        }
+    }
+
+    /// T241.6b regression guard — CUDA `rms_norm_bf16` matches CPU rms_norm.
+    /// Catches the kind of bug we'd suspect : wrong axis sum, missing eps,
+    /// gamma misapplied.
+    #[test]
+    fn rms_norm_bf16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let n = 128usize;
+        let eps = 1e-6f32;
+        // Hand-picked input + gamma — odd values to detect bugs in iteration.
+        let x_f32: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.13).sin()) + 0.1).collect();
+        let gamma_f32: Vec<f32> = (0..n).map(|i| 1.0 + 0.01 * (i as f32)).collect();
+
+        let mut x_cpu = x_f32.clone();
+        cpu_rms_norm(&mut x_cpu, &gamma_f32, eps);
+
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let x_bf: Vec<half::bf16> = x_f32.iter().copied().map(half::bf16::from_f32).collect();
+        let gamma_bf: Vec<half::bf16> = gamma_f32
+            .iter()
+            .copied()
+            .map(half::bf16::from_f32)
+            .collect();
+        let mut x_dev = stream.memcpy_stod(&x_bf)?;
+        let gamma_dev = stream.memcpy_stod(&gamma_bf)?;
+        unsafe {
+            let (x_p, _r1) = x_dev.device_ptr_mut(&stream);
+            let (g_p, _r2) = gamma_dev.device_ptr(&stream);
+            kernels.rms_norm_bf16(&stream, x_p, g_p, eps, n as i32, 1)?;
+        }
+        let x_host: Vec<half::bf16> = stream.memcpy_dtov(&x_dev)?;
+        let x_gpu: Vec<f32> = x_host.into_iter().map(|x| x.to_f32()).collect();
+
+        for i in 0..n {
+            let diff = (x_cpu[i] - x_gpu[i]).abs();
+            let tol = x_cpu[i].abs() * 5e-2 + 1e-2; // BF16 ~= 1% relative
+            assert!(
+                diff <= tol,
+                "rms_norm[{i}] cpu={} gpu={} diff={}",
+                x_cpu[i],
+                x_gpu[i],
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    /// T241.6b regression guard — CUDA `rope_half_split_bf16` matches CPU.
+    /// Catches the bug we just fixed : kernel was using interleaved indexing
+    /// `(2k, 2k+1)` while the CPU uses half-split `(k, k+half)`.
+    #[test]
+    fn rope_half_split_bf16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let head_dim = 32usize;
+        let n_heads = 4usize;
+        let pos = 5usize;
+        let base = 10_000.0f32;
+        let half = head_dim / 2;
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|k| 1.0 / base.powf((2 * k) as f32 / head_dim as f32))
+            .collect();
+
+        // Asymmetric input — so any axis-pair bug shows up.
+        let x_f32: Vec<f32> = (0..(n_heads * head_dim))
+            .map(|i| ((i as f32 * 0.07).cos()) * 0.5 + 0.1)
+            .collect();
+
+        let mut x_cpu = x_f32.clone();
+        cpu_rope_half_split(&mut x_cpu, &inv_freq, pos, n_heads, head_dim);
+
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let x_bf: Vec<half::bf16> = x_f32.iter().copied().map(half::bf16::from_f32).collect();
+        let mut x_dev = stream.memcpy_stod(&x_bf)?;
+        let inv_freq_dev = stream.memcpy_stod(&inv_freq)?;
+        unsafe {
+            let (x_p, _r1) = x_dev.device_ptr_mut(&stream);
+            let (inv_p, _r2) = inv_freq_dev.device_ptr(&stream);
+            kernels.rope_half_split_bf16(
+                &stream,
+                x_p,
+                inv_p,
+                pos as i32,
+                n_heads as i32,
+                head_dim as i32,
+            )?;
+        }
+        let x_host: Vec<half::bf16> = stream.memcpy_dtov(&x_dev)?;
+        let x_gpu: Vec<f32> = x_host.into_iter().map(|x| x.to_f32()).collect();
+
+        for i in 0..(n_heads * head_dim) {
+            let diff = (x_cpu[i] - x_gpu[i]).abs();
+            let tol = x_cpu[i].abs() * 1e-1 + 1e-2;
+            assert!(
+                diff <= tol,
+                "rope[{i}] (h={}, j={}) cpu={} gpu={} diff={}",
+                i / head_dim,
+                i % head_dim,
+                x_cpu[i],
+                x_gpu[i],
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    /// T241.6b — embedding lookup CUDA vs CPU. Simple gather, but the test
+    /// catches off-by-one strides and wrong dtype.
+    #[test]
+    fn embedding_lookup_bf16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let vocab = 16usize;
+        let hidden = 8usize;
+        let ids: Vec<u32> = vec![3, 7, 0, 15];
+        let table_f32: Vec<f32> = (0..(vocab * hidden)).map(|i| i as f32 * 0.01).collect();
+
+        let mut out_cpu = vec![0.0f32; ids.len() * hidden];
+        for (s, &id) in ids.iter().enumerate() {
+            let off = (id as usize) * hidden;
+            out_cpu[s * hidden..(s + 1) * hidden].copy_from_slice(&table_f32[off..off + hidden]);
+        }
+
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let table_bf: Vec<half::bf16> = table_f32
+            .iter()
+            .copied()
+            .map(half::bf16::from_f32)
+            .collect();
+        let table_dev = stream.memcpy_stod(&table_bf)?;
+        let ids_dev = stream.memcpy_stod(&ids)?;
+        let mut out_dev = stream.alloc_zeros::<half::bf16>(ids.len() * hidden)?;
+        unsafe {
+            let (t_p, _r1) = table_dev.device_ptr(&stream);
+            let (i_p, _r2) = ids_dev.device_ptr(&stream);
+            let (o_p, _r3) = out_dev.device_ptr_mut(&stream);
+            kernels.embedding_lookup_bf16(
+                &stream,
+                t_p,
+                i_p,
+                o_p,
+                ids.len() as i32,
+                hidden as i32,
+            )?;
+        }
+        let out_host: Vec<half::bf16> = stream.memcpy_dtov(&out_dev)?;
+        let out_gpu: Vec<f32> = out_host.into_iter().map(|x| x.to_f32()).collect();
+
+        for i in 0..(ids.len() * hidden) {
+            let diff = (out_cpu[i] - out_gpu[i]).abs();
+            assert!(
+                diff < 1e-2,
+                "embedding[{i}] cpu={} gpu={}",
+                out_cpu[i],
+                out_gpu[i]
+            );
+        }
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Stub sans cuda
 // ─────────────────────────────────────────────────────────────────────────
 
