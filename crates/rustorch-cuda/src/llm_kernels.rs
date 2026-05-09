@@ -4733,6 +4733,265 @@ mod parity_tests {
         );
     }
 
+    /// T245.1 — CUDA Graphs bench : capture the full Qwen3.6-27B Q4_K_M
+    /// decode (496 matmul calls), replay it. Eliminates ~5μs × 400 launches
+    /// = 2 ms launch overhead per token.
+    ///
+    /// Expected : 10.49 tok/s (without graphs) → ~11.5 tok/s (with graphs).
+    #[test]
+    #[ignore = "real-data full decode bench with CUDA Graphs"]
+    fn real_qwen36_27b_full_decode_bench_cuda_graphs() {
+        use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode_enum};
+        use rustorch_gguf::reader::GgufFile;
+        use rustorch_gguf::tensor::GgmlType;
+        use std::path::Path;
+        use std::time::Instant;
+
+        let path =
+            Path::new("/home/triviere/projects/models/qwen3.6-27b-gguf/Qwen3.6-27B-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("[skip] {path:?} not found");
+            return;
+        }
+        let file = GgufFile::open(path).expect("open gguf");
+
+        let d = 5120usize;
+        let n_layers = 64usize;
+        let n_attn_layers = 16usize;
+        let is_attn_layer = |li: usize| (li + 1) % 4 == 0;
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        // CUDA Graphs cannot capture the default stream. Use a fresh stream.
+        let stream = ctx.new_stream().expect("new stream");
+        let kernels = LlmKernels::new(ctx);
+
+        let h_dev = stream.alloc_zeros::<half::bf16>(d).expect("alloc h");
+        let mut buf_d = stream.alloc_zeros::<half::bf16>(d).expect("alloc buf_d");
+        let mut buf_qkv = stream.alloc_zeros::<half::bf16>(20480).expect("alloc qkv");
+        let mut buf_f = stream.alloc_zeros::<half::bf16>(20480).expect("alloc f");
+
+        struct L {
+            ptr: u64,
+            n: usize,
+            k: usize,
+            dt: GgmlType,
+        }
+        let mut calls: Vec<L> = Vec::with_capacity(n_layers * 7);
+        let mut weight_buffers: Vec<cudarc::driver::CudaSlice<u8>> = Vec::new();
+        let mut total_bytes_loaded: usize = 0;
+
+        let total_t0 = Instant::now();
+        for li in 0..n_layers {
+            let mut load = |name: String, buffers: &mut Vec<_>, total: &mut usize| -> L {
+                let info = file
+                    .tensor(&name)
+                    .unwrap_or_else(|| panic!("{name} not found"));
+                let bytes = file.tensor_bytes(info);
+                let n = info.shape[1] as usize;
+                let k = info.shape[0] as usize;
+                let buf = stream.memcpy_stod(bytes).expect("upload");
+                let ptr = unsafe {
+                    use cudarc::driver::DevicePtr;
+                    let (p, _g) = buf.device_ptr(&stream);
+                    p
+                };
+                *total += bytes.len();
+                buffers.push(buf);
+                L {
+                    ptr,
+                    n,
+                    k,
+                    dt: info.dtype,
+                }
+            };
+            if is_attn_layer(li) {
+                calls.push(load(
+                    format!("blk.{li}.attn_q.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.attn_k.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.attn_v.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.attn_output.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+            } else {
+                calls.push(load(
+                    format!("blk.{li}.attn_qkv.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.attn_gate.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.ssm_alpha.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.ssm_beta.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+                calls.push(load(
+                    format!("blk.{li}.ssm_out.weight"),
+                    &mut weight_buffers,
+                    &mut total_bytes_loaded,
+                ));
+            }
+            calls.push(load(
+                format!("blk.{li}.ffn_gate.weight"),
+                &mut weight_buffers,
+                &mut total_bytes_loaded,
+            ));
+            calls.push(load(
+                format!("blk.{li}.ffn_up.weight"),
+                &mut weight_buffers,
+                &mut total_bytes_loaded,
+            ));
+            calls.push(load(
+                format!("blk.{li}.ffn_down.weight"),
+                &mut weight_buffers,
+                &mut total_bytes_loaded,
+            ));
+        }
+        let load_secs = total_t0.elapsed().as_secs_f64();
+        eprintln!(
+            "Loaded {n_layers} layers ({n_attn_layers} attn + {} SSM) in {load_secs:.2}s",
+            n_layers - n_attn_layers
+        );
+
+        let dispatch = |w_p: u64, dt: GgmlType, x_p: u64, y_p: u64, n: usize, k: usize| -> bool {
+            unsafe {
+                match dt {
+                    GgmlType::Q4_K => {
+                        kernels
+                            .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                            .ok();
+                        true
+                    },
+                    GgmlType::Q5_K => {
+                        kernels
+                            .sgemv_q5k_bf16(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                            .ok();
+                        true
+                    },
+                    GgmlType::Q6_K => {
+                        kernels
+                            .sgemv_q6k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                            .ok();
+                        true
+                    },
+                    _ => false,
+                }
+            }
+        };
+
+        let (h_p, qkv_p, d_p, f_p) = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a, _g1) = h_dev.device_ptr(&stream);
+            let (b, _g2) = buf_qkv.device_ptr_mut(&stream);
+            let (c, _g3) = buf_d.device_ptr_mut(&stream);
+            let (e, _g4) = buf_f.device_ptr_mut(&stream);
+            (a, b, c, e)
+        };
+
+        let do_decode = || {
+            let mut bytes = 0usize;
+            let mut dispatched = 0usize;
+            for c in &calls {
+                let out = if c.n <= d { d_p } else { qkv_p };
+                let in_p = if c.k <= d { h_p } else { f_p };
+                if dispatch(c.ptr, c.dt, in_p, out, c.n, c.k) {
+                    dispatched += 1;
+                    let info = match c.dt {
+                        GgmlType::Q4_K => (c.n * c.k * 144) / 256,
+                        GgmlType::Q5_K => (c.n * c.k * 176) / 256,
+                        GgmlType::Q6_K => (c.n * c.k * 210) / 256,
+                        _ => 0,
+                    };
+                    bytes += info;
+                }
+            }
+            (dispatched, bytes)
+        };
+
+        // Warm-up : also forces all kernels to be JIT-compiled BEFORE the
+        // capture (CudaGraph capture rejects compile_or_get).
+        let (n_dispatched, bytes_dispatched) = do_decode();
+        stream.synchronize().ok();
+        eprintln!(
+            "Warm-up done : {n_dispatched} matmul/token, {:.2} GB",
+            bytes_dispatched as f64 / 1e9
+        );
+
+        // === Path A : baseline (no graphs).
+        let n_iters_baseline = 30;
+        let t0 = Instant::now();
+        for _ in 0..n_iters_baseline {
+            do_decode();
+        }
+        stream.synchronize().ok();
+        let baseline_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters_baseline as f64;
+        let baseline_tok_s = 1000.0 / baseline_ms;
+        let baseline_bw = bytes_dispatched as f64 / (baseline_ms * 1e-3) / 1e9;
+
+        // === Path B : capture once, replay n_iters times.
+        stream
+            .begin_capture(CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .expect("begin_capture");
+        do_decode();
+        let graph = stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .expect("end_capture")
+            .expect("graph created");
+
+        // Warm-up the graph (first replay has CUDA-side init).
+        graph.launch().expect("graph warmup");
+        stream.synchronize().ok();
+
+        let n_iters_graph = 50;
+        let t0 = Instant::now();
+        for _ in 0..n_iters_graph {
+            graph.launch().expect("graph launch");
+        }
+        stream.synchronize().ok();
+        let graph_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_iters_graph as f64;
+        let graph_tok_s = 1000.0 / graph_ms;
+        let graph_bw = bytes_dispatched as f64 / (graph_ms * 1e-3) / 1e9;
+
+        eprintln!();
+        eprintln!("=== Qwen3.6-27B Q4_K_M FULL DECODE — CUDA Graphs ===");
+        eprintln!(
+            "  baseline (separate launches) : {baseline_ms:.2} ms = {baseline_tok_s:.2} tok/s @ {baseline_bw:.1} GB/s"
+        );
+        eprintln!(
+            "  CUDA Graphs (replay)         : {graph_ms:.2} ms = {graph_tok_s:.2} tok/s @ {graph_bw:.1} GB/s"
+        );
+        let speedup = baseline_ms / graph_ms;
+        eprintln!("  speedup graph/baseline       : {speedup:.2}×");
+        eprintln!();
+        eprintln!("  llama.cpp Qwen3.6-27B Q4_K_M : 11.62 tok/s");
+        let r = graph_tok_s / 11.62;
+        eprintln!(
+            "  ratio rustorch(graphs)/llama : {r:.2}× ({})",
+            if r >= 1.0 { "FASTER ✓" } else { "slower" }
+        );
+    }
+
     /// T244.1.4 — bench réel : lit les vrais Q4_K bytes d'un Qwen2.5-7B
     /// Q4_K_M GGUF et mesure sgemv_q4k_bf16_v2 dessus. Valide que le
     /// speedup tient sur vrai data avec scales et nibbles non-uniformes.
