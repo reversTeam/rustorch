@@ -327,7 +327,7 @@ impl LlamaModelCuda {
                 .alloc_zeros::<u8>(scale_bytes.max(1))
                 .map_err(|e| LlmError::Backend(format!("alloc scale: {e:?}")))?;
             if !skip_quant {
-                use cudarc::driver::DevicePtrMut;
+                use cudarc::driver::{DevicePtr, DevicePtrMut};
                 // Tampon temporaire BF16 pour la transposition.
                 let mut tmp = stream
                     .alloc_zeros::<half::bf16>(n)
@@ -337,6 +337,8 @@ impl LlamaModelCuda {
                     self.kernels
                         .transpose_bf16(stream, src_bf16, tmp_p, rows as i32, cols as i32)
                         .map_err(|e| LlmError::Backend(format!("transpose: {e:?}")))?;
+                }
+                unsafe {
                     let (fp4_p, _r1) = fp4.device_ptr_mut(stream);
                     let (sc_p, _r2) = scale.device_ptr_mut(stream);
                     let (tmp_p2, _r3) = tmp.device_ptr(stream);
@@ -351,14 +353,34 @@ impl LlamaModelCuda {
         // Per-weight FP4 + scale (vraie quantization si BF16 weights real).
         let mut blocks_fp4: Vec<BlockWeightsCudaFp4> = Vec::with_capacity(self.blocks.len());
         for blk in self.blocks.iter() {
-            // rms_attn / rms_ffn restent BF16 — copy depuis les blocks existants
-            // pour que RMSNorm marche correctement.
-            let rms_attn = stream
+            // T241.6c — rms_attn / rms_ffn restent BF16 et doivent être COPIÉS
+            // depuis les vrais poids BF16 (sinon le RMSNorm avec gamma=0 produit
+            // un output nul et tout le forward s'effondre). Le path BF16 utilise
+            // self.blocks[li].rms_attn directement ; le path FP4 a besoin de sa
+            // propre copie car blocks_fp4 et blocks sont 2 Vec disjoints.
+            let mut rms_attn = stream
                 .alloc_zeros::<half::bf16>(d)
                 .map_err(|e| LlmError::Backend(format!("alloc rms_attn: {e:?}")))?;
-            let rms_ffn = stream
+            let mut rms_ffn = stream
                 .alloc_zeros::<half::bf16>(d)
                 .map_err(|e| LlmError::Backend(format!("alloc rms_ffn: {e:?}")))?;
+            if !skip_quant {
+                use cudarc::driver::DevicePtrMut;
+                unsafe {
+                    let (src_a, _g1) = blk.rms_attn.device_ptr(stream);
+                    let (dst_a, _g2) = rms_attn.device_ptr_mut(stream);
+                    self.kernels
+                        .copy_bf16(stream, dst_a, src_a, d as i32)
+                        .map_err(|e| LlmError::Backend(format!("copy rms_attn: {e:?}")))?;
+                }
+                unsafe {
+                    let (src_f, _g1) = blk.rms_ffn.device_ptr(stream);
+                    let (dst_f, _g2) = rms_ffn.device_ptr_mut(stream);
+                    self.kernels
+                        .copy_bf16(stream, dst_f, src_f, d as i32)
+                        .map_err(|e| LlmError::Backend(format!("copy rms_ffn: {e:?}")))?;
+                }
+            }
 
             use cudarc::driver::DevicePtr;
             let (qkv_p, _r1) = unsafe { blk.w_qkv.device_ptr(stream) };
@@ -413,14 +435,24 @@ impl LlamaModelCuda {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         use rustorch_cuda::cublas_lt::{Fp4ScaleMode, Fp8Output};
 
-        let blocks_fp4 = self
-            .blocks_fp4
-            .as_ref()
-            .ok_or_else(|| LlmError::Backend("enable_fp4() not called".into()))?;
-        let scratch_fp4 = self
-            .scratch_fp4
-            .as_ref()
-            .ok_or_else(|| LlmError::Backend("enable_fp4() not called".into()))?;
+        // T241.6c — split borrow on self : blocks_fp4 (immut, weights fixed)
+        // and scratch_fp4 (mut, for runtime quantize of activations).
+        if self.blocks_fp4.is_none() || self.scratch_fp4.is_none() {
+            return Err(LlmError::Backend("enable_fp4() not called".into()));
+        }
+        // Extract FP4 activation buffer pointers once. The SyncOnDrop guards
+        // are released at end of this scope ; the device pointers remain
+        // valid as long as the CudaSlices in self.scratch_fp4 live.
+        let (x_fp4_p, x_fp4_scale_p, ffn_inter_fp4_p, ffn_inter_fp4_scale_p) = {
+            let scratch_fp4 = self.scratch_fp4.as_mut().unwrap();
+            unsafe {
+                let (p1, _g1) = scratch_fp4.x_fp4.device_ptr_mut(&self.stream);
+                let (p2, _g2) = scratch_fp4.x_fp4_scale.device_ptr_mut(&self.stream);
+                let (p3, _g3) = scratch_fp4.ffn_inter_fp4.device_ptr_mut(&self.stream);
+                let (p4, _g4) = scratch_fp4.ffn_inter_fp4_scale.device_ptr_mut(&self.stream);
+                (p1, p2, p3, p4)
+            }
+        };
 
         let d = self.config.hidden_size;
         let f = self.config.intermediate_size;
@@ -456,7 +488,7 @@ impl LlamaModelCuda {
         }
 
         for li in 0..n_layers {
-            let block = &blocks_fp4[li];
+            let block = &self.blocks_fp4.as_ref().unwrap()[li];
             // ATTENTION SUB-BLOCK
             // h ← copy(x), RMSNorm pre-attn
             unsafe {
@@ -474,19 +506,24 @@ impl LlamaModelCuda {
                     .map_err(|e| LlmError::Backend(format!("rms_attn L{li}: {e:?}")))?;
             }
 
-            // QKV matmul FP4 : (h reinterpreté comme FP4) · w_qkv_fp4 → qkv (BF16 out)
-            // En MVP : on cast pointer scratch.h (BF16) comme si c'était FP4 packed
-            // (donc lu en garbage byte-pattern). Le timing matmul est correct.
+            // T241.6c — Quantize h (BF16) → x_fp4 + x_fp4_scale (NVFP4) before
+            // each FP4 matmul. Activations have to be quantized at runtime
+            // because they change every step ; only the W weights are static.
             unsafe {
-                let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
-                let (sa_p, _r2) = scratch_fp4.x_fp4_scale.device_ptr(&self.stream);
+                let (h_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+                self.kernels
+                    .quantize_bf16_to_nvfp4(&self.stream, h_p, x_fp4_p, x_fp4_scale_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("quantize h L{li}: {e:?}")))?;
+            }
+            // QKV matmul FP4 : x_fp4 · w_qkv_fp4 → qkv (BF16 out)
+            unsafe {
                 let (b_p, _r3) = block.w_qkv.device_ptr(&self.stream);
                 let (sb_p, _r4) = block.w_qkv_scale.device_ptr(&self.stream);
                 let (c_p, _r5) = self.scratch.qkv.device_ptr_mut(&self.stream);
                 self.session
                     .matmul_mxfp4(
-                        a_p,
-                        sa_p,
+                        x_fp4_p,
+                        x_fp4_scale_p,
                         b_p,
                         sb_p,
                         c_p,
@@ -572,17 +609,22 @@ impl LlamaModelCuda {
                     )
                     .map_err(|e| LlmError::Backend(format!("gqa_decode L{li}: {e:?}")))?;
             }
+            // T241.6c — Quantize attention output → x_fp4 (reuse buffer)
+            unsafe {
+                let (bo_p, _r1) = self.scratch.block_out.device_ptr(&self.stream);
+                self.kernels
+                    .quantize_bf16_to_nvfp4(&self.stream, bo_p, x_fp4_p, x_fp4_scale_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("quantize attn_out L{li}: {e:?}")))?;
+            }
             // O proj FP4
             unsafe {
-                let (a_p, _r1) = self.scratch.block_out.device_ptr(&self.stream);
-                let (sa_p, _r2) = scratch_fp4.x_fp4_scale.device_ptr(&self.stream);
                 let (b_p, _r3) = block.w_o.device_ptr(&self.stream);
                 let (sb_p, _r4) = block.w_o_scale.device_ptr(&self.stream);
                 let (c_p, _r5) = self.scratch.h.device_ptr_mut(&self.stream);
                 self.session
                     .matmul_mxfp4(
-                        a_p,
-                        sa_p,
+                        x_fp4_p,
+                        x_fp4_scale_p,
                         b_p,
                         sb_p,
                         c_p,
@@ -620,17 +662,22 @@ impl LlamaModelCuda {
                     .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
                     .map_err(|e| LlmError::Backend(format!("rms_ffn L{li}: {e:?}")))?;
             }
+            // T241.6c — Quantize h (post-rms_ffn) → x_fp4
+            unsafe {
+                let (h_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+                self.kernels
+                    .quantize_bf16_to_nvfp4(&self.stream, h_p, x_fp4_p, x_fp4_scale_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("quantize ffn_in L{li}: {e:?}")))?;
+            }
             // gate+up FP4
             unsafe {
-                let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
-                let (sa_p, _r2) = scratch_fp4.x_fp4_scale.device_ptr(&self.stream);
                 let (b_p, _r3) = block.w_gate_up.device_ptr(&self.stream);
                 let (sb_p, _r4) = block.w_gate_up_scale.device_ptr(&self.stream);
                 let (c_p, _r5) = self.scratch.gate_up.device_ptr_mut(&self.stream);
                 self.session
                     .matmul_mxfp4(
-                        a_p,
-                        sa_p,
+                        x_fp4_p,
+                        x_fp4_scale_p,
                         b_p,
                         sb_p,
                         c_p,
@@ -653,17 +700,28 @@ impl LlamaModelCuda {
                     .swiglu_bf16(&self.stream, gu_p, up_p, out_p, f as i32)
                     .map_err(|e| LlmError::Backend(format!("swiglu L{li}: {e:?}")))?;
             }
+            // T241.6c — Quantize ffn_inter → ffn_inter_fp4 (taille f, dédié)
+            unsafe {
+                let (fi_p, _r1) = self.scratch.ffn_inter.device_ptr(&self.stream);
+                self.kernels
+                    .quantize_bf16_to_nvfp4(
+                        &self.stream,
+                        fi_p,
+                        ffn_inter_fp4_p,
+                        ffn_inter_fp4_scale_p,
+                        f as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("quantize ffn_inter L{li}: {e:?}")))?;
+            }
             // Down FP4
             unsafe {
-                let (a_p, _r1) = self.scratch.ffn_inter.device_ptr(&self.stream);
-                let (sa_p, _r2) = scratch_fp4.ffn_inter_fp4_scale.device_ptr(&self.stream);
                 let (b_p, _r3) = block.w_down.device_ptr(&self.stream);
                 let (sb_p, _r4) = block.w_down_scale.device_ptr(&self.stream);
                 let (c_p, _r5) = self.scratch.block_out.device_ptr_mut(&self.stream);
                 self.session
                     .matmul_mxfp4(
-                        a_p,
-                        sa_p,
+                        ffn_inter_fp4_p,
+                        ffn_inter_fp4_scale_p,
                         b_p,
                         sb_p,
                         c_p,

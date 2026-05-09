@@ -81,3 +81,8 @@ required-features = ["cuda"]
 name = "qwen_parity_test"
 path = "examples/qwen_parity_test.rs"
 required-features = ["cuda"]
+
+[[example]]
+name = "qwen_cuda_inference"
+path = "examples/qwen_cuda_inference.rs"
+required-features = ["cuda"]
