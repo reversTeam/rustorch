@@ -14,7 +14,7 @@ categories.workspace = true
 default = []
 # T241.3 — CUDA backend (LlamaModelCuda). Without this, CPU/Metal still
 # build. Requires CUDA toolkit at compile time and runtime on the host.
-cuda = ["dep:rustorch-cuda", "dep:cudarc", "dep:half"]
+cuda = ["dep:rustorch-cuda", "dep:cudarc"]
 
 [dependencies]
 rustorch-core      = { workspace = true }
@@ -27,11 +27,11 @@ serde              = { workspace = true, features = ["derive"] }
 serde_json         = { version = "1" }
 rayon              = { workspace = true }
 gemm               = { version = "0.18", default-features = false, features = ["rayon"] }
+half               = { workspace = true }
 
 # T241.3 — CUDA backend (gated by `cuda` feature).
 rustorch-cuda = { workspace = true, optional = true, features = ["cuda"] }
 cudarc        = { version = "0.17", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "dynamic-loading", "cuda-version-from-build-system", "f16"], optional = true }
-half          = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Used by `qwen_inference_metal` example to wire our T71/T72 Metal
