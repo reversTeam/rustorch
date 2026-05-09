@@ -244,6 +244,270 @@ impl LlamaModelCuda {
         self.config.vocab_size
     }
 
+    /// Decode 1 token, full forward Qwen-style (T241.4 step 3).
+    ///
+    /// Pour chaque layer applique le bloc complet :
+    ///   1. RMSNorm pre-attention
+    ///   2. QKV matmul (fused), split Q/K/V
+    ///   3. RoPE on Q, K
+    ///   4. KV cache append
+    ///   5. GQA decode naive : Q · K^T → softmax → P · V
+    ///   6. O proj matmul + residual
+    ///   7. RMSNorm pre-FFN
+    ///   8. Fused gate+up matmul
+    ///   9. SwiGLU
+    ///  10. Down matmul + residual
+    /// Puis final RMSNorm + LM head + argmax.
+    ///
+    /// Avance `kv_pos` de 1.
+    ///
+    /// # Safety
+    /// Caller : `token_id < vocab_size`, `self.kv_pos < self.max_seq`.
+    pub fn decode_step(&mut self, token_id: u32) -> Result<u32, LlmError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let d = self.config.hidden_size;
+        let f = self.config.intermediate_size;
+        let v = self.config.vocab_size;
+        let n_heads = self.config.num_attention_heads;
+        let n_kv = self.config.n_kv_heads();
+        let head_dim = self.config.head_dim();
+        let kv_dim = n_kv * head_dim;
+        let n_layers = self.config.num_hidden_layers;
+        let eps = self.config.rms_norm_eps;
+        let qkv_n = d + 2 * kv_dim;
+        let max_seq = self.max_seq;
+        let pos = self.kv_pos;
+        if pos >= max_seq {
+            return Err(LlmError::Backend(format!(
+                "kv_pos {pos} >= max_seq {max_seq}"
+            )));
+        }
+        let kv_len = pos + 1;
+
+        // 1. Embed → scratch.x
+        let token_id_dev = self
+            .stream
+            .memcpy_stod(&[token_id])
+            .map_err(|e| LlmError::Backend(format!("upload token_id: {e:?}")))?;
+        unsafe {
+            let (table_p, _r1) = self.token_emb.device_ptr(&self.stream);
+            let (ids_p, _r2) = token_id_dev.device_ptr(&self.stream);
+            let (out_p, _r3) = self.scratch.x.device_ptr_mut(&self.stream);
+            self.kernels
+                .embedding_lookup_bf16(&self.stream, table_p, ids_p, out_p, 1, d as i32)
+                .map_err(|e| LlmError::Backend(format!("embedding_lookup: {e:?}")))?;
+        }
+
+        for li in 0..n_layers {
+            // === ATTENTION SUB-BLOCK ===
+            // x → h via copy kernel device-to-device
+            unsafe {
+                let (dst_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+                let (src_p, _r2) = self.scratch.x.device_ptr(&self.stream);
+                self.kernels
+                    .copy_bf16(&self.stream, dst_p, src_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("copy x→h L{li}: {e:?}")))?;
+            }
+            let block = &self.blocks[li];
+            // RMSNorm pre-attn
+            unsafe {
+                let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+                let (g_p, _r2) = block.rms_attn.device_ptr(&self.stream);
+                self.kernels
+                    .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
+                    .map_err(|e| LlmError::Backend(format!("rms_attn L{li}: {e:?}")))?;
+            }
+            // Fused QKV matmul : h [1, d] · w_qkv [d, d + 2*kv_dim] → qkv
+            unsafe {
+                let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+                let (b_p, _r2) = block.w_qkv.device_ptr(&self.stream);
+                let (c_p, _r3) = self.scratch.qkv.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_bf16(a_p, b_p, c_p, 1, d, qkv_n, 1.0, 0.0)
+                    .map_err(|e| LlmError::Backend(format!("w_qkv L{li}: {e:?}")))?;
+            }
+            // qkv layout (col-major output) : [q_0..q_{d-1}, k_0..k_{kv_dim-1}, v_0..v_{kv_dim-1}]
+            let (q_off, k_off, v_off) = (0u64, (d as u64) * 2, ((d + kv_dim) as u64) * 2);
+
+            // RoPE on Q (n_heads × head_dim) and K (n_kv × head_dim).
+            unsafe {
+                let (qkv_base, _r1) = self.scratch.qkv.device_ptr_mut(&self.stream);
+                let (inv_p, _r2) = self.rope_inv_freq.device_ptr(&self.stream);
+                self.kernels
+                    .rope_half_split_bf16(
+                        &self.stream,
+                        qkv_base + q_off,
+                        inv_p,
+                        pos as i32,
+                        n_heads as i32,
+                        head_dim as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("rope Q L{li}: {e:?}")))?;
+            }
+            unsafe {
+                let (qkv_base, _r1) = self.scratch.qkv.device_ptr_mut(&self.stream);
+                let (inv_p, _r2) = self.rope_inv_freq.device_ptr(&self.stream);
+                self.kernels
+                    .rope_half_split_bf16(
+                        &self.stream,
+                        qkv_base + k_off,
+                        inv_p,
+                        pos as i32,
+                        n_kv as i32,
+                        head_dim as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("rope K L{li}: {e:?}")))?;
+            }
+            // KV append : copy K/V into cache at pos
+            unsafe {
+                let (qkv_base, _r1) = self.scratch.qkv.device_ptr(&self.stream);
+                let k_in = qkv_base + k_off;
+                let v_in = qkv_base + v_off;
+                let (k_cache_p, _r2) = self.kv_cache_k[li].device_ptr_mut(&self.stream);
+                let (v_cache_p, _r3) = self.kv_cache_v[li].device_ptr_mut(&self.stream);
+                self.kernels
+                    .kv_append_bf16(
+                        &self.stream,
+                        k_cache_p,
+                        v_cache_p,
+                        k_in,
+                        v_in,
+                        pos as i32,
+                        n_kv as i32,
+                        head_dim as i32,
+                        max_seq as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("kv_append L{li}: {e:?}")))?;
+            }
+            // GQA decode : Q · cached K^T softmax · cached V → block_out (reuse buffer)
+            unsafe {
+                let (qkv_base, _r1) = self.scratch.qkv.device_ptr(&self.stream);
+                let (kc_p, _r2) = self.kv_cache_k[li].device_ptr(&self.stream);
+                let (vc_p, _r3) = self.kv_cache_v[li].device_ptr(&self.stream);
+                let (out_p, _r4) = self.scratch.block_out.device_ptr_mut(&self.stream);
+                self.kernels
+                    .gqa_decode_naive_bf16(
+                        &self.stream,
+                        qkv_base + q_off,
+                        kc_p,
+                        vc_p,
+                        out_p,
+                        n_heads as i32,
+                        n_kv as i32,
+                        kv_len as i32,
+                        head_dim as i32,
+                        max_seq as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("gqa_decode L{li}: {e:?}")))?;
+            }
+            // O proj : block_out [1, d] · w_o [d, d] → h
+            unsafe {
+                let (a_p, _r1) = self.scratch.block_out.device_ptr(&self.stream);
+                let (b_p, _r2) = block.w_o.device_ptr(&self.stream);
+                let (c_p, _r3) = self.scratch.h.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_bf16(a_p, b_p, c_p, 1, d, d, 1.0, 0.0)
+                    .map_err(|e| LlmError::Backend(format!("w_o L{li}: {e:?}")))?;
+            }
+            // Residual : x += h
+            unsafe {
+                let (x_p, _r1) = self.scratch.x.device_ptr_mut(&self.stream);
+                let (h_p, _r2) = self.scratch.h.device_ptr(&self.stream);
+                self.kernels
+                    .add_inplace_bf16(&self.stream, x_p, h_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("residual attn L{li}: {e:?}")))?;
+            }
+
+            // === FFN SUB-BLOCK ===
+            // h = copy(x), RMSNorm pre-FFN
+            unsafe {
+                let (dst_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+                let (src_p, _r2) = self.scratch.x.device_ptr(&self.stream);
+                self.kernels
+                    .copy_bf16(&self.stream, dst_p, src_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("copy x→h ffn L{li}: {e:?}")))?;
+            }
+            unsafe {
+                let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+                let (g_p, _r2) = block.rms_ffn.device_ptr(&self.stream);
+                self.kernels
+                    .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
+                    .map_err(|e| LlmError::Backend(format!("rms_ffn L{li}: {e:?}")))?;
+            }
+            // gate+up matmul
+            unsafe {
+                let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+                let (b_p, _r2) = block.w_gate_up.device_ptr(&self.stream);
+                let (c_p, _r3) = self.scratch.gate_up.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_bf16(a_p, b_p, c_p, 1, d, 2 * f, 1.0, 0.0)
+                    .map_err(|e| LlmError::Backend(format!("gate_up L{li}: {e:?}")))?;
+            }
+            // SwiGLU
+            unsafe {
+                let (gu_p, _r1) = self.scratch.gate_up.device_ptr(&self.stream);
+                let up_p = gu_p + (f as u64) * 2;
+                let (out_p, _r2) = self.scratch.ffn_inter.device_ptr_mut(&self.stream);
+                self.kernels
+                    .swiglu_bf16(&self.stream, gu_p, up_p, out_p, f as i32)
+                    .map_err(|e| LlmError::Backend(format!("swiglu L{li}: {e:?}")))?;
+            }
+            // Down + residual
+            unsafe {
+                let (a_p, _r1) = self.scratch.ffn_inter.device_ptr(&self.stream);
+                let (b_p, _r2) = block.w_down.device_ptr(&self.stream);
+                let (c_p, _r3) = self.scratch.block_out.device_ptr_mut(&self.stream);
+                self.session
+                    .matmul_bf16(a_p, b_p, c_p, 1, f, d, 1.0, 0.0)
+                    .map_err(|e| LlmError::Backend(format!("w_down L{li}: {e:?}")))?;
+            }
+            unsafe {
+                let (x_p, _r1) = self.scratch.x.device_ptr_mut(&self.stream);
+                let (b_p, _r2) = self.scratch.block_out.device_ptr(&self.stream);
+                self.kernels
+                    .add_inplace_bf16(&self.stream, x_p, b_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("residual ffn L{li}: {e:?}")))?;
+            }
+        }
+
+        // Final RMSNorm + LM head + argmax
+        unsafe {
+            let (dst_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+            let (src_p, _r2) = self.scratch.x.device_ptr(&self.stream);
+            self.kernels
+                .copy_bf16(&self.stream, dst_p, src_p, d as i32)
+                .map_err(|e| LlmError::Backend(format!("copy x→h final: {e:?}")))?;
+        }
+        unsafe {
+            let (h_p, _r1) = self.scratch.h.device_ptr_mut(&self.stream);
+            let (g_p, _r2) = self.final_norm.device_ptr(&self.stream);
+            self.kernels
+                .rms_norm_bf16(&self.stream, h_p, g_p, eps, d as i32, 1)
+                .map_err(|e| LlmError::Backend(format!("final_norm: {e:?}")))?;
+        }
+        unsafe {
+            let (a_p, _r1) = self.scratch.h.device_ptr(&self.stream);
+            let (b_p, _r2) = self.lm_head.device_ptr(&self.stream);
+            let (c_p, _r3) = self.scratch.logits.device_ptr_mut(&self.stream);
+            self.session
+                .matmul_bf16(a_p, b_p, c_p, 1, d, v, 1.0, 0.0)
+                .map_err(|e| LlmError::Backend(format!("lm_head: {e:?}")))?;
+        }
+        unsafe {
+            let (l_p, _r1) = self.scratch.logits.device_ptr(&self.stream);
+            let (o_p, _r2) = self.scratch.sample_out.device_ptr_mut(&self.stream);
+            self.kernels
+                .argmax_bf16(&self.stream, l_p, o_p, v as i32)
+                .map_err(|e| LlmError::Backend(format!("argmax: {e:?}")))?;
+        }
+        let out: Vec<u32> = self
+            .stream
+            .memcpy_dtov(&self.scratch.sample_out)
+            .map_err(|e| LlmError::Backend(format!("dtov sample: {e:?}")))?;
+        self.kv_pos += 1;
+        Ok(out[0])
+    }
+
     /// Decode 1 token avec layers FFN-only (T241.4 step 2).
     ///
     /// Pour chaque layer applique :

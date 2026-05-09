@@ -222,6 +222,131 @@ extern "C" __global__ void add_inplace_bf16(
 }
 "#;
 
+#[cfg(feature = "cuda")]
+const COPY_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// dst[i] = src[i]
+extern "C" __global__ void copy_bf16(
+    __nv_bfloat16* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = src[i];
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const KV_APPEND_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// Append k_in [kv_dim] / v_in [kv_dim] to KV cache at position `pos`.
+// KV cache layout : [n_kv, max_seq, head_dim] = [kv_dim_groups, max_seq * head_dim]
+// (compact storage : groupe kv_h occupe max_seq * head_dim contigus).
+//
+// Indexing : k_cache[kv_h * max_seq * head_dim + pos * head_dim + i] = k_in[kv_h * head_dim + i]
+extern "C" __global__ void kv_append_bf16(
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ k_in,
+    const __nv_bfloat16* __restrict__ v_in,
+    int pos,
+    int n_kv,
+    int head_dim,
+    int max_seq
+) {
+    int kv_h = blockIdx.x;
+    if (kv_h >= n_kv) return;
+    int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= head_dim) return;
+
+    int cache_off = kv_h * max_seq * head_dim + pos * head_dim + i;
+    int in_off = kv_h * head_dim + i;
+    k_cache[cache_off] = k_in[in_off];
+    v_cache[cache_off] = v_in[in_off];
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const GQA_DECODE_NAIVE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// Naive GQA decode (single-token Q against KV cache prefix).
+//
+// Inputs :
+//   q     : [n_heads, head_dim]            BF16  current token Q
+//   k_cache : [n_kv, max_seq, head_dim]   BF16  cache (only first kv_len valid)
+//   v_cache : same shape                    BF16
+//   out   : [n_heads, head_dim]            BF16  attention output (one token)
+//
+// One block per head. Threads cooperate to compute scores + softmax + V·P.
+// Shared memory : kv_len floats for scores.
+extern "C" __global__ void gqa_decode_naive_bf16(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    __nv_bfloat16* __restrict__ out,
+    int n_heads,
+    int n_kv,
+    int kv_len,
+    int head_dim,
+    int max_seq,
+    float scale       // 1.0 / sqrt(head_dim)
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int kv_h = h * n_kv / n_heads;          // GQA group mapping
+
+    extern __shared__ float scores[];        // [kv_len]
+
+    // 1. Pass : compute scores[t] = Q[h] · K[kv_h, t] * scale, find max
+    float local_max = -1e30f;
+    for (int t = threadIdx.x; t < kv_len; t += blockDim.x) {
+        float dot = 0.0f;
+        for (int i = 0; i < head_dim; ++i) {
+            float qi = (float)q[h * head_dim + i];
+            float ki = (float)k_cache[(kv_h * max_seq + t) * head_dim + i];
+            dot += qi * ki;
+        }
+        scores[t] = dot * scale;
+        if (scores[t] > local_max) local_max = scores[t];
+    }
+
+    // Block-reduce max
+    __shared__ float block_max;
+    if (threadIdx.x == 0) block_max = -1e30f;
+    __syncthreads();
+    atomicMax((int*)&block_max, __float_as_int(local_max));
+    __syncthreads();
+    float max_score = block_max;
+
+    // 2. Pass : exp(scores - max) and sum
+    float local_sum = 0.0f;
+    for (int t = threadIdx.x; t < kv_len; t += blockDim.x) {
+        scores[t] = expf(scores[t] - max_score);
+        local_sum += scores[t];
+    }
+    __shared__ float block_sum;
+    if (threadIdx.x == 0) block_sum = 0.0f;
+    __syncthreads();
+    atomicAdd(&block_sum, local_sum);
+    __syncthreads();
+    float sum = block_sum;
+
+    // 3. Pass : out[h, i] = sum_t (scores[t]/sum) * V[kv_h, t, i]
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int t = 0; t < kv_len; ++t) {
+            float vi = (float)v_cache[(kv_h * max_seq + t) * head_dim + i];
+            acc += (scores[t] / sum) * vi;
+        }
+        out[h * head_dim + i] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
 /// Container des kernels LLM CUDA, compilés paresseusement et cachés.
 #[cfg(feature = "cuda")]
 pub struct LlmKernels {
@@ -233,6 +358,9 @@ pub struct LlmKernels {
     embed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     argmax: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     add_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    copy: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    kv_append: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    gqa_decode: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -249,6 +377,9 @@ impl LlmKernels {
             embed: std::sync::OnceLock::new(),
             argmax: std::sync::OnceLock::new(),
             add_inplace: std::sync::OnceLock::new(),
+            copy: std::sync::OnceLock::new(),
+            kv_append: std::sync::OnceLock::new(),
+            gqa_decode: std::sync::OnceLock::new(),
         }
     }
 
@@ -517,6 +648,124 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "add_inplace_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Copy device-to-device : dst[i] = src[i] (BF16).
+    pub unsafe fn copy_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        dst: u64,
+        src: u64,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(&self.copy, COPY_BF16_SRC, "copy_bf16")?;
+        let block_dim = 256u32;
+        let grid_dim = (n as u32 + block_dim - 1) / block_dim;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&dst).arg(&src).arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "copy_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Append (k_in, v_in) to KV cache at position `pos`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn kv_append_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        k_cache: u64,
+        v_cache: u64,
+        k_in: u64,
+        v_in: u64,
+        pos: i32,
+        n_kv: i32,
+        head_dim: i32,
+        max_seq: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) =
+            self.compile_or_get(&self.kv_append, KV_APPEND_BF16_SRC, "kv_append_bf16")?;
+        let block_dim = 64u32.min(head_dim as u32);
+        let grid_y = (head_dim as u32 + block_dim - 1) / block_dim;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_kv as u32, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&k_cache)
+            .arg(&v_cache)
+            .arg(&k_in)
+            .arg(&v_in)
+            .arg(&pos)
+            .arg(&n_kv)
+            .arg(&head_dim)
+            .arg(&max_seq);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "kv_append_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Naive GQA decode : Q against KV cache prefix.
+    ///
+    /// Q : [n_heads, head_dim] BF16  (single-token query)
+    /// K/V cache : [n_kv, max_seq, head_dim] BF16  (only first kv_len valid)
+    /// out : [n_heads, head_dim] BF16
+    ///
+    /// Each block handles one head, threads cooperate on softmax + V matmul.
+    /// Shared mem = kv_len * 4 bytes (scores).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gqa_decode_naive_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k_cache: u64,
+        v_cache: u64,
+        out: u64,
+        n_heads: i32,
+        n_kv: i32,
+        kv_len: i32,
+        head_dim: i32,
+        max_seq: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.gqa_decode,
+            GQA_DECODE_NAIVE_BF16_SRC,
+            "gqa_decode_naive_bf16",
+        )?;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let block_dim = 128u32.min(head_dim as u32);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: (kv_len as u32) * 4 + 8, // scores + block_max + block_sum
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&q)
+            .arg(&k_cache)
+            .arg(&v_cache)
+            .arg(&out)
+            .arg(&n_heads)
+            .arg(&n_kv)
+            .arg(&kv_len)
+            .arg(&head_dim)
+            .arg(&max_seq)
+            .arg(&scale);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gqa_decode_naive_bf16::launch",
         })?;
         Ok(())
     }
