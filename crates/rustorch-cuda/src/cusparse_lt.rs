@@ -139,6 +139,48 @@ enum CusparseLtPruneAlg {
     SpmmaStrip = 1,
 }
 
+/// cuSPARSELt scale mode for FP4 / FP8 matmuls. Different block sizes
+/// from cublasLt's NVFP4: cuSPARSELt uses VEC32_UE4M3 (block 32) here
+/// where cublasLt uses VEC16_UE4M3 (block 16) for NVFP4 dense.
+#[cfg(feature = "cuda")]
+#[repr(i32)]
+#[allow(dead_code, non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+enum CusparseLtMatmulMatrixScale {
+    None = 0,
+    Scalar32F = 1,
+    Vec32Ue4m3 = 2,
+    Vec64Ue8m0 = 3,
+}
+
+/// Matmul-desc attribute IDs (subset we use).
+#[cfg(feature = "cuda")]
+#[repr(i32)]
+#[allow(dead_code, non_camel_case_types)]
+#[derive(Copy, Clone, Debug)]
+enum CusparseLtMatmulDescAttribute {
+    ActivationRelu = 0,
+    ActivationReluUpperbound = 1,
+    ActivationReluThreshold = 2,
+    ActivationGelu = 3,
+    ActivationGeluScaling = 4,
+    AlphaVectorScaling = 5,
+    BetaVectorScaling = 6,
+    BiasStride = 7,
+    BiasPointer = 8,
+    SparseMatPointer = 9,
+    AScaleMode = 10,
+    BScaleMode = 11,
+    CScaleMode = 12,
+    DScaleMode = 13,
+    DOutScaleMode = 14,
+    AScalePointer = 15,
+    BScalePointer = 16,
+    CScalePointer = 17,
+    DScalePointer = 18,
+    DOutScalePointer = 19,
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Raw FFI
 // ─────────────────────────────────────────────────────────────────────────
@@ -205,6 +247,14 @@ extern "C" {
     ) -> i32;
 
     fn cusparseLtMatmulPlanDestroy(plan: *const CusparseLtMatmulPlan) -> i32;
+
+    fn cusparseLtMatmulDescSetAttribute(
+        handle: *const CusparseLtHandle,
+        matmul_descr: *mut CusparseLtMatmulDescriptor,
+        matmul_attribute: CusparseLtMatmulDescAttribute,
+        data: *const std::ffi::c_void,
+        data_size: usize,
+    ) -> i32;
 
     fn cusparseLtMatmulGetWorkspace(
         handle: *const CusparseLtHandle,
@@ -541,6 +591,261 @@ impl SparseLtSession {
             location: "SparseLtSession::sync_after_compress",
         })?;
         // pruned and compressed_buffer are dropped here, freeing their memory.
+
+        Ok(SparseWeight {
+            a_desc,
+            b_desc,
+            c_desc,
+            matmul_desc,
+            _alg_sel: alg_sel,
+            plan,
+            compressed,
+            workspace_size,
+            workspace,
+        })
+    }
+
+    /// Prune a dense FP4-packed weight to 2:4 + compress + build plan.
+    ///
+    /// FP4 buffers are byte-packed (1 byte = 2 elements). The scale
+    /// tensors are UE4M3 bytes per VEC32 block on the K dim — note this
+    /// is cuSPARSELt's VEC32_UE4M3, NOT cublasLt's VEC16_UE4M3 for
+    /// NVFP4 dense. This means FP4 weights pre-quantized for the dense
+    /// cublasLt path need re-blocking before use here.
+    ///
+    /// # Safety
+    /// `dense_weight_dev` must point to a valid FP4-packed (m × k / 2)
+    /// byte buffer. `*_scale_dev` must point to UE4M3 scale tensors of
+    /// size m × (k / 32) and (k / 32) × n respectively.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn prune_compress_fp4(
+        &self,
+        dense_weight_dev: u64,
+        a_scale_dev: u64,
+        b_scale_dev: u64,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<SparseWeight, CudaError> {
+        let value = cudaDataType_t::CUDA_R_4F_E2M1;
+        let alignment: u32 = 32;
+        let stream_ptr = self.stream.cu_stream() as *mut std::ffi::c_void;
+
+        let mut a_desc = CusparseLtMatDescriptor { _data: [0u8; 512] };
+        let mut b_desc = CusparseLtMatDescriptor { _data: [0u8; 512] };
+        let mut c_desc = CusparseLtMatDescriptor { _data: [0u8; 512] };
+        let mut matmul_desc = CusparseLtMatmulDescriptor { _data: [0u8; 512] };
+        let mut alg_sel = CusparseLtMatmulAlgSelection { _data: [0u8; 512] };
+        let mut plan = CusparseLtMatmulPlan { _data: [0u8; 512] };
+
+        // Sparse A: (m × k) FP4 row-major
+        check(
+            cusparseLtStructuredDescriptorInit(
+                &self.handle,
+                &mut a_desc,
+                m as i64,
+                k as i64,
+                k as i64,
+                alignment,
+                value,
+                CusparseOrder::Row,
+                CusparseLtSparsity::Sparsity50Percent,
+            ),
+            "structured_desc_a_fp4",
+        )?;
+        // Dense B: (k × n) FP4 col-major
+        check(
+            cusparseLtDenseDescriptorInit(
+                &self.handle,
+                &mut b_desc,
+                k as i64,
+                n as i64,
+                k as i64,
+                alignment,
+                value,
+                CusparseOrder::Col,
+            ),
+            "dense_desc_b_fp4",
+        )?;
+        // Dense C: (m × n) BF16 col-major (scales fold into accumulator)
+        check(
+            cusparseLtDenseDescriptorInit(
+                &self.handle,
+                &mut c_desc,
+                m as i64,
+                n as i64,
+                m as i64,
+                alignment,
+                cudaDataType_t::CUDA_R_16BF,
+                CusparseOrder::Col,
+            ),
+            "dense_desc_c_fp4",
+        )?;
+
+        check(
+            cusparseLtMatmulDescriptorInit(
+                &self.handle,
+                &mut matmul_desc,
+                CusparseOperation::NonTranspose,
+                CusparseOperation::NonTranspose,
+                &a_desc,
+                &b_desc,
+                &c_desc,
+                &c_desc,
+                CusparseComputeType::Compute32F,
+            ),
+            "matmul_desc_init_fp4",
+        )?;
+
+        // Bind scale modes (VEC32_UE4M3) and scale pointers
+        let scale_mode = CusparseLtMatmulMatrixScale::Vec32Ue4m3;
+        let scale_mode_size = std::mem::size_of::<CusparseLtMatmulMatrixScale>();
+        check(
+            cusparseLtMatmulDescSetAttribute(
+                &self.handle,
+                &mut matmul_desc,
+                CusparseLtMatmulDescAttribute::AScaleMode,
+                (&scale_mode) as *const _ as *const _,
+                scale_mode_size,
+            ),
+            "set_a_scale_mode_fp4",
+        )?;
+        check(
+            cusparseLtMatmulDescSetAttribute(
+                &self.handle,
+                &mut matmul_desc,
+                CusparseLtMatmulDescAttribute::BScaleMode,
+                (&scale_mode) as *const _ as *const _,
+                scale_mode_size,
+            ),
+            "set_b_scale_mode_fp4",
+        )?;
+        check(
+            cusparseLtMatmulDescSetAttribute(
+                &self.handle,
+                &mut matmul_desc,
+                CusparseLtMatmulDescAttribute::AScalePointer,
+                (&a_scale_dev) as *const _ as *const _,
+                std::mem::size_of::<u64>(),
+            ),
+            "set_a_scale_ptr_fp4",
+        )?;
+        check(
+            cusparseLtMatmulDescSetAttribute(
+                &self.handle,
+                &mut matmul_desc,
+                CusparseLtMatmulDescAttribute::BScalePointer,
+                (&b_scale_dev) as *const _ as *const _,
+                std::mem::size_of::<u64>(),
+            ),
+            "set_b_scale_ptr_fp4",
+        )?;
+
+        check(
+            cusparseLtMatmulAlgSelectionInit(
+                &self.handle,
+                &mut alg_sel,
+                &matmul_desc,
+                CusparseLtMatmulAlg::AlgDefault,
+            ),
+            "alg_sel_init_fp4",
+        )?;
+        check(
+            cusparseLtMatmulPlanInit(&self.handle, &mut plan, &matmul_desc, &alg_sel),
+            "plan_init_fp4",
+        )?;
+
+        let mut workspace_size: usize = 0;
+        check(
+            cusparseLtMatmulGetWorkspace(&self.handle, &plan, &mut workspace_size),
+            "get_workspace_fp4",
+        )?;
+        let workspace = self
+            .stream
+            .alloc_zeros::<u8>(workspace_size.max(1))
+            .map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "SparseLtSession::workspace_alloc_fp4",
+            })?;
+
+        // Prune (FP4-packed: m * k bytes / 2)
+        let pruned_size = m * k / 2;
+        let mut pruned: cudarc::driver::CudaSlice<u8> = self
+            .stream
+            .alloc_zeros::<u8>(pruned_size)
+            .map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "SparseLtSession::pruned_alloc_fp4",
+            })?;
+        let pruned_ptr = {
+            use cudarc::driver::DevicePtrMut;
+            pruned.device_ptr_mut(&self.stream).0 as *mut std::ffi::c_void
+        };
+        check(
+            cusparseLtSpMMAPrune(
+                &self.handle,
+                &matmul_desc,
+                dense_weight_dev as *const std::ffi::c_void,
+                pruned_ptr,
+                CusparseLtPruneAlg::SpmmaTile,
+                stream_ptr,
+            ),
+            "prune_fp4",
+        )?;
+
+        let mut compressed_size: usize = 0;
+        let mut compressed_buffer_size: usize = 0;
+        check(
+            cusparseLtSpMMACompressedSize(
+                &self.handle,
+                &plan,
+                &mut compressed_size,
+                &mut compressed_buffer_size,
+            ),
+            "compressed_size_fp4",
+        )?;
+        let compressed = self
+            .stream
+            .alloc_zeros::<u8>(compressed_size)
+            .map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "SparseLtSession::compressed_alloc_fp4",
+            })?;
+        let mut compressed_buffer = self
+            .stream
+            .alloc_zeros::<u8>(compressed_buffer_size.max(1))
+            .map_err(|e| CudaError::Driver {
+                code: format!("{e:?}").len() as i32,
+                location: "SparseLtSession::compressed_buffer_alloc_fp4",
+            })?;
+        let pruned_const_ptr = {
+            use cudarc::driver::DevicePtr;
+            pruned.device_ptr(&self.stream).0 as *const std::ffi::c_void
+        };
+        let compressed_ptr = {
+            use cudarc::driver::DevicePtr;
+            compressed.device_ptr(&self.stream).0 as *mut std::ffi::c_void
+        };
+        let compressed_buffer_ptr = {
+            use cudarc::driver::DevicePtrMut;
+            compressed_buffer.device_ptr_mut(&self.stream).0 as *mut std::ffi::c_void
+        };
+        check(
+            cusparseLtSpMMACompress(
+                &self.handle,
+                &plan,
+                pruned_const_ptr,
+                compressed_ptr,
+                compressed_buffer_ptr,
+                stream_ptr,
+            ),
+            "compress_fp4",
+        )?;
+
+        self.stream.synchronize().map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "SparseLtSession::sync_after_compress_fp4",
+        })?;
 
         Ok(SparseWeight {
             a_desc,
