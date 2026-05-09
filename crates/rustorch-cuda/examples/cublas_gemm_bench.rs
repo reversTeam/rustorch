@@ -84,13 +84,16 @@ fn main() -> Result<(), BenchError> {
         }
     }
 
-    println!("[cublas_gemm_bench] device ready, sweeping (TF32 + BF16 + FP8 + MXFP4)");
+    println!("[cublas_gemm_bench] device ready, sweeping (TF32+BF16+FP8+FP4 / cached vs uncached)");
     println!();
     println!(
-        "  {:>5} {:>8} {:>10} {:>10} {:>10} {:>10}",
-        "M=N=K", "iters", "TF32 TFL", "BF16 TFL", "FP8 TFL", "FP4 TFL"
+        "  {:>5} {:>8} {:>9} {:>9} {:>9} {:>9} {:>11}",
+        "M=N=K", "iters", "TF32", "BF16", "FP8", "FP4", "FP4 cached"
     );
-    println!("  {}", "─".repeat(68));
+    println!("  {}", "─".repeat(74));
+
+    let mut session = rustorch_cuda::cublas_lt::LtSession::new(stream.clone())
+        .map_err(|e| BenchError(format!("LtSession::new: {e}")))?;
 
     // Square shape sweep. Shapes chosen to span small (cache-resident-ish)
     // up to 4096² which is the typical "large dense gemm" sweet spot.
@@ -396,9 +399,94 @@ fn main() -> Result<(), BenchError> {
             },
         };
 
+        // ───────── FP4 NVFP4 cached via LtSession ─────────
+        let fp4_cached_tflops = {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            // Warm-up (also primes the cache).
+            let warmup = || -> Result<(), BenchError> {
+                for _ in 0..5 {
+                    unsafe {
+                        let (a_p, _r1) = a_dev_fp4.device_ptr(&stream);
+                        let (b_p, _r2) = b_dev_fp4.device_ptr(&stream);
+                        let (c_p, _r3) = c_dev_fp4.device_ptr_mut(&stream);
+                        let (sa_p, _r4) = scale_a_ue4m3_dev.device_ptr(&stream);
+                        let (sb_p, _r5) = scale_b_ue4m3_dev.device_ptr(&stream);
+                        session
+                            .matmul_mxfp4(
+                                a_p,
+                                sa_p,
+                                b_p,
+                                sb_p,
+                                c_p,
+                                m,
+                                k,
+                                n,
+                                1.0,
+                                0.0,
+                                rustorch_cuda::cublas_lt::Fp8Output::Bf16,
+                                rustorch_cuda::cublas_lt::Fp4ScaleMode::Vec16Ue4m3,
+                            )
+                            .map_err(|e| BenchError(format!("session.matmul_mxfp4: {e}")))?;
+                    }
+                }
+                stream.synchronize()?;
+                Ok(())
+            };
+            match warmup() {
+                Err(e) => {
+                    if dim == 128 {
+                        eprintln!("[cublas_gemm_bench] FP4 cached path skipped — {e}");
+                    }
+                    f64::NAN
+                },
+                Ok(()) => {
+                    let t0 = Instant::now();
+                    let timed = || -> Result<(), BenchError> {
+                        for _ in 0..n_iters {
+                            unsafe {
+                                let (a_p, _r1) = a_dev_fp4.device_ptr(&stream);
+                                let (b_p, _r2) = b_dev_fp4.device_ptr(&stream);
+                                let (c_p, _r3) = c_dev_fp4.device_ptr_mut(&stream);
+                                let (sa_p, _r4) = scale_a_ue4m3_dev.device_ptr(&stream);
+                                let (sb_p, _r5) = scale_b_ue4m3_dev.device_ptr(&stream);
+                                session
+                                    .matmul_mxfp4(
+                                        a_p,
+                                        sa_p,
+                                        b_p,
+                                        sb_p,
+                                        c_p,
+                                        m,
+                                        k,
+                                        n,
+                                        1.0,
+                                        0.0,
+                                        rustorch_cuda::cublas_lt::Fp8Output::Bf16,
+                                        rustorch_cuda::cublas_lt::Fp4ScaleMode::Vec16Ue4m3,
+                                    )
+                                    .map_err(|e| {
+                                        BenchError(format!("session.matmul_mxfp4: {e}"))
+                                    })?;
+                            }
+                        }
+                        stream.synchronize()?;
+                        Ok(())
+                    };
+                    match timed() {
+                        Err(_) => f64::NAN,
+                        Ok(()) => {
+                            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            let ms_per_iter = wall_ms / n_iters as f64;
+                            flops_per_iter / (ms_per_iter / 1000.0) / 1e12
+                        },
+                    }
+                },
+            }
+        };
+
         println!(
-            "  {:>5} {:>8} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
-            dim, n_iters, tf32_tflops, bf16_tflops, fp8_tflops, fp4_tflops
+            "  {:>5} {:>8} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>11.2}",
+            dim, n_iters, tf32_tflops, bf16_tflops, fp8_tflops, fp4_tflops, fp4_cached_tflops
         );
     }
 
