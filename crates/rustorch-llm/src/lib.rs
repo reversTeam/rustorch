@@ -45,6 +45,8 @@ use serde::Deserialize;
 
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+#[cfg(feature = "cuda")]
+pub mod cuda_backend_q4k;
 pub mod gguf_loader;
 pub mod model;
 pub mod qwen35;

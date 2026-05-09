@@ -92,3 +92,8 @@ required-features = ["cuda"]
 [[example]]
 name = "qwen35_cpu_inference"
 path = "examples/qwen35_cpu_inference.rs"
+
+[[example]]
+name = "qwen_q4k_bench"
+path = "examples/qwen_q4k_bench.rs"
+required-features = ["cuda"]
