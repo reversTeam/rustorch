@@ -3800,6 +3800,7 @@ dependencies = [
  "half",
  "metal",
  "rayon",
+ "rustorch-autograd",
  "rustorch-core",
  "rustorch-cpu",
  "rustorch-cuda",

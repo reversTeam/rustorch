@@ -129,3 +129,9 @@ required-features = ["cuda"]
 [[example]]
 name = "lookahead_pool_microbench"
 path = "examples/lookahead_pool_microbench.rs"
+
+# T246.7 P1.4b — Lookahead-enabled decode bench (baseline vs Lookahead, parity check).
+[[example]]
+name = "qwen2_lookahead_bench"
+path = "examples/qwen2_lookahead_bench.rs"
+required-features = ["cuda"]
