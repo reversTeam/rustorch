@@ -54,6 +54,11 @@ pub mod qwen35_cpu;
 pub mod qwen35_cuda;
 #[cfg(feature = "cuda")]
 pub mod qwen35_cuda_q4k;
+
+// T247 Phase 2 — autograd dispatch wiring for CUDA backward kernels.
+#[cfg(feature = "cuda")]
+pub mod cuda_train;
+
 #[cfg(feature = "cuda")]
 pub use cuda_backend::LlamaModelCuda;
 pub use gguf_loader::{GgufBlockWeights, GgufWeights};

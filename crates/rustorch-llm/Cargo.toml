@@ -20,6 +20,7 @@ cuda = ["dep:rustorch-cuda", "dep:cudarc"]
 rustorch-core      = { workspace = true }
 rustorch-serde     = { workspace = true }
 rustorch-nn        = { workspace = true }
+rustorch-autograd  = { workspace = true }
 rustorch-tokenizer = { workspace = true }
 rustorch-fusion    = { workspace = true }
 rustorch-gguf      = { workspace = true }
