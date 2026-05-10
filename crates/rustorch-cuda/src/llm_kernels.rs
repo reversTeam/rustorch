@@ -6463,10 +6463,61 @@ mod parity_tests {
         })
         .1;
 
+        // M=8 batched variants : need x of size [M=8, K].
+        let m_batch = 8usize;
+        let x_batch_bf: Vec<half::bf16> = (0..m_batch * k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.001).sin()))
+            .collect();
+        let x_batch_dev = stream.memcpy_stod(&x_batch_bf).expect("");
+        let mut y_m8_dev = stream.alloc_zeros::<half::bf16>(m_batch * n).expect("");
+        let (xb_p, y8_p) = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            (
+                x_batch_dev.device_ptr(&stream).0,
+                y_m8_dev.device_ptr_mut(&stream).0,
+            )
+        };
+        // Warm-up M=8 kernels.
+        unsafe {
+            kernels
+                .sgemm_q4k_bf16_m8(&stream, w4_p, xb_p, y8_p, n as i32, k as i32)
+                .ok();
+            kernels
+                .sgemm_q5k_bf16_m8(&stream, w5_p, xb_p, y8_p, n as i32, k as i32)
+                .ok();
+            kernels
+                .sgemm_q6k_bf16_m8(&stream, w6_p, xb_p, y8_p, n as i32, k as i32)
+                .ok();
+        }
+        stream.synchronize().ok();
+
+        let q4_m8_ms = bench("Q4_K M8", &mut || unsafe {
+            kernels
+                .sgemm_q4k_bf16_m8(&stream, w4_p, xb_p, y8_p, n as i32, k as i32)
+                .ok();
+        })
+        .1;
+        let q5_m8_ms = bench("Q5_K M8", &mut || unsafe {
+            kernels
+                .sgemm_q5k_bf16_m8(&stream, w5_p, xb_p, y8_p, n as i32, k as i32)
+                .ok();
+        })
+        .1;
+        let q6_m8_ms = bench("Q6_K M8", &mut || unsafe {
+            kernels
+                .sgemm_q6k_bf16_m8(&stream, w6_p, xb_p, y8_p, n as i32, k as i32)
+                .ok();
+        })
+        .1;
+
         let q4_bw = (n * row_bytes_q4) as f64 / (q4_ms * 1e-3) / 1e9;
         let q5_bw = (n * row_bytes_q5) as f64 / (q5_ms * 1e-3) / 1e9;
         let q6_bw = (n * row_bytes_q6) as f64 / (q6_ms * 1e-3) / 1e9;
         let q6_v2_bw = (n * row_bytes_q6) as f64 / (q6_v2_ms * 1e-3) / 1e9;
+        // M=8 amortized bandwidth (W only, divided by 8 tokens).
+        let q4_m8_bw = (n * row_bytes_q4) as f64 / (q4_m8_ms * 1e-3) / 1e9;
+        let q5_m8_bw = (n * row_bytes_q5) as f64 / (q5_m8_ms * 1e-3) / 1e9;
+        let q6_m8_bw = (n * row_bytes_q6) as f64 / (q6_m8_ms * 1e-3) / 1e9;
 
         eprintln!("\n=== sgemv quantized SGEMV bench ({n}x{k}) ===");
         eprintln!("  Q4_K V2 : {q4_ms:.3} ms  ({q4_bw:.1} GB/s)");
@@ -6475,6 +6526,19 @@ mod parity_tests {
         eprintln!(
             "  Q6_K V2 : {q6_v2_ms:.3} ms  ({q6_v2_bw:.1} GB/s)  speedup vs V1 = {:.2}×",
             q6_ms / q6_v2_ms
+        );
+        eprintln!("  --- M=8 batched ---");
+        eprintln!(
+            "  Q4_K M8 : {q4_m8_ms:.3} ms  ({q4_m8_bw:.1} GB/s W single-pass)  ratio M8/M1 = {:.2}× (× 8 outputs!)",
+            q4_m8_ms / q4_ms
+        );
+        eprintln!(
+            "  Q5_K M8 : {q5_m8_ms:.3} ms  ({q5_m8_bw:.1} GB/s W single-pass)  ratio M8/M1 = {:.2}×",
+            q5_m8_ms / q5_ms
+        );
+        eprintln!(
+            "  Q6_K M8 : {q6_m8_ms:.3} ms  ({q6_m8_bw:.1} GB/s W single-pass)  ratio M8/M1V2 = {:.2}×",
+            q6_m8_ms / q6_v2_ms
         );
     }
 
