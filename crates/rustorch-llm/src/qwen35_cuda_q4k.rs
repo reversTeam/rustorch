@@ -54,12 +54,19 @@ pub(crate) enum QuantTensor {
 
 impl QuantTensor {
     /// Dispatch a M=1 GEMV through the appropriate kernel.
+    ///
+    /// `x_q8_staging` is a device pointer to a scratch buffer of at least
+    /// `(K/32) * 36` bytes used by the Q4_K dp4a path (T246.5.5) for the
+    /// on-the-fly Q8_1 quantization of the activation. Pass 0 to disable
+    /// dp4a and force the float v2 fallback. The buffer is overwritten
+    /// each call so the same one can be reused across all matmuls.
     pub(crate) fn dispatch_matmul_m1(
         &self,
         kernels: &LlmKernels,
         stream: &Arc<CudaStream>,
         x: u64,
         y: u64,
+        x_q8_staging: u64,
     ) -> Result<(), LlmError> {
         unsafe {
             use cudarc::driver::DevicePtr;
@@ -72,9 +79,28 @@ impl QuantTensor {
                 },
                 QuantTensor::Q4K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);
-                    kernels
-                        .sgemv_q4k_bf16_v2(stream, w, x, y, *n as i32, *k as i32)
-                        .map_err(|e| LlmError::Backend(format!("sgemv_q4k: {e:?}")))
+                    if x_q8_staging != 0 {
+                        // T246.5.5 — dp4a path: quantize x → Q8_1, then
+                        // Q4_K × Q8_1 SGEMV using __dp4a (mirror of
+                        // llama.cpp vec_dot_q4_K_q8_1_impl_vmmq).
+                        kernels
+                            .quantize_q8_1_bf16(stream, x, x_q8_staging, *k as i32)
+                            .map_err(|e| LlmError::Backend(format!("quant q8_1: {e:?}")))?;
+                        kernels
+                            .sgemv_q4k_q8_1_dp4a_bf16(
+                                stream,
+                                w,
+                                x_q8_staging,
+                                y,
+                                *n as i32,
+                                *k as i32,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("sgemv_q4k_dp4a: {e:?}")))
+                    } else {
+                        kernels
+                            .sgemv_q4k_bf16_v2(stream, w, x, y, *n as i32, *k as i32)
+                            .map_err(|e| LlmError::Backend(format!("sgemv_q4k: {e:?}")))
+                    }
                 },
                 QuantTensor::Q5K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);
@@ -260,6 +286,10 @@ pub(crate) struct DecodeScratch {
     pub(crate) down_buf: CudaSlice<half::bf16>,
     pub(crate) logits: CudaSlice<half::bf16>,
     pub(crate) next_token: CudaSlice<u32>,
+    /// T246.5.5 — staging buffer for Q8_1 quantized activation (used by the
+    /// dp4a Q4_K matmul path). Sized to accommodate the largest K seen in
+    /// any matmul of the model: `(max_k / 32) * 36` bytes.
+    pub(crate) x_q8_scratch: CudaSlice<u8>,
 }
 
 /// CUDA-resident Qwen3.5/3.6 hybrid model with Q4_K_M weights.
@@ -307,6 +337,12 @@ pub struct Qwen35ModelCudaQ4K {
     /// decode_step replays this graph in a single launch instead of issuing
     /// ~1908 individual cuLaunchKernel calls.
     pub(crate) decode_graph: Option<CudaGraph>,
+    /// T246.5.5 — toggle for the dp4a Q4_K matmul path. Off by default:
+    /// current dp4a kernel is W-bandwidth-bound on M=1 (same as the float
+    /// v2 path) but adds a quantize-q8_1 kernel per matmul → ~1% slower
+    /// than v2 today. Set `RUSTORCH_USE_DP4A_Q4K=1` at process start to
+    /// enable for benchmarking / iterative kernel optimization.
+    pub(crate) use_dp4a_q4k: bool,
 }
 
 impl Qwen35ModelCudaQ4K {
@@ -586,6 +622,15 @@ impl Qwen35ModelCudaQ4K {
             next_token: stream
                 .alloc_zeros::<u32>(1)
                 .map_err(|e| LlmError::Backend(format!("scratch token: {e:?}")))?,
+            x_q8_scratch: {
+                // Max K across all matmuls = cfg.f (down_proj K=F). Round up
+                // to next multiple of 32 for safety.
+                let max_k = cfg.f.max(cfg.d).max(q_dim).max(value_dim);
+                let max_k_blocks = max_k.div_ceil(32);
+                stream
+                    .alloc_zeros::<u8>(max_k_blocks * 36)
+                    .map_err(|e| LlmError::Backend(format!("scratch x_q8: {e:?}")))?
+            },
         };
 
         // T246.5.3 — device-resident counters for CUDA Graph capture.
@@ -619,6 +664,9 @@ impl Qwen35ModelCudaQ4K {
             kv_len_dev,
             current_token_dev,
             decode_graph: None,
+            use_dp4a_q4k: std::env::var("RUSTORCH_USE_DP4A_Q4K")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
         })
     }
 
@@ -806,6 +854,7 @@ impl Qwen35ModelCudaQ4K {
             logits_p,
             tok_p,
             final_norm_p,
+            x_q8_p,
         ) = unsafe {
             let (a, _g0) = self.scratch.h.device_ptr_mut(&self.stream);
             let (b, _g1) = self.scratch.h_norm.device_ptr_mut(&self.stream);
@@ -828,8 +877,17 @@ impl Qwen35ModelCudaQ4K {
             let (s, _g18) = self.scratch.logits.device_ptr_mut(&self.stream);
             let (t, _g19) = self.scratch.next_token.device_ptr_mut(&self.stream);
             let (u, _g20) = self.final_norm.device_ptr(&self.stream);
+            // T246.5.5 — only expose the Q8_1 staging ptr when the dp4a
+            // path is enabled (env-gated). Passing 0 forces the float v2
+            // fallback in dispatch_matmul_m1.
+            let v = if self.use_dp4a_q4k {
+                let (p_, _g21) = self.scratch.x_q8_scratch.device_ptr_mut(&self.stream);
+                p_
+            } else {
+                0u64
+            };
             (
-                a, b, c, d_, e, f_, g, h_, i, j, k_, l, m, n_, o, p, q_, r, s, t, u,
+                a, b, c, d_, e, f_, g, h_, i, j, k_, l, m, n_, o, p, q_, r, s, t, u, v,
             )
         };
 
@@ -924,11 +982,17 @@ impl Qwen35ModelCudaQ4K {
                         &self.stream,
                         h_norm_p,
                         qkv_mixed_p,
+                        x_q8_p,
                     )?;
 
                     // 3. z = w_gate @ h_norm
-                    ssm.w_gate
-                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, z_p)?;
+                    ssm.w_gate.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        h_norm_p,
+                        z_p,
+                        x_q8_p,
+                    )?;
 
                     // 4. alpha = w_alpha @ h_norm
                     ssm.w_alpha.dispatch_matmul_m1(
@@ -936,11 +1000,17 @@ impl Qwen35ModelCudaQ4K {
                         &self.stream,
                         h_norm_p,
                         alpha_p,
+                        x_q8_p,
                     )?;
 
                     // 5. beta_logit = w_beta @ h_norm ; beta = sigmoid
-                    ssm.w_beta
-                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, beta_p)?;
+                    ssm.w_beta.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        h_norm_p,
+                        beta_p,
+                        x_q8_p,
+                    )?;
                     unsafe {
                         self.kernels
                             .sigmoid_inplace_bf16(&self.stream, beta_p, n_v as i32)
@@ -1089,8 +1159,13 @@ impl Qwen35ModelCudaQ4K {
                     }
 
                     // 14. h = ssm_out @ gated  (overwrites h)
-                    ssm.ssm_out
-                        .dispatch_matmul_m1(&self.kernels, &self.stream, sso_p, h_p)?;
+                    ssm.ssm_out.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        sso_p,
+                        h_p,
+                        x_q8_p,
+                    )?;
 
                     // 15. residual : h += residual
                     unsafe {
@@ -1125,8 +1200,13 @@ impl Qwen35ModelCudaQ4K {
 
                     // Reuse `up_buf` (size f=17408 ≥ 2*q_dim) as QG scratch.
                     let qg_p = up_p;
-                    attn.w_q
-                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, qg_p)?;
+                    attn.w_q.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        h_norm_p,
+                        qg_p,
+                        x_q8_p,
+                    )?;
 
                     // 3. Split qg into q (q_dim) and gate (q_dim, used as sigmoid gate).
                     //    Use q_buf and (reuse) attn_out as gate buffer.
@@ -1144,10 +1224,20 @@ impl Qwen35ModelCudaQ4K {
                     }
 
                     // 4. K, V projections.
-                    attn.w_k
-                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, k_p)?;
-                    attn.w_v
-                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, v_p)?;
+                    attn.w_k.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        h_norm_p,
+                        k_p,
+                        x_q8_p,
+                    )?;
+                    attn.w_v.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        h_norm_p,
+                        v_p,
+                        x_q8_p,
+                    )?;
 
                     // 5. Per-head Q-norm and K-norm (RMSNorm with shared gamma).
                     unsafe {
@@ -1250,8 +1340,13 @@ impl Qwen35ModelCudaQ4K {
                     }
 
                     // 10. h = w_o @ gated_attn  (output dim d)
-                    attn.w_o
-                        .dispatch_matmul_m1(&self.kernels, &self.stream, gate_p, h_p)?;
+                    attn.w_o.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        gate_p,
+                        h_p,
+                        x_q8_p,
+                    )?;
 
                     // 11. residual : h += residual
                     unsafe {
@@ -1284,15 +1379,15 @@ impl Qwen35ModelCudaQ4K {
                     .map_err(|e| LlmError::Backend(format!("rms_norm post: {e:?}")))?;
             }
             // gate = w_gate @ h_norm ; up = w_up @ h_norm ; gate = silu(gate) * up
-            gate_w.dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, gate_p)?;
-            up_w.dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, up_p)?;
+            gate_w.dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, gate_p, x_q8_p)?;
+            up_w.dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, up_p, x_q8_p)?;
             unsafe {
                 self.kernels
                     .swiglu_bf16(&self.stream, gate_p, up_p, gate_p, f as i32)
                     .map_err(|e| LlmError::Backend(format!("swiglu: {e:?}")))?;
             }
             // h = w_down @ gate
-            down_w.dispatch_matmul_m1(&self.kernels, &self.stream, gate_p, h_p)?;
+            down_w.dispatch_matmul_m1(&self.kernels, &self.stream, gate_p, h_p, x_q8_p)?;
             // h += residual
             unsafe {
                 self.kernels
@@ -1308,7 +1403,7 @@ impl Qwen35ModelCudaQ4K {
                 .map_err(|e| LlmError::Backend(format!("final_norm: {e:?}")))?;
         }
         self.lm_head
-            .dispatch_matmul_m1(&self.kernels, &self.stream, h_p, logits_p)?;
+            .dispatch_matmul_m1(&self.kernels, &self.stream, h_p, logits_p, x_q8_p)?;
 
         // ---- Sample (argmax for now) ----
         unsafe {
