@@ -414,6 +414,46 @@ pub(crate) struct DecodeScratch {
     pub(crate) tree_logits: CudaSlice<half::bf16>,
     /// Host-pinned `[MAX_TREE_SIZE]` u32 — DtoH target for tree argmax tokens.
     pub(crate) tree_argmax_host_pinned: PinnedHostSlice<u32>,
+
+    // ── T246.7 TrackC — SSM-hybrid Lookahead per-branch state forking ──
+    //
+    // For SSM-hybrid variants (Dense / MoE on Qwen3.6) every SSM layer
+    // carries a recurrent state that must be forked per tree branch
+    // during the verify pass, then the deepest accepted node's state is
+    // copied back into the model's per-layer scratch on commit.
+    //
+    // Memory budget on Qwen3.6-27B (48 SSM layers, n_v=48, head_v=128) :
+    //   - tree_ssm_states : 32 × 48 × 48 × 128 × 128 × 2 bytes ≈ 2.25 GB
+    //   - tree_conv_states : 32 × 48 × (4-1) × 10240 × 2 bytes ≈ 92 MB
+    // For pure-transformer variants these vectors are empty (zero cost).
+    /// Per-SSM-layer tree-fork state buffer, sized
+    /// `[MAX_TREE_SIZE × n_v_heads × head_v_dim²]` BF16 each.
+    /// Empty for pure-transformer variants.
+    pub(crate) tree_ssm_states: Vec<CudaSlice<half::bf16>>,
+    /// Per-SSM-layer tree-fork conv1d state buffer, sized
+    /// `[MAX_TREE_SIZE × (conv_kernel-1) × conv_dim]` BF16 each.
+    /// Empty for pure-transformer variants.
+    pub(crate) tree_conv_states: Vec<CudaSlice<half::bf16>>,
+    /// Per-tree-row scratch for the SSM-hybrid forward.
+    /// `[MAX_TREE_SIZE × conv_dim]` BF16 — qkv_mixed (post-input-projection).
+    pub(crate) tree_ssm_qkv_mixed: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE × conv_dim]` BF16 — conv_out.
+    pub(crate) tree_ssm_conv_out: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE × value_dim]` BF16 — z (gate).
+    pub(crate) tree_ssm_z: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE × n_v_heads]` BF16 — alpha (dt).
+    pub(crate) tree_ssm_alpha: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE × n_v_heads]` BF16 — beta.
+    pub(crate) tree_ssm_beta: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE × value_dim]` BF16 — q broadcast to n_v heads.
+    pub(crate) tree_ssm_q_v: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE × value_dim]` BF16 — k broadcast to n_v heads.
+    pub(crate) tree_ssm_k_v: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE × value_dim]` BF16 — gated SSM output.
+    pub(crate) tree_ssm_out_buf: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE]` i32 — depth-wave indices buffer used by the
+    /// `delta_net_step_tree_bf16` launcher (one launch per BFS depth).
+    pub(crate) tree_ssm_wave_indices: CudaSlice<i32>,
 }
 
 /// CUDA-resident Qwen3.5/3.6 hybrid model with Q4_K_M weights.
@@ -995,6 +1035,66 @@ impl Qwen35ModelCudaQ4K {
                 .map_err(|e| LlmError::Backend(format!("scratch tree_logits: {e:?}")))?,
             tree_argmax_host_pinned: unsafe { ctx.alloc_pinned::<u32>(MAX_TREE_SIZE) }
                 .map_err(|e| LlmError::Backend(format!("alloc_pinned tree_argmax: {e:?}")))?,
+
+            // ── T246.7 TrackC — SSM-hybrid Lookahead per-branch buffers ──
+            // For SSM-hybrid models (Qwen3.6 Dense / MoE) we pre-allocate one
+            // tree-state buffer per SSM layer plus per-tree-row scratch.
+            // For pure-transformer variants `cfg.ssm_indices` is empty and
+            // these allocations are zero-sized.
+            tree_ssm_states: {
+                let head_v_dim = cfg.ssm_state;
+                let n_v_heads = cfg.ssm_dt_rank;
+                let mut v = Vec::with_capacity(cfg.ssm_indices.len());
+                for _ in 0..cfg.ssm_indices.len() {
+                    let buf = stream
+                        .alloc_zeros::<half::bf16>(
+                            MAX_TREE_SIZE * n_v_heads * head_v_dim * head_v_dim,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_state: {e:?}")))?;
+                    v.push(buf);
+                }
+                v
+            },
+            tree_conv_states: {
+                let mut v = Vec::with_capacity(cfg.ssm_indices.len());
+                let conv_kernel_minus_1 = cfg.ssm_conv_kernel.saturating_sub(1);
+                for _ in 0..cfg.ssm_indices.len() {
+                    let buf = stream
+                        .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * conv_kernel_minus_1 * conv_dim)
+                        .map_err(|e| {
+                            LlmError::Backend(format!("scratch tree_conv_state: {e:?}"))
+                        })?;
+                    v.push(buf);
+                }
+                v
+            },
+            tree_ssm_qkv_mixed: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * conv_dim.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_qkv: {e:?}")))?,
+            tree_ssm_conv_out: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * conv_dim.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_conv_out: {e:?}")))?,
+            tree_ssm_z: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * value_dim.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_z: {e:?}")))?,
+            tree_ssm_alpha: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.ssm_dt_rank.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_alpha: {e:?}")))?,
+            tree_ssm_beta: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.ssm_dt_rank.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_beta: {e:?}")))?,
+            tree_ssm_q_v: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * value_dim.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_q_v: {e:?}")))?,
+            tree_ssm_k_v: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * value_dim.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_k_v: {e:?}")))?,
+            tree_ssm_out_buf: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * value_dim.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_out_buf: {e:?}")))?,
+            tree_ssm_wave_indices: stream
+                .alloc_zeros::<i32>(MAX_TREE_SIZE)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_wave: {e:?}")))?,
         };
 
         // T246.5.3 — device-resident counters for CUDA Graph capture.
