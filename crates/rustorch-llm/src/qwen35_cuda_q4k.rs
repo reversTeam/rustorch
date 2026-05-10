@@ -17,7 +17,8 @@
 
 use crate::qwen35::{LayerKind, Qwen35Config, Qwen35Variant};
 use crate::LlmError;
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+use cudarc::driver::{CudaContext, CudaGraph, CudaSlice, CudaStream};
 use rustorch_cuda::cublas_lt::LtSession;
 use rustorch_cuda::llm_kernels::LlmKernels;
 use rustorch_gguf::reader::GgufFile;
@@ -300,6 +301,12 @@ pub struct Qwen35ModelCudaQ4K {
     /// Used by `embedding_lookup_bf16` so the per-step token id is read
     /// from device memory inside the captured graph.
     pub(crate) current_token_dev: CudaSlice<u32>,
+    /// T246.5.3 — captured CUDA Graph of one full decode_step body.
+    /// Initialized lazily on the 2nd decode call (after the 1st-call warmup
+    /// triggers all kernel JIT compilations). Once set, every subsequent
+    /// decode_step replays this graph in a single launch instead of issuing
+    /// ~1908 individual cuLaunchKernel calls.
+    pub(crate) decode_graph: Option<CudaGraph>,
 }
 
 impl Qwen35ModelCudaQ4K {
@@ -311,7 +318,26 @@ impl Qwen35ModelCudaQ4K {
     pub fn from_gguf(path: &Path, max_seq: usize) -> Result<Self, LlmError> {
         let ctx =
             CudaContext::new(0).map_err(|e| LlmError::Backend(format!("CudaContext: {e:?}")))?;
-        let stream = ctx.default_stream();
+        // T246.5.3 — Disable cudarc's automatic event tracking BEFORE allocating
+        // anything. With multi-stream mode + event tracking on, every
+        // device_ptr_mut() injects `stream.wait(event)` calls referencing events
+        // recorded on the warmup pass. During CUDA Graph capture those waits
+        // reference an event NOT belonging to the capture → the graph is
+        // invalidated immediately (CUDA_ERROR_STREAM_CAPTURE_INVALIDATED on
+        // the first op after begin_capture). All decode work runs on a single
+        // stream so we don't need cross-stream safety here.
+        // SAFETY: disable_event_tracking only affects slices created AFTER this
+        // call. We immediately allocate everything below, so no pre-existing
+        // tracked slices exist.
+        unsafe {
+            ctx.disable_event_tracking();
+        }
+        // T246.5.3 — dedicated non-default stream for CUDA Graph capture.
+        // CUDA Graphs cannot capture the default/legacy stream — begin_capture
+        // returns CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED on it.
+        let stream = ctx
+            .new_stream()
+            .map_err(|e| LlmError::Backend(format!("new_stream: {e:?}")))?;
         let session = LtSession::new(stream.clone())
             .map_err(|e| LlmError::Backend(format!("LtSession: {e:?}")))?;
         let kernels = LlmKernels::new(ctx.clone());
@@ -592,6 +618,7 @@ impl Qwen35ModelCudaQ4K {
             position_dev,
             kv_len_dev,
             current_token_dev,
+            decode_graph: None,
         })
     }
 
@@ -621,6 +648,9 @@ impl Qwen35ModelCudaQ4K {
         self.stream
             .memcpy_htod(&[1i32], &mut self.kv_len_dev)
             .map_err(|e| LlmError::Backend(format!("reset kv_len_dev: {e:?}")))?;
+        // T246.5.3 — captured graph is no longer valid for the new state.
+        // It will be re-captured on the 2nd decode_step after this reset.
+        self.decode_graph = None;
         Ok(())
     }
 
@@ -649,19 +679,48 @@ impl Qwen35ModelCudaQ4K {
         // ---- Use pre-allocated scratch (no per-step alloc, T246.4.1) ----
         let _ = (conv_dim, value_dim, n_v, head_kv, q_dim, kv_dim, f);
 
-        // T246.5.3 — sync host counters → device counters. 3 × 4-byte H2D.
-        // These mirror `self.position` so the *_devcnt kernels read the right
-        // values inside a captured CUDA Graph (Phase C).
-        let pos_i32 = self.position as i32;
+        // T246.5.3 — Always update current_token_dev (1 × 4-byte H2D, OUTSIDE
+        // any capture region so it executes immediately and remains mutable
+        // between graph replays). position_dev and kv_len_dev are self-managing
+        // via increment_u32_dev kernels at the end of the body — no need to
+        // write them from host after init.
         self.stream
             .memcpy_htod(&[token_id], &mut self.current_token_dev)
             .map_err(|e| LlmError::Backend(format!("upload token id: {e:?}")))?;
-        self.stream
-            .memcpy_htod(&[pos_i32], &mut self.position_dev)
-            .map_err(|e| LlmError::Backend(format!("upload position: {e:?}")))?;
-        self.stream
-            .memcpy_htod(&[pos_i32 + 1], &mut self.kv_len_dev)
-            .map_err(|e| LlmError::Backend(format!("upload kv_len: {e:?}")))?;
+
+        // T246.5.3 — Replay path: if a graph was captured on a previous step,
+        // just launch it. Skips ~1908 cuLaunchKernel calls for one replay.
+        if let Some(graph) = &self.decode_graph {
+            graph
+                .launch()
+                .map_err(|e| LlmError::Backend(format!("graph launch: {e:?}")))?;
+            let next_tokens: Vec<u32> = self
+                .stream
+                .memcpy_dtov(&self.scratch.next_token)
+                .map_err(|e| LlmError::Backend(format!("dtov next_token: {e:?}")))?;
+            self.position += 1;
+            return Ok(next_tokens[0]);
+        }
+
+        // T246.5.3 — Capture path: on the 2nd decode call (position == 1),
+        // wrap the body in begin_capture / end_capture so all kernels become
+        // a single replayable CUDA Graph. The 1st call (position == 0) is a
+        // warmup that triggers nvrtc compile + cuModuleLoadData for every
+        // kernel — these are NOT capturable and must happen before begin_capture.
+        let should_capture = self.position == 1 && self.decode_graph.is_none();
+        if should_capture {
+            // T246.5.3 — Drain pending stream work before begin_capture. The
+            // H2D upload of token_id above is cuMemcpyHtoDAsync on pageable
+            // memory, which is *not* a captureable op. If it bleeds into the
+            // capture region the capture is invalidated immediately on the
+            // next op (CUDA_ERROR_STREAM_CAPTURE_INVALIDATED).
+            self.stream
+                .synchronize()
+                .map_err(|e| LlmError::Backend(format!("pre-capture sync: {e:?}")))?;
+            self.stream
+                .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+                .map_err(|e| LlmError::Backend(format!("begin_capture: {e:?}")))?;
+        }
 
         // T246.4.2 — zero scratch buffers at start of each step. Without this,
         // residual reads of stale buffers cause non-deterministic output across
@@ -774,8 +833,10 @@ impl Qwen35ModelCudaQ4K {
             )
         };
 
-        // Force sync after zeroing scratch.
-        self.stream.synchronize().ok();
+        // T246.5.3 — removed `self.stream.synchronize()` here. host syncs are
+        // INVALID during CUDA Graph capture. The memset_zeros above are
+        // ordered on the same stream as the kernels below, so they execute
+        // in order without needing a host barrier.
 
         // T246.4.3 — DEBUG : if env var set, dump KV cache + SSM state values
         // BEFORE any computation, to verify alloc_zeros gave us actual zeros.
@@ -832,7 +893,7 @@ impl Qwen35ModelCudaQ4K {
                 .embedding_lookup_bf16(&self.stream, te_p, ct_p, h_p, 1, d as i32)
                 .map_err(|e| LlmError::Backend(format!("embed lookup: {e:?}")))?;
         }
-        self.stream.synchronize().ok();
+        // T246.5.3 — removed sync here, same reason as above.
 
         // ---- Iterate over all 64 layers ----
         for (li, block) in self.blocks.iter_mut().enumerate() {
@@ -1255,47 +1316,45 @@ impl Qwen35ModelCudaQ4K {
                 .argmax_bf16(&self.stream, logits_p, tok_p, cfg.vocab as i32)
                 .map_err(|e| LlmError::Backend(format!("argmax: {e:?}")))?;
         }
-        self.stream.synchronize().ok();
+        let _ = (tok_p, logits_p, final_norm_p); // silence unused warnings
 
+        // T246.5.3 — Auto-advance device counters at the end of body. These
+        // become part of the captured graph so each replay also advances the
+        // counters, eliminating the need for host-side writes between replays.
+        unsafe {
+            let (pos_p, _g_pos) = self.position_dev.device_ptr_mut(&self.stream);
+            self.kernels
+                .increment_u32_dev(&self.stream, pos_p)
+                .map_err(|e| LlmError::Backend(format!("inc position_dev: {e:?}")))?;
+        }
+        unsafe {
+            let (kvl_p, _g_kvl) = self.kv_len_dev.device_ptr_mut(&self.stream);
+            self.kernels
+                .increment_u32_dev(&self.stream, kvl_p)
+                .map_err(|e| LlmError::Backend(format!("inc kv_len_dev: {e:?}")))?;
+        }
+
+        // T246.5.3 — Capture path closure: end_capture + first launch.
+        if should_capture {
+            let graph = self
+                .stream
+                .end_capture(
+                    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                )
+                .map_err(|e| LlmError::Backend(format!("end_capture: {e:?}")))?
+                .ok_or_else(|| LlmError::Backend("end_capture returned no graph".into()))?;
+            // Launch once now to actually execute the recorded body for this step.
+            graph
+                .launch()
+                .map_err(|e| LlmError::Backend(format!("first graph launch: {e:?}")))?;
+            self.decode_graph = Some(graph);
+        }
+
+        // Read back next token (host op, OUTSIDE any capture).
         let next_id_host: Vec<u32> = self
             .stream
             .memcpy_dtov(&self.scratch.next_token)
             .map_err(|e| LlmError::Backend(format!("dl token: {e:?}")))?;
-        let _ = (tok_p, logits_p, final_norm_p); // silence unused warnings
-
-        // T246.4.2 — DEBUG : print first few logits to diagnose non-determinism.
-        if self.position == 0 && std::env::var("RUSTORCH_DEBUG_LOGITS").is_ok() {
-            let logits_host: Vec<half::bf16> = self
-                .stream
-                .memcpy_dtov(&self.scratch.logits)
-                .map_err(|e| LlmError::Backend(format!("dl logits: {e:?}")))?;
-            eprintln!(
-                "[debug] first 5 logits : {:?}",
-                logits_host
-                    .iter()
-                    .take(5)
-                    .map(|v| v.to_f32())
-                    .collect::<Vec<_>>()
-            );
-            eprintln!(
-                "[debug] argmax token   : {} (logit {:.4})",
-                next_id_host[0],
-                logits_host[next_id_host[0] as usize].to_f32()
-            );
-            // Sample some h state in scratch.
-            let h_host: Vec<half::bf16> = self
-                .stream
-                .memcpy_dtov(&self.scratch.h)
-                .map_err(|e| LlmError::Backend(format!("dl h: {e:?}")))?;
-            eprintln!(
-                "[debug] first 5 h     : {:?}",
-                h_host
-                    .iter()
-                    .take(5)
-                    .map(|v| v.to_f32())
-                    .collect::<Vec<_>>()
-            );
-        }
 
         self.position += 1;
         Ok(next_id_host[0])
