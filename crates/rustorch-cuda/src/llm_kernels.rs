@@ -1910,6 +1910,126 @@ extern "C" __global__ void sgemv_bf16_bf16(
 }
 "#;
 
+// T246.8 A3 — sgemv_bf16_bf16_v2 : tensor-core (mma.sync m16n8k16) thin GEMV.
+//
+// Replaces V1 warp-shuffle SGEMV for N >= 128. Uses BF16 tensor cores
+// (m16n8k16 with FP32 accumulator) to amortize 16 output rows per warp
+// per mma instruction.
+//
+// Layout :
+//   - 1 block = 1 warp = 32 threads
+//   - 1 block computes 16 contiguous output rows (y[row_base..row_base+16])
+//   - K loop : 16 BF16 elements per iteration (mma.sync m16n8k16 K-tile)
+//
+// mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 :
+//   D[16,8] += A[16,16] @ B[16,8]    (BF16 inputs, FP32 accumulators)
+//
+// We broadcast x (16 BF16 values per K-tile) across all 8 N-cols of B,
+// so each output column 0..7 of D is the same value (= row · x). We only
+// keep col 0 (held by lanes where lane%4 == 0). Wasted compute on cols 1..7
+// is acceptable since the kernel is bandwidth-bound on W, not compute-bound.
+//
+// Constraint : K must be multiple of 16 (mma K-stride). N rounded up to 16.
+//
+// Per-thread fragment layout (PTX ISA §9.7.13.4 m16n8k16) :
+//   lane = 4*groupID + threadID_in_group, groupID in 0..7, tig in 0..3.
+//   A (16x16 BF16, .row) per thread :
+//     a[0] = W[row_base+groupID,    K_base + 2*tig + 0..1]
+//     a[1] = W[row_base+groupID+8,  K_base + 2*tig + 0..1]
+//     a[2] = W[row_base+groupID,    K_base + 2*tig + 8..9]
+//     a[3] = W[row_base+groupID+8,  K_base + 2*tig + 8..9]
+//   B (16(K)x8(N) BF16, .col, broadcast x across N) per thread :
+//     b[0] = x[K_base + 2*tig + 0..1]   (replicated across all 8 N-cols)
+//     b[1] = x[K_base + 2*tig + 8..9]
+//   D (16x8 FP32) per thread :
+//     d[0] = D[groupID,    2*tig + 0]
+//     d[1] = D[groupID,    2*tig + 1]
+//     d[2] = D[groupID+8,  2*tig + 0]
+//     d[3] = D[groupID+8,  2*tig + 1]
+//   We only keep col 0 → only tig == 0 lanes write outputs (8 lanes write
+//   16 outputs total : lane 0 writes y[row_base], y[row_base+8] ; lane 4
+//   writes y[row_base+1], y[row_base+9] ; ... ; lane 28 writes y[row_base+7],
+//   y[row_base+15]).
+#[cfg(feature = "cuda")]
+const SGEMV_BF16_BF16_V2_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void sgemv_bf16_bf16_v2(
+    const __nv_bfloat16* __restrict__ w,    // [N, K] row-major
+    const __nv_bfloat16* __restrict__ x,    // [K]
+    __nv_bfloat16* __restrict__ y,          // [N]
+    int N,
+    int K
+) {
+    const int row_base = blockIdx.x * 16;
+    if (row_base >= N) return;
+
+    const int lane = threadIdx.x;       // 0..31
+    const int group_id = lane >> 2;     // 0..7
+    const int tig      = lane & 3;      // 0..3
+
+    // Accumulators (FP32, 4 per thread for D[16,8]).
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    // Mask : are the two A-rows we own (group_id, group_id+8) valid ?
+    const int row_a = row_base + group_id;
+    const int row_b = row_base + group_id + 8;
+    const bool row_a_valid = (row_a < N);
+    const bool row_b_valid = (row_b < N);
+
+    const int K_steps = K / 16;
+    for (int k_step = 0; k_step < K_steps; ++k_step) {
+        const int k_base = k_step * 16;
+
+        // ---- Load B fragments (broadcast x across 8 N-cols) ----
+        // b[0] = pack(x[k_base + 2*tig], x[k_base + 2*tig + 1])
+        // b[1] = pack(x[k_base + 2*tig + 8], x[k_base + 2*tig + 9])
+        // BF16 pair packed as a single 32-bit unsigned (lo = first, hi = second).
+        const unsigned int* xp = reinterpret_cast<const unsigned int*>(x + k_base);
+        const unsigned int b0 = xp[tig];       // x[k_base + 2*tig + 0..1]
+        const unsigned int b1 = xp[tig + 4];   // x[k_base + 2*tig + 8..9]
+
+        // ---- Load A fragments ----
+        // a[0,1] need cols [2*tig + 0..1] of rows (group_id, group_id+8).
+        // a[2,3] need cols [2*tig + 8..9] of rows (group_id, group_id+8).
+        unsigned int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        if (row_a_valid) {
+            const unsigned int* wp_a = reinterpret_cast<const unsigned int*>(
+                w + row_a * K + k_base);
+            a0 = wp_a[tig];          // cols 2*tig + 0..1
+            a2 = wp_a[tig + 4];      // cols 2*tig + 8..9
+        }
+        if (row_b_valid) {
+            const unsigned int* wp_b = reinterpret_cast<const unsigned int*>(
+                w + row_b * K + k_base);
+            a1 = wp_b[tig];          // cols 2*tig + 0..1
+            a3 = wp_b[tig + 4];      // cols 2*tig + 8..9
+        }
+
+        // ---- mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 ----
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+            : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+              "r"(b0), "r"(b1),
+              "f"(d0), "f"(d1), "f"(d2), "f"(d3));
+    }
+
+    // Output : only tig == 0 lanes hold col 0 of D.
+    //   d0 = D[group_id,   0]  → y[row_base + group_id]
+    //   d2 = D[group_id+8, 0]  → y[row_base + group_id + 8]
+    if (tig == 0) {
+        if (row_a_valid) {
+            y[row_a] = (__nv_bfloat16)d0;
+        }
+        if (row_b_valid) {
+            y[row_b] = (__nv_bfloat16)d2;
+        }
+    }
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const CONV1D_DEPTHWISE_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -4629,6 +4749,8 @@ pub struct LlmKernels {
     sgemv_q6k_v4: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemm_q6k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    /// T246.8 A3 — sgemv_bf16_bf16_v2 mma.sync m16n8k16 tensor-core SGEMV.
+    sgemv_bf16_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     softplus_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sigmoid_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     mul_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -4723,6 +4845,7 @@ impl LlmKernels {
             sgemv_q6k_v4: std::sync::OnceLock::new(),
             sgemm_q6k_m8: std::sync::OnceLock::new(),
             sgemv_bf16: std::sync::OnceLock::new(),
+            sgemv_bf16_v2: std::sync::OnceLock::new(),
             softplus_inplace: std::sync::OnceLock::new(),
             sigmoid_inplace: std::sync::OnceLock::new(),
             mul_inplace: std::sync::OnceLock::new(),
@@ -6003,6 +6126,78 @@ impl LlmKernels {
             location: "sgemv_bf16_bf16::launch",
         })?;
         Ok(())
+    }
+
+    /// T246.8 A3 — Tensor-core BF16 thin GEMV (mma.sync m16n8k16).
+    ///
+    /// Replaces V1 warp-shuffle SGEMV for N >= 128. Uses BF16 tensor cores
+    /// with FP32 accumulator. 1 warp per block, 16 output rows per block.
+    /// Targets 1.7-2.2× speedup over V1 on Qwen3.6-35B-A3B Q4_K_M decode
+    /// (BF16 sgemv is 46% of GPU time post-A2).
+    ///
+    /// Falls back to V1 via `sgemv_bf16_bf16_dispatch` for K not multiple
+    /// of 16 (mma constraint) or N < 128 (mma overhead exceeds win).
+    ///
+    /// # Safety  Caller ensures pointers valid, K multiple of 16.
+    pub unsafe fn sgemv_bf16_bf16_v2(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: u64, // [N, K] BF16 row-major
+        x: u64, // [K] BF16
+        y: u64, // [N] BF16
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 16 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_bf16_bf16_v2: K={k} must be multiple of 16 (mma m16n8k16)"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_bf16_v2,
+            SGEMV_BF16_BF16_V2_SRC,
+            "sgemv_bf16_bf16_v2",
+        )?;
+        let n_blocks = (n as u32).div_ceil(16);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w).arg(&x).arg(&y).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_bf16_bf16_v2::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.8 A3 — Dispatch helper : V2 (tensor-core) for N >= 128 and
+    /// K multiple of 16, else V1 (warp-shuffle, requires K multiple of 256).
+    ///
+    /// If neither is applicable (K < 256 not multiple of 16) we still try V2
+    /// since its only constraint is K % 16 == 0 ; otherwise we propagate the
+    /// V1 error to surface the unsupported shape.
+    ///
+    /// # Safety  Same as `sgemv_bf16_bf16` / `sgemv_bf16_bf16_v2`.
+    pub unsafe fn sgemv_bf16_bf16_dispatch(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        // V2 wins for large N (mma amortization). For small N (e.g. shexp
+        // dot M=1, single-row reductions) keep V1 to avoid mma launch cost
+        // and the wasted N=8 broadcast.
+        if n >= 128 && k % 16 == 0 {
+            self.sgemv_bf16_bf16_v2(stream, w, x, y, n, k)
+        } else {
+            self.sgemv_bf16_bf16(stream, w, x, y, n, k)
+        }
     }
 
     /// T243.2 — Depth-wise 1-D conv (Qwen3.5/3.6 SSM block).
