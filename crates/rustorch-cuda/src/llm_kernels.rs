@@ -2912,7 +2912,8 @@ __global__ void sgemv_q4k_bf16_v3_indexed(
     int K
 ) {
     int e_idx = topk_indices[slot];
-    const unsigned char* w_q4k = (const unsigned char*)expert_ptrs[e_idx];
+    const unsigned char* __restrict__ w_q4k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
 
     int row0 = blockIdx.x * 4;
     int tid  = threadIdx.x;
@@ -3025,7 +3026,8 @@ extern "C" __global__ void sgemv_q4k_q8_1_dp4a_bf16_indexed(
     int K
 ) {
     int e_idx = topk_indices[slot];
-    const unsigned char* w_q4k = (const unsigned char*)expert_ptrs[e_idx];
+    const unsigned char* __restrict__ w_q4k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
 
     int row = blockIdx.x;
     if (row >= N) return;
@@ -3111,7 +3113,8 @@ __global__ void sgemv_q5k_bf16_v3_indexed(
     int K
 ) {
     int e_idx = topk_indices[slot];
-    const unsigned char* w_q5k = (const unsigned char*)expert_ptrs[e_idx];
+    const unsigned char* __restrict__ w_q5k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
 
     int row0 = blockIdx.x * 4;
     int tid  = threadIdx.x;
@@ -3239,7 +3242,8 @@ __global__ void sgemv_q6k_bf16_v3_indexed(
     int K
 ) {
     int e_idx = topk_indices[slot];
-    const unsigned char* w_q6k = (const unsigned char*)expert_ptrs[e_idx];
+    const unsigned char* __restrict__ w_q6k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
 
     int row0 = blockIdx.x * 4;
     int tid  = threadIdx.x;
@@ -3338,7 +3342,8 @@ extern "C" __global__ void sgemv_bf16_bf16_indexed(
     int K
 ) {
     int e_idx = topk_indices[slot];
-    const __nv_bfloat16* w = (const __nv_bfloat16*)expert_ptrs[e_idx];
+    const __nv_bfloat16* __restrict__ w =
+        (const __nv_bfloat16* __restrict__)expert_ptrs[e_idx];
 
     int row = blockIdx.x;
     if (row >= N) return;
@@ -3400,6 +3405,39 @@ extern "C" __global__ void scaled_add_inplace_bf16_devscalar(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float alpha = (float)alpha_dev[slot];
+    float yi = (float)y[i];
+    float xi = (float)x[i];
+    y[i] = (__nv_bfloat16)(yi + alpha * xi);
+}
+"#;
+
+// T246.8 A2.1 — Fused shared-expert sigmoid + scaled_add for MoE FFN.
+//
+// `y[i] += sigmoid((float)dot_bf16[0]) * x[i]`
+//
+// Replaces the host-sync sequence of (DtoH dot → host sigmoid in f32 →
+// scaled_add with f32 alpha) in the routed-MoE shared-expert path.
+// CRUCIAL : the sigmoid value is computed and held in float precision
+// per thread, NOT stored back to bf16, so this matches the sync path's
+// `1.0_f32 / (1.0 + (-v).exp())` precision exactly. Using
+// `sigmoid_inplace_bf16 + scaled_add_inplace_bf16_devscalar` instead
+// would round the sigmoid to bf16 between ops and cause ~7-bit drift
+// per layer, which compounds across the 64 MoE layers and produces
+// different greedy tokens from token 1.
+#[cfg(feature = "cuda")]
+const SCALED_ADD_SIGMOID_DEVSCALAR_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void scaled_add_sigmoid_devscalar_bf16(
+    __nv_bfloat16*       __restrict__ y,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ dot_bf16,  // 1 element
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float dot = (float)dot_bf16[0];
+    float alpha = 1.0f / (1.0f + expf(-dot));
     float yi = (float)y[i];
     float xi = (float)x[i];
     y[i] = (__nv_bfloat16)(yi + alpha * xi);
@@ -4648,6 +4686,7 @@ pub struct LlmKernels {
     sgemv_q6k_v3_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_bf16_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     scaled_add_inplace_devscalar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    scaled_add_sigmoid_devscalar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     zero_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
@@ -4728,6 +4767,7 @@ impl LlmKernels {
             sgemv_q6k_v3_indexed: std::sync::OnceLock::new(),
             sgemv_bf16_indexed: std::sync::OnceLock::new(),
             scaled_add_inplace_devscalar: std::sync::OnceLock::new(),
+            scaled_add_sigmoid_devscalar: std::sync::OnceLock::new(),
             zero_bf16: std::sync::OnceLock::new(),
         }
     }
@@ -7479,6 +7519,43 @@ impl LlmKernels {
         Ok(())
     }
 
+    /// Fused shared-expert sigmoid + scaled_add :
+    /// `y[i] += sigmoid((float)dot_bf16[0]) * x[i]`. The sigmoid is
+    /// computed in float precision per-thread (NOT rounded to bf16
+    /// between sigmoid and multiply). This bit-matches the original
+    /// MoE sync path's `host(sigmoid_f32)(... f32 alpha)` precision
+    /// for graph-capturable execution.
+    ///
+    /// # Safety  `y`/`x` length n BF16, `dot_bf16` ≥ 1 BF16.
+    pub unsafe fn scaled_add_sigmoid_devscalar_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        y: u64,
+        x: u64,
+        dot_bf16: u64,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.scaled_add_sigmoid_devscalar,
+            SCALED_ADD_SIGMOID_DEVSCALAR_BF16_SRC,
+            "scaled_add_sigmoid_devscalar_bf16",
+        )?;
+        let block_dim: u32 = 256;
+        let grid_dim: u32 = (n as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&y).arg(&x).arg(&dot_bf16).arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "scaled_add_sigmoid_devscalar_bf16::launch",
+        })?;
+        Ok(())
+    }
+
     /// Zero a BF16 vector of length `n`. # Safety : `y` is `n` BF16 elements.
     pub unsafe fn zero_bf16(
         &self,
@@ -8982,6 +9059,233 @@ mod parity_tests {
                     r_ref[i].to_bits(),
                     r_idx[i].to_bits(),
                     "slot={slot} (expert {e_idx}) row[{i}] ref={} idx={}",
+                    r_ref[i].to_f32(),
+                    r_idx[i].to_f32(),
+                );
+            }
+        }
+    }
+
+    /// T246.8 A2.1 — Indexed Q4_K dp4a vs non-indexed dp4a parity.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn sgemv_q4k_q8_1_dp4a_bf16_indexed_matches_dp4a() {
+        use cudarc::driver::DevicePtrMut;
+        let n_experts = 3usize;
+        let n = 8usize;
+        let k = 256usize;
+        let row_bytes = (k / 256) * 144;
+        let expert_bytes = n * row_bytes;
+
+        let mut state: u64 = 0x12_34_56_78;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut all_w: Vec<Vec<u8>> = Vec::with_capacity(n_experts);
+        for _ in 0..n_experts {
+            let mut w = vec![0u8; expert_bytes];
+            for b in &mut w {
+                *b = (next() & 0xFF) as u8;
+            }
+            for row in 0..n {
+                for blk in 0..(k / 256) {
+                    let off = row * row_bytes + blk * 144;
+                    let d = half::f16::from_f32(0.05).to_le_bytes();
+                    let dmin = half::f16::from_f32(0.025).to_le_bytes();
+                    w[off] = d[0];
+                    w[off + 1] = d[1];
+                    w[off + 2] = dmin[0];
+                    w[off + 3] = dmin[1];
+                    for i in 0..12 {
+                        w[off + 4 + i] &= 0x3F;
+                    }
+                }
+            }
+            all_w.push(w);
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let mut exp_dev: Vec<cudarc::driver::CudaSlice<u8>> = Vec::new();
+        for w in &all_w {
+            exp_dev.push(stream.memcpy_stod(w).expect("upload expert"));
+        }
+        let mut ptrs: Vec<u64> = Vec::with_capacity(n_experts);
+        for d in &exp_dev {
+            let (p, _g) = d.device_ptr(&stream);
+            ptrs.push(p);
+        }
+        let ptrs_dev = stream.memcpy_stod(&ptrs).expect("upload ptrs");
+
+        let x_bf: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.01).sin()))
+            .collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+
+        let mut x_q8 = stream.alloc_zeros::<u8>((k / 32) * 36).expect("q8 alloc");
+        unsafe {
+            let (xp, _g) = x_dev.device_ptr(&stream);
+            let (xq, _g2) = x_q8.device_ptr_mut(&stream);
+            kernels
+                .quantize_q8_1_bf16(&stream, xp, xq, k as i32)
+                .expect("quant q8_1");
+        }
+
+        let topk: Vec<i32> = vec![2, 0];
+        let topk_dev = stream.memcpy_stod(&topk).expect("upload topk");
+
+        let mut y_ref = stream.alloc_zeros::<half::bf16>(n).expect("alloc y_ref");
+        let mut y_idx = stream.alloc_zeros::<half::bf16>(n).expect("alloc y_idx");
+
+        for (slot, &e_idx) in topk.iter().enumerate() {
+            unsafe {
+                let (w_p, _g) = exp_dev[e_idx as usize].device_ptr(&stream);
+                let (xq, _g2) = x_q8.device_ptr(&stream);
+                let (y_p, _g3) = y_ref.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q4k_q8_1_dp4a_bf16(&stream, w_p, xq, y_p, n as i32, k as i32)
+                    .expect("dp4a");
+            }
+            unsafe {
+                let (pp, _g) = ptrs_dev.device_ptr(&stream);
+                let (tp, _g2) = topk_dev.device_ptr(&stream);
+                let (xq, _g3) = x_q8.device_ptr(&stream);
+                let (y_p, _g4) = y_idx.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q4k_q8_1_dp4a_bf16_indexed(
+                        &stream,
+                        pp,
+                        tp,
+                        slot as i32,
+                        xq,
+                        y_p,
+                        n as i32,
+                        k as i32,
+                    )
+                    .expect("dp4a_indexed");
+            }
+            let r_ref: Vec<half::bf16> = stream.memcpy_dtov(&y_ref).expect("dtov ref");
+            let r_idx: Vec<half::bf16> = stream.memcpy_dtov(&y_idx).expect("dtov idx");
+            for i in 0..n {
+                assert_eq!(
+                    r_ref[i].to_bits(),
+                    r_idx[i].to_bits(),
+                    "slot={slot} expert={e_idx} row[{i}] ref={} idx={}",
+                    r_ref[i].to_f32(),
+                    r_idx[i].to_f32(),
+                );
+            }
+        }
+    }
+
+    /// T246.8 A2.1 — Indexed Q5_K v3 vs non-indexed Q5_K v3 parity.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn sgemv_q5k_bf16_v3_indexed_matches_v3() {
+        use cudarc::driver::DevicePtrMut;
+        let n_experts = 3usize;
+        let n = 8usize; // we go through v3 path (n_blocks = 2 since 8/4 = 2)
+        let k = 256usize;
+        let row_bytes = (k / 256) * 176;
+        let expert_bytes = n * row_bytes;
+
+        let mut state: u64 = 0xab_cd_ef_10;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut all_w: Vec<Vec<u8>> = Vec::with_capacity(n_experts);
+        for _ in 0..n_experts {
+            let mut w = vec![0u8; expert_bytes];
+            for b in &mut w {
+                *b = (next() & 0xFF) as u8;
+            }
+            for row in 0..n {
+                for blk in 0..(k / 256) {
+                    let off = row * row_bytes + blk * 176;
+                    let d = half::f16::from_f32(0.05).to_le_bytes();
+                    let dmin = half::f16::from_f32(0.025).to_le_bytes();
+                    w[off] = d[0];
+                    w[off + 1] = d[1];
+                    w[off + 2] = dmin[0];
+                    w[off + 3] = dmin[1];
+                    for i in 0..12 {
+                        w[off + 4 + i] &= 0x3F;
+                    }
+                }
+            }
+            all_w.push(w);
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let mut exp_dev: Vec<cudarc::driver::CudaSlice<u8>> = Vec::new();
+        for w in &all_w {
+            exp_dev.push(stream.memcpy_stod(w).expect("upload expert"));
+        }
+        let mut ptrs: Vec<u64> = Vec::with_capacity(n_experts);
+        for d in &exp_dev {
+            let (p, _g) = d.device_ptr(&stream);
+            ptrs.push(p);
+        }
+        let ptrs_dev = stream.memcpy_stod(&ptrs).expect("upload ptrs");
+
+        let x_bf: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.01).sin()))
+            .collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+
+        let topk: Vec<i32> = vec![2, 0];
+        let topk_dev = stream.memcpy_stod(&topk).expect("upload topk");
+
+        let mut y_ref = stream.alloc_zeros::<half::bf16>(n).expect("alloc y_ref");
+        let mut y_idx = stream.alloc_zeros::<half::bf16>(n).expect("alloc y_idx");
+
+        for (slot, &e_idx) in topk.iter().enumerate() {
+            unsafe {
+                let (w_p, _g) = exp_dev[e_idx as usize].device_ptr(&stream);
+                let (x_p, _g2) = x_dev.device_ptr(&stream);
+                let (y_p, _g3) = y_ref.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q5k_bf16_v3(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                    .expect("v3");
+            }
+            unsafe {
+                let (pp, _g) = ptrs_dev.device_ptr(&stream);
+                let (tp, _g2) = topk_dev.device_ptr(&stream);
+                let (x_p, _g3) = x_dev.device_ptr(&stream);
+                let (y_p, _g4) = y_idx.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q5k_bf16_v3_indexed(
+                        &stream,
+                        pp,
+                        tp,
+                        slot as i32,
+                        x_p,
+                        y_p,
+                        n as i32,
+                        k as i32,
+                    )
+                    .expect("v3_indexed");
+            }
+            let r_ref: Vec<half::bf16> = stream.memcpy_dtov(&y_ref).expect("dtov ref");
+            let r_idx: Vec<half::bf16> = stream.memcpy_dtov(&y_idx).expect("dtov idx");
+            for i in 0..n {
+                assert_eq!(
+                    r_ref[i].to_bits(),
+                    r_idx[i].to_bits(),
+                    "Q5_K slot={slot} expert={e_idx} row[{i}] ref={} idx={}",
                     r_ref[i].to_f32(),
                     r_idx[i].to_f32(),
                 );
