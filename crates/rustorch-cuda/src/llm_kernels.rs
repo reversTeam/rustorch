@@ -2071,6 +2071,148 @@ extern "C" __global__ void delta_net_step_bf16(
 }
 "#;
 
+// T246.8 A1.1 — Fused SSM pre-step elementwise chain.
+//
+// Replaces 4 separate kernel launches per SSM layer per token by 1 fused
+// kernel :
+//   1. beta[i]  = sigmoid(beta[i])                   for i in 0..n
+//   2. alpha[i] = alpha[i] + dt_bias[i]              for i in 0..n
+//   3. alpha[i] = softplus(alpha[i])                  for i in 0..n
+//   4. alpha[i] = alpha[i] * ssm_a[i]                 for i in 0..n
+//
+// All four operate on the same length-n bf16 vectors, so each thread
+// handles exactly one element with the same FP order as the unfused
+// chain (each unfused kernel writes its result back to bf16 before the
+// next reads it — we mirror that bit-exact by round-tripping through
+// bf16 between phases).
+//
+// Bit-exact parity with the four-kernel sequence is preserved because
+// each thread independently performs the same scalar steps on its own
+// element, and the bf16 round-trip after every step matches the
+// unfused version's writeback.
+#[cfg(feature = "cuda")]
+const SSM_PRE_STEP_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void ssm_pre_step_bf16(
+    __nv_bfloat16*       __restrict__ alpha,    // [n]   in/out
+    __nv_bfloat16*       __restrict__ beta,     // [n]   in/out
+    const __nv_bfloat16* __restrict__ dt_bias,  // [n]
+    const __nv_bfloat16* __restrict__ ssm_a,    // [n]
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    // Step 1 — sigmoid(beta) inplace, mirroring sigmoid_inplace_bf16.
+    {
+        float v = (float)beta[i];
+        float s = 1.0f / (1.0f + expf(-v));
+        beta[i] = (__nv_bfloat16)s;
+    }
+
+    // Step 2 — alpha += dt_bias, mirroring add_inplace_bf16.
+    float a;
+    {
+        float ya = (float)alpha[i];
+        float xa = (float)dt_bias[i];
+        a = ya + xa;
+        alpha[i] = (__nv_bfloat16)a;
+    }
+
+    // Step 3 — softplus(alpha) inplace, mirroring softplus_inplace_bf16.
+    {
+        // Re-read from bf16 to match unfused FP order exactly.
+        float v = (float)alpha[i];
+        float am = v > 0.0f ? v : 0.0f;
+        float bm = log1pf(expf(-fabsf(v)));
+        alpha[i] = (__nv_bfloat16)(am + bm);
+    }
+
+    // Step 4 — alpha *= ssm_a, mirroring mul_inplace_bf16.
+    {
+        float ya = (float)alpha[i];
+        float xa = (float)ssm_a[i];
+        alpha[i] = (__nv_bfloat16)(ya * xa);
+    }
+}
+"#;
+
+// T246.8 A1.2 — Fused SSM post-step output processing.
+//
+// Replaces 3 separate kernel launches per SSM layer per token by 1 fused
+// kernel :
+//   1. ssm_norm : RMSNorm on `out` per head (n_v batches of head_kv each),
+//                 with shared `gamma`. Mirrors rms_norm_bf16(out, sn,
+//                 head_kv, n_v).
+//   2. silu(z) inplace on length-(n_v * head_kv) bf16 vector, mirroring
+//                 silu_bf16.
+//   3. out *= silu(z) elementwise, mirroring mul_inplace_bf16.
+//
+// One block per head : block.x = head_kv threads (one per channel within
+// a head), grid.x = n_v heads. The reduction over head_kv mirrors the
+// existing rms_norm_bf16 reduction (tree reduction in shared memory),
+// so the resulting inv_rms is bit-identical to the unfused call.
+//
+// Each thread then :
+//   * reads original out[h, c] (loaded into shmem before reduction),
+//   * applies inv_rms * gamma[c] → ssm_norm result,
+//   * computes silu(z[h, c]) = z / (1 + exp(-z)),
+//   * writes out[h, c] = ssm_norm * silu(z),
+//   * writes z[h, c] = silu(z) (matches the inplace silu writeback).
+#[cfg(feature = "cuda")]
+const SSM_POST_STEP_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void ssm_post_step_bf16(
+    __nv_bfloat16*       __restrict__ out,    // [n_v, head_kv]   in/out (norm * silu(z))
+    __nv_bfloat16*       __restrict__ z,      // [n_v, head_kv]   in/out (becomes silu(z))
+    const __nv_bfloat16* __restrict__ gamma,  // [head_kv]
+    float eps,
+    int head_kv
+) {
+    int h   = blockIdx.x;
+    int tid = threadIdx.x;
+    if (tid >= head_kv) return;
+
+    extern __shared__ float sdata[];
+
+    // Load out[h, tid] and compute square (rms_norm_bf16 reduction).
+    float v   = (float)out[h * head_kv + tid];
+    float vsq = v * v;
+    sdata[tid] = vsq;
+    __syncthreads();
+
+    // Tree reduction over head_kv threads (same shape as rms_norm_bf16).
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    // sdata[0] = sum of squares ; rms_norm uses (sum/n + eps).
+    float inv_rms = rsqrtf(sdata[0] / (float)head_kv + eps);
+
+    // Step 1 — out = ssm_norm(out, gamma) (mirrors rms_norm_bf16
+    // writeback : v * inv_rms * gamma[tid]).
+    float normed = v * inv_rms * (float)gamma[tid];
+    // Round-trip through bf16 to match the unfused intermediate,
+    // then re-read as float for the multiply (bit-identical to
+    // rms_norm_bf16 then mul_inplace_bf16).
+    __nv_bfloat16 normed_bf = (__nv_bfloat16)normed;
+    float normed_f = (float)normed_bf;
+
+    // Step 2 — z = silu(z) inplace (mirrors silu_bf16).
+    float zv = (float)z[h * head_kv + tid];
+    float sz = zv / (1.0f + expf(-zv));
+    __nv_bfloat16 sz_bf = (__nv_bfloat16)sz;
+    z[h * head_kv + tid] = sz_bf;
+    float sz_f = (float)sz_bf;
+
+    // Step 3 — out *= silu(z) (mirrors mul_inplace_bf16).
+    out[h * head_kv + tid] = (__nv_bfloat16)(normed_f * sz_f);
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const DELTA_NET_STEP_TREE_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -3946,6 +4088,9 @@ pub struct LlmKernels {
     argmax_logits_tree: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     add_u32_dev: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     set_u32_dev: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.8 A1 — fused SSM block element-wise mega-kernels
+    ssm_pre_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    ssm_post_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -4015,6 +4160,9 @@ impl LlmKernels {
             argmax_logits_tree: std::sync::OnceLock::new(),
             add_u32_dev: std::sync::OnceLock::new(),
             set_u32_dev: std::sync::OnceLock::new(),
+            // T246.8 A1 — fused SSM mega-kernels
+            ssm_pre_step: std::sync::OnceLock::new(),
+            ssm_post_step: std::sync::OnceLock::new(),
         }
     }
 
@@ -5434,6 +5582,105 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "delta_net_step_tree_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.8 A1.1 — Fused SSM pre-step elementwise chain.
+    ///
+    /// Replaces 4 separate kernel launches per SSM layer per token :
+    ///   1. `sigmoid_inplace_bf16(beta, n)`
+    ///   2. `add_inplace_bf16(alpha, dt_bias, n)`
+    ///   3. `softplus_inplace_bf16(alpha, n)`
+    ///   4. `mul_inplace_bf16(alpha, ssm_a, n)`
+    ///
+    /// Each thread handles ONE element ; intermediate values round-trip
+    /// through bf16 between phases to preserve bit-exact parity with
+    /// the four-kernel sequence.
+    ///
+    /// # Safety  All four pointers must reference length-`n` BF16 device
+    /// buffers ; `alpha` and `beta` are mutated in place.
+    pub unsafe fn ssm_pre_step_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        alpha: u64,
+        beta: u64,
+        dt_bias: u64,
+        ssm_a: u64,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.ssm_pre_step,
+            SSM_PRE_STEP_BF16_SRC,
+            "ssm_pre_step_bf16",
+        )?;
+        let block_dim: u32 = 256;
+        let grid_dim = (n as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&alpha)
+            .arg(&beta)
+            .arg(&dt_bias)
+            .arg(&ssm_a)
+            .arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "ssm_pre_step_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.8 A1.2 — Fused SSM post-step output processing.
+    ///
+    /// Replaces 3 separate kernel launches per SSM layer per token :
+    ///   1. `rms_norm_bf16(out, gamma, eps, head_kv, n_v)` — per head
+    ///   2. `silu_bf16(z, n_v * head_kv)` (inplace)
+    ///   3. `mul_inplace_bf16(out, z, n_v * head_kv)`
+    ///
+    /// One block per head, `head_kv` threads ; tree reduction over
+    /// head_kv mirrors `rms_norm_bf16` so `inv_rms` is bit-identical.
+    /// All intermediates round-trip through bf16 to preserve bit-exact
+    /// parity with the unfused chain.
+    ///
+    /// # Safety  `out` and `z` are mutated in place. `out` and `z` must
+    /// be `n_v * head_kv` BF16 each ; `gamma` is `head_kv` BF16.
+    /// `head_kv` must be a power of two ≤ 1024 (constraint inherited
+    /// from the tree-reduction shape).
+    pub unsafe fn ssm_post_step_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        out: u64,
+        z: u64,
+        gamma: u64,
+        eps: f32,
+        n_v: i32,
+        head_kv: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.ssm_post_step,
+            SSM_POST_STEP_BF16_SRC,
+            "ssm_post_step_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_v as u32, 1, 1),
+            block_dim: (head_kv as u32, 1, 1),
+            shared_mem_bytes: (head_kv as u32) * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&out)
+            .arg(&z)
+            .arg(&gamma)
+            .arg(&eps)
+            .arg(&head_kv);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "ssm_post_step_bf16::launch",
         })?;
         Ok(())
     }
