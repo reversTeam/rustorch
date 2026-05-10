@@ -38,6 +38,32 @@ use rustorch_gguf::tensor::GgmlType;
 use std::path::Path;
 use std::sync::Arc;
 
+/// T246.8 A2.3 — runtime gate for the async (zero-host-sync) MoE FFN
+/// path. Default OFF for safety until parity is checked. Set
+/// `RUSTORCH_MOE_ASYNC=1` to enable. When enabled, the per-layer MoE
+/// dispatch reads top-K indices/weights directly from device memory
+/// (via the indexed kernels, T246.8 A2.1) and never blocks the stream.
+fn moe_async_enabled() -> bool {
+    std::env::var("RUSTORCH_MOE_ASYNC")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// T246.8 A2.4 — runtime gate for re-enabling CUDA Graph capture for
+/// the MoE variant. Only valid when `RUSTORCH_MOE_ASYNC=1` (otherwise
+/// the per-layer host syncs invalidate capture). Default ON when
+/// async is enabled, OFF otherwise.
+fn moe_graph_enabled() -> bool {
+    if !moe_async_enabled() {
+        return false;
+    }
+    std::env::var("RUSTORCH_MOE_GRAPH")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
 /// One matmul weight on GPU. Qwen3.6 Q4_K_M uses a mix of Q4_K / Q5_K /
 /// Q6_K for big matmuls and F32 (→ BF16) for small ones (ssm_alpha, ssm_beta
 /// when n_v_heads is small : n=48 typical, K=hidden_size, ≈1 MB each).
@@ -191,6 +217,113 @@ impl QuantTensor {
             QuantTensor::Q6K { n, k, .. } => (*n, *k),
         }
     }
+
+    /// Return this tensor's base device pointer as a u64 (for indexed
+    /// dispatch tables).
+    pub(crate) fn base_ptr(&self, stream: &Arc<CudaStream>) -> u64 {
+        use cudarc::driver::DevicePtr;
+        match self {
+            QuantTensor::Bf16 { weights, .. } => {
+                let (p, _g) = weights.device_ptr(stream);
+                p
+            },
+            QuantTensor::Q4K { bytes, .. }
+            | QuantTensor::Q5K { bytes, .. }
+            | QuantTensor::Q6K { bytes, .. } => {
+                let (p, _g) = bytes.device_ptr(stream);
+                p
+            },
+        }
+    }
+}
+
+/// T246.8 A2 — Dispatch an indexed M=1 SGEMV through the right kernel
+/// for `kind`. Each call launches one indexed kernel that reads the
+/// expert weight pointer from `expert_ptrs_p[topk_indices_p[slot]]` on
+/// device. Mirrors `QuantTensor::dispatch_matmul_m1`'s dispatch logic.
+///
+/// `n` and `k` are the per-expert output/input dims (uniform across the
+/// stacked-expert tensor).
+///
+/// `x_q8_staging` : pass the device pointer to a `(K/32)*36`-byte Q8_1
+/// staging buffer to enable the dp4a path for Q4_K experts (much faster
+/// than the float V3 fallback). Pass 0 to force the float V3 path. Caller
+/// must have already filled the staging buffer with `quantize_q8_1_bf16(x)`
+/// before calling this dispatcher (the buffer is shared across all k
+/// indexed calls in one MoE layer iteration).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_indexed_matmul_m1(
+    kernels: &LlmKernels,
+    stream: &Arc<CudaStream>,
+    kind: ExpertQuantKind,
+    expert_ptrs_p: u64,
+    topk_indices_p: u64,
+    slot: i32,
+    x: u64,
+    y: u64,
+    n: i32,
+    k: i32,
+    x_q8_staging: u64,
+) -> Result<(), LlmError> {
+    unsafe {
+        match kind {
+            ExpertQuantKind::Q4K => {
+                if x_q8_staging != 0 {
+                    // Mirror `QuantTensor::dispatch_matmul_m1` Q4K dp4a path :
+                    // quantize x → x_q8_staging just before the kernel.
+                    kernels
+                        .quantize_q8_1_bf16(stream, x, x_q8_staging, k)
+                        .map_err(|e| LlmError::Backend(format!("q8_1 quant idx: {e:?}")))?;
+                    kernels
+                        .sgemv_q4k_q8_1_dp4a_bf16_indexed(
+                            stream,
+                            expert_ptrs_p,
+                            topk_indices_p,
+                            slot,
+                            x_q8_staging,
+                            y,
+                            n,
+                            k,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("q4k_dp4a_idx: {e:?}")))
+                } else {
+                    kernels
+                        .sgemv_q4k_bf16_v3_indexed(
+                            stream,
+                            expert_ptrs_p,
+                            topk_indices_p,
+                            slot,
+                            x,
+                            y,
+                            n,
+                            k,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("q4k_v3_idx: {e:?}")))
+                }
+            },
+            ExpertQuantKind::Q5K => kernels
+                .sgemv_q5k_bf16_v3_indexed(stream, expert_ptrs_p, topk_indices_p, slot, x, y, n, k)
+                .map_err(|e| LlmError::Backend(format!("q5k_v3_idx: {e:?}"))),
+            ExpertQuantKind::Q6K => kernels
+                .sgemv_q6k_bf16_v3_indexed(stream, expert_ptrs_p, topk_indices_p, slot, x, y, n, k)
+                .map_err(|e| LlmError::Backend(format!("q6k_v3_idx: {e:?}"))),
+            ExpertQuantKind::Bf16 => kernels
+                .sgemv_bf16_bf16_indexed(stream, expert_ptrs_p, topk_indices_p, slot, x, y, n, k)
+                .map_err(|e| LlmError::Backend(format!("bf16_idx: {e:?}"))),
+        }
+    }
+}
+
+/// Quant family of a stacked-expert tensor — all experts in a `Vec<QuantTensor>`
+/// share the same source dtype (per GGUF tensor contract). Used by the indexed
+/// MoE dispatch path (T246.8 A2) to pick the right kernel without
+/// per-iteration host-side dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpertQuantKind {
+    Q4K,
+    Q5K,
+    Q6K,
+    Bf16,
 }
 
 /// MoE FFN weights for one layer (Qwen3.6-35B-A3B). Top-K routed experts +
@@ -212,6 +345,16 @@ pub(crate) struct MoeFfnQ4K {
     pub(crate) up_shexp: QuantTensor,
     /// `[D, expert_f]` quantized — shared-expert down.
     pub(crate) down_shexp: QuantTensor,
+
+    // ── T246.8 A2 — device-side dispatch tables (built once at load time) ──
+    /// `[n_experts]` u64 — base device pointers of each `gate_exps[e]`.
+    pub(crate) gate_exp_ptrs_dev: CudaSlice<u64>,
+    pub(crate) up_exp_ptrs_dev: CudaSlice<u64>,
+    pub(crate) down_exp_ptrs_dev: CudaSlice<u64>,
+    /// Quant family for each set (homogeneous within a stacked tensor).
+    pub(crate) gate_exp_kind: ExpertQuantKind,
+    pub(crate) up_exp_kind: ExpertQuantKind,
+    pub(crate) down_exp_kind: ExpertQuantKind,
 }
 
 /// FFN variant — dense SwiGLU or top-K MoE.
@@ -752,30 +895,72 @@ impl Qwen35ModelCudaQ4K {
                     let n_e = cfg.n_experts;
                     let ef = cfg.expert_f;
                     let d = cfg.d;
+                    let gate_exps =
+                        load_stacked_quant_experts(&key("ffn_gate_exps.weight"), n_e, ef, d)?;
+                    let up_exps =
+                        load_stacked_quant_experts(&key("ffn_up_exps.weight"), n_e, ef, d)?;
+                    let down_exps =
+                        load_stacked_quant_experts(&key("ffn_down_exps.weight"), n_e, d, ef)?;
+
+                    // T246.8 A2 — build device-side weight pointer tables.
+                    // Each `Vec<QuantTensor>` is homogeneous in dtype (single
+                    // GGUF tensor, same source dtype). The pointer values are
+                    // stable for the model's lifetime since the underlying
+                    // CudaSlice<u8>/CudaSlice<bf16> buffers are owned by
+                    // `MoeFfnQ4K` and never reallocated.
+                    let kind_of = |v: &[QuantTensor]| -> Result<ExpertQuantKind, LlmError> {
+                        if v.is_empty() {
+                            return Err(LlmError::Backend("MoE expert vec is empty".into()));
+                        }
+                        let k = match &v[0] {
+                            QuantTensor::Q4K { .. } => ExpertQuantKind::Q4K,
+                            QuantTensor::Q5K { .. } => ExpertQuantKind::Q5K,
+                            QuantTensor::Q6K { .. } => ExpertQuantKind::Q6K,
+                            QuantTensor::Bf16 { .. } => ExpertQuantKind::Bf16,
+                        };
+                        for (i, t) in v.iter().enumerate().skip(1) {
+                            let ki = match t {
+                                QuantTensor::Q4K { .. } => ExpertQuantKind::Q4K,
+                                QuantTensor::Q5K { .. } => ExpertQuantKind::Q5K,
+                                QuantTensor::Q6K { .. } => ExpertQuantKind::Q6K,
+                                QuantTensor::Bf16 { .. } => ExpertQuantKind::Bf16,
+                            };
+                            if ki != k {
+                                return Err(LlmError::Backend(format!(
+                                    "MoE expert vec is heterogeneous : expert 0 is {k:?} but expert {i} is {ki:?}"
+                                )));
+                            }
+                        }
+                        Ok(k)
+                    };
+                    let build_ptrs = |v: &[QuantTensor]| -> Result<CudaSlice<u64>, LlmError> {
+                        let host: Vec<u64> = v.iter().map(|t| t.base_ptr(&stream)).collect();
+                        stream
+                            .memcpy_stod(&host)
+                            .map_err(|e| LlmError::Backend(format!("upload expert ptrs: {e:?}")))
+                    };
+                    let gate_exp_kind = kind_of(&gate_exps)?;
+                    let up_exp_kind = kind_of(&up_exps)?;
+                    let down_exp_kind = kind_of(&down_exps)?;
+                    let gate_exp_ptrs_dev = build_ptrs(&gate_exps)?;
+                    let up_exp_ptrs_dev = build_ptrs(&up_exps)?;
+                    let down_exp_ptrs_dev = build_ptrs(&down_exps)?;
+
                     let moe = MoeFfnQ4K {
                         gate_inp: load_quant(&key("ffn_gate_inp.weight"))?,
-                        gate_exps: load_stacked_quant_experts(
-                            &key("ffn_gate_exps.weight"),
-                            n_e,
-                            ef,
-                            d,
-                        )?,
-                        up_exps: load_stacked_quant_experts(
-                            &key("ffn_up_exps.weight"),
-                            n_e,
-                            ef,
-                            d,
-                        )?,
-                        down_exps: load_stacked_quant_experts(
-                            &key("ffn_down_exps.weight"),
-                            n_e,
-                            d,
-                            ef,
-                        )?,
+                        gate_exps,
+                        up_exps,
+                        down_exps,
                         gate_inp_shexp: load_bf16(&key("ffn_gate_inp_shexp.weight"))?,
                         gate_shexp: load_quant(&key("ffn_gate_shexp.weight"))?,
                         up_shexp: load_quant(&key("ffn_up_shexp.weight"))?,
                         down_shexp: load_quant(&key("ffn_down_shexp.weight"))?,
+                        gate_exp_ptrs_dev,
+                        up_exp_ptrs_dev,
+                        down_exp_ptrs_dev,
+                        gate_exp_kind,
+                        up_exp_kind,
+                        down_exp_kind,
                     };
                     Ok(FfnQ4K::Moe(Box::new(moe)))
                 },
@@ -1279,12 +1464,18 @@ impl Qwen35ModelCudaQ4K {
         // a single replayable CUDA Graph. The 1st call (position == 0) is a
         // warmup that triggers nvrtc compile + cuModuleLoadData for every
         // kernel — these are NOT capturable and must happen before begin_capture.
-        // T246.6 — MoE variant uses memcpy_dtov inside the decode body to
-        // read top-K indices to host. That host sync is INCOMPATIBLE with
-        // CUDA Graph capture (the stream is captured → DtoH stalls and
-        // returns garbage). Skip capture for MoE.
+        // T246.6 — MoE variant USED to issue memcpy_dtov inside the decode
+        // body to read top-K indices to host. That host sync is incompatible
+        // with CUDA Graph capture, so capture was previously disabled
+        // unconditionally for MoE.
+        // T246.8 A2.4 — with `RUSTORCH_MOE_ASYNC=1` the new
+        // `moe_ffn_forward_step_async` path eliminates all host syncs in
+        // the MoE body (indexed dispatch + devscalar scaled_add + on-device
+        // sigmoid). When also `RUSTORCH_MOE_GRAPH=1` (default ON when
+        // ASYNC is on), allow capture for MoE too.
         let moe_in_use = matches!(cfg.variant, Qwen35Variant::Moe);
-        let should_capture = !moe_in_use && self.position == 1 && self.decode_graph.is_none();
+        let moe_capture_ok = !moe_in_use || moe_graph_enabled();
+        let should_capture = moe_capture_ok && self.position == 1 && self.decode_graph.is_none();
         if should_capture {
             // T246.5.3 — Drain pending stream work before begin_capture. The
             // H2D upload of token_id above is cuMemcpyHtoDAsync on pageable
@@ -2048,25 +2239,44 @@ impl Qwen35ModelCudaQ4K {
                     down.dispatch_matmul_m1(&self.kernels, &self.stream, gate_p, h_p, x_q8_p)?;
                 },
                 FfnQ4K::Moe(moe) => {
-                    moe_ffn_forward_step(
-                        moe,
-                        &self.kernels,
-                        &self.stream,
-                        &cfg,
-                        h_norm_p,
-                        h_p,
-                        x_q8_p,
-                        moe_router_p,
-                        moe_idx_p,
-                        &self.scratch.moe_topk_idx,
-                        moe_w_p,
-                        &self.scratch.moe_topk_w,
-                        moe_egate_p,
-                        moe_eup_p,
-                        moe_eout_p,
-                        moe_sd_p,
-                        &self.scratch.moe_shexp_dot,
-                    )?;
+                    if moe_async_enabled() {
+                        moe_ffn_forward_step_async(
+                            moe,
+                            &self.kernels,
+                            &self.stream,
+                            &cfg,
+                            h_norm_p,
+                            h_p,
+                            x_q8_p,
+                            moe_router_p,
+                            moe_idx_p,
+                            moe_w_p,
+                            moe_egate_p,
+                            moe_eup_p,
+                            moe_eout_p,
+                            moe_sd_p,
+                        )?;
+                    } else {
+                        moe_ffn_forward_step(
+                            moe,
+                            &self.kernels,
+                            &self.stream,
+                            &cfg,
+                            h_norm_p,
+                            h_p,
+                            x_q8_p,
+                            moe_router_p,
+                            moe_idx_p,
+                            &self.scratch.moe_topk_idx,
+                            moe_w_p,
+                            &self.scratch.moe_topk_w,
+                            moe_egate_p,
+                            moe_eup_p,
+                            moe_eout_p,
+                            moe_sd_p,
+                            &self.scratch.moe_shexp_dot,
+                        )?;
+                    }
                 },
             }
             // h += residual
@@ -4221,6 +4431,168 @@ fn moe_ffn_forward_step(
         kernels
             .scaled_add_inplace_bf16(stream, h_p, expert_out_p, shexp_w, d)
             .map_err(|e| LlmError::Backend(format!("scaled_add shexp: {e:?}")))?;
+    }
+
+    Ok(())
+}
+
+/// T246.8 A2.3 — async (zero-host-sync) MoE FFN forward step. Same
+/// semantics as `moe_ffn_forward_step` but every per-layer host sync is
+/// eliminated :
+///
+///   - top-K indices and weights are NEVER read back to host : the
+///     indexed SGEMV kernels (q4k/q5k/q6k v3 + bf16, T246.8 A2.1) read
+///     `topk_indices[slot]` from device memory and use it to fetch the
+///     per-expert weight pointer from a pre-cached device array.
+///   - top-K weights are consumed by `scaled_add_inplace_bf16_devscalar`
+///     (alpha read from device).
+///   - shared-expert sigmoid is computed in-place on device via
+///     `sigmoid_inplace_bf16` then consumed by the same devscalar
+///     scaled_add primitive.
+///
+/// The Q4_K dp4a x_q8_1 staging is computed ONCE per MoE layer before
+/// the per-expert loop (since `h_norm` is the same input for all
+/// experts) — this matches what `dispatch_matmul_m1` does internally
+/// per call but amortizes the quantize across the k=8 routed experts.
+///
+/// Net result : zero `memcpy_dtov` in the body. The full decode_step
+/// is now CUDA-Graph-capturable for the MoE variant.
+#[allow(clippy::too_many_arguments)]
+fn moe_ffn_forward_step_async(
+    moe: &MoeFfnQ4K,
+    kernels: &LlmKernels,
+    stream: &Arc<CudaStream>,
+    cfg: &Qwen35Config,
+    h_norm_p: u64,
+    h_p: u64,
+    x_q8_p: u64,
+    router_logits_p: u64,
+    topk_idx_p: u64,
+    topk_w_p: u64,
+    expert_gate_p: u64,
+    expert_up_p: u64,
+    expert_out_p: u64,
+    shexp_dot_p: u64,
+) -> Result<(), LlmError> {
+    use cudarc::driver::DevicePtr;
+    let d = cfg.d as i32;
+    let ef = cfg.expert_f as i32;
+    let n_e = cfg.n_experts as i32;
+    let k = cfg.n_experts_used as i32;
+
+    // ---- 1. Router logits ----
+    moe.gate_inp
+        .dispatch_matmul_m1(kernels, stream, h_norm_p, router_logits_p, x_q8_p)?;
+
+    // ---- 2. Top-K softmax → indices + renormalized weights on device ----
+    unsafe {
+        kernels
+            .topk_softmax_bf16(stream, router_logits_p, topk_idx_p, topk_w_p, n_e, k)
+            .map_err(|e| LlmError::Backend(format!("topk_softmax: {e:?}")))?;
+    }
+
+    // ---- 3. Zero h_p (clean primitive ; replaces self-aliasing trick) ----
+    unsafe {
+        kernels
+            .zero_bf16(stream, h_p, d)
+            .map_err(|e| LlmError::Backend(format!("zero h_p: {e:?}")))?;
+    }
+
+    // ---- 4. Routed experts loop (zero host sync) ----
+    // `dispatch_indexed_matmul_m1` internally quantizes its own input
+    // when called for Q4K with x_q8_p != 0, mirroring the per-call
+    // quantize that `QuantTensor::dispatch_matmul_m1` does. So we don't
+    // need to manage the staging buffer outside the dispatcher.
+    let (g_ptrs_p, _gg) = moe.gate_exp_ptrs_dev.device_ptr(stream);
+    let (u_ptrs_p, _gu) = moe.up_exp_ptrs_dev.device_ptr(stream);
+    let (d_ptrs_p, _gd) = moe.down_exp_ptrs_dev.device_ptr(stream);
+    for slot in 0..k {
+        // gate = w_gate[topk[slot]] @ h_norm
+        dispatch_indexed_matmul_m1(
+            kernels,
+            stream,
+            moe.gate_exp_kind,
+            g_ptrs_p,
+            topk_idx_p,
+            slot,
+            h_norm_p,
+            expert_gate_p,
+            ef,
+            d,
+            x_q8_p,
+        )?;
+        // up = w_up[topk[slot]] @ h_norm
+        dispatch_indexed_matmul_m1(
+            kernels,
+            stream,
+            moe.up_exp_kind,
+            u_ptrs_p,
+            topk_idx_p,
+            slot,
+            h_norm_p,
+            expert_up_p,
+            ef,
+            d,
+            x_q8_p,
+        )?;
+        // gate = silu(gate) * up
+        unsafe {
+            kernels
+                .swiglu_bf16(stream, expert_gate_p, expert_up_p, expert_gate_p, ef)
+                .map_err(|e| LlmError::Backend(format!("swiglu expert slot={slot}: {e:?}")))?;
+        }
+        // down_out = w_down[topk[slot]] @ gate
+        dispatch_indexed_matmul_m1(
+            kernels,
+            stream,
+            moe.down_exp_kind,
+            d_ptrs_p,
+            topk_idx_p,
+            slot,
+            expert_gate_p,
+            expert_out_p,
+            d,
+            ef,
+            x_q8_p,
+        )?;
+        // h_p += topk_w[slot] * down_out (alpha read from device)
+        unsafe {
+            kernels
+                .scaled_add_inplace_bf16_devscalar(stream, h_p, expert_out_p, topk_w_p, slot, d)
+                .map_err(|e| {
+                    LlmError::Backend(format!("scaled_add devscalar slot={slot}: {e:?}"))
+                })?;
+        }
+    }
+
+    // ---- 5. Shared expert (parallel path) ----
+    // shexp_dot = gate_inp_shexp · h_norm  (BF16 scalar) ; sigmoid fused
+    // into the final scaled_add to keep the sigmoid value in float precision
+    // (matching the sync path's host-side `1/(1+exp(-v))` computation
+    // precision exactly — no intermediate bf16 rounding).
+    unsafe {
+        let (gip_p, _g) = moe.gate_inp_shexp.device_ptr(stream);
+        kernels
+            .sgemv_bf16_bf16(stream, gip_p, h_norm_p, shexp_dot_p, 1, d)
+            .map_err(|e| LlmError::Backend(format!("shexp dot: {e:?}")))?;
+    }
+
+    moe.gate_shexp
+        .dispatch_matmul_m1(kernels, stream, h_norm_p, expert_gate_p, x_q8_p)?;
+    moe.up_shexp
+        .dispatch_matmul_m1(kernels, stream, h_norm_p, expert_up_p, x_q8_p)?;
+    unsafe {
+        kernels
+            .swiglu_bf16(stream, expert_gate_p, expert_up_p, expert_gate_p, ef)
+            .map_err(|e| LlmError::Backend(format!("swiglu shexp: {e:?}")))?;
+    }
+    moe.down_shexp
+        .dispatch_matmul_m1(kernels, stream, expert_gate_p, expert_out_p, x_q8_p)?;
+    // h_p += sigmoid(dot) * down_out — fused kernel keeps sigmoid in float.
+    unsafe {
+        kernels
+            .scaled_add_sigmoid_devscalar_bf16(stream, h_p, expert_out_p, shexp_dot_p, d)
+            .map_err(|e| LlmError::Backend(format!("scaled_add_sigmoid shexp: {e:?}")))?;
     }
 
     Ok(())
