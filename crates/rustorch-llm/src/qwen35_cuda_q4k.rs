@@ -207,6 +207,11 @@ pub(crate) struct KvCache {
     pub(crate) v: CudaSlice<half::bf16>,
 }
 
+/// Precomputed RoPE inverse frequencies `[rope_dim / 2]` F32, on GPU.
+pub(crate) struct RopeFreqs {
+    pub(crate) inv_freq: CudaSlice<f32>,
+}
+
 /// Per-SSM-layer recurrent state.
 pub(crate) struct SsmState {
     /// `[num_v_heads, head_v_dim, head_v_dim]` BF16 — outer-product state.
@@ -246,6 +251,8 @@ pub struct Qwen35ModelCudaQ4K {
     pub(crate) final_norm: CudaSlice<half::bf16>,
     /// LM head `[V, D]` quantized (typically Q6_K).
     pub(crate) lm_head: QuantTensor,
+    /// Precomputed RoPE inv_freq buffer.
+    pub(crate) rope_freqs: RopeFreqs,
     /// Per-block weights, one per layer.
     pub(crate) blocks: Vec<BlockQ4K>,
     /// KV cache, one entry per attention layer (in original layer-index order).
@@ -343,6 +350,17 @@ impl Qwen35ModelCudaQ4K {
         // ---- Globals ----
         let token_emb = load_bf16("token_embd.weight")?;
         let final_norm = load_bf16("output_norm.weight")?;
+        // Precompute RoPE inv_freq for the attention layers.
+        let rope_dim = cfg.rope_dim;
+        let inv_freq_host: Vec<f32> = (0..rope_dim / 2)
+            .map(|i| (cfg.rope_base).powf(-(2.0 * i as f32) / rope_dim as f32))
+            .collect();
+        let inv_freq_dev = stream
+            .memcpy_stod(&inv_freq_host)
+            .map_err(|e| LlmError::Backend(format!("rope_inv_freq: {e:?}")))?;
+        let rope_freqs = RopeFreqs {
+            inv_freq: inv_freq_dev,
+        };
         let lm_head = if file.tensor("output.weight").is_some() {
             load_quant("output.weight")?
         } else {
@@ -446,6 +464,7 @@ impl Qwen35ModelCudaQ4K {
             token_emb,
             final_norm,
             lm_head,
+            rope_freqs,
             blocks,
             kv_caches,
             ssm_states,
@@ -808,13 +827,163 @@ impl Qwen35ModelCudaQ4K {
                             .map_err(|e| LlmError::Backend(format!("ssm residual: {e:?}")))?;
                     }
                 },
-                BlockQ4K::Attn(_attn) => {
-                    // T246.3 — full attention block. For now : pass-through (h unchanged
-                    // beyond residual already copied). Hack so SSM-only layers
-                    // can be debugged first.
-                    return Err(LlmError::Backend(format!(
-                        "attention block layer {li} not yet implemented (T246.3)"
-                    )));
+                BlockQ4K::Attn(attn) => {
+                    // T246.3 — full attention block forward at M=1.
+
+                    // 1. h_norm = rms_norm(h, attn_norm)
+                    unsafe {
+                        let (an, _g) = attn.attn_norm.device_ptr(&self.stream);
+                        self.kernels
+                            .copy_bf16(&self.stream, h_norm_p, h_p, d as i32)
+                            .map_err(|e| LlmError::Backend(format!("copy h_norm attn: {e:?}")))?;
+                        self.kernels
+                            .rms_norm_bf16(&self.stream, h_norm_p, an, eps, d as i32, 1)
+                            .map_err(|e| LlmError::Backend(format!("rms_norm attn: {e:?}")))?;
+                    }
+
+                    // 2. qg = w_q @ h_norm    (output dim 2*q_dim, fused Q + per-head gate)
+                    let (qg_n, _qg_k) = attn.w_q.shape();
+                    debug_assert_eq!(qg_n, 2 * q_dim);
+                    // Use the conv_out_p buffer as a scratch (size conv_dim ≥ 2*q_dim
+                    // typically) — except for Qwen3.6-27B where conv_dim=10240 and
+                    // 2*q_dim=12288. We need a dedicated buffer. Use qkv_mixed (conv_dim)
+                    // and check it fits, else use h_norm... Hmm.
+                    // Safer : allocate a fresh scratch sized for 2*q_dim.
+                    // For decode (single token) this is small.
+
+                    // Reuse `up_buf` (size f=17408 ≥ 2*q_dim) as QG scratch.
+                    let qg_p = up_p;
+                    attn.w_q
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, qg_p)?;
+
+                    // 3. Split qg into q (q_dim) and gate (q_dim, used as sigmoid gate).
+                    //    Use q_buf and (reuse) attn_out as gate buffer.
+                    unsafe {
+                        self.kernels
+                            .split_qg_bf16(
+                                &self.stream,
+                                qg_p,
+                                q_p,
+                                ao_p, // store gate here temporarily
+                                n_q as i32,
+                                head_dim as i32,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("split_qg: {e:?}")))?;
+                    }
+
+                    // 4. K, V projections.
+                    attn.w_k
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, k_p)?;
+                    attn.w_v
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, v_p)?;
+
+                    // 5. Per-head Q-norm and K-norm (RMSNorm with shared gamma).
+                    unsafe {
+                        let (qn, _g1) = attn.q_norm.device_ptr(&self.stream);
+                        let (kn, _g2) = attn.k_norm.device_ptr(&self.stream);
+                        // rms_norm_bf16(x, gamma, eps, n, batch) where each batch is size n.
+                        self.kernels
+                            .rms_norm_bf16(&self.stream, q_p, qn, eps, head_dim as i32, n_q as i32)
+                            .map_err(|e| LlmError::Backend(format!("q_norm: {e:?}")))?;
+                        self.kernels
+                            .rms_norm_bf16(&self.stream, k_p, kn, eps, head_dim as i32, n_kv as i32)
+                            .map_err(|e| LlmError::Backend(format!("k_norm: {e:?}")))?;
+                    }
+
+                    // 6. RoPE on q (n_q heads) and k (n_kv heads).
+                    // Qwen3.6 : rope_dim=64 < head_dim=256. Only first 64 dims rotate.
+                    let position = self.position;
+                    let rope_dim = cfg.rope_dim;
+                    unsafe {
+                        let (inv_p, _g_inv) = self.rope_freqs.inv_freq.device_ptr(&self.stream);
+                        self.kernels
+                            .rope_partial_bf16(
+                                &self.stream,
+                                q_p,
+                                inv_p,
+                                position as i32,
+                                n_q as i32,
+                                head_dim as i32,
+                                rope_dim as i32,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("rope q: {e:?}")))?;
+                        self.kernels
+                            .rope_partial_bf16(
+                                &self.stream,
+                                k_p,
+                                inv_p,
+                                position as i32,
+                                n_kv as i32,
+                                head_dim as i32,
+                                rope_dim as i32,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("rope k: {e:?}")))?;
+                    }
+
+                    // 7. Append k, v to KV cache at `position`.
+                    let attn_idx = get_attn_layer_idx(&cfg, li);
+                    let kv_cache = &mut self.kv_caches[attn_idx];
+                    unsafe {
+                        let (kc_p, _g1) = kv_cache.k.device_ptr_mut(&self.stream);
+                        let (vc_p, _g2) = kv_cache.v.device_ptr_mut(&self.stream);
+                        let dst_offset = (position as u64) * (kv_dim as u64) * 2; // BF16 = 2 bytes
+                        self.kernels
+                            .copy_bf16(&self.stream, kc_p + dst_offset, k_p, kv_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("kv append k: {e:?}")))?;
+                        self.kernels
+                            .copy_bf16(&self.stream, vc_p + dst_offset, v_p, kv_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("kv append v: {e:?}")))?;
+                    }
+
+                    // 8. GQA decode online softmax.
+                    let kv_len = position + 1;
+                    unsafe {
+                        let (kc_p, _g1) = kv_cache.k.device_ptr(&self.stream);
+                        let (vc_p, _g2) = kv_cache.v.device_ptr(&self.stream);
+                        // Reuse h_norm_p as attn output buffer (size d ≥ q_dim).
+                        // Wait — q_dim = 6144 but d = 5120, so h_norm doesn't fit. Use down_buf
+                        // which is d-sized too, or use up_p (size f=17408) — but up_p is qg.
+                        // Use gate_p (size f=17408) since we just used it for qg/gate.
+                        // Actually `ao_p` (= attn_out, size q_dim) is the right buffer, but we
+                        // stashed gate there in step 3. We need to handle the gate AFTER attn_out.
+                        // So gate is now in ao_p ; we need a different buffer for attn_out.
+                        // Use gate_p (size f=17408 ≥ q_dim).
+                        self.kernels
+                            .gqa_decode_online_bf16(
+                                &self.stream,
+                                q_p,
+                                kc_p,
+                                vc_p,
+                                gate_p, // attn raw output
+                                n_q as i32,
+                                n_kv as i32,
+                                kv_len as i32,
+                                head_dim as i32,
+                                self.max_seq as i32,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("gqa_decode: {e:?}")))?;
+                    }
+
+                    // 9. sigmoid(gate) ; attn_out *= gate
+                    unsafe {
+                        self.kernels
+                            .sigmoid_inplace_bf16(&self.stream, ao_p, q_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("sigmoid gate: {e:?}")))?;
+                        self.kernels
+                            .mul_inplace_bf16(&self.stream, gate_p, ao_p, q_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("attn*gate: {e:?}")))?;
+                    }
+
+                    // 10. h = w_o @ gated_attn  (output dim d)
+                    attn.w_o
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, gate_p, h_p)?;
+
+                    // 11. residual : h += residual
+                    unsafe {
+                        self.kernels
+                            .add_inplace_bf16(&self.stream, h_p, res_p, d as i32)
+                            .map_err(|e| LlmError::Backend(format!("attn residual: {e:?}")))?;
+                    }
                 },
             }
 

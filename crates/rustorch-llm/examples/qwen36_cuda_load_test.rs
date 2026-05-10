@@ -53,6 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ssm_state          : {}", model.config.ssm_state);
     println!("  ssm_dt_rank        : {}", model.config.ssm_dt_rank);
     println!("  ssm_conv_kernel    : {}", model.config.ssm_conv_kernel);
+    println!("  rope_dim           : {}", model.config.rope_dim);
+    println!("  rope_base          : {}", model.config.rope_base);
+    println!("  rms_eps            : {}", model.config.rms_eps);
 
     Ok(())
 }

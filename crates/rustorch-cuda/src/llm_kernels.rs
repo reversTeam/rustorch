@@ -282,6 +282,74 @@ extern "C" __global__ void mul_inplace_bf16(
 }
 "#;
 
+// T246.3 — partial RoPE for Qwen3.x where rope_dim < head_dim.
+// Only the first `rope_dim` elements of each head_dim are rotated;
+// the remaining (head_dim - rope_dim) pass through unchanged.
+//
+// Half-split convention :
+//   For k in [0, rope_dim/2) :
+//     a   = x[h, k]
+//     b   = x[h, k + rope_dim/2]
+//     theta = inv_freq[k] * pos
+//     x[h, k]               = a * cos - b * sin
+//     x[h, k + rope_dim/2]  = a * sin + b * cos
+//   Elements in [rope_dim, head_dim) are untouched.
+#[cfg(feature = "cuda")]
+const ROPE_PARTIAL_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void rope_partial_bf16(
+    __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ inv_freq,   // [rope_dim/2]
+    int pos,
+    int n_heads,
+    int head_dim,
+    int rope_dim
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int half = rope_dim / 2;
+    int k = blockIdx.y * blockDim.x + threadIdx.x;
+    if (k >= half) return;
+
+    float theta = inv_freq[k] * (float)pos;
+    float cos_k, sin_k;
+    sincosf(theta, &sin_k, &cos_k);
+
+    int row = h * head_dim;
+    float a = (float)x[row + k];
+    float b = (float)x[row + k + half];
+    x[row + k]        = (__nv_bfloat16)(a * cos_k - b * sin_k);
+    x[row + k + half] = (__nv_bfloat16)(a * sin_k + b * cos_k);
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const SPLIT_QG_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// Qwen3.6 attention : the Q projection produces a fused [2*q_dim] output
+// where each head_dim block alternates between Q and gate :
+//   qg[h * 2 * head_dim + 0..head_dim]            = q_h
+//   qg[h * 2 * head_dim + head_dim..2*head_dim]   = gate_h
+// This kernel deinterleaves into separate q[q_dim] and gate[q_dim] buffers.
+extern "C" __global__ void split_qg_bf16(
+    const __nv_bfloat16* __restrict__ qg,
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ gate,
+    int n_heads,
+    int head_dim
+) {
+    int h = blockIdx.x;
+    int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j >= head_dim) return;
+    int src_off = h * 2 * head_dim + j;
+    int dst_off = h * head_dim + j;
+    q[dst_off]    = qg[src_off];
+    gate[dst_off] = qg[src_off + head_dim];
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const REPEAT_HEADS_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -1848,6 +1916,8 @@ pub struct LlmKernels {
     sigmoid_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     mul_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     repeat_heads: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    split_qg: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    rope_partial: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     conv1d_depthwise: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     l2_norm_per_head: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     delta_net_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -1886,6 +1956,8 @@ impl LlmKernels {
             sigmoid_inplace: std::sync::OnceLock::new(),
             mul_inplace: std::sync::OnceLock::new(),
             repeat_heads: std::sync::OnceLock::new(),
+            split_qg: std::sync::OnceLock::new(),
+            rope_partial: std::sync::OnceLock::new(),
             conv1d_depthwise: std::sync::OnceLock::new(),
             l2_norm_per_head: std::sync::OnceLock::new(),
             delta_net_step: std::sync::OnceLock::new(),
@@ -2250,6 +2322,80 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "mul_inplace_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.3 — partial RoPE : rotate only first `rope_dim` of each head.
+    /// Used by Qwen3.6 (rope_dim=64 < head_dim=256).
+    pub unsafe fn rope_partial_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: u64,
+        inv_freq: u64,
+        pos: i32,
+        n_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.rope_partial,
+            ROPE_PARTIAL_BF16_SRC,
+            "rope_partial_bf16",
+        )?;
+        let half = rope_dim / 2;
+        let block_dim = 64u32.min(half as u32);
+        let grid_y = (half as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&x)
+            .arg(&inv_freq)
+            .arg(&pos)
+            .arg(&n_heads)
+            .arg(&head_dim)
+            .arg(&rope_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "rope_partial_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.3 — split fused QG buffer (Qwen3.6 attention) into Q and gate.
+    /// qg layout : per head, first head_dim is q_h, next head_dim is gate_h.
+    pub unsafe fn split_qg_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        qg: u64,
+        q: u64,
+        gate: u64,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) =
+            self.compile_or_get(&self.split_qg, SPLIT_QG_BF16_SRC, "split_qg_bf16")?;
+        let block_dim = 128u32;
+        let grid_y = (head_dim as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&qg)
+            .arg(&q)
+            .arg(&gate)
+            .arg(&n_heads)
+            .arg(&head_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "split_qg_bf16::launch",
         })?;
         Ok(())
     }
