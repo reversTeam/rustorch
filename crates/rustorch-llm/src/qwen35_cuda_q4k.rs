@@ -289,6 +289,17 @@ pub struct Qwen35ModelCudaQ4K {
     pub(crate) position: usize,
     /// Pre-allocated scratch buffers (one-time alloc).
     pub(crate) scratch: DecodeScratch,
+    /// T246.5.3 — device-resident position counter, mirror of `position`.
+    /// Used by `rope_partial_bf16_devcnt` so RoPE remains correct across
+    /// CUDA Graph replays. Updated each step via tiny H2D (Phase B).
+    pub(crate) position_dev: CudaSlice<i32>,
+    /// T246.5.3 — device-resident kv_len counter (= position + 1).
+    /// Used by `gqa_decode_online_bf16_devcnt`. Updated each step.
+    pub(crate) kv_len_dev: CudaSlice<i32>,
+    /// T246.5.3 — device-resident current-token-id buffer.
+    /// Used by `embedding_lookup_bf16` so the per-step token id is read
+    /// from device memory inside the captured graph.
+    pub(crate) current_token_dev: CudaSlice<u32>,
 }
 
 impl Qwen35ModelCudaQ4K {
@@ -551,6 +562,17 @@ impl Qwen35ModelCudaQ4K {
                 .map_err(|e| LlmError::Backend(format!("scratch token: {e:?}")))?,
         };
 
+        // T246.5.3 — device-resident counters for CUDA Graph capture.
+        let position_dev = stream
+            .memcpy_stod(&[0i32])
+            .map_err(|e| LlmError::Backend(format!("position_dev: {e:?}")))?;
+        let kv_len_dev = stream
+            .memcpy_stod(&[1i32])
+            .map_err(|e| LlmError::Backend(format!("kv_len_dev: {e:?}")))?;
+        let current_token_dev = stream
+            .memcpy_stod(&[0u32])
+            .map_err(|e| LlmError::Backend(format!("current_token_dev: {e:?}")))?;
+
         Ok(Self {
             config: cfg,
             ctx,
@@ -567,6 +589,9 @@ impl Qwen35ModelCudaQ4K {
             max_seq,
             position: 0,
             scratch,
+            position_dev,
+            kv_len_dev,
+            current_token_dev,
         })
     }
 
@@ -589,6 +614,13 @@ impl Qwen35ModelCudaQ4K {
                 .map_err(|e| LlmError::Backend(format!("zero conv state: {e:?}")))?;
         }
         self.position = 0;
+        // T246.5.3 — also reset device-side counters.
+        self.stream
+            .memcpy_htod(&[0i32], &mut self.position_dev)
+            .map_err(|e| LlmError::Backend(format!("reset position_dev: {e:?}")))?;
+        self.stream
+            .memcpy_htod(&[1i32], &mut self.kv_len_dev)
+            .map_err(|e| LlmError::Backend(format!("reset kv_len_dev: {e:?}")))?;
         Ok(())
     }
 
@@ -616,6 +648,20 @@ impl Qwen35ModelCudaQ4K {
 
         // ---- Use pre-allocated scratch (no per-step alloc, T246.4.1) ----
         let _ = (conv_dim, value_dim, n_v, head_kv, q_dim, kv_dim, f);
+
+        // T246.5.3 — sync host counters → device counters. 3 × 4-byte H2D.
+        // These mirror `self.position` so the *_devcnt kernels read the right
+        // values inside a captured CUDA Graph (Phase C).
+        let pos_i32 = self.position as i32;
+        self.stream
+            .memcpy_htod(&[token_id], &mut self.current_token_dev)
+            .map_err(|e| LlmError::Backend(format!("upload token id: {e:?}")))?;
+        self.stream
+            .memcpy_htod(&[pos_i32], &mut self.position_dev)
+            .map_err(|e| LlmError::Backend(format!("upload position: {e:?}")))?;
+        self.stream
+            .memcpy_htod(&[pos_i32 + 1], &mut self.kv_len_dev)
+            .map_err(|e| LlmError::Backend(format!("upload kv_len: {e:?}")))?;
 
         // T246.4.2 — zero scratch buffers at start of each step. Without this,
         // residual reads of stale buffers cause non-deterministic output across
@@ -775,17 +821,16 @@ impl Qwen35ModelCudaQ4K {
             eprintln!("[debug-init] token_emb[token_id={token_id}] first 8 = {sample:?}");
         }
 
-        // ---- Step 0 : Load h from token_emb[token_id, :] ----
+        // ---- Step 0 : Load h from token_emb[current_token_dev, :] ----
+        // T246.5.3 — use embedding_lookup_bf16 with token_id read from device.
+        // This makes the lookup CUDA-Graph-capturable (was: host pointer
+        // arithmetic on token_id).
         unsafe {
             let (te_p, _g) = self.token_emb.device_ptr(&self.stream);
+            let (ct_p, _g2) = self.current_token_dev.device_ptr(&self.stream);
             self.kernels
-                .copy_bf16(
-                    &self.stream,
-                    h_p,
-                    te_p + (token_id as u64) * (d as u64) * 2,
-                    d as i32,
-                )
-                .map_err(|e| LlmError::Backend(format!("copy embed: {e:?}")))?;
+                .embedding_lookup_bf16(&self.stream, te_p, ct_p, h_p, 1, d as i32)
+                .map_err(|e| LlmError::Backend(format!("embed lookup: {e:?}")))?;
         }
         self.stream.synchronize().ok();
 
@@ -1058,27 +1103,29 @@ impl Qwen35ModelCudaQ4K {
 
                     // 6. RoPE on q (n_q heads) and k (n_kv heads).
                     // Qwen3.6 : rope_dim=64 < head_dim=256. Only first 64 dims rotate.
+                    // T246.5.3 — devcnt variant reads `pos` from position_dev.
                     let position = self.position;
                     let rope_dim = cfg.rope_dim;
                     unsafe {
                         let (inv_p, _g_inv) = self.rope_freqs.inv_freq.device_ptr(&self.stream);
+                        let (pos_p, _g_pos) = self.position_dev.device_ptr(&self.stream);
                         self.kernels
-                            .rope_partial_bf16(
+                            .rope_partial_bf16_devcnt(
                                 &self.stream,
                                 q_p,
                                 inv_p,
-                                position as i32,
+                                pos_p,
                                 n_q as i32,
                                 head_dim as i32,
                                 rope_dim as i32,
                             )
                             .map_err(|e| LlmError::Backend(format!("rope q: {e:?}")))?;
                         self.kernels
-                            .rope_partial_bf16(
+                            .rope_partial_bf16_devcnt(
                                 &self.stream,
                                 k_p,
                                 inv_p,
-                                position as i32,
+                                pos_p,
                                 n_kv as i32,
                                 head_dim as i32,
                                 rope_dim as i32,
@@ -1102,28 +1149,22 @@ impl Qwen35ModelCudaQ4K {
                     }
 
                     // 8. GQA decode online softmax.
-                    let kv_len = position + 1;
+                    // T246.5.3 — devcnt variant reads `kv_len` from kv_len_dev.
+                    let _ = position; // kept for the host-side KV append above
                     unsafe {
                         let (kc_p, _g1) = kv_cache.k.device_ptr(&self.stream);
                         let (vc_p, _g2) = kv_cache.v.device_ptr(&self.stream);
-                        // Reuse h_norm_p as attn output buffer (size d ≥ q_dim).
-                        // Wait — q_dim = 6144 but d = 5120, so h_norm doesn't fit. Use down_buf
-                        // which is d-sized too, or use up_p (size f=17408) — but up_p is qg.
-                        // Use gate_p (size f=17408) since we just used it for qg/gate.
-                        // Actually `ao_p` (= attn_out, size q_dim) is the right buffer, but we
-                        // stashed gate there in step 3. We need to handle the gate AFTER attn_out.
-                        // So gate is now in ao_p ; we need a different buffer for attn_out.
-                        // Use gate_p (size f=17408 ≥ q_dim).
+                        let (kv_len_p, _g3) = self.kv_len_dev.device_ptr(&self.stream);
                         self.kernels
-                            .gqa_decode_online_bf16(
+                            .gqa_decode_online_bf16_devcnt(
                                 &self.stream,
                                 q_p,
                                 kc_p,
                                 vc_p,
-                                gate_p, // attn raw output
+                                gate_p, // attn raw output (size f ≥ q_dim)
                                 n_q as i32,
                                 n_kv as i32,
-                                kv_len as i32,
+                                kv_len_p,
                                 head_dim as i32,
                                 self.max_seq as i32,
                             )
