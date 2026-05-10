@@ -516,6 +516,13 @@ pub struct Qwen35ModelCudaQ4K {
     /// than v2 today. Set `RUSTORCH_USE_DP4A_Q4K=1` at process start to
     /// enable for benchmarking / iterative kernel optimization.
     pub(crate) use_dp4a_q4k: bool,
+    /// T246.8 A1 — toggle for the fused SSM mega-kernels. ON by default
+    /// (set `RUSTORCH_SSM_FUSE=0` to fall back to the unfused chain for
+    /// A/B benchmarking and parity testing). When ON, the SSM block
+    /// pre-step (sigmoid+add+softplus+mul on alpha/beta) and post-step
+    /// (rms_norm+silu+mul on out/z) chains are each replaced by a single
+    /// fused launch (`ssm_pre_step_bf16` / `ssm_post_step_bf16`).
+    pub(crate) use_ssm_fuse: bool,
     /// T246.5.6 — pinned host buffer (1× u32) for the per-step next-token
     /// DtoH. Replacing `memcpy_dtov` (Vec<u32> on pageable mem, which
     /// the driver implicitly synchronizes) with `memcpy_dtoh` to this
@@ -1173,6 +1180,11 @@ impl Qwen35ModelCudaQ4K {
             use_dp4a_q4k: std::env::var("RUSTORCH_USE_DP4A_Q4K")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
+            // T246.8 A1 — fused SSM kernels default ON ; opt-out via
+            // RUSTORCH_SSM_FUSE=0 for A/B parity / bench.
+            use_ssm_fuse: std::env::var("RUSTORCH_SSM_FUSE")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true),
             next_token_host_pinned,
         })
     }
@@ -1551,25 +1563,38 @@ impl Qwen35ModelCudaQ4K {
                         beta_p,
                         x_q8_p,
                     )?;
-                    unsafe {
-                        self.kernels
-                            .sigmoid_inplace_bf16(&self.stream, beta_p, n_v as i32)
-                            .map_err(|e| LlmError::Backend(format!("sigmoid: {e:?}")))?;
-                    }
-
-                    // 6. alpha += dt_bias ; softplus(alpha) ; alpha *= ssm_a → gate_h
+                    // 5b+6. Fused SSM pre-step (T246.8 A1.1) :
+                    //   sigmoid(beta) ; alpha += dt_bias ; softplus(alpha) ;
+                    //   alpha *= ssm_a → gate_h. Replaces 4 launches with 1
+                    //   when RUSTORCH_SSM_FUSE=1 (default), bit-exact w/ unfused.
                     unsafe {
                         let (db, _g) = ssm.dt_bias.device_ptr(&self.stream);
-                        self.kernels
-                            .add_inplace_bf16(&self.stream, alpha_p, db, n_v as i32)
-                            .map_err(|e| LlmError::Backend(format!("alpha+dt_bias: {e:?}")))?;
-                        self.kernels
-                            .softplus_inplace_bf16(&self.stream, alpha_p, n_v as i32)
-                            .map_err(|e| LlmError::Backend(format!("softplus: {e:?}")))?;
                         let (sa, _g2) = ssm.ssm_a.device_ptr(&self.stream);
-                        self.kernels
-                            .mul_inplace_bf16(&self.stream, alpha_p, sa, n_v as i32)
-                            .map_err(|e| LlmError::Backend(format!("mul ssm_a: {e:?}")))?;
+                        if self.use_ssm_fuse {
+                            self.kernels
+                                .ssm_pre_step_bf16(
+                                    &self.stream,
+                                    alpha_p,
+                                    beta_p,
+                                    db,
+                                    sa,
+                                    n_v as i32,
+                                )
+                                .map_err(|e| LlmError::Backend(format!("ssm_pre_step: {e:?}")))?;
+                        } else {
+                            self.kernels
+                                .sigmoid_inplace_bf16(&self.stream, beta_p, n_v as i32)
+                                .map_err(|e| LlmError::Backend(format!("sigmoid: {e:?}")))?;
+                            self.kernels
+                                .add_inplace_bf16(&self.stream, alpha_p, db, n_v as i32)
+                                .map_err(|e| LlmError::Backend(format!("alpha+dt_bias: {e:?}")))?;
+                            self.kernels
+                                .softplus_inplace_bf16(&self.stream, alpha_p, n_v as i32)
+                                .map_err(|e| LlmError::Backend(format!("softplus: {e:?}")))?;
+                            self.kernels
+                                .mul_inplace_bf16(&self.stream, alpha_p, sa, n_v as i32)
+                                .map_err(|e| LlmError::Backend(format!("mul ssm_a: {e:?}")))?;
+                        }
                     }
                     // alpha is now gate_h (alpha_softplus * ssm_a).
 
@@ -1680,22 +1705,44 @@ impl Qwen35ModelCudaQ4K {
                             .map_err(|e| LlmError::Backend(format!("delta_net: {e:?}")))?;
                     }
 
-                    // 13. ssm_norm per head + multiply by silu(z)
+                    // 13. ssm_norm per head + multiply by silu(z) :
+                    //   Fused (T246.8 A1.2) : ssm_post_step_bf16 replaces
+                    //   rms_norm_bf16 + silu_bf16 + mul_inplace_bf16 (3→1
+                    //   launches) when RUSTORCH_SSM_FUSE=1 (default).
                     unsafe {
                         let (sn, _g) = ssm.ssm_norm.device_ptr(&self.stream);
-                        // RMSNorm per head : we have rms_norm_bf16 with batch parameter.
-                        // Use n_v batches, each of size head_kv, with same gamma.
-                        self.kernels
-                            .rms_norm_bf16(&self.stream, sso_p, sn, eps, head_kv as i32, n_v as i32)
-                            .map_err(|e| LlmError::Backend(format!("ssm_norm: {e:?}")))?;
-                        // silu(z) inplace
-                        self.kernels
-                            .silu_bf16(&self.stream, z_p, value_dim as i32)
-                            .map_err(|e| LlmError::Backend(format!("silu z: {e:?}")))?;
-                        // out *= silu(z)
-                        self.kernels
-                            .mul_inplace_bf16(&self.stream, sso_p, z_p, value_dim as i32)
-                            .map_err(|e| LlmError::Backend(format!("mul gated: {e:?}")))?;
+                        if self.use_ssm_fuse {
+                            self.kernels
+                                .ssm_post_step_bf16(
+                                    &self.stream,
+                                    sso_p,
+                                    z_p,
+                                    sn,
+                                    eps,
+                                    n_v as i32,
+                                    head_kv as i32,
+                                )
+                                .map_err(|e| LlmError::Backend(format!("ssm_post_step: {e:?}")))?;
+                        } else {
+                            // RMSNorm per head : we have rms_norm_bf16 with batch parameter.
+                            // Use n_v batches, each of size head_kv, with same gamma.
+                            self.kernels
+                                .rms_norm_bf16(
+                                    &self.stream,
+                                    sso_p,
+                                    sn,
+                                    eps,
+                                    head_kv as i32,
+                                    n_v as i32,
+                                )
+                                .map_err(|e| LlmError::Backend(format!("ssm_norm: {e:?}")))?;
+                            self.kernels
+                                .silu_bf16(&self.stream, z_p, value_dim as i32)
+                                .map_err(|e| LlmError::Backend(format!("silu z: {e:?}")))?;
+                            self.kernels
+                                .mul_inplace_bf16(&self.stream, sso_p, z_p, value_dim as i32)
+                                .map_err(|e| LlmError::Backend(format!("mul gated: {e:?}")))?;
+                        }
                     }
 
                     // 14. h = ssm_out @ gated  (overwrites h)
@@ -3133,31 +3180,34 @@ impl Qwen35ModelCudaQ4K {
                 .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, beta_r, x_q8_p)?;
         }
 
-        // 5b. sigmoid(beta) per row.
-        for r in 0..tree_size {
-            let beta_r = tssm_beta_p + (r as u64) * row_alpha;
-            unsafe {
-                self.kernels
-                    .sigmoid_inplace_bf16(&self.stream, beta_r, n_v as i32)
-                    .map_err(|e| LlmError::Backend(format!("hyb sigmoid beta r{r}: {e:?}")))?;
-            }
-        }
-
-        // 6. alpha += dt_bias ; softplus ; alpha *= ssm_a (per row).
+        // 5b+6. Fused SSM pre-step (T246.8 A1.1) per row :
+        //   sigmoid(beta) ; alpha += dt_bias ; softplus(alpha) ;
+        //   alpha *= ssm_a → gate_h. Replaces 4 launches per row by 1
+        //   when RUSTORCH_SSM_FUSE=1 (default).
         unsafe {
             let (db, _gdb) = ssm.dt_bias.device_ptr(&self.stream);
             let (sa, _gsa) = ssm.ssm_a.device_ptr(&self.stream);
             for r in 0..tree_size {
                 let alpha_r = tssm_alpha_p + (r as u64) * row_alpha;
-                self.kernels
-                    .add_inplace_bf16(&self.stream, alpha_r, db, n_v as i32)
-                    .map_err(|e| LlmError::Backend(format!("hyb alpha+dt r{r}: {e:?}")))?;
-                self.kernels
-                    .softplus_inplace_bf16(&self.stream, alpha_r, n_v as i32)
-                    .map_err(|e| LlmError::Backend(format!("hyb softplus r{r}: {e:?}")))?;
-                self.kernels
-                    .mul_inplace_bf16(&self.stream, alpha_r, sa, n_v as i32)
-                    .map_err(|e| LlmError::Backend(format!("hyb mul_a r{r}: {e:?}")))?;
+                let beta_r = tssm_beta_p + (r as u64) * row_alpha;
+                if self.use_ssm_fuse {
+                    self.kernels
+                        .ssm_pre_step_bf16(&self.stream, alpha_r, beta_r, db, sa, n_v as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb ssm_pre_step r{r}: {e:?}")))?;
+                } else {
+                    self.kernels
+                        .sigmoid_inplace_bf16(&self.stream, beta_r, n_v as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb sigmoid beta r{r}: {e:?}")))?;
+                    self.kernels
+                        .add_inplace_bf16(&self.stream, alpha_r, db, n_v as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb alpha+dt r{r}: {e:?}")))?;
+                    self.kernels
+                        .softplus_inplace_bf16(&self.stream, alpha_r, n_v as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb softplus r{r}: {e:?}")))?;
+                    self.kernels
+                        .mul_inplace_bf16(&self.stream, alpha_r, sa, n_v as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb mul_a r{r}: {e:?}")))?;
+                }
             }
         }
 
@@ -3368,21 +3418,38 @@ impl Qwen35ModelCudaQ4K {
             }
         }
 
-        // 11. ssm_norm per head + multiply by silu(z) per row.
+        // 11. ssm_norm per head + multiply by silu(z) per row :
+        //   Fused (T246.8 A1.2) : ssm_post_step_bf16 replaces
+        //   rms_norm_bf16 + silu_bf16 + mul_inplace_bf16 (3→1) per row
+        //   when RUSTORCH_SSM_FUSE=1 (default).
         for r in 0..tree_size {
             let out_r = tssm_out_p + (r as u64) * row_value;
             let z_r = tssm_z_p + (r as u64) * row_value;
             unsafe {
                 let (sn, _g) = ssm.ssm_norm.device_ptr(&self.stream);
-                self.kernels
-                    .rms_norm_bf16(&self.stream, out_r, sn, eps, head_kv as i32, n_v as i32)
-                    .map_err(|e| LlmError::Backend(format!("hyb ssm_norm r{r}: {e:?}")))?;
-                self.kernels
-                    .silu_bf16(&self.stream, z_r, value_dim as i32)
-                    .map_err(|e| LlmError::Backend(format!("hyb silu z r{r}: {e:?}")))?;
-                self.kernels
-                    .mul_inplace_bf16(&self.stream, out_r, z_r, value_dim as i32)
-                    .map_err(|e| LlmError::Backend(format!("hyb mul gated r{r}: {e:?}")))?;
+                if self.use_ssm_fuse {
+                    self.kernels
+                        .ssm_post_step_bf16(
+                            &self.stream,
+                            out_r,
+                            z_r,
+                            sn,
+                            eps,
+                            n_v as i32,
+                            head_kv as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("hyb ssm_post_step r{r}: {e:?}")))?;
+                } else {
+                    self.kernels
+                        .rms_norm_bf16(&self.stream, out_r, sn, eps, head_kv as i32, n_v as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb ssm_norm r{r}: {e:?}")))?;
+                    self.kernels
+                        .silu_bf16(&self.stream, z_r, value_dim as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb silu z r{r}: {e:?}")))?;
+                    self.kernels
+                        .mul_inplace_bf16(&self.stream, out_r, z_r, value_dim as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb mul gated r{r}: {e:?}")))?;
+                }
             }
         }
 
