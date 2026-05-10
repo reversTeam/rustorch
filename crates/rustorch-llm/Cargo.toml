@@ -118,3 +118,8 @@ required-features = ["cuda"]
 name = "qwen36_cuda_determinism_test"
 path = "examples/qwen36_cuda_determinism_test.rs"
 required-features = ["cuda"]
+
+# T246.7 P1.2 — Lookahead Decoding CPU-side microbench.
+[[example]]
+name = "lookahead_pool_microbench"
+path = "examples/lookahead_pool_microbench.rs"

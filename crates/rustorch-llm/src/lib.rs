@@ -48,6 +48,7 @@ pub mod cuda_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend_q4k;
 pub mod gguf_loader;
+pub mod lookahead;
 pub mod model;
 pub mod qwen35;
 pub mod qwen35_cpu;
