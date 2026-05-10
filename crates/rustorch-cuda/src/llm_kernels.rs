@@ -66,6 +66,81 @@ extern "C" __global__ void rms_norm_bf16(
 }
 "#;
 
+// T247.3 — RoPE partial backward kernel (BF16). Same layout as forward
+// (pairs (k, k+half)) but applies the inverse rotation matrix.
+//   Forward (per pair):
+//     y_a = a·cos - b·sin
+//     y_b = a·sin + b·cos
+//   Backward (given dy):
+//     da =  dy_a · cos + dy_b · sin
+//     db = -dy_a · sin + dy_b · cos
+//
+// In-place: input dy is read, output dx is written to the same buffer
+// (or pass separate buffers — see wrapper).
+#[cfg(feature = "cuda")]
+const ROPE_PARTIAL_GRAD_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void rope_partial_grad_bf16(
+    const __nv_bfloat16* __restrict__ dy,
+    const float*         __restrict__ inv_freq,
+    int pos,
+    __nv_bfloat16*       __restrict__ dx,
+    int n_heads,
+    int head_dim,
+    int rope_dim
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int half = rope_dim / 2;
+    int k = blockIdx.y * blockDim.x + threadIdx.x;
+    if (k >= half) return;
+
+    float theta = inv_freq[k] * (float)pos;
+    float cos_k, sin_k;
+    sincosf(theta, &sin_k, &cos_k);
+
+    int row = h * head_dim;
+    float dya = (float)dy[row + k];
+    float dyb = (float)dy[row + k + half];
+
+    dx[row + k]        = (__nv_bfloat16)( dya * cos_k + dyb * sin_k);
+    dx[row + k + half] = (__nv_bfloat16)(-dya * sin_k + dyb * cos_k);
+}
+"#;
+
+// T247.2 — SwiGLU backward kernel (BF16). Elementwise, no reduction.
+//   silu(g)       = g * σ(g)            where σ(g) = 1/(1+e^-g)
+//   silu'(g)      = σ(g) + g·σ(g)·(1-σ(g))
+//   dgate_i       = dy_i · silu'(gate_i) · up_i
+//   dup_i         = dy_i · silu(gate_i)
+#[cfg(feature = "cuda")]
+const SWIGLU_GRAD_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void swiglu_grad_bf16(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    const __nv_bfloat16* __restrict__ dy,
+    __nv_bfloat16*       __restrict__ dgate,
+    __nv_bfloat16*       __restrict__ dup,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g   = (float)gate[i];
+    float u   = (float)up[i];
+    float dyi = (float)dy[i];
+
+    float sig         = 1.0f / (1.0f + expf(-g));
+    float silu        = g * sig;
+    float silu_prime  = sig + g * sig * (1.0f - sig);
+
+    dgate[i] = (__nv_bfloat16)(dyi * silu_prime * u);
+    dup[i]   = (__nv_bfloat16)(dyi * silu);
+}
+"#;
+
 // T247.1 — RMSNorm backward kernel (BF16). Pilot for the training-ready
 // CUDA backward path. Single-row (outer=1) implementation suitable for the
 // LLM decode regime. Multi-row training (outer > 1) requires either an
@@ -2469,6 +2544,10 @@ pub struct LlmKernels {
     gqa_split_combine: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T247.1 — RMSNorm backward kernel (training-ready pilot)
     rms_norm_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T247.2 — SwiGLU backward kernel
+    swiglu_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T247.3 — RoPE partial backward kernel
+    rope_partial_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2518,6 +2597,8 @@ impl LlmKernels {
             gqa_split_partial: std::sync::OnceLock::new(),
             gqa_split_combine: std::sync::OnceLock::new(),
             rms_norm_grad: std::sync::OnceLock::new(),
+            swiglu_grad: std::sync::OnceLock::new(),
+            rope_partial_grad: std::sync::OnceLock::new(),
         }
     }
 
@@ -3950,6 +4031,90 @@ impl LlmKernels {
         Ok(())
     }
 
+    /// T247.3 — RoPE partial backward kernel. Inverse rotation per pair.
+    ///
+    /// # Safety  All bf16 buffers length `n_heads * head_dim`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rope_partial_grad_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        dy: u64,
+        inv_freq: u64,
+        pos: i32,
+        dx: u64,
+        n_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.rope_partial_grad,
+            ROPE_PARTIAL_GRAD_BF16_SRC,
+            "rope_partial_grad_bf16",
+        )?;
+        let half = (rope_dim / 2) as u32;
+        let block_dim: u32 = 32.min(half.max(1));
+        let grid_y = (half + block_dim - 1) / block_dim;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&dy)
+            .arg(&inv_freq)
+            .arg(&pos)
+            .arg(&dx)
+            .arg(&n_heads)
+            .arg(&head_dim)
+            .arg(&rope_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "rope_partial_grad_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T247.2 — SwiGLU backward kernel. Elementwise, n threads total.
+    ///
+    /// Inputs (forward saved): gate, up. Plus output gradient dy.
+    /// Outputs: dgate (gradient w.r.t. gate input), dup (gradient w.r.t. up).
+    ///
+    /// # Safety  All five buffers are length-`n` bf16 device pointers.
+    pub unsafe fn swiglu_grad_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        gate: u64,
+        up: u64,
+        dy: u64,
+        dgate: u64,
+        dup: u64,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) =
+            self.compile_or_get(&self.swiglu_grad, SWIGLU_GRAD_BF16_SRC, "swiglu_grad_bf16")?;
+        let block_dim: u32 = 256;
+        let grid_dim = ((n as u32) + block_dim - 1) / block_dim;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&gate)
+            .arg(&up)
+            .arg(&dy)
+            .arg(&dgate)
+            .arg(&dup)
+            .arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "swiglu_grad_bf16::launch",
+        })?;
+        Ok(())
+    }
+
     /// T246.5.3 — append K and V vectors to KV cache at slot `*pos_dev`.
     /// Replaces `copy_bf16(kc + pos*kv_dim*2, k, kv_dim)` ×2 with a single
     /// graph-capturable launch (since `pos` is read from device memory).
@@ -5158,6 +5323,191 @@ mod parity_tests {
                 "dgamma[{i}] ref={} cuda={} diff={} tol={}",
                 dg_ref[i],
                 dg_cuda[i],
+                diff,
+                tol
+            );
+        }
+    }
+
+    /// T247.2 — SwiGLU backward kernel parity test.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn swiglu_grad_bf16_matches_cpu_reference() {
+        let n = 1024usize;
+        let mut state: u64 = 0xbadc0ffe;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (((state >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5
+        };
+
+        let gate_f32: Vec<f32> = (0..n).map(|_| next() * 4.0).collect();
+        let up_f32: Vec<f32> = (0..n).map(|_| next() * 4.0).collect();
+        let dy_f32: Vec<f32> = (0..n).map(|_| next() * 0.5).collect();
+
+        // CPU reference.
+        let mut dgate_ref = vec![0.0_f32; n];
+        let mut dup_ref = vec![0.0_f32; n];
+        for i in 0..n {
+            let g = gate_f32[i];
+            let u = up_f32[i];
+            let dyi = dy_f32[i];
+            let sig = 1.0 / (1.0 + (-g).exp());
+            let silu = g * sig;
+            let silu_prime = sig + g * sig * (1.0 - sig);
+            dgate_ref[i] = dyi * silu_prime * u;
+            dup_ref[i] = dyi * silu;
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let to_bf = |v: &[f32]| -> Vec<half::bf16> {
+            v.iter().copied().map(half::bf16::from_f32).collect()
+        };
+        let gate_dev = stream.memcpy_stod(&to_bf(&gate_f32)).expect("upload gate");
+        let up_dev = stream.memcpy_stod(&to_bf(&up_f32)).expect("upload up");
+        let dy_dev = stream.memcpy_stod(&to_bf(&dy_f32)).expect("upload dy");
+        let mut dgate_dev = stream.alloc_zeros::<half::bf16>(n).expect("alloc dgate");
+        let mut dup_dev = stream.alloc_zeros::<half::bf16>(n).expect("alloc dup");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (gp, _g0) = gate_dev.device_ptr(&stream);
+            let (up_p, _g1) = up_dev.device_ptr(&stream);
+            let (dyp, _g2) = dy_dev.device_ptr(&stream);
+            let (dgp, _g3) = dgate_dev.device_ptr_mut(&stream);
+            let (dup_p, _g4) = dup_dev.device_ptr_mut(&stream);
+            kernels
+                .swiglu_grad_bf16(&stream, gp, up_p, dyp, dgp, dup_p, n as i32)
+                .expect("swiglu_grad");
+        }
+
+        let dgate_cuda: Vec<f32> = stream
+            .memcpy_dtov(&dgate_dev)
+            .expect("dtov dgate")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+        let dup_cuda: Vec<f32> = stream
+            .memcpy_dtov(&dup_dev)
+            .expect("dtov dup")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        for i in 0..n {
+            let diff = (dgate_ref[i] - dgate_cuda[i]).abs();
+            let tol = dgate_ref[i].abs() * 1.5e-2 + 5e-3;
+            assert!(
+                diff <= tol,
+                "dgate[{i}] ref={} cuda={} diff={} tol={}",
+                dgate_ref[i],
+                dgate_cuda[i],
+                diff,
+                tol
+            );
+        }
+        for i in 0..n {
+            let diff = (dup_ref[i] - dup_cuda[i]).abs();
+            let tol = dup_ref[i].abs() * 1.5e-2 + 5e-3;
+            assert!(
+                diff <= tol,
+                "dup[{i}] ref={} cuda={} diff={} tol={}",
+                dup_ref[i],
+                dup_cuda[i],
+                diff,
+                tol
+            );
+        }
+    }
+
+    /// T247.3 — RoPE partial backward kernel parity test.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn rope_partial_grad_bf16_matches_cpu_reference() {
+        let n_heads = 4usize;
+        let head_dim = 32usize;
+        let rope_dim = 32usize;
+        let half = rope_dim / 2;
+        let pos = 7i32;
+
+        let mut state: u64 = 0xfacefeed;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (((state >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5
+        };
+
+        let dy_f32: Vec<f32> = (0..n_heads * head_dim).map(|_| next() * 0.5).collect();
+
+        // inv_freq[k] = 1 / 10000^(2k / rope_dim) — standard RoPE.
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|k| 1.0 / (10000.0_f32).powf(2.0 * k as f32 / rope_dim as f32))
+            .collect();
+
+        // CPU reference: per pair (k, k+half), inverse rotation.
+        let mut dx_ref = vec![0.0_f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            for k in 0..half {
+                let theta = inv_freq[k] * pos as f32;
+                let (sin_k, cos_k) = theta.sin_cos();
+                let row = h * head_dim;
+                let dya = dy_f32[row + k];
+                let dyb = dy_f32[row + k + half];
+                dx_ref[row + k] = dya * cos_k + dyb * sin_k;
+                dx_ref[row + k + half] = -dya * sin_k + dyb * cos_k;
+            }
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let dy_bf: Vec<half::bf16> = dy_f32.iter().copied().map(half::bf16::from_f32).collect();
+        let dy_dev = stream.memcpy_stod(&dy_bf).expect("upload dy");
+        let if_dev = stream.memcpy_stod(&inv_freq).expect("upload inv_freq");
+        let mut dx_dev = stream
+            .alloc_zeros::<half::bf16>(n_heads * head_dim)
+            .expect("alloc dx");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (dyp, _g0) = dy_dev.device_ptr(&stream);
+            let (ifp, _g1) = if_dev.device_ptr(&stream);
+            let (dxp, _g2) = dx_dev.device_ptr_mut(&stream);
+            kernels
+                .rope_partial_grad_bf16(
+                    &stream,
+                    dyp,
+                    ifp,
+                    pos,
+                    dxp,
+                    n_heads as i32,
+                    head_dim as i32,
+                    rope_dim as i32,
+                )
+                .expect("rope_partial_grad");
+        }
+
+        let dx_cuda: Vec<f32> = stream
+            .memcpy_dtov(&dx_dev)
+            .expect("dtov dx")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        for i in 0..n_heads * head_dim {
+            let diff = (dx_ref[i] - dx_cuda[i]).abs();
+            let tol = dx_ref[i].abs() * 1.5e-2 + 5e-3;
+            assert!(
+                diff <= tol,
+                "dx[{i}] ref={} cuda={} diff={} tol={}",
+                dx_ref[i],
+                dx_cuda[i],
                 diff,
                 tol
             );
