@@ -324,6 +324,51 @@ extern "C" __global__ void rope_partial_bf16(
 }
 "#;
 
+// T246.5.3 — RoPE variant qui lit `pos` depuis device pointer (CUDA Graph friendly).
+// Sémantiquement identique à rope_partial_bf16 mais avec `pos = *pos_dev`. Permet
+// que la valeur de pos puisse changer entre replays d'un même graph capturé.
+#[cfg(feature = "cuda")]
+const ROPE_PARTIAL_BF16_DEVCNT_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void rope_partial_bf16_devcnt(
+    __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ inv_freq,
+    const int* __restrict__ pos_dev,
+    int n_heads,
+    int head_dim,
+    int rope_dim
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int half = rope_dim / 2;
+    int k = blockIdx.y * blockDim.x + threadIdx.x;
+    if (k >= half) return;
+    int pos = *pos_dev;
+
+    float theta = inv_freq[k] * (float)pos;
+    float cos_k, sin_k;
+    sincosf(theta, &sin_k, &cos_k);
+
+    int row = h * head_dim;
+    float a = (float)x[row + k];
+    float b = (float)x[row + k + half];
+    x[row + k]        = (__nv_bfloat16)(a * cos_k - b * sin_k);
+    x[row + k + half] = (__nv_bfloat16)(a * sin_k + b * cos_k);
+}
+"#;
+
+// T246.5.3 — increment 1-elt int device buffer. 1 thread, 1 block. Used to
+// advance position counter at the end of decode_step (inside captured graph).
+#[cfg(feature = "cuda")]
+const INCREMENT_U32_DEV_SRC: &str = r#"
+extern "C" __global__ void increment_u32_dev(int* p) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *p = *p + 1;
+    }
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const SPLIT_QG_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -1828,6 +1873,69 @@ extern "C" __global__ void gqa_decode_online_bf16(
 }
 "#;
 
+// T246.5.3 — GQA online variant qui lit `kv_len` depuis device pointer.
+// Sémantiquement identique à gqa_decode_online_bf16 mais avec
+// `kv_len = *kv_len_dev`. Permet capture en CUDA Graph + replay avec
+// kv_len qui change entre tokens.
+#[cfg(feature = "cuda")]
+const GQA_DECODE_ONLINE_BF16_DEVCNT_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void gqa_decode_online_bf16_devcnt(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    __nv_bfloat16* __restrict__ out,
+    int n_heads,
+    int n_kv,
+    const int* __restrict__ kv_len_dev,
+    int head_dim,
+    int max_seq,
+    float scale
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int kv_h = h * n_kv / n_heads;
+
+    int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+
+    int kv_len = *kv_len_dev;
+    float q_i = (float)q[h * head_dim + tid];
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float o = 0.0f;
+
+    extern __shared__ float sdata[];
+
+    for (int t = 0; t < kv_len; ++t) {
+        float k_i = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+        float partial = q_i * k_i;
+        sdata[tid] = partial;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s && tid + s < head_dim) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+        float s_t = sdata[0] * scale;
+        __syncthreads();
+
+        float new_m = fmaxf(m, s_t);
+        float correction = expf(m - new_m);
+        float p = expf(s_t - new_m);
+        float v_i = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+        o = o * correction + p * v_i;
+        l = l * correction + p;
+        m = new_m;
+    }
+
+    out[h * head_dim + tid] = (__nv_bfloat16)(o / fmaxf(l, 1e-12f));
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const GQA_DECODE_NAIVE_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -1941,6 +2049,10 @@ pub struct LlmKernels {
     conv1d_depthwise: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     l2_norm_per_head: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     delta_net_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.5.3 — devcnt variants & helpers for CUDA Graph capture
+    rope_partial_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    gqa_decode_online_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    increment_u32_dev: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1981,6 +2093,9 @@ impl LlmKernels {
             conv1d_depthwise: std::sync::OnceLock::new(),
             l2_norm_per_head: std::sync::OnceLock::new(),
             delta_net_step: std::sync::OnceLock::new(),
+            rope_partial_devcnt: std::sync::OnceLock::new(),
+            gqa_decode_online_devcnt: std::sync::OnceLock::new(),
+            increment_u32_dev: std::sync::OnceLock::new(),
         }
     }
 
@@ -3088,6 +3203,128 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "delta_net_step_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.5.3 — RoPE variant qui lit `pos` depuis device pointer.
+    /// Identique à `rope_partial_bf16` mais permet capture en CUDA Graph.
+    ///
+    /// # Safety  Caller assure pointers valides + `pos_dev` pointe vers
+    /// 1 i32 device-resident contenant la position courante.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rope_partial_bf16_devcnt(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: u64,
+        inv_freq: u64,
+        pos_dev: u64,
+        n_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.rope_partial_devcnt,
+            ROPE_PARTIAL_BF16_DEVCNT_SRC,
+            "rope_partial_bf16_devcnt",
+        )?;
+        let half = rope_dim / 2;
+        let block_dim = 64u32.min(half as u32);
+        let grid_y = (half as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&x)
+            .arg(&inv_freq)
+            .arg(&pos_dev)
+            .arg(&n_heads)
+            .arg(&head_dim)
+            .arg(&rope_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "rope_partial_bf16_devcnt::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.5.3 — GQA online variant qui lit `kv_len` depuis device pointer.
+    ///
+    /// # Safety  Caller assure pointers valides + `kv_len_dev` pointe vers
+    /// 1 i32 device-resident contenant la longueur courante du cache KV.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gqa_decode_online_bf16_devcnt(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k_cache: u64,
+        v_cache: u64,
+        out: u64,
+        n_heads: i32,
+        n_kv: i32,
+        kv_len_dev: u64,
+        head_dim: i32,
+        max_seq: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.gqa_decode_online_devcnt,
+            GQA_DECODE_ONLINE_BF16_DEVCNT_SRC,
+            "gqa_decode_online_bf16_devcnt",
+        )?;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let block_dim = head_dim as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&q)
+            .arg(&k_cache)
+            .arg(&v_cache)
+            .arg(&out)
+            .arg(&n_heads)
+            .arg(&n_kv)
+            .arg(&kv_len_dev)
+            .arg(&head_dim)
+            .arg(&max_seq)
+            .arg(&scale);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gqa_decode_online_bf16_devcnt::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.5.3 — atomic-style increment d'un i32 device-resident.
+    /// Lance 1 thread / 1 block. Utilisé pour avancer le compteur de position
+    /// (kv_len, current_token offset) au sein d'un graph CUDA capturé.
+    ///
+    /// # Safety  `p` doit pointer vers 1 i32 device-resident.
+    pub unsafe fn increment_u32_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        p: u64,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.increment_u32_dev,
+            INCREMENT_U32_DEV_SRC,
+            "increment_u32_dev",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&p);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "increment_u32_dev::launch",
         })?;
         Ok(())
     }
@@ -7196,6 +7433,193 @@ mod parity_tests {
             assert_eq!(lo, 7, "block[{}] low nibble = 0x{:x} ≠ 7", i * 2, lo);
             assert_eq!(hi, 7, "block[{}] hi nibble = 0x{:x} ≠ 7", i * 2 + 1, hi);
         }
+    }
+
+    /// T246.5.3 — `rope_partial_bf16_devcnt` doit produire un output BIT-EXACT
+    /// identique à `rope_partial_bf16` quand `*pos_dev == pos`.
+    #[test]
+    fn rope_partial_bf16_devcnt_matches_static_pos() {
+        let n_heads = 8usize;
+        let head_dim = 128usize;
+        let rope_dim = 64usize;
+        let pos: i32 = 17;
+        let total = n_heads * head_dim;
+
+        // Inv freq for rope_dim=64 with base=10000.
+        let half = rope_dim / 2;
+        let inv_freq_host: Vec<f32> = (0..half)
+            .map(|i| (10000.0_f32).powf(-(2.0 * i as f32) / rope_dim as f32))
+            .collect();
+
+        // Random-ish input.
+        let x_host: Vec<half::bf16> = (0..total)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.013).sin() * 0.5))
+            .collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        // Run static-pos variant.
+        let mut x_static = stream.memcpy_stod(&x_host).expect("x_static");
+        let inv_freq_dev = stream.memcpy_stod(&inv_freq_host).expect("inv_freq");
+        {
+            let (xs_p, _g) = unsafe { x_static.device_ptr_mut(&stream) };
+            let (if_p, _g2) = unsafe { inv_freq_dev.device_ptr(&stream) };
+            unsafe {
+                kernels
+                    .rope_partial_bf16(
+                        &stream,
+                        xs_p,
+                        if_p,
+                        pos,
+                        n_heads as i32,
+                        head_dim as i32,
+                        rope_dim as i32,
+                    )
+                    .unwrap();
+            }
+        }
+        let y_static: Vec<half::bf16> = stream.memcpy_dtov(&x_static).expect("dl static");
+
+        // Run devcnt variant with pos in device buffer.
+        let mut x_devcnt = stream.memcpy_stod(&x_host).expect("x_devcnt");
+        let pos_dev = stream.memcpy_stod(&[pos]).expect("pos_dev");
+        {
+            let (xd_p, _g3) = unsafe { x_devcnt.device_ptr_mut(&stream) };
+            let (if_p, _g4) = unsafe { inv_freq_dev.device_ptr(&stream) };
+            let (pd_p, _g5) = unsafe { pos_dev.device_ptr(&stream) };
+            unsafe {
+                kernels
+                    .rope_partial_bf16_devcnt(
+                        &stream,
+                        xd_p,
+                        if_p,
+                        pd_p,
+                        n_heads as i32,
+                        head_dim as i32,
+                        rope_dim as i32,
+                    )
+                    .unwrap();
+            }
+        }
+        let y_devcnt: Vec<half::bf16> = stream.memcpy_dtov(&x_devcnt).expect("dl devcnt");
+
+        assert_eq!(y_static, y_devcnt, "rope_devcnt ≠ rope_static at pos={pos}");
+    }
+
+    /// T246.5.3 — `gqa_decode_online_bf16_devcnt` doit produire un output
+    /// BIT-EXACT identique à `gqa_decode_online_bf16` quand `*kv_len_dev == kv_len`.
+    #[test]
+    fn gqa_decode_online_bf16_devcnt_matches_static_kv_len() {
+        let n_heads = 4usize;
+        let n_kv = 2usize;
+        let head_dim = 64usize;
+        let max_seq = 32i32;
+        let kv_len: i32 = 13;
+
+        let q_host: Vec<half::bf16> = (0..n_heads * head_dim)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.07).sin() * 0.4))
+            .collect();
+        let kv_total = n_kv * (max_seq as usize) * head_dim;
+        let k_host: Vec<half::bf16> = (0..kv_total)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.011).cos() * 0.3))
+            .collect();
+        let v_host: Vec<half::bf16> = (0..kv_total)
+            .map(|i| half::bf16::from_f32(((i as f32) * 0.017).sin() * 0.25))
+            .collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let q_dev = stream.memcpy_stod(&q_host).expect("q");
+        let k_dev = stream.memcpy_stod(&k_host).expect("k");
+        let v_dev = stream.memcpy_stod(&v_host).expect("v");
+        let mut out_static = stream
+            .alloc_zeros::<half::bf16>(n_heads * head_dim)
+            .expect("out_s");
+        let mut out_devcnt = stream
+            .alloc_zeros::<half::bf16>(n_heads * head_dim)
+            .expect("out_d");
+
+        // Static-kv_len variant.
+        {
+            let (q_p, _g1) = unsafe { q_dev.device_ptr(&stream) };
+            let (k_p, _g2) = unsafe { k_dev.device_ptr(&stream) };
+            let (v_p, _g3) = unsafe { v_dev.device_ptr(&stream) };
+            let (os_p, _g4) = unsafe { out_static.device_ptr_mut(&stream) };
+            unsafe {
+                kernels
+                    .gqa_decode_online_bf16(
+                        &stream,
+                        q_p,
+                        k_p,
+                        v_p,
+                        os_p,
+                        n_heads as i32,
+                        n_kv as i32,
+                        kv_len,
+                        head_dim as i32,
+                        max_seq,
+                    )
+                    .unwrap();
+            }
+        }
+        let y_static: Vec<half::bf16> = stream.memcpy_dtov(&out_static).expect("dl s");
+
+        // Devcnt variant.
+        let kv_len_dev = stream.memcpy_stod(&[kv_len]).expect("kv_len_dev");
+        {
+            let (q_p, _g1) = unsafe { q_dev.device_ptr(&stream) };
+            let (k_p, _g2) = unsafe { k_dev.device_ptr(&stream) };
+            let (v_p, _g3) = unsafe { v_dev.device_ptr(&stream) };
+            let (kld_p, _g5) = unsafe { kv_len_dev.device_ptr(&stream) };
+            let (od_p, _g6) = unsafe { out_devcnt.device_ptr_mut(&stream) };
+            unsafe {
+                kernels
+                    .gqa_decode_online_bf16_devcnt(
+                        &stream,
+                        q_p,
+                        k_p,
+                        v_p,
+                        od_p,
+                        n_heads as i32,
+                        n_kv as i32,
+                        kld_p,
+                        head_dim as i32,
+                        max_seq,
+                    )
+                    .unwrap();
+            }
+        }
+        let y_devcnt: Vec<half::bf16> = stream.memcpy_dtov(&out_devcnt).expect("dl d");
+
+        assert_eq!(
+            y_static, y_devcnt,
+            "gqa_devcnt ≠ gqa_static at kv_len={kv_len}"
+        );
+    }
+
+    /// T246.5.3 — `increment_u32_dev` advance le compteur de 1 à chaque appel.
+    #[test]
+    fn increment_u32_dev_advances_by_one() {
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let mut counter = stream.memcpy_stod(&[5i32]).expect("counter");
+        {
+            let (c_p, _g) = unsafe { counter.device_ptr_mut(&stream) };
+            unsafe {
+                kernels.increment_u32_dev(&stream, c_p).unwrap();
+                kernels.increment_u32_dev(&stream, c_p).unwrap();
+                kernels.increment_u32_dev(&stream, c_p).unwrap();
+            }
+        }
+
+        let value: Vec<i32> = stream.memcpy_dtov(&counter).expect("dl");
+        assert_eq!(value[0], 8, "expected 5 + 3 = 8");
     }
 }
 
