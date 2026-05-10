@@ -721,6 +721,155 @@ extern "C" __global__ void sgemv_q4k_bf16_v2(
 }
 "#;
 
+// T246.5.5 — Q8_1 quantization of BF16 activation row.
+// Mirrors llama.cpp `quantize_q8_1` but reads bf16 instead of f32.
+//
+// Output layout per 32-element block (36 bytes total) :
+//   bytes 0-1  : __half d        (= amax / 127)
+//   bytes 2-3  : __half s        (= sum(x[i]) for the 32 elements ;
+//                                  used by Q4_K vec_dot for offset correction)
+//   bytes 4-35 : int8_t qs[32]
+//
+// Launch : grid_dim = (n_blocks, 1, 1), block_dim = (32, 1, 1).
+// Each warp = 1 block_q8_1.
+#[cfg(feature = "cuda")]
+const QUANTIZE_Q8_1_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void quantize_q8_1_bf16(
+    const __nv_bfloat16* __restrict__ x,
+    unsigned char* __restrict__ y,
+    int n_blocks
+) {
+    int blk = blockIdx.x;
+    if (blk >= n_blocks) return;
+    int tid = threadIdx.x;  // 0..31, one warp
+
+    const __nv_bfloat16* x_blk = x + blk * 32;
+    unsigned char* y_blk       = y + blk * 36;
+
+    float xv   = (float)x_blk[tid];
+    float amax = fabsf(xv);
+    float sum  = xv;
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+        sum  = sum   +     __shfl_xor_sync(0xffffffff, sum,  o);
+    }
+
+    float d     = amax / 127.0f;
+    float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / d;
+    int   qi    = __float2int_rn(xv * inv_d);
+    if (qi < -127) qi = -127;
+    if (qi >  127) qi =  127;
+    signed char q = (signed char)qi;
+
+    ((signed char*)(y_blk + 4))[tid] = q;
+
+    if (tid == 0) {
+        ((__half*)y_blk)[0] = __float2half_rn(d);
+        ((__half*)y_blk)[1] = __float2half_rn(sum);
+    }
+}
+"#;
+
+// T246.5.5 — Q4_K × Q8_1 SGEMV using __dp4a (mirror of llama.cpp
+// vec_dot_q4_K_q8_1_impl_vmmq packed into a per-row CTA).
+//
+// Per super-block of W (256 weights, 144 bytes), 16 vec_dot units :
+//   bq8_offset ∈ {0,2,4,6} (= 2*bp, bp ∈ 0..3) — selects 32-byte W chunk + 2 sub-blocks of x
+//   qc         ∈ {0,1,2,3}                       — selects 4-byte int within the chunk
+//
+// Per unit : 4 dp4a calls, accumulates dot1 (dot of v×u) and dot2 (sum of u
+// for offset correction) for sub-blocks (bq8_offset, bq8_offset+1) jointly via
+// low/high nibble decomposition (i ∈ {0,1}).
+//
+// Launch : grid_dim = (N, 1, 1), block_dim = (32, 1, 1). Each warp = 1 row.
+#[cfg(feature = "cuda")]
+const SGEMV_Q4K_Q8_1_DP4A_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemv_q4k_q8_1_dp4a_bf16(
+    const unsigned char* __restrict__ w_q4k,    // [N, blocks_per_row * 144]
+    const unsigned char* __restrict__ x_q8_1,   // [(K/32) * 36]
+    __nv_bfloat16*       __restrict__ y,         // [N]
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;  // 0..31
+
+    int blocks_per_row = K / 256;
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += 32) {
+        const unsigned char* blk = w_q4k + (row * blocks_per_row + b) * 144;
+
+        // d, dmin (fp16 scalars in W's super-block header)
+        float d    = __half2float(*(const __half*)(blk + 0));
+        float dmin = __half2float(*(const __half*)(blk + 2));
+
+        // 12-byte scales → 8 sc + 8 m (6-bit + 4-bit hi extension)
+        const unsigned char* sr = blk + 4;
+        unsigned char sc[8], m[8];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sc[i]     = sr[i]     & 0x3F;
+            m[i]      = sr[i + 4] & 0x3F;
+            sc[i + 4] = (sr[i + 8] & 0x0F) | ((sr[i]     >> 6) << 4);
+            m[i  + 4] = (sr[i + 8] >>   4) | ((sr[i + 4] >> 6) << 4);
+        }
+
+        const unsigned char* qs = blk + 16;  // 128 bytes nibble payload
+
+        // 16 vec_dot units per super-block.
+        #pragma unroll
+        for (int bp = 0; bp < 4; ++bp) {
+            int bq8_offset = 2 * bp;
+            #pragma unroll
+            for (int qc = 0; qc < 4; ++qc) {
+                int v0 = *(const int*)(qs + 32 * bp +  4 * qc);
+                int v1 = *(const int*)(qs + 32 * bp + 16 + 4 * qc);
+
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    unsigned int v0i = (v0 >> (4 * i)) & 0x0F0F0F0Fu;
+                    unsigned int v1i = (v1 >> (4 * i)) & 0x0F0F0F0Fu;
+
+                    int sb_idx = b * 8 + bq8_offset + i;
+                    const unsigned char* x_blk = x_q8_1 + sb_idx * 36;
+                    float xd = __half2float(*(const __half*)x_blk);
+
+                    int u0 = *(const int*)(x_blk + 4      + 4 * qc);
+                    int u1 = *(const int*)(x_blk + 4 + 16 + 4 * qc);
+
+                    int dot1 = __dp4a((int)v1i, u1, __dp4a((int)v0i, u0, 0));
+                    int dot2 = __dp4a((int)0x01010101u, u1,
+                               __dp4a((int)0x01010101u, u0, 0));
+
+                    acc += d    * xd * (float)(dot1 * (int)sc[bq8_offset + i])
+                         - dmin * xd * (float)(dot2 * (int)m [bq8_offset + i]);
+                }
+            }
+        }
+    }
+
+    // Warp-shuffle reduction.
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, o);
+    }
+
+    if (tid == 0) {
+        y[row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
 // T245.4 — sgemm_q4k_bf16_m8 : Q4_K matmul with batch M=8 (8 input tokens
 // processed in one weight pass). This is the algorithmic key for speculative
 // decoding : reads W once, produces 8 output rows simultaneously.
@@ -2080,6 +2229,9 @@ pub struct LlmKernels {
     gqa_decode_online_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     increment_u32_dev: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     kv_append_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.5.5 — dp4a-based Q4_K × Q8_1 path (port of llama.cpp vec_dot_q4_K_q8_1)
+    quantize_q8_1: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemv_q4k_q8_1_dp4a: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2124,6 +2276,8 @@ impl LlmKernels {
             gqa_decode_online_devcnt: std::sync::OnceLock::new(),
             increment_u32_dev: std::sync::OnceLock::new(),
             kv_append_devcnt: std::sync::OnceLock::new(),
+            quantize_q8_1: std::sync::OnceLock::new(),
+            sgemv_q4k_q8_1_dp4a: std::sync::OnceLock::new(),
         }
     }
 
@@ -2855,6 +3009,85 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemv_q4k_bf16_v2::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.5.5 — Quantize a BF16 row of length K (multiple of 32) into
+    /// Q8_1 packed format (36 bytes per 32-element block, GGML-compatible).
+    ///
+    /// # Safety
+    /// Caller ensures `x` points to K bf16 elements, `y` has capacity for
+    /// `(K/32) * 36` bytes, K is a multiple of 32, and both are valid for
+    /// the duration of the kernel.
+    pub unsafe fn quantize_q8_1_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: u64,
+        y: u64,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 32 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("quantize_q8_1_bf16: K={k} must be multiple of 32"),
+            });
+        }
+        let n_blocks = k / 32;
+        let (_module, func) = self.compile_or_get(
+            &self.quantize_q8_1,
+            QUANTIZE_Q8_1_BF16_SRC,
+            "quantize_q8_1_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&x).arg(&y).arg(&n_blocks);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "quantize_q8_1_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.5.5 — Q4_K × Q8_1 SGEMV using __dp4a (port of llama.cpp
+    /// vec_dot_q4_K_q8_1_impl_vmmq). Expects activation pre-quantized via
+    /// `quantize_q8_1_bf16`. Output is BF16. K must be multiple of 256.
+    ///
+    /// # Safety
+    /// Caller ensures w_q4k has `N * K/256 * 144` bytes, x_q8_1 has
+    /// `K/32 * 36` bytes, y has N bf16 slots, and all pointers are valid.
+    pub unsafe fn sgemv_q4k_q8_1_dp4a_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q4k: u64,
+        x_q8_1: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q4k_q8_1_dp4a_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q4k_q8_1_dp4a,
+            SGEMV_Q4K_Q8_1_DP4A_BF16_SRC,
+            "sgemv_q4k_q8_1_dp4a_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q4k).arg(&x_q8_1).arg(&y).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q4k_q8_1_dp4a_bf16::launch",
         })?;
         Ok(())
     }
@@ -4261,6 +4494,165 @@ mod parity_tests {
                 v1[i],
                 v2[i],
                 diff
+            );
+        }
+    }
+
+    /// T246.5.5 — quantize_q8_1_bf16 roundtrip sanity : quantize a known
+    /// input and dequantize on host ; max abs error should be < d (= amax/127).
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn quantize_q8_1_bf16_roundtrip_basic() {
+        let k = 32usize * 8; // 8 blocks
+        let x_f32: Vec<f32> = (0..k).map(|i| ((i as f32 * 0.07).sin()) * 1.7).collect();
+        let x_bf: Vec<half::bf16> = x_f32.iter().copied().map(half::bf16::from_f32).collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+        let n_blocks = k / 32;
+        let mut y_dev = stream.alloc_zeros::<u8>(n_blocks * 36).expect("alloc q8_1");
+        unsafe {
+            let (x_p, _g1) = x_dev.device_ptr(&stream);
+            let (y_p, _g2) = y_dev.device_ptr_mut(&stream);
+            kernels
+                .quantize_q8_1_bf16(&stream, x_p, y_p, k as i32)
+                .expect("quant");
+        }
+        let q8: Vec<u8> = stream.memcpy_dtov(&y_dev).expect("dtov q8_1");
+
+        // Dequantize on host and compare against the BF16 input (the kernel
+        // operates on BF16, so int8 quant error is bounded by 0.5*d on top of
+        // the BF16 representation — comparing to f32 mixes in BF16 rounding).
+        for blk in 0..n_blocks {
+            let off = blk * 36;
+            let d_bits = u16::from_le_bytes([q8[off], q8[off + 1]]);
+            let d = half::f16::from_bits(d_bits).to_f32();
+            let mut max_err: f32 = 0.0;
+            for i in 0..32 {
+                let q = q8[off + 4 + i] as i8;
+                let recon = (q as f32) * d;
+                let orig_bf = x_bf[blk * 32 + i].to_f32();
+                max_err = max_err.max((recon - orig_bf).abs());
+            }
+            // Rounding error of int8 quant : at most 0.5 * d. Allow tiny slack
+            // for fp32 reduction order in the warp reduce.
+            assert!(
+                max_err <= d.max(1e-6) * 0.6,
+                "block[{blk}]: d={d} max_err={max_err}"
+            );
+        }
+    }
+
+    /// T246.5.5 — Q4_K dp4a path numeric parity vs sgemv_q4k_bf16_v2
+    /// reference. Tolerance ~1.5% relative + 0.5 abs (Q8_1 quant of the
+    /// activation introduces ~1% per-element loss).
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn sgemv_q4k_dp4a_matches_v2() {
+        use rustorch_gguf::dequant::{Q4_K_BYTES, QK_K};
+
+        let n = 64usize;
+        let k = 512usize;
+        let blocks_per_row = k / QK_K;
+        let row_bytes = blocks_per_row * Q4_K_BYTES;
+
+        // Same RNG-driven W as the v1/v2 test.
+        let mut state: u64 = 0xfeedbeef;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut w_bytes = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q4_K_BYTES;
+                let d = half::f16::from_f32(0.07).to_le_bytes();
+                let dmin = half::f16::from_f32(0.03).to_le_bytes();
+                w_bytes[off] = d[0];
+                w_bytes[off + 1] = d[1];
+                w_bytes[off + 2] = dmin[0];
+                w_bytes[off + 3] = dmin[1];
+                for i in 0..12 {
+                    w_bytes[off + 4 + i] = (next() & 0x3F) as u8;
+                }
+                for i in 0..128 {
+                    w_bytes[off + 16 + i] = (next() & 0xFF) as u8;
+                }
+            }
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let w_dev = stream.memcpy_stod(&w_bytes).expect("upload w");
+        let x_f32: Vec<f32> = (0..k).map(|i| ((i as f32 * 0.05).cos()) * 0.5).collect();
+        let x_bf: Vec<half::bf16> = x_f32.iter().copied().map(half::bf16::from_f32).collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+
+        // Reference : sgemv_q4k_bf16_v2 (float dot).
+        let mut y_ref = stream.alloc_zeros::<half::bf16>(n).expect("alloc y_ref");
+        unsafe {
+            let (w_p, _g1) = w_dev.device_ptr(&stream);
+            let (x_p, _g2) = x_dev.device_ptr(&stream);
+            let (y_p, _g3) = y_ref.device_ptr_mut(&stream);
+            kernels
+                .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                .expect("v2");
+        }
+        let r_ref: Vec<f32> = stream
+            .memcpy_dtov(&y_ref)
+            .expect("dtov ref")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        // Test path : quantize x → Q8_1, then sgemv_q4k_q8_1_dp4a.
+        let n_blocks_q8 = k / 32;
+        let mut x_q8 = stream
+            .alloc_zeros::<u8>(n_blocks_q8 * 36)
+            .expect("alloc q8_1");
+        let mut y_dp4a = stream.alloc_zeros::<half::bf16>(n).expect("alloc y_dp4a");
+        unsafe {
+            let (x_p, _g1) = x_dev.device_ptr(&stream);
+            let (xq_p, _g2) = x_q8.device_ptr_mut(&stream);
+            kernels
+                .quantize_q8_1_bf16(&stream, x_p, xq_p, k as i32)
+                .expect("quant");
+        }
+        unsafe {
+            let (w_p, _g1) = w_dev.device_ptr(&stream);
+            let (xq_p, _g2) = x_q8.device_ptr(&stream);
+            let (y_p, _g3) = y_dp4a.device_ptr_mut(&stream);
+            kernels
+                .sgemv_q4k_q8_1_dp4a_bf16(&stream, w_p, xq_p, y_p, n as i32, k as i32)
+                .expect("dp4a");
+        }
+        let r_dp4a: Vec<f32> = stream
+            .memcpy_dtov(&y_dp4a)
+            .expect("dtov dp4a")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        for i in 0..n {
+            let diff = (r_ref[i] - r_dp4a[i]).abs();
+            // Q8_1 quant of activation : ~1% relative loss per element ; over
+            // K=512 with mean cancellation the row sum loss is ~1.5% of |ref|,
+            // plus 0.5 abs slack for BF16 cast.
+            let tol = r_ref[i].abs() * 1.5e-2 + 0.5;
+            assert!(
+                diff <= tol,
+                "row[{i}] ref={} dp4a={} diff={} tol={}",
+                r_ref[i],
+                r_dp4a[i],
+                diff,
+                tol
             );
         }
     }
