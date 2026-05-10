@@ -626,6 +626,9 @@ extern "C" __global__ void sgemv_q4k_bf16_v2(
             xv = (float)xbf;
             acc += w_val * xv;
         }
+        // T246.4.4 — RACE FIX : sync between iterations so next iter's write
+        // to sc_pre/m_pre doesn't race with this iter's reads.
+        __syncthreads();
     }
 
     // T244.1.1.1 — Warp-shuffle reduction over 64 threads = 2 warps.
@@ -754,6 +757,8 @@ extern "C" __global__ void sgemm_q4k_bf16_m8(
                 acc[m] += w_val * (float)xbf;
             }
         }
+        // T246.4.4 — RACE FIX : sync between iterations.
+        __syncthreads();
     }
 
     // Reduction : we have 8 accumulators per thread × 64 threads = 512 floats.
@@ -1085,6 +1090,9 @@ extern "C" __global__ void sgemv_q6k_bf16(
         float w_val = sc_pre[scale_idx] * (float)(q - 32);
         float x_val = (float)x[b * 256 + tid];
         acc += w_val * x_val;
+        // T246.4.4 — RACE FIX : sync between iterations so next iter's write
+        // to sc_pre by thread 0 doesn't race with this iter's reads.
+        __syncthreads();
     }
 
     // T244.1.3.1 — Warp-shuffle reduction over 256 threads = 8 warps.
@@ -1196,6 +1204,12 @@ extern "C" __global__ void sgemv_q6k_bf16_v2(
         float x3 = (float)x_ptr[l + 96];
 
         acc += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+
+        // T246.4.4 — RACE FIX : sync at end of iteration so next iter's write
+        // to sc_pre by thread 0 doesn't race with this iter's reads by other
+        // threads. Without this, output is non-deterministic (compute-sanitizer
+        // racecheck found 1.25M hazards).
+        __syncthreads();
     }
 
     #pragma unroll
@@ -1316,6 +1330,8 @@ extern "C" __global__ void sgemv_q5k_bf16(
             __nv_bfloat16 xbf = __ushort_as_bfloat16(xb[i]);
             acc += w_val * (float)xbf;
         }
+        // T246.4.4 — RACE FIX : sync between iterations.
+        __syncthreads();
     }
 
     // Warp-shuffle reduction.
@@ -1433,6 +1449,8 @@ extern "C" __global__ void sgemm_q5k_bf16_m8(
                 acc[m] += w_val * (float)xbf;
             }
         }
+        // T246.4.4 — RACE FIX : sync between iterations.
+        __syncthreads();
     }
 
     #pragma unroll
@@ -1534,6 +1552,8 @@ extern "C" __global__ void sgemm_q6k_bf16_m8(
             float x3 = (float)x_base[m * K + l + 96];
             acc[m] += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
         }
+        // T246.4.4 — RACE FIX : sync between iterations.
+        __syncthreads();
     }
 
     #pragma unroll
