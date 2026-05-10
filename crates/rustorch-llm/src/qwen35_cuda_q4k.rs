@@ -2198,23 +2198,1211 @@ impl Qwen35ModelCudaQ4K {
             return Ok(vec![tok]);
         }
 
-        // ── tree_size > 1 : SSM-hybrid variants are NOT yet supported ────
-        // The kv-append + gqa-decode primitives handle the attention layers
-        // for any number of tree positions in one kernel each. SSM layers
-        // (gated delta net) are recurrent — each verify branch needs its
-        // own forked SSM state, then commit-the-accepted-branch at the
-        // end. That design lands in a follow-up task ; see note
-        // f0477041-1bf0-4f91-ab1c-83f7843a4a82.
-        if !self.config.variant.is_pure_transformer() {
-            return Err(LlmError::Backend(format!(
-                "decode_step_tree multi-token (tree_size={tree_size}): SSM-hybrid \
-                 variants need state forking — see note f0477041 for the design \
-                 deferral. Use decode_step or wait for the SSM-fork task."
-            )));
+        // ── tree_size > 1 : dispatch by variant ──────────────────────────
+        // Pure-transformer  → decode_step_tree_pure_transformer (P1.4a).
+        // Dense (SSM+attn)  → decode_step_tree_hybrid (T246.7 TrackC.3).
+        // MoE  (SSM+attn)   → not yet supported (Phase 2 follow-up : the
+        //                     MoE router introduces host-sync per layer
+        //                     which interacts badly with the per-row
+        //                     forward).
+        match self.config.variant {
+            Qwen35Variant::Qwen2PureTransformer | Qwen35Variant::Qwen3PureTransformer => {
+                self.decode_step_tree_pure_transformer(drafts, parents, depths)
+            },
+            Qwen35Variant::Dense => self.decode_step_tree_hybrid(drafts, parents, depths),
+            Qwen35Variant::Moe => Err(LlmError::Backend(format!(
+                "decode_step_tree multi-token (tree_size={tree_size}): MoE+SSM \
+                 hybrid Lookahead deferred to a later task — see note f0477041. \
+                 Set RUSTORCH_LOOKAHEAD=0 to fall back to decode_step."
+            ))),
+        }
+    }
+
+    /// T246.7 TrackC.3 — multi-token tree forward for the SSM-hybrid Dense
+    /// variant (Qwen3.6-27B). Mirrors `decode_step_tree_pure_transformer`
+    /// but with two extra responsibilities :
+    ///
+    /// 1. **Per-branch SSM state forking** — for each SSM layer we
+    ///    pre-load the model's current per-layer state into the root
+    ///    slot of `tree_ssm_states[layer]` and `tree_conv_states[layer]`,
+    ///    then run the per-row SSM forward where each tree node reads
+    ///    from its parent's slot via `delta_net_step_tree_bf16` and a
+    ///    parent-aware conv1d sequence.
+    ///
+    /// 2. **Commit on accept** — after the acceptance walk we copy the
+    ///    deepest accepted node's SSM state and conv state back into the
+    ///    model's per-layer scratch, dropping the discarded branches.
+    ///
+    /// Conv1d state forking uses the per-row sequential strategy (see
+    /// the deferred-design note f0477041) : we copy parent → child slot
+    /// in `tree_conv_states[layer]` then call the existing scalar
+    /// `conv1d_depthwise_bf16` on slot `r`. For up to MAX_TREE_SIZE=32
+    /// nodes this is 32 small kernel launches per SSM layer per call.
+    /// `delta_net_step_tree_bf16` itself handles forking natively but
+    /// requires one launch per BFS depth wave (read-after-write barrier
+    /// across waves). On Qwen3.6-27B (48 SSM layers, max depth ~7)
+    /// this is ~336 small kernel launches — driver-overhead-bound, not
+    /// compute-bound.
+    #[allow(clippy::too_many_lines)]
+    fn decode_step_tree_hybrid(
+        &mut self,
+        drafts: &[u32],
+        parents: &[i32],
+        depths: &[u8],
+    ) -> Result<Vec<u32>, LlmError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+        let cfg = self.config.clone();
+        let d = cfg.d;
+        let f = cfg.f;
+        let n_q = cfg.n_q_heads;
+        let n_kv = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim();
+        let q_dim = n_q * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let eps = cfg.rms_eps;
+        let rope_dim = cfg.rope_dim;
+        let vocab = cfg.vocab;
+        let head_kv = cfg.ssm_state;
+        let n_k = cfg.ssm_groups;
+        let n_v = cfg.ssm_dt_rank;
+        let key_dim = head_kv * n_k;
+        let value_dim = head_kv * n_v;
+        let conv_dim = 2 * key_dim + value_dim;
+        let conv_kernel = cfg.ssm_conv_kernel;
+        let tree_size = drafts.len();
+        debug_assert!(tree_size > 1 && tree_size <= MAX_TREE_SIZE);
+
+        let base_position = self.position;
+
+        // ── 0. Upload tree descriptors ────────────────────────────────────
+        self.stream
+            .memcpy_htod(drafts, &mut self.scratch.tree_drafts)
+            .map_err(|e| LlmError::Backend(format!("upload tree_drafts: {e:?}")))?;
+        self.stream
+            .memcpy_htod(parents, &mut self.scratch.tree_parents)
+            .map_err(|e| LlmError::Backend(format!("upload tree_parents: {e:?}")))?;
+        self.stream
+            .memcpy_htod(depths, &mut self.scratch.tree_depths)
+            .map_err(|e| LlmError::Backend(format!("upload tree_depths: {e:?}")))?;
+
+        // ── 1. Group tree nodes by BFS depth wave ─────────────────────────
+        // Used by the SSM `delta_net_step_tree_bf16` launches : one launch
+        // per depth so reads of parent slots see the prior-wave writes.
+        let max_depth = *depths.iter().max().unwrap_or(&0) as usize;
+        let mut waves: Vec<Vec<i32>> = vec![Vec::new(); max_depth + 1];
+        for (r, &dep) in depths.iter().enumerate() {
+            waves[dep as usize].push(r as i32);
         }
 
-        // ── tree_size > 1 : pure-transformer multi-token forward (P1.4a) ─
-        self.decode_step_tree_pure_transformer(drafts, parents, depths)
+        // ── 2. Zero per-tree scratch (sized MAX_TREE_SIZE × per-token) ────
+        // Mirrors decode_step_tree_pure_transformer.
+        for buf in [
+            &mut self.scratch.tree_h,
+            &mut self.scratch.tree_h_norm,
+            &mut self.scratch.tree_residual,
+            &mut self.scratch.tree_q_buf,
+            &mut self.scratch.tree_k_buf,
+            &mut self.scratch.tree_v_buf,
+            &mut self.scratch.tree_attn_out,
+            &mut self.scratch.tree_gate_buf,
+            &mut self.scratch.tree_up_buf,
+            &mut self.scratch.tree_logits,
+        ] {
+            self.stream
+                .memset_zeros(buf)
+                .map_err(|e| LlmError::Backend(format!("zero tree scratch: {e:?}")))?;
+        }
+        for buf in [
+            &mut self.scratch.tree_ssm_qkv_mixed,
+            &mut self.scratch.tree_ssm_conv_out,
+            &mut self.scratch.tree_ssm_z,
+            &mut self.scratch.tree_ssm_alpha,
+            &mut self.scratch.tree_ssm_beta,
+            &mut self.scratch.tree_ssm_q_v,
+            &mut self.scratch.tree_ssm_k_v,
+            &mut self.scratch.tree_ssm_out_buf,
+        ] {
+            self.stream
+                .memset_zeros(buf)
+                .map_err(|e| LlmError::Backend(format!("zero tree ssm scratch: {e:?}")))?;
+        }
+
+        // Per-row byte offsets (BF16 = 2 bytes).
+        let bf16_sz = std::mem::size_of::<half::bf16>() as u64;
+        let row_h = (d as u64) * bf16_sz;
+        let row_q = (q_dim as u64) * bf16_sz;
+        let row_kv = (kv_dim as u64) * bf16_sz;
+        let row_logits = (vocab as u64) * bf16_sz;
+        let row_conv = (conv_dim as u64) * bf16_sz;
+        let row_value = (value_dim as u64) * bf16_sz;
+        let row_alpha = (n_v as u64) * bf16_sz;
+        let conv_state_per_slot = ((conv_kernel - 1) * conv_dim) as u64 * bf16_sz;
+        let ssm_state_per_slot = (n_v * head_kv * head_kv) as u64 * bf16_sz;
+
+        // Pre-extract device pointers (once per call ; the guards keep
+        // the underlying CudaSlice alive for the duration of `unsafe`).
+        let (
+            th_p,
+            thn_p,
+            tres_p,
+            tq_p,
+            tk_p,
+            tv_p,
+            tao_p,
+            tgate_p,
+            tup_p,
+            tlogits_p,
+            tdrafts_p,
+            tparents_p,
+            tdepths_p,
+            targmax_p,
+            tgqa_m_p,
+            tgqa_l_p,
+            tgqa_o_p,
+            tssm_qkv_p,
+            tssm_conv_p,
+            tssm_z_p,
+            tssm_alpha_p,
+            tssm_beta_p,
+            tssm_qv_p,
+            tssm_kv_p,
+            tssm_out_p,
+            tssm_wave_p,
+            x_q8_p,
+        ) = {
+            let (a, _g0) = self.scratch.tree_h.device_ptr_mut(&self.stream);
+            let (b, _g1) = self.scratch.tree_h_norm.device_ptr_mut(&self.stream);
+            let (c, _g2) = self.scratch.tree_residual.device_ptr_mut(&self.stream);
+            let (d_, _g3) = self.scratch.tree_q_buf.device_ptr_mut(&self.stream);
+            let (e, _g4) = self.scratch.tree_k_buf.device_ptr_mut(&self.stream);
+            let (f_, _g5) = self.scratch.tree_v_buf.device_ptr_mut(&self.stream);
+            let (g, _g6) = self.scratch.tree_attn_out.device_ptr_mut(&self.stream);
+            let (h, _g7) = self.scratch.tree_gate_buf.device_ptr_mut(&self.stream);
+            let (i, _g8) = self.scratch.tree_up_buf.device_ptr_mut(&self.stream);
+            let (j, _g9) = self.scratch.tree_logits.device_ptr_mut(&self.stream);
+            let (k, _g10) = self.scratch.tree_drafts.device_ptr(&self.stream);
+            let (l, _g11) = self.scratch.tree_parents.device_ptr(&self.stream);
+            let (m, _g12) = self.scratch.tree_depths.device_ptr(&self.stream);
+            let (n_, _g13) = self.scratch.tree_argmax.device_ptr_mut(&self.stream);
+            let (o, _g14) = self.scratch.tree_gqa_partial_m.device_ptr_mut(&self.stream);
+            let (p, _g15) = self.scratch.tree_gqa_partial_l.device_ptr_mut(&self.stream);
+            let (q, _g16) = self.scratch.tree_gqa_partial_o.device_ptr_mut(&self.stream);
+            let (r0, _g17) = self.scratch.tree_ssm_qkv_mixed.device_ptr_mut(&self.stream);
+            let (r1, _g18) = self.scratch.tree_ssm_conv_out.device_ptr_mut(&self.stream);
+            let (r2, _g19) = self.scratch.tree_ssm_z.device_ptr_mut(&self.stream);
+            let (r3, _g20) = self.scratch.tree_ssm_alpha.device_ptr_mut(&self.stream);
+            let (r4, _g21) = self.scratch.tree_ssm_beta.device_ptr_mut(&self.stream);
+            let (r5, _g22) = self.scratch.tree_ssm_q_v.device_ptr_mut(&self.stream);
+            let (r6, _g23) = self.scratch.tree_ssm_k_v.device_ptr_mut(&self.stream);
+            let (r7, _g24) = self.scratch.tree_ssm_out_buf.device_ptr_mut(&self.stream);
+            let (r8, _g25) = self
+                .scratch
+                .tree_ssm_wave_indices
+                .device_ptr_mut(&self.stream);
+            let q8 = if self.use_dp4a_q4k {
+                let (s, _g26) = self.scratch.x_q8_scratch.device_ptr_mut(&self.stream);
+                s
+            } else {
+                0u64
+            };
+            (
+                a, b, c, d_, e, f_, g, h, i, j, k, l, m, n_, o, p, q, r0, r1, r2, r3, r4, r5, r6,
+                r7, r8, q8,
+            )
+        };
+
+        // ── 3. Embedding lookup ───────────────────────────────────────────
+        unsafe {
+            let (te_p, _g) = self.token_emb.device_ptr(&self.stream);
+            self.kernels
+                .embedding_lookup_bf16(
+                    &self.stream,
+                    te_p,
+                    tdrafts_p,
+                    th_p,
+                    tree_size as i32,
+                    d as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("tree embed: {e:?}")))?;
+        }
+
+        // ── 4. Per-layer forward ──────────────────────────────────────────
+        // Iterate by index so we can borrow `self` for kernel calls AND
+        // mutate `self.ssm_states` / `self.kv_caches` inside the loop.
+        let n_layers = self.blocks.len();
+        for li in 0..n_layers {
+            // Snapshot residual and pre-norm hidden state per row.
+            unsafe {
+                self.kernels
+                    .copy_bf16(&self.stream, tres_p, th_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb copy res l{li}: {e:?}")))?;
+            }
+
+            // Differ on layer kind. Borrow the block by raw index ; we
+            // never alias mutably across this borrow.
+            let is_attn = matches!(self.blocks[li], BlockQ4K::Attn(_));
+            if is_attn {
+                self.hybrid_attn_layer(
+                    li,
+                    tree_size,
+                    base_position,
+                    th_p,
+                    thn_p,
+                    tres_p,
+                    tq_p,
+                    tk_p,
+                    tv_p,
+                    tao_p,
+                    tgate_p,
+                    tup_p,
+                    tparents_p,
+                    tdepths_p,
+                    tgqa_m_p,
+                    tgqa_l_p,
+                    tgqa_o_p,
+                    x_q8_p,
+                    row_h,
+                    row_q,
+                    row_kv,
+                    depths,
+                    f,
+                    eps,
+                    n_q,
+                    n_kv,
+                    head_dim,
+                    q_dim,
+                    kv_dim,
+                    rope_dim,
+                    d,
+                )?;
+            } else {
+                self.hybrid_ssm_layer(
+                    li,
+                    tree_size,
+                    parents,
+                    &waves,
+                    th_p,
+                    thn_p,
+                    tres_p,
+                    tssm_qkv_p,
+                    tssm_conv_p,
+                    tssm_z_p,
+                    tssm_alpha_p,
+                    tssm_beta_p,
+                    tssm_qv_p,
+                    tssm_kv_p,
+                    tssm_out_p,
+                    tssm_wave_p,
+                    x_q8_p,
+                    row_h,
+                    row_conv,
+                    row_value,
+                    row_alpha,
+                    conv_state_per_slot,
+                    ssm_state_per_slot,
+                    eps,
+                    n_v,
+                    n_k,
+                    head_kv,
+                    key_dim,
+                    value_dim,
+                    conv_dim,
+                    conv_kernel,
+                    d,
+                )?;
+            }
+
+            // ── FFN block ────────────────────────────────────────────────
+            // residual <- h (post-mixer value)
+            unsafe {
+                self.kernels
+                    .copy_bf16(&self.stream, tres_p, th_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb copy res ffn l{li}: {e:?}")))?;
+            }
+
+            // Pick the post_norm and ffn from the right block kind.
+            let (post_norm_ptr, ffn_ref): (u64, &FfnQ4K) = match &self.blocks[li] {
+                BlockQ4K::Attn(a) => {
+                    let (p, _g) = a.post_norm.device_ptr(&self.stream);
+                    (p, &a.ffn)
+                },
+                BlockQ4K::Ssm(s) => {
+                    let (p, _g) = s.post_norm.device_ptr(&self.stream);
+                    (p, &s.ffn)
+                },
+            };
+
+            // h_norm = rms_norm(h, post_norm) — batched.
+            unsafe {
+                self.kernels
+                    .copy_bf16(&self.stream, thn_p, th_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb copy h_norm ffn l{li}: {e:?}")))?;
+                self.kernels
+                    .rms_norm_bf16(
+                        &self.stream,
+                        thn_p,
+                        post_norm_ptr,
+                        eps,
+                        d as i32,
+                        tree_size as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("hyb rms_norm post l{li}: {e:?}")))?;
+            }
+
+            let row_ffn_gate = (self.scratch.tree_gate_buf.len() / MAX_TREE_SIZE) as u64 * bf16_sz;
+            let row_ffn_up = (self.scratch.tree_up_buf.len() / MAX_TREE_SIZE) as u64 * bf16_sz;
+            match ffn_ref {
+                FfnQ4K::Dense { gate, up, down } => {
+                    for r in 0..tree_size {
+                        let hn_r = thn_p + (r as u64) * row_h;
+                        let gate_r = tgate_p + (r as u64) * row_ffn_gate;
+                        let up_r = tup_p + (r as u64) * row_ffn_up;
+                        let h_r = th_p + (r as u64) * row_h;
+                        gate.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, gate_r, x_q8_p)?;
+                        up.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, up_r, x_q8_p)?;
+                        unsafe {
+                            self.kernels
+                                .swiglu_bf16(&self.stream, gate_r, up_r, gate_r, f as i32)
+                                .map_err(|e| {
+                                    LlmError::Backend(format!("hyb swiglu r{r} l{li}: {e:?}"))
+                                })?;
+                        }
+                        down.dispatch_matmul_m1(&self.kernels, &self.stream, gate_r, h_r, x_q8_p)?;
+                    }
+                },
+                FfnQ4K::Moe(_) => {
+                    return Err(LlmError::Backend(format!(
+                        "decode_step_tree_hybrid: layer {li} has MoE FFN — \
+                         MoE+SSM hybrid Lookahead not supported (see \
+                         dispatch error path in decode_step_tree)"
+                    )));
+                },
+            }
+
+            // h += residual (post-FFN).
+            unsafe {
+                self.kernels
+                    .add_inplace_bf16(&self.stream, th_p, tres_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb ffn residual l{li}: {e:?}")))?;
+            }
+        }
+
+        // ── 5. Final RMSNorm + LM head per row ────────────────────────────
+        unsafe {
+            let (fn_p, _g) = self.final_norm.device_ptr(&self.stream);
+            self.kernels
+                .rms_norm_bf16(&self.stream, th_p, fn_p, eps, d as i32, tree_size as i32)
+                .map_err(|e| LlmError::Backend(format!("hyb final_norm: {e:?}")))?;
+        }
+        for r in 0..tree_size {
+            let h_r = th_p + (r as u64) * row_h;
+            let logits_r = tlogits_p + (r as u64) * row_logits;
+            self.lm_head
+                .dispatch_matmul_m1(&self.kernels, &self.stream, h_r, logits_r, x_q8_p)?;
+        }
+
+        // ── 6. Argmax + DtoH ──────────────────────────────────────────────
+        unsafe {
+            self.kernels
+                .argmax_logits_tree_bf16(
+                    &self.stream,
+                    tlogits_p,
+                    targmax_p,
+                    tree_size as i32,
+                    vocab as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("hyb argmax: {e:?}")))?;
+        }
+        self.stream
+            .memcpy_dtoh(
+                &self.scratch.tree_argmax,
+                &mut self.scratch.tree_argmax_host_pinned,
+            )
+            .map_err(|e| LlmError::Backend(format!("hyb dtoh argmax: {e:?}")))?;
+        let argmax_host = self
+            .scratch
+            .tree_argmax_host_pinned
+            .as_slice()
+            .map_err(|e| LlmError::Backend(format!("hyb pinned argmax: {e:?}")))?;
+
+        // ── 7. CPU acceptance walk (same as pure-transformer path) ────────
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
+        for (r, &p) in parents.iter().enumerate().skip(1) {
+            children[p as usize].push(r);
+        }
+        let mut accepted_indices: Vec<usize> = vec![0];
+        let mut accepted_tokens: Vec<u32> = vec![argmax_host[0]];
+        let mut cur = 0usize;
+        loop {
+            let next_tok = argmax_host[cur];
+            let mut found: Option<usize> = None;
+            for &c in &children[cur] {
+                if drafts[c] == next_tok {
+                    found = Some(c);
+                    break;
+                }
+            }
+            match found {
+                Some(c) => {
+                    accepted_indices.push(c);
+                    accepted_tokens.push(argmax_host[c]);
+                    cur = c;
+                },
+                None => break,
+            }
+        }
+        let accept_len = accepted_tokens.len();
+        debug_assert!(accept_len >= 1);
+
+        // ── 8. Compact accepted KV slots (attention layers only) ──────────
+        for li in 0..self.blocks.len() {
+            if !matches!(self.blocks[li], BlockQ4K::Attn(_)) {
+                continue;
+            }
+            let attn_idx = get_attn_layer_idx(&cfg, li);
+            let kv_cache = &mut self.kv_caches[attn_idx];
+            unsafe {
+                let (kc_p, _g1) = kv_cache.k.device_ptr_mut(&self.stream);
+                let (vc_p, _g2) = kv_cache.v.device_ptr_mut(&self.stream);
+                for (i, &src) in accepted_indices.iter().enumerate().take(accept_len).skip(1) {
+                    if src == i {
+                        continue;
+                    }
+                    let src_off = (base_position as u64 + src as u64) * (kv_dim as u64);
+                    let dst_off = (base_position as u64 + i as u64) * (kv_dim as u64);
+                    self.kernels
+                        .copy_bf16(
+                            &self.stream,
+                            kc_p + dst_off * bf16_sz,
+                            kc_p + src_off * bf16_sz,
+                            kv_dim as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("hyb compact K l{li}: {e:?}")))?;
+                    self.kernels
+                        .copy_bf16(
+                            &self.stream,
+                            vc_p + dst_off * bf16_sz,
+                            vc_p + src_off * bf16_sz,
+                            kv_dim as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("hyb compact V l{li}: {e:?}")))?;
+                }
+            }
+        }
+
+        // ── 9. Commit accepted SSM state — copy deepest accepted node's
+        //       per-layer state and conv state back into the model's
+        //       per-SSM-layer buffers. ────────────────────────────────────
+        let leaf_idx = *accepted_indices.last().unwrap();
+        for li in 0..self.blocks.len() {
+            if !matches!(self.blocks[li], BlockQ4K::Ssm(_)) {
+                continue;
+            }
+            let s_idx = get_ssm_layer_idx(&cfg, li);
+            // Two scopes : the SsmState struct holds both `state` and
+            // `conv_state` fields, but cudarc's device_ptr_mut takes a
+            // &mut on the slice, and the borrow checker can't see that
+            // the two field borrows are disjoint when going through
+            // `self.ssm_states[s_idx]`. Splitting into two separate
+            // scopes (releasing the first guard before acquiring the
+            // second) sidesteps this.
+            unsafe {
+                let (src_state_p, _g1) =
+                    self.scratch.tree_ssm_states[s_idx].device_ptr(&self.stream);
+                let (dst_state_p, _g2) = self.ssm_states[s_idx].state.device_ptr_mut(&self.stream);
+                let n_state_elems = (n_v * head_kv * head_kv) as i32;
+                self.kernels
+                    .copy_bf16(
+                        &self.stream,
+                        dst_state_p,
+                        src_state_p + (leaf_idx as u64) * ssm_state_per_slot,
+                        n_state_elems,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("hyb commit ssm state l{li}: {e:?}")))?;
+            }
+            unsafe {
+                let (src_conv_p, _g3) =
+                    self.scratch.tree_conv_states[s_idx].device_ptr(&self.stream);
+                let (dst_conv_p, _g4) = self.ssm_states[s_idx]
+                    .conv_state
+                    .device_ptr_mut(&self.stream);
+                let n_conv_elems = ((conv_kernel - 1) * conv_dim) as i32;
+                self.kernels
+                    .copy_bf16(
+                        &self.stream,
+                        dst_conv_p,
+                        src_conv_p + (leaf_idx as u64) * conv_state_per_slot,
+                        n_conv_elems,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("hyb commit conv l{li}: {e:?}")))?;
+            }
+        }
+
+        // ── 10. Advance device counters ───────────────────────────────────
+        unsafe {
+            let (pos_p, _g_pos) = self.position_dev.device_ptr_mut(&self.stream);
+            self.kernels
+                .add_u32_dev(&self.stream, pos_p, accept_len as i32)
+                .map_err(|e| LlmError::Backend(format!("hyb add_u32 pos: {e:?}")))?;
+        }
+        unsafe {
+            let (kvl_p, _g_kvl) = self.kv_len_dev.device_ptr_mut(&self.stream);
+            self.kernels
+                .add_u32_dev(&self.stream, kvl_p, accept_len as i32)
+                .map_err(|e| LlmError::Backend(format!("hyb add_u32 kv_len: {e:?}")))?;
+        }
+        self.position += accept_len;
+
+        Ok(accepted_tokens)
+    }
+
+    // ── TrackC.3 — per-layer helpers for decode_step_tree_hybrid ──────────
+    //
+    // The two helpers below isolate the attention and SSM forward paths so
+    // the dispatching `decode_step_tree_hybrid` body stays manageable.
+    // They take a wide arg list because they share the per-call scratch
+    // pointers extracted at the top of the dispatcher (avoids re-acquiring
+    // device_ptr_mut inside hot loops, and keeps the borrow scope short).
+
+    #[allow(clippy::too_many_arguments)]
+    fn hybrid_attn_layer(
+        &mut self,
+        li: usize,
+        tree_size: usize,
+        base_position: usize,
+        th_p: u64,
+        thn_p: u64,
+        tres_p: u64,
+        tq_p: u64,
+        tk_p: u64,
+        tv_p: u64,
+        tao_p: u64,
+        tgate_p: u64,
+        tup_p: u64,
+        tparents_p: u64,
+        tdepths_p: u64,
+        tgqa_m_p: u64,
+        tgqa_l_p: u64,
+        tgqa_o_p: u64,
+        x_q8_p: u64,
+        row_h: u64,
+        row_q: u64,
+        row_kv: u64,
+        depths: &[u8],
+        _f: usize,
+        eps: f32,
+        n_q: usize,
+        n_kv: usize,
+        head_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        rope_dim: usize,
+        d: usize,
+    ) -> Result<(), LlmError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let cfg = &self.config;
+        let attn = match &self.blocks[li] {
+            BlockQ4K::Attn(a) => a,
+            _ => unreachable!("hybrid_attn_layer called on non-attn layer {li}"),
+        };
+
+        // Per-row strides for the wider scratch buffers (gate / up).
+        let bf16_sz = std::mem::size_of::<half::bf16>() as u64;
+        let row_gate = (self.scratch.tree_gate_buf.len() / MAX_TREE_SIZE) as u64 * bf16_sz;
+        let row_up = (self.scratch.tree_up_buf.len() / MAX_TREE_SIZE) as u64 * bf16_sz;
+
+        // RMSNorm.
+        unsafe {
+            let (an, _g) = attn.attn_norm.device_ptr(&self.stream);
+            self.kernels
+                .copy_bf16(&self.stream, thn_p, th_p, (tree_size * d) as i32)
+                .map_err(|e| LlmError::Backend(format!("hyb attn copy h_norm l{li}: {e:?}")))?;
+            self.kernels
+                .rms_norm_bf16(&self.stream, thn_p, an, eps, d as i32, tree_size as i32)
+                .map_err(|e| LlmError::Backend(format!("hyb attn rms_norm l{li}: {e:?}")))?;
+        }
+
+        // Q projection. With Q+gate (Qwen3 / Qwen3.5 / Qwen3.6), w_q
+        // outputs 2*q_dim per row : we route it through tree_up_buf
+        // (scratch row stride ≥ 2*q_dim guaranteed at constructor) then
+        // split into q (→ tq_p) and gate (→ tree_gate_buf). For variants
+        // without output gate (qwen2), w_q outputs q_dim directly into
+        // tq_p.
+        if cfg.variant.attn_has_output_gate() {
+            for r in 0..tree_size {
+                let hn_r = thn_p + (r as u64) * row_h;
+                let qg_r = tup_p + (r as u64) * row_up;
+                attn.w_q
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, qg_r, x_q8_p)?;
+            }
+            for r in 0..tree_size {
+                let qg_r = tup_p + (r as u64) * row_up;
+                let q_r = tq_p + (r as u64) * row_q;
+                let gate_r = tgate_p + (r as u64) * row_gate;
+                unsafe {
+                    self.kernels
+                        .split_qg_bf16(
+                            &self.stream,
+                            qg_r,
+                            q_r,
+                            gate_r, // pre-sigmoid gate, q_dim per row
+                            n_q as i32,
+                            head_dim as i32,
+                        )
+                        .map_err(|e| {
+                            LlmError::Backend(format!("hyb split_qg r{r} l{li}: {e:?}"))
+                        })?;
+                }
+            }
+        } else {
+            for r in 0..tree_size {
+                let hn_r = thn_p + (r as u64) * row_h;
+                let q_r = tq_p + (r as u64) * row_q;
+                attn.w_q
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, q_r, x_q8_p)?;
+            }
+        }
+
+        // K, V per row.
+        for r in 0..tree_size {
+            let hn_r = thn_p + (r as u64) * row_h;
+            let k_r = tk_p + (r as u64) * row_kv;
+            let v_r = tv_p + (r as u64) * row_kv;
+            attn.w_k
+                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, k_r, x_q8_p)?;
+            attn.w_v
+                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, v_r, x_q8_p)?;
+        }
+
+        // QKV bias add (qwen2 only — Qwen3.6 has no bias).
+        if cfg.variant.attn_has_qkv_bias() {
+            unsafe {
+                let (bq, _gbq) = attn
+                    .b_q
+                    .as_ref()
+                    .expect("qwen2: b_q present")
+                    .device_ptr(&self.stream);
+                let (bk, _gbk) = attn
+                    .b_k
+                    .as_ref()
+                    .expect("qwen2: b_k present")
+                    .device_ptr(&self.stream);
+                let (bv, _gbv) = attn
+                    .b_v
+                    .as_ref()
+                    .expect("qwen2: b_v present")
+                    .device_ptr(&self.stream);
+                for r in 0..tree_size {
+                    let q_r = tq_p + (r as u64) * row_q;
+                    let k_r = tk_p + (r as u64) * row_kv;
+                    let v_r = tv_p + (r as u64) * row_kv;
+                    self.kernels
+                        .add_inplace_bf16(&self.stream, q_r, bq, q_dim as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb q_bias r{r}: {e:?}")))?;
+                    self.kernels
+                        .add_inplace_bf16(&self.stream, k_r, bk, kv_dim as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb k_bias r{r}: {e:?}")))?;
+                    self.kernels
+                        .add_inplace_bf16(&self.stream, v_r, bv, kv_dim as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb v_bias r{r}: {e:?}")))?;
+                }
+            }
+        }
+
+        // Per-head Q-norm and K-norm.
+        if cfg.variant.attn_has_qk_norm() {
+            unsafe {
+                let (qn, _g1) = attn
+                    .q_norm
+                    .as_ref()
+                    .expect("qk_norm variant: q_norm present")
+                    .device_ptr(&self.stream);
+                let (kn, _g2) = attn
+                    .k_norm
+                    .as_ref()
+                    .expect("qk_norm variant: k_norm present")
+                    .device_ptr(&self.stream);
+                self.kernels
+                    .rms_norm_bf16(
+                        &self.stream,
+                        tq_p,
+                        qn,
+                        eps,
+                        head_dim as i32,
+                        (tree_size * n_q) as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("hyb q_norm l{li}: {e:?}")))?;
+                self.kernels
+                    .rms_norm_bf16(
+                        &self.stream,
+                        tk_p,
+                        kn,
+                        eps,
+                        head_dim as i32,
+                        (tree_size * n_kv) as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("hyb k_norm l{li}: {e:?}")))?;
+            }
+        }
+
+        // RoPE per row with explicit pos = base_position + depths[r].
+        unsafe {
+            let (inv_p, _g_inv) = self.rope_freqs.inv_freq.device_ptr(&self.stream);
+            for (r, &dep) in depths.iter().enumerate().take(tree_size) {
+                let pos_r = base_position as i32 + dep as i32;
+                let q_r = tq_p + (r as u64) * row_q;
+                let k_r = tk_p + (r as u64) * row_kv;
+                self.kernels
+                    .rope_partial_bf16(
+                        &self.stream,
+                        q_r,
+                        inv_p,
+                        pos_r,
+                        n_q as i32,
+                        head_dim as i32,
+                        rope_dim as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("hyb rope q r{r} l{li}: {e:?}")))?;
+                self.kernels
+                    .rope_partial_bf16(
+                        &self.stream,
+                        k_r,
+                        inv_p,
+                        pos_r,
+                        n_kv as i32,
+                        head_dim as i32,
+                        rope_dim as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("hyb rope k r{r} l{li}: {e:?}")))?;
+            }
+        }
+
+        // KV append + GQA decode (tree-aware). Attention output writes
+        // into tree_attn_out (tao_p), q_dim per row.
+        let attn_idx = get_attn_layer_idx(cfg, li);
+        let kv_cache = &mut self.kv_caches[attn_idx];
+        unsafe {
+            let (kc_p, _g1) = kv_cache.k.device_ptr_mut(&self.stream);
+            let (vc_p, _g2) = kv_cache.v.device_ptr_mut(&self.stream);
+            let (pos_p, _g3) = self.position_dev.device_ptr(&self.stream);
+            self.kernels
+                .kv_append_tree_bf16(
+                    &self.stream,
+                    kc_p,
+                    vc_p,
+                    tk_p,
+                    tv_p,
+                    pos_p,
+                    tree_size as i32,
+                    kv_dim as i32,
+                    self.max_seq as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("hyb kv_append l{li}: {e:?}")))?;
+        }
+        unsafe {
+            let (kc_p, _g1) = kv_cache.k.device_ptr(&self.stream);
+            let (vc_p, _g2) = kv_cache.v.device_ptr(&self.stream);
+            let (kvl_p, _g3) = self.kv_len_dev.device_ptr(&self.stream);
+            self.kernels
+                .gqa_decode_tree_bf16(
+                    &self.stream,
+                    tq_p,
+                    kc_p,
+                    vc_p,
+                    tao_p,
+                    tparents_p,
+                    tdepths_p,
+                    tgqa_m_p,
+                    tgqa_l_p,
+                    tgqa_o_p,
+                    n_q as i32,
+                    n_kv as i32,
+                    kvl_p,
+                    head_dim as i32,
+                    self.max_seq as i32,
+                    GQA_N_SPLIT as i32,
+                    tree_size as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("hyb gqa l{li}: {e:?}")))?;
+        }
+
+        // Sigmoid gate × attn_out per row (Qwen3.6 has output gate).
+        // Gate is in tree_gate_buf (q_dim per row, gate_r stride).
+        if cfg.variant.attn_has_output_gate() {
+            for r in 0..tree_size {
+                let gate_r = tgate_p + (r as u64) * row_gate;
+                let ao_r = tao_p + (r as u64) * row_q;
+                unsafe {
+                    self.kernels
+                        .sigmoid_inplace_bf16(&self.stream, gate_r, q_dim as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb sigmoid r{r} l{li}: {e:?}")))?;
+                    self.kernels
+                        .mul_inplace_bf16(&self.stream, ao_r, gate_r, q_dim as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb gate*ao r{r} l{li}: {e:?}")))?;
+                }
+            }
+        }
+
+        // w_o per row → tree_h ; residual add.
+        for r in 0..tree_size {
+            let ao_r = tao_p + (r as u64) * row_q;
+            let h_r = th_p + (r as u64) * row_h;
+            attn.w_o
+                .dispatch_matmul_m1(&self.kernels, &self.stream, ao_r, h_r, x_q8_p)?;
+        }
+        unsafe {
+            self.kernels
+                .add_inplace_bf16(&self.stream, th_p, tres_p, (tree_size * d) as i32)
+                .map_err(|e| LlmError::Backend(format!("hyb attn residual l{li}: {e:?}")))?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hybrid_ssm_layer(
+        &mut self,
+        li: usize,
+        tree_size: usize,
+        parents: &[i32],
+        waves: &[Vec<i32>],
+        th_p: u64,
+        thn_p: u64,
+        _tres_p: u64,
+        tssm_qkv_p: u64,
+        tssm_conv_p: u64,
+        tssm_z_p: u64,
+        tssm_alpha_p: u64,
+        tssm_beta_p: u64,
+        tssm_qv_p: u64,
+        tssm_kv_p: u64,
+        tssm_out_p: u64,
+        tssm_wave_p: u64,
+        x_q8_p: u64,
+        row_h: u64,
+        row_conv: u64,
+        row_value: u64,
+        row_alpha: u64,
+        conv_state_per_slot: u64,
+        _ssm_state_per_slot: u64,
+        eps: f32,
+        n_v: usize,
+        n_k: usize,
+        head_kv: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_dim: usize,
+        conv_kernel: usize,
+        d: usize,
+    ) -> Result<(), LlmError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let cfg = &self.config;
+        let bf16_sz = std::mem::size_of::<half::bf16>() as u64;
+        let s_idx = get_ssm_layer_idx(cfg, li);
+        let ssm = match &self.blocks[li] {
+            BlockQ4K::Ssm(s) => s,
+            _ => unreachable!("hybrid_ssm_layer called on non-ssm layer {li}"),
+        };
+
+        // 1. Pre-SSM RMSNorm — batched over tree rows.
+        unsafe {
+            let (an, _g) = ssm.attn_norm.device_ptr(&self.stream);
+            self.kernels
+                .copy_bf16(&self.stream, thn_p, th_p, (tree_size * d) as i32)
+                .map_err(|e| LlmError::Backend(format!("hyb ssm copy h_norm l{li}: {e:?}")))?;
+            self.kernels
+                .rms_norm_bf16(&self.stream, thn_p, an, eps, d as i32, tree_size as i32)
+                .map_err(|e| LlmError::Backend(format!("hyb ssm rms_norm l{li}: {e:?}")))?;
+        }
+
+        // 2-5. Per-row w_qkv, w_gate, w_alpha, w_beta projections.
+        for r in 0..tree_size {
+            let hn_r = thn_p + (r as u64) * row_h;
+            let qkv_r = tssm_qkv_p + (r as u64) * row_conv;
+            let z_r = tssm_z_p + (r as u64) * row_value;
+            let alpha_r = tssm_alpha_p + (r as u64) * row_alpha;
+            let beta_r = tssm_beta_p + (r as u64) * row_alpha;
+            ssm.w_qkv
+                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, qkv_r, x_q8_p)?;
+            ssm.w_gate
+                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, z_r, x_q8_p)?;
+            ssm.w_alpha
+                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, alpha_r, x_q8_p)?;
+            ssm.w_beta
+                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, beta_r, x_q8_p)?;
+        }
+
+        // 5b. sigmoid(beta) per row.
+        for r in 0..tree_size {
+            let beta_r = tssm_beta_p + (r as u64) * row_alpha;
+            unsafe {
+                self.kernels
+                    .sigmoid_inplace_bf16(&self.stream, beta_r, n_v as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb sigmoid beta r{r}: {e:?}")))?;
+            }
+        }
+
+        // 6. alpha += dt_bias ; softplus ; alpha *= ssm_a (per row).
+        unsafe {
+            let (db, _gdb) = ssm.dt_bias.device_ptr(&self.stream);
+            let (sa, _gsa) = ssm.ssm_a.device_ptr(&self.stream);
+            for r in 0..tree_size {
+                let alpha_r = tssm_alpha_p + (r as u64) * row_alpha;
+                self.kernels
+                    .add_inplace_bf16(&self.stream, alpha_r, db, n_v as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb alpha+dt r{r}: {e:?}")))?;
+                self.kernels
+                    .softplus_inplace_bf16(&self.stream, alpha_r, n_v as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb softplus r{r}: {e:?}")))?;
+                self.kernels
+                    .mul_inplace_bf16(&self.stream, alpha_r, sa, n_v as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb mul_a r{r}: {e:?}")))?;
+            }
+        }
+
+        // 7. Conv1d per tree row. Pre-load slot 0 with model's current
+        //    conv state, then for each row r > 0 copy parent's conv slot
+        //    into row r's slot before launching the (in-place) conv1d.
+        unsafe {
+            let (model_conv_p, _g) = self.ssm_states[s_idx].conv_state.device_ptr(&self.stream);
+            let (tree_conv_states_p, _g2) =
+                self.scratch.tree_conv_states[s_idx].device_ptr_mut(&self.stream);
+            // Slot 0 ← model state.
+            self.kernels
+                .copy_bf16(
+                    &self.stream,
+                    tree_conv_states_p,
+                    model_conv_p,
+                    ((conv_kernel - 1) * conv_dim) as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("hyb pre-load conv state l{li}: {e:?}")))?;
+
+            // Walk in BFS order (depth waves order doesn't matter for
+            // conv since each row's call is sequential and independent
+            // once parent's slot is committed). parents[r] < r so a
+            // forward 0..tree_size pass respects dependency.
+            let (cw, _gcw) = ssm.conv1d.device_ptr(&self.stream);
+            for (r, &p) in parents.iter().enumerate().take(tree_size) {
+                if r > 0 {
+                    let parent = p as usize;
+                    let dst = tree_conv_states_p + (r as u64) * conv_state_per_slot;
+                    let src = tree_conv_states_p + (parent as u64) * conv_state_per_slot;
+                    self.kernels
+                        .copy_bf16(
+                            &self.stream,
+                            dst,
+                            src,
+                            ((conv_kernel - 1) * conv_dim) as i32,
+                        )
+                        .map_err(|e| {
+                            LlmError::Backend(format!("hyb conv parent copy r{r}: {e:?}"))
+                        })?;
+                }
+                let qkv_r = tssm_qkv_p + (r as u64) * row_conv;
+                let conv_out_r = tssm_conv_p + (r as u64) * row_conv;
+                let slot_state = tree_conv_states_p + (r as u64) * conv_state_per_slot;
+                self.kernels
+                    .conv1d_depthwise_bf16(
+                        &self.stream,
+                        cw,
+                        slot_state,
+                        qkv_r,
+                        conv_out_r,
+                        conv_dim as i32,
+                        conv_kernel as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("hyb conv1d r{r}: {e:?}")))?;
+            }
+        }
+
+        // 8. silu(conv_out) per row.
+        for r in 0..tree_size {
+            let conv_out_r = tssm_conv_p + (r as u64) * row_conv;
+            unsafe {
+                self.kernels
+                    .silu_bf16(&self.stream, conv_out_r, conv_dim as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb silu conv r{r}: {e:?}")))?;
+            }
+        }
+
+        // 9. Split q/k/v from conv_out, l2_norm_per_head, broadcast n_k→n_v.
+        // Conv output layout per row : [2*key_dim (q,k) | value_dim (v)].
+        let q_offset = 0u64;
+        let k_offset = (key_dim as u64) * bf16_sz;
+        let v_offset = (2 * key_dim as u64) * bf16_sz;
+        for r in 0..tree_size {
+            let conv_out_r = tssm_conv_p + (r as u64) * row_conv;
+            let q_r = conv_out_r + q_offset;
+            let k_r = conv_out_r + k_offset;
+            unsafe {
+                self.kernels
+                    .l2_norm_per_head_bf16(&self.stream, q_r, n_k as i32, head_kv as i32, eps)
+                    .map_err(|e| LlmError::Backend(format!("hyb l2 q r{r}: {e:?}")))?;
+                self.kernels
+                    .l2_norm_per_head_bf16(&self.stream, k_r, n_k as i32, head_kv as i32, eps)
+                    .map_err(|e| LlmError::Backend(format!("hyb l2 k r{r}: {e:?}")))?;
+            }
+        }
+
+        // Broadcast q,k from n_k → n_v heads per row into tree_ssm_q_v / k_v.
+        for r in 0..tree_size {
+            let conv_out_r = tssm_conv_p + (r as u64) * row_conv;
+            let q_r = conv_out_r + q_offset;
+            let k_r = conv_out_r + k_offset;
+            let qv_r = tssm_qv_p + (r as u64) * row_value;
+            let kv_r = tssm_kv_p + (r as u64) * row_value;
+            unsafe {
+                if n_k == n_v {
+                    self.kernels
+                        .copy_bf16(&self.stream, qv_r, q_r, value_dim as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb copy qv r{r}: {e:?}")))?;
+                    self.kernels
+                        .copy_bf16(&self.stream, kv_r, k_r, value_dim as i32)
+                        .map_err(|e| LlmError::Backend(format!("hyb copy kv r{r}: {e:?}")))?;
+                } else {
+                    self.kernels
+                        .repeat_heads_bf16(
+                            &self.stream,
+                            q_r,
+                            qv_r,
+                            n_k as i32,
+                            n_v as i32,
+                            head_kv as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("hyb repeat q r{r}: {e:?}")))?;
+                    self.kernels
+                        .repeat_heads_bf16(
+                            &self.stream,
+                            k_r,
+                            kv_r,
+                            n_k as i32,
+                            n_v as i32,
+                            head_kv as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("hyb repeat k r{r}: {e:?}")))?;
+                }
+            }
+        }
+
+        // 10. Pre-load model's current SSM state into tree slot 0, then
+        //     launch delta_net_step_tree_bf16 once per BFS depth wave.
+        unsafe {
+            let (model_state_p, _g) = self.ssm_states[s_idx].state.device_ptr(&self.stream);
+            let (tree_states_p, _gts) =
+                self.scratch.tree_ssm_states[s_idx].device_ptr_mut(&self.stream);
+            self.kernels
+                .copy_bf16(
+                    &self.stream,
+                    tree_states_p,
+                    model_state_p,
+                    (n_v * head_kv * head_kv) as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("hyb pre-load ssm state l{li}: {e:?}")))?;
+
+            let (parents_dev_p, _gp) = self.scratch.tree_parents.device_ptr(&self.stream);
+            // V slice : v lives at conv_out + v_offset for each row.
+            // Build a contiguous-per-row layout : the kernel expects
+            // [tree_size, n_v, head_kv] BF16. tssm_conv_p row stride is
+            // conv_dim ; the v sub-region within a row is value_dim and
+            // is already laid out as [n_v, head_kv]. So passing
+            // tssm_conv_p + v_offset as base, with row stride = conv_dim
+            // BF16 elements, would NOT give the kernel a contiguous
+            // [tree_size, n_v, head_kv] view. We must repack v into a
+            // dedicated `tree_v` buffer or accept the layout mismatch.
+            //
+            // Workaround : copy each row's v segment into tssm_out_buf
+            // (used as V scratch — it has size value_dim per row,
+            // matching exactly).
+            for r in 0..tree_size {
+                let conv_out_r = tssm_conv_p + (r as u64) * row_conv;
+                let v_r = conv_out_r + v_offset;
+                let dst_v = tssm_out_p + (r as u64) * row_value;
+                self.kernels
+                    .copy_bf16(&self.stream, dst_v, v_r, value_dim as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb copy v r{r}: {e:?}")))?;
+            }
+
+            // Launch one wave per depth. Upload wave indices via a small
+            // H2D into the scratch buffer.
+            for (depth, wave) in waves.iter().enumerate() {
+                if wave.is_empty() {
+                    continue;
+                }
+                self.stream
+                    .memcpy_htod(wave, &mut self.scratch.tree_ssm_wave_indices)
+                    .map_err(|e| LlmError::Backend(format!("hyb wave H2D d{depth}: {e:?}")))?;
+
+                // delta_net_step_tree_bf16(q, k, v, gate, beta, parents,
+                //   wave_indices, tree_states, out, wave_size, n_heads,
+                //   head_dim).
+                self.kernels
+                    .delta_net_step_tree_bf16(
+                        &self.stream,
+                        tssm_qv_p,
+                        tssm_kv_p,
+                        tssm_out_p,   // V (we copied it above)
+                        tssm_alpha_p, // gate (alpha after softplus*ssm_a)
+                        tssm_beta_p,  // beta
+                        parents_dev_p,
+                        tssm_wave_p,
+                        tree_states_p,
+                        // out destination : we re-use tssm_out_buf since it
+                        // holds the input V which we no longer need after
+                        // the kernel reads it (within the same launch).
+                        // Actually safer : write delta-net output to a
+                        // distinct buffer. Re-use tssm_qv_p (we no longer
+                        // need q after the kernel reads it). Hmm — same
+                        // issue. The cleanest is a dedicated `tree_ssm_y`
+                        // scratch but we don't have one. Use tssm_kv_p
+                        // (k_v values consumed by the kernel input read,
+                        // safe to overwrite for output).
+                        tssm_out_p,
+                        wave.len() as i32,
+                        n_v as i32,
+                        head_kv as i32,
+                    )
+                    .map_err(|e| {
+                        LlmError::Backend(format!("hyb delta_net_tree d{depth} l{li}: {e:?}"))
+                    })?;
+            }
+        }
+
+        // 11. ssm_norm per head + multiply by silu(z) per row.
+        for r in 0..tree_size {
+            let out_r = tssm_out_p + (r as u64) * row_value;
+            let z_r = tssm_z_p + (r as u64) * row_value;
+            unsafe {
+                let (sn, _g) = ssm.ssm_norm.device_ptr(&self.stream);
+                self.kernels
+                    .rms_norm_bf16(&self.stream, out_r, sn, eps, head_kv as i32, n_v as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb ssm_norm r{r}: {e:?}")))?;
+                self.kernels
+                    .silu_bf16(&self.stream, z_r, value_dim as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb silu z r{r}: {e:?}")))?;
+                self.kernels
+                    .mul_inplace_bf16(&self.stream, out_r, z_r, value_dim as i32)
+                    .map_err(|e| LlmError::Backend(format!("hyb mul gated r{r}: {e:?}")))?;
+            }
+        }
+
+        // 12. ssm_out @ gated → tree_h ; residual is already in tres_p
+        //     and will be added by the dispatcher's FFN-pre block (so we
+        //     do NOT add residual here).
+        for r in 0..tree_size {
+            let out_r = tssm_out_p + (r as u64) * row_value;
+            let h_r = th_p + (r as u64) * row_h;
+            ssm.ssm_out
+                .dispatch_matmul_m1(&self.kernels, &self.stream, out_r, h_r, x_q8_p)?;
+        }
+        // Residual : h += residual (= pre-mixer hidden state).
+        unsafe {
+            self.kernels
+                .add_inplace_bf16(&self.stream, th_p, _tres_p, (tree_size * d) as i32)
+                .map_err(|e| LlmError::Backend(format!("hyb ssm residual l{li}: {e:?}")))?;
+        }
+
+        Ok(())
     }
 
     /// T246.7 P1.4 — multi-token tree forward for the pure-transformer

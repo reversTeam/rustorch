@@ -135,3 +135,9 @@ path = "examples/lookahead_pool_microbench.rs"
 name = "qwen2_lookahead_bench"
 path = "examples/qwen2_lookahead_bench.rs"
 required-features = ["cuda"]
+
+# T246.7 TrackC.3 — hybrid (SSM+Attn) decode_step_tree smoke test (Qwen3.6).
+[[example]]
+name = "qwen36_hybrid_tree_smoke"
+path = "examples/qwen36_hybrid_tree_smoke.rs"
+required-features = ["cuda"]
