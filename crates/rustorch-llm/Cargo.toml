@@ -97,3 +97,8 @@ path = "examples/qwen35_cpu_inference.rs"
 name = "qwen_q4k_bench"
 path = "examples/qwen_q4k_bench.rs"
 required-features = ["cuda"]
+
+[[example]]
+name = "qwen36_cuda_load_test"
+path = "examples/qwen36_cuda_load_test.rs"
+required-features = ["cuda"]

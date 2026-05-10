@@ -25,9 +25,15 @@ use rustorch_gguf::tensor::GgmlType;
 use std::path::Path;
 use std::sync::Arc;
 
-/// One quantized matmul weight on GPU. Qwen3.6 Q4_K_M uses a mix of Q4_K /
-/// Q5_K / Q6_K (per llama.cpp's quantization rules).
+/// One matmul weight on GPU. Qwen3.6 Q4_K_M uses a mix of Q4_K / Q5_K /
+/// Q6_K for big matmuls and F32 (→ BF16) for small ones (ssm_alpha, ssm_beta
+/// when n_v_heads is small : n=48 typical, K=hidden_size, ≈1 MB each).
 pub(crate) enum QuantTensor {
+    Bf16 {
+        weights: CudaSlice<half::bf16>,
+        n: usize,
+        k: usize,
+    },
     Q4K {
         bytes: CudaSlice<u8>,
         n: usize, // out dim (rows)
@@ -57,6 +63,12 @@ impl QuantTensor {
         unsafe {
             use cudarc::driver::DevicePtr;
             match self {
+                QuantTensor::Bf16 { weights, n, k } => {
+                    let (w, _g) = weights.device_ptr(stream);
+                    kernels
+                        .sgemv_bf16_bf16(stream, w, x, y, *n as i32, *k as i32)
+                        .map_err(|e| LlmError::Backend(format!("sgemv_bf16: {e:?}")))
+                },
                 QuantTensor::Q4K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);
                     kernels
@@ -92,6 +104,9 @@ impl QuantTensor {
         unsafe {
             use cudarc::driver::DevicePtr;
             match self {
+                QuantTensor::Bf16 { .. } => Err(LlmError::Backend(
+                    "BF16 M=8 batched not yet implemented (T246.5)".into(),
+                )),
                 QuantTensor::Q4K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);
                     kernels
@@ -116,6 +131,7 @@ impl QuantTensor {
 
     pub(crate) fn shape(&self) -> (usize, usize) {
         match self {
+            QuantTensor::Bf16 { n, k, .. } => (*n, *k),
             QuantTensor::Q4K { n, k, .. } => (*n, *k),
             QuantTensor::Q5K { n, k, .. } => (*n, *k),
             QuantTensor::Q6K { n, k, .. } => (*n, *k),
@@ -257,15 +273,39 @@ impl Qwen35ModelCudaQ4K {
             let bytes = file.tensor_bytes(info);
             let n = info.shape[1] as usize;
             let k = info.shape[0] as usize;
-            let dev = stream
-                .memcpy_stod(bytes)
-                .map_err(|e| LlmError::Backend(format!("upload {name}: {e:?}")))?;
             match info.dtype {
-                GgmlType::Q4_K => Ok(QuantTensor::Q4K { bytes: dev, n, k }),
-                GgmlType::Q5_K => Ok(QuantTensor::Q5K { bytes: dev, n, k }),
-                GgmlType::Q6_K => Ok(QuantTensor::Q6K { bytes: dev, n, k }),
+                GgmlType::Q4_K => {
+                    let dev = stream
+                        .memcpy_stod(bytes)
+                        .map_err(|e| LlmError::Backend(format!("upload {name}: {e:?}")))?;
+                    Ok(QuantTensor::Q4K { bytes: dev, n, k })
+                },
+                GgmlType::Q5_K => {
+                    let dev = stream
+                        .memcpy_stod(bytes)
+                        .map_err(|e| LlmError::Backend(format!("upload {name}: {e:?}")))?;
+                    Ok(QuantTensor::Q5K { bytes: dev, n, k })
+                },
+                GgmlType::Q6_K => {
+                    let dev = stream
+                        .memcpy_stod(bytes)
+                        .map_err(|e| LlmError::Backend(format!("upload {name}: {e:?}")))?;
+                    Ok(QuantTensor::Q6K { bytes: dev, n, k })
+                },
+                // F32 fallback : small tensors (typically ssm_alpha, ssm_beta with
+                // n=48 — only ~1 MB each). Dequant to BF16, dispatch via sgemv_bf16.
+                GgmlType::F32 => {
+                    let f32_buf = rustorch_gguf::dequant::dequant_to_f32(info, bytes)
+                        .map_err(|e| LlmError::Backend(format!("dequant F32 {name}: {e:?}")))?;
+                    let bf: Vec<half::bf16> =
+                        f32_buf.iter().copied().map(half::bf16::from_f32).collect();
+                    let dev = stream
+                        .memcpy_stod(&bf)
+                        .map_err(|e| LlmError::Backend(format!("upload {name}: {e:?}")))?;
+                    Ok(QuantTensor::Bf16 { weights: dev, n, k })
+                },
                 other => Err(LlmError::Backend(format!(
-                    "unsupported dtype {other:?} for {name} — only Q4_K/Q5_K/Q6_K supported in matmul path"
+                    "unsupported dtype {other:?} for {name} — only Q4_K/Q5_K/Q6_K/F32 supported"
                 ))),
             }
         };
