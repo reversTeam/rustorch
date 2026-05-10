@@ -2875,6 +2875,556 @@ __global__ void sgemv_q5k_bf16_v3(
 }
 "#;
 
+// ─────────────────────────────────────────────────────────────────────────
+// T246.8 A2.1 — INDEXED SGEMV variants for MoE FFN (Qwen3.6-35B-A3B).
+//
+// Each kernel below mirrors the body of its non-indexed v3 counterpart but
+// adds a tiny prologue : it reads `topk_indices[slot]` from device memory
+// and uses it to fetch the per-expert weight base pointer from a
+// device-resident `expert_ptrs[]` array. This eliminates the host-side
+// `memcpy_dtov(topk_idx_slice)` that previously preceded the per-expert
+// matmul dispatch loop, removing ~150 host syncs per MoE token and
+// allowing the entire decode body to be captured by a CUDA Graph.
+//
+// Layout of `expert_ptrs` (host-build, device-resident `CudaSlice<u64>`):
+//   expert_ptrs[e] = device pointer (as u64) to expert e's weight base.
+//   This is built once at load_ffn time, never modified per-step.
+//
+// Note : Q4_K dp4a path needs both the indexed-w prologue AND the host-
+// supplied x_q8_1 (no per-expert variation in x_q8_1 since x is shared).
+// ─────────────────────────────────────────────────────────────────────────
+
+// Indexed Q4_K v3 — same body as SGEMV_Q4K_BF16_V3_SRC, but the weight
+// pointer is fetched from `expert_ptrs[topk_indices[slot]]` on device.
+#[cfg(feature = "cuda")]
+const SGEMV_Q4K_BF16_V3_INDEXED_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(128, 8)
+__global__ void sgemv_q4k_bf16_v3_indexed(
+    const unsigned long long* __restrict__ expert_ptrs,  // [n_experts] u64
+    const int*                __restrict__ topk_indices, // [k] device i32
+    int slot,                                            // 0..k-1 (host const)
+    const __nv_bfloat16*      __restrict__ x,
+    __nv_bfloat16*            __restrict__ y,
+    int N,
+    int K
+) {
+    int e_idx = topk_indices[slot];
+    const unsigned char* w_q4k = (const unsigned char*)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 144;
+
+    int group     = lane >> 3;
+    int pos_base  = (lane & 7) << 2;
+    int byte_base = (group << 5) + pos_base;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 144;
+        const unsigned char* blk = w_q4k + blk_off;
+
+        unsigned short d_bits    = blk[0] | (blk[1] << 8);
+        unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_bits));
+        float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+        const unsigned char* scales = blk + 4;
+        int sub_a = group * 2;
+        int sub_b = sub_a + 1;
+        unsigned char sc_a, m_a, sc_b, m_b;
+        if (sub_a < 4) {
+            sc_a = scales[sub_a]     & 0x3F;
+            m_a  = scales[sub_a + 4] & 0x3F;
+        } else {
+            int ga = sub_a - 4;
+            sc_a = (scales[ga + 8] & 0x0F) | ((scales[ga]     >> 6) << 4);
+            m_a  = (scales[ga + 8] >> 4)   | ((scales[ga + 4] >> 6) << 4);
+        }
+        if (sub_b < 4) {
+            sc_b = scales[sub_b]     & 0x3F;
+            m_b  = scales[sub_b + 4] & 0x3F;
+        } else {
+            int gb = sub_b - 4;
+            sc_b = (scales[gb + 8] & 0x0F) | ((scales[gb]     >> 6) << 4);
+            m_b  = (scales[gb + 8] >> 4)   | ((scales[gb + 4] >> 6) << 4);
+        }
+        float scale_a = d    * (float)sc_a;
+        float min_a   = dmin * (float)m_a;
+        float scale_b = d    * (float)sc_b;
+        float min_b   = dmin * (float)m_b;
+
+        const unsigned char* qs = blk + 16;
+        unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
+
+        const __nv_bfloat16* xa_ptr = x + b * 256 + sub_a * 32 + pos_base;
+        const __nv_bfloat16* xb_ptr = x + b * 256 + sub_b * 32 + pos_base;
+        uint2 xa = *(const uint2*)xa_ptr;
+        uint2 xb = *(const uint2*)xb_ptr;
+        float xa0 = (float)__ushort_as_bfloat16((unsigned short)(xa.x & 0xFFFFu));
+        float xa1 = (float)__ushort_as_bfloat16((unsigned short)(xa.x >> 16));
+        float xa2 = (float)__ushort_as_bfloat16((unsigned short)(xa.y & 0xFFFFu));
+        float xa3 = (float)__ushort_as_bfloat16((unsigned short)(xa.y >> 16));
+        float xb0 = (float)__ushort_as_bfloat16((unsigned short)(xb.x & 0xFFFFu));
+        float xb1 = (float)__ushort_as_bfloat16((unsigned short)(xb.x >> 16));
+        float xb2 = (float)__ushort_as_bfloat16((unsigned short)(xb.y & 0xFFFFu));
+        float xb3 = (float)__ushort_as_bfloat16((unsigned short)(xb.y >> 16));
+
+        unsigned char by0 = (qbytes      ) & 0xFFu;
+        unsigned char by1 = (qbytes >>  8) & 0xFFu;
+        unsigned char by2 = (qbytes >> 16) & 0xFFu;
+        unsigned char by3 = (qbytes >> 24) & 0xFFu;
+        int na0 = by0 & 0x0F, na1 = by1 & 0x0F, na2 = by2 & 0x0F, na3 = by3 & 0x0F;
+        int nb0 = by0 >>   4, nb1 = by1 >>   4, nb2 = by2 >>   4, nb3 = by3 >>   4;
+
+        acc += (scale_a * (float)na0 - min_a) * xa0;
+        acc += (scale_a * (float)na1 - min_a) * xa1;
+        acc += (scale_a * (float)na2 - min_a) * xa2;
+        acc += (scale_a * (float)na3 - min_a) * xa3;
+        acc += (scale_b * (float)nb0 - min_b) * xb0;
+        acc += (scale_b * (float)nb1 - min_b) * xb1;
+        acc += (scale_b * (float)nb2 - min_b) * xb2;
+        acc += (scale_b * (float)nb3 - min_b) * xb3;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        y[row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+// Indexed Q4_K dp4a — same body as SGEMV_Q4K_Q8_1_DP4A_BF16_SRC, but the
+// weight pointer is fetched from `expert_ptrs[topk_indices[slot]]`. The
+// activation x_q8_1 is shared across all experts (no per-expert variation).
+#[cfg(feature = "cuda")]
+const SGEMV_Q4K_Q8_1_DP4A_BF16_INDEXED_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemv_q4k_q8_1_dp4a_bf16_indexed(
+    const unsigned long long* __restrict__ expert_ptrs,  // [n_experts] u64
+    const int*                __restrict__ topk_indices, // [k] device i32
+    int slot,                                            // host const
+    const unsigned char*      __restrict__ x_q8_1,
+    __nv_bfloat16*            __restrict__ y,
+    int N,
+    int K
+) {
+    int e_idx = topk_indices[slot];
+    const unsigned char* w_q4k = (const unsigned char*)expert_ptrs[e_idx];
+
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+
+    int blocks_per_row = K / 256;
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += 32) {
+        const unsigned char* blk = w_q4k + (row * blocks_per_row + b) * 144;
+
+        float d    = __half2float(*(const __half*)(blk + 0));
+        float dmin = __half2float(*(const __half*)(blk + 2));
+
+        const unsigned char* sr = blk + 4;
+        unsigned char sc[8], m[8];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sc[i]     = sr[i]     & 0x3F;
+            m[i]      = sr[i + 4] & 0x3F;
+            sc[i + 4] = (sr[i + 8] & 0x0F) | ((sr[i]     >> 6) << 4);
+            m[i  + 4] = (sr[i + 8] >>   4) | ((sr[i + 4] >> 6) << 4);
+        }
+
+        const unsigned char* qs = blk + 16;
+
+        #pragma unroll
+        for (int bp = 0; bp < 4; ++bp) {
+            int bq8_offset = 2 * bp;
+            #pragma unroll
+            for (int qc = 0; qc < 4; ++qc) {
+                int v0 = *(const int*)(qs + 32 * bp +  4 * qc);
+                int v1 = *(const int*)(qs + 32 * bp + 16 + 4 * qc);
+
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    unsigned int v0i = (v0 >> (4 * i)) & 0x0F0F0F0Fu;
+                    unsigned int v1i = (v1 >> (4 * i)) & 0x0F0F0F0Fu;
+
+                    int sb_idx = b * 8 + bq8_offset + i;
+                    const unsigned char* x_blk = x_q8_1 + sb_idx * 36;
+                    float xd = __half2float(*(const __half*)x_blk);
+
+                    int u0 = *(const int*)(x_blk + 4      + 4 * qc);
+                    int u1 = *(const int*)(x_blk + 4 + 16 + 4 * qc);
+
+                    int dot1 = __dp4a((int)v1i, u1, __dp4a((int)v0i, u0, 0));
+                    int dot2 = __dp4a((int)0x01010101u, u1,
+                               __dp4a((int)0x01010101u, u0, 0));
+
+                    acc += d    * xd * (float)(dot1 * (int)sc[bq8_offset + i])
+                         - dmin * xd * (float)(dot2 * (int)m [bq8_offset + i]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, o);
+    }
+
+    if (tid == 0) {
+        y[row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+// Indexed Q5_K v3 — same body as SGEMV_Q5K_BF16_V3_SRC, with indexed-w prologue.
+#[cfg(feature = "cuda")]
+const SGEMV_Q5K_BF16_V3_INDEXED_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(128, 8)
+__global__ void sgemv_q5k_bf16_v3_indexed(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices,
+    int slot,
+    const __nv_bfloat16*      __restrict__ x,
+    __nv_bfloat16*            __restrict__ y,
+    int N,
+    int K
+) {
+    int e_idx = topk_indices[slot];
+    const unsigned char* w_q5k = (const unsigned char*)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 176;
+
+    int group     = lane >> 3;
+    int pos_base  = (lane & 7) << 2;
+    int byte_base = (group << 5) + pos_base;
+    unsigned int qh_mask_a = 1u << (2 * group);
+    unsigned int qh_mask_b = 1u << (2 * group + 1);
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 176;
+        const unsigned char* blk = w_q5k + blk_off;
+
+        unsigned short d_bits    = blk[0] | (blk[1] << 8);
+        unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_bits));
+        float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+        const unsigned char* scales = blk + 4;
+        int sub_a = group * 2;
+        int sub_b = sub_a + 1;
+        unsigned char sc_a, m_a, sc_b, m_b;
+        if (sub_a < 4) {
+            sc_a = scales[sub_a]     & 0x3F;
+            m_a  = scales[sub_a + 4] & 0x3F;
+        } else {
+            int ga = sub_a - 4;
+            sc_a = (scales[ga + 8] & 0x0F) | ((scales[ga]     >> 6) << 4);
+            m_a  = (scales[ga + 8] >> 4)   | ((scales[ga + 4] >> 6) << 4);
+        }
+        if (sub_b < 4) {
+            sc_b = scales[sub_b]     & 0x3F;
+            m_b  = scales[sub_b + 4] & 0x3F;
+        } else {
+            int gb = sub_b - 4;
+            sc_b = (scales[gb + 8] & 0x0F) | ((scales[gb]     >> 6) << 4);
+            m_b  = (scales[gb + 8] >> 4)   | ((scales[gb + 4] >> 6) << 4);
+        }
+        float scale_a = d    * (float)sc_a;
+        float min_a   = dmin * (float)m_a;
+        float scale_b = d    * (float)sc_b;
+        float min_b   = dmin * (float)m_b;
+
+        const unsigned char* qh = blk + 16;
+        const unsigned char* ql = blk + 16 + 32;
+
+        unsigned int qlbytes = *(const unsigned int*)(ql + byte_base);
+        unsigned int qhbytes = *(const unsigned int*)(qh + pos_base);
+
+        const __nv_bfloat16* xa_ptr = x + b * 256 + sub_a * 32 + pos_base;
+        const __nv_bfloat16* xb_ptr = x + b * 256 + sub_b * 32 + pos_base;
+        uint2 xa = *(const uint2*)xa_ptr;
+        uint2 xb = *(const uint2*)xb_ptr;
+        float xa0 = (float)__ushort_as_bfloat16((unsigned short)(xa.x & 0xFFFFu));
+        float xa1 = (float)__ushort_as_bfloat16((unsigned short)(xa.x >> 16));
+        float xa2 = (float)__ushort_as_bfloat16((unsigned short)(xa.y & 0xFFFFu));
+        float xa3 = (float)__ushort_as_bfloat16((unsigned short)(xa.y >> 16));
+        float xb0 = (float)__ushort_as_bfloat16((unsigned short)(xb.x & 0xFFFFu));
+        float xb1 = (float)__ushort_as_bfloat16((unsigned short)(xb.x >> 16));
+        float xb2 = (float)__ushort_as_bfloat16((unsigned short)(xb.y & 0xFFFFu));
+        float xb3 = (float)__ushort_as_bfloat16((unsigned short)(xb.y >> 16));
+
+        unsigned char qb0 = (qlbytes      ) & 0xFFu;
+        unsigned char qb1 = (qlbytes >>  8) & 0xFFu;
+        unsigned char qb2 = (qlbytes >> 16) & 0xFFu;
+        unsigned char qb3 = (qlbytes >> 24) & 0xFFu;
+        unsigned char hb0 = (qhbytes      ) & 0xFFu;
+        unsigned char hb1 = (qhbytes >>  8) & 0xFFu;
+        unsigned char hb2 = (qhbytes >> 16) & 0xFFu;
+        unsigned char hb3 = (qhbytes >> 24) & 0xFFu;
+
+        int qa0 = (qb0 & 0x0F) + ((hb0 & qh_mask_a) ? 16 : 0);
+        int qa1 = (qb1 & 0x0F) + ((hb1 & qh_mask_a) ? 16 : 0);
+        int qa2 = (qb2 & 0x0F) + ((hb2 & qh_mask_a) ? 16 : 0);
+        int qa3 = (qb3 & 0x0F) + ((hb3 & qh_mask_a) ? 16 : 0);
+        int qbq0 = (qb0 >>   4) + ((hb0 & qh_mask_b) ? 16 : 0);
+        int qbq1 = (qb1 >>   4) + ((hb1 & qh_mask_b) ? 16 : 0);
+        int qbq2 = (qb2 >>   4) + ((hb2 & qh_mask_b) ? 16 : 0);
+        int qbq3 = (qb3 >>   4) + ((hb3 & qh_mask_b) ? 16 : 0);
+
+        acc += (scale_a * (float)qa0  - min_a) * xa0;
+        acc += (scale_a * (float)qa1  - min_a) * xa1;
+        acc += (scale_a * (float)qa2  - min_a) * xa2;
+        acc += (scale_a * (float)qa3  - min_a) * xa3;
+        acc += (scale_b * (float)qbq0 - min_b) * xb0;
+        acc += (scale_b * (float)qbq1 - min_b) * xb1;
+        acc += (scale_b * (float)qbq2 - min_b) * xb2;
+        acc += (scale_b * (float)qbq3 - min_b) * xb3;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        y[row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+// Indexed Q6_K v3 — same body as SGEMV_Q6K_BF16_V3_SRC, with indexed-w prologue.
+#[cfg(feature = "cuda")]
+const SGEMV_Q6K_BF16_V3_INDEXED_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(128, 8)
+__global__ void sgemv_q6k_bf16_v3_indexed(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices,
+    int slot,
+    const __nv_bfloat16*      __restrict__ x,
+    __nv_bfloat16*            __restrict__ y,
+    int N,
+    int K
+) {
+    int e_idx = topk_indices[slot];
+    const unsigned char* w_q6k = (const unsigned char*)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 210;
+    int l16            = lane >> 4;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 210;
+        const unsigned char* blk = w_q6k + blk_off;
+
+        unsigned short d_bits = blk[208] | (blk[209] << 8);
+        float d = __half2float(__ushort_as_half(d_bits));
+
+        const signed char* scales = (const signed char*)(blk + 192);
+        float sc0_a = d * (float)scales[0 + l16];
+        float sc2_a = d * (float)scales[2 + l16];
+        float sc4_a = d * (float)scales[4 + l16];
+        float sc6_a = d * (float)scales[6 + l16];
+        float sc0_b = d * (float)scales[8 + l16];
+        float sc2_b = d * (float)scales[10 + l16];
+        float sc4_b = d * (float)scales[12 + l16];
+        float sc6_b = d * (float)scales[14 + l16];
+
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+
+        unsigned char ql_a0 = ql[0 + lane];
+        unsigned char ql_b0 = ql[0 + lane + 32];
+        unsigned char qh_0  = qh[0 + lane];
+        int q0a = (ql_a0 & 0x0F) | (((qh_0)      & 0x03) << 4);
+        int q1a = (ql_b0 & 0x0F) | (((qh_0 >> 2) & 0x03) << 4);
+        int q2a = (ql_a0 >> 4)   | (((qh_0 >> 4) & 0x03) << 4);
+        int q3a = (ql_b0 >> 4)   | (((qh_0 >> 6) & 0x03) << 4);
+
+        const __nv_bfloat16* x_ptr_a = x + b * 256 + 0;
+        float x0a = (float)x_ptr_a[lane];
+        float x1a = (float)x_ptr_a[lane + 32];
+        float x2a = (float)x_ptr_a[lane + 64];
+        float x3a = (float)x_ptr_a[lane + 96];
+
+        acc += sc0_a * (float)(q0a - 32) * x0a;
+        acc += sc2_a * (float)(q1a - 32) * x1a;
+        acc += sc4_a * (float)(q2a - 32) * x2a;
+        acc += sc6_a * (float)(q3a - 32) * x3a;
+
+        unsigned char ql_a1 = ql[64 + lane];
+        unsigned char ql_b1 = ql[64 + lane + 32];
+        unsigned char qh_1  = qh[32 + lane];
+        int q0b = (ql_a1 & 0x0F) | (((qh_1)      & 0x03) << 4);
+        int q1b = (ql_b1 & 0x0F) | (((qh_1 >> 2) & 0x03) << 4);
+        int q2b = (ql_a1 >> 4)   | (((qh_1 >> 4) & 0x03) << 4);
+        int q3b = (ql_b1 >> 4)   | (((qh_1 >> 6) & 0x03) << 4);
+
+        const __nv_bfloat16* x_ptr_b = x + b * 256 + 128;
+        float x0b = (float)x_ptr_b[lane];
+        float x1b = (float)x_ptr_b[lane + 32];
+        float x2b = (float)x_ptr_b[lane + 64];
+        float x3b = (float)x_ptr_b[lane + 96];
+
+        acc += sc0_b * (float)(q0b - 32) * x0b;
+        acc += sc2_b * (float)(q1b - 32) * x1b;
+        acc += sc4_b * (float)(q2b - 32) * x2b;
+        acc += sc6_b * (float)(q3b - 32) * x3b;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        y[row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+// Indexed BF16 sgemv — same body as SGEMV_BF16_BF16_SRC, with indexed-w prologue.
+#[cfg(feature = "cuda")]
+const SGEMV_BF16_BF16_INDEXED_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void sgemv_bf16_bf16_indexed(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices,
+    int slot,
+    const __nv_bfloat16*      __restrict__ x,
+    __nv_bfloat16*            __restrict__ y,
+    int N,
+    int K
+) {
+    int e_idx = topk_indices[slot];
+    const __nv_bfloat16* w = (const __nv_bfloat16*)expert_ptrs[e_idx];
+
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+
+    extern __shared__ float shmem[];
+
+    float acc = 0.0f;
+    int blocks_per_row = K / 256;
+    int pos_base = tid * 4;
+    int row_offset = row * K;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int k_off = b * 256 + pos_base;
+        const __nv_bfloat16* w_ptr = w + row_offset + k_off;
+        const __nv_bfloat16* x_ptr = x + k_off;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float wv = (float)w_ptr[i];
+            float xv = (float)x_ptr[i];
+            acc += wv * xv;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    if (lane_id == 0) {
+        shmem[warp_id] = acc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float total = shmem[0] + shmem[1];
+        y[row] = (__nv_bfloat16)total;
+    }
+}
+"#;
+
+// T246.8 A2.1 — `y[i] += alpha_dev[slot] * x[i]` where alpha_dev is a
+// device-resident bf16 vector and `slot` is a host-side index. Used to
+// accumulate routed-expert outputs scaled by topk_w[slot] without ever
+// reading the topk weights back to host. For the shared-expert sigmoid
+// path : caller passes `slot=0` and a 1-element alpha_dev that holds the
+// post-sigmoid weight (computed on device by sigmoid_inplace_bf16).
+#[cfg(feature = "cuda")]
+const SCALED_ADD_INPLACE_BF16_DEVSCALAR_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void scaled_add_inplace_bf16_devscalar(
+    __nv_bfloat16*       __restrict__ y,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ alpha_dev,
+    int slot,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float alpha = (float)alpha_dev[slot];
+    float yi = (float)y[i];
+    float xi = (float)x[i];
+    y[i] = (__nv_bfloat16)(yi + alpha * xi);
+}
+"#;
+
+// T246.8 A2.1 — zero a BF16 vector (n elements). Replaces the
+// `scaled_add_inplace_bf16(y, y, -1, n)` trick used to zero h_p in MoE
+// FFN start ; the trick has a benign data race that's fine but we want
+// a clean primitive when capturing CUDA Graphs (the alias-self pattern
+// is OK for graphs but reads cleaner).
+#[cfg(feature = "cuda")]
+const ZERO_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void zero_bf16(
+    __nv_bfloat16* __restrict__ y,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = (__nv_bfloat16)0.0f;
+}
+"#;
+
 // T244.3 — sgemv_q5k_bf16 — direct Q5_K matmul (Qwen 3.6 needs this:
 // 12% of weights are Q5_K, 76% Q4_K, 12% Q6_K).
 //
@@ -4091,6 +4641,14 @@ pub struct LlmKernels {
     // T246.8 A1 — fused SSM block element-wise mega-kernels
     ssm_pre_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     ssm_post_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.8 A2 — indexed MoE FFN dispatch kernels (device-side expert lookup)
+    sgemv_q4k_v3_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemv_q4k_q8_1_dp4a_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemv_q5k_v3_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemv_q6k_v3_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemv_bf16_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    scaled_add_inplace_devscalar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    zero_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -4163,6 +4721,14 @@ impl LlmKernels {
             // T246.8 A1 — fused SSM mega-kernels
             ssm_pre_step: std::sync::OnceLock::new(),
             ssm_post_step: std::sync::OnceLock::new(),
+            // T246.8 A2 — indexed MoE FFN dispatch kernels
+            sgemv_q4k_v3_indexed: std::sync::OnceLock::new(),
+            sgemv_q4k_q8_1_dp4a_indexed: std::sync::OnceLock::new(),
+            sgemv_q5k_v3_indexed: std::sync::OnceLock::new(),
+            sgemv_q6k_v3_indexed: std::sync::OnceLock::new(),
+            sgemv_bf16_indexed: std::sync::OnceLock::new(),
+            scaled_add_inplace_devscalar: std::sync::OnceLock::new(),
+            zero_bf16: std::sync::OnceLock::new(),
         }
     }
 
@@ -6635,6 +7201,307 @@ impl LlmKernels {
         })?;
         Ok(())
     }
+
+    // ─── T246.8 A2 — INDEXED MoE FFN dispatch wrappers ───────────────────
+
+    /// Indexed Q4_K v3 SGEMV : `y = expert_ptrs[topk_indices[slot]] @ x`.
+    /// `expert_ptrs` is a device-resident `[n_experts]` array of `u64`
+    /// pointers to per-expert Q4_K weight buffers ; `topk_indices` is a
+    /// device-resident `[k]` array (output of `topk_softmax_bf16`).
+    ///
+    /// # Safety  `expert_ptrs[i]` must point to a Q4_K block of `(K/256)*144`
+    /// bytes. `topk_indices[slot] ∈ [0, n_experts)`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sgemv_q4k_bf16_v3_indexed(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        slot: i32,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q4k_bf16_v3_indexed: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q4k_v3_indexed,
+            SGEMV_Q4K_BF16_V3_INDEXED_SRC,
+            "sgemv_q4k_bf16_v3_indexed",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&slot)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q4k_bf16_v3_indexed::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Indexed Q4_K dp4a SGEMV : `y = expert_ptrs[topk_indices[slot]] @ x_q8_1`.
+    ///
+    /// # Safety  Same as `sgemv_q4k_bf16_v3_indexed` for `expert_ptrs` and
+    /// `topk_indices`. `x_q8_1` is the Q8_1-quantized activation row
+    /// (`(K/32)*36` bytes), shared across all experts.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sgemv_q4k_q8_1_dp4a_bf16_indexed(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        slot: i32,
+        x_q8_1: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q4k_q8_1_dp4a_bf16_indexed: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q4k_q8_1_dp4a_indexed,
+            SGEMV_Q4K_Q8_1_DP4A_BF16_INDEXED_SRC,
+            "sgemv_q4k_q8_1_dp4a_bf16_indexed",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&slot)
+            .arg(&x_q8_1)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q4k_q8_1_dp4a_bf16_indexed::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Indexed Q5_K v3 SGEMV. # Safety same as Q4_K indexed (Q5_K layout
+    /// = `(K/256)*176` bytes per expert).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sgemv_q5k_bf16_v3_indexed(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        slot: i32,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q5k_bf16_v3_indexed: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q5k_v3_indexed,
+            SGEMV_Q5K_BF16_V3_INDEXED_SRC,
+            "sgemv_q5k_bf16_v3_indexed",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&slot)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q5k_bf16_v3_indexed::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Indexed Q6_K v3 SGEMV. # Safety same as Q4_K indexed (Q6_K layout
+    /// = `(K/256)*210` bytes per expert).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sgemv_q6k_bf16_v3_indexed(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        slot: i32,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q6k_bf16_v3_indexed: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q6k_v3_indexed,
+            SGEMV_Q6K_BF16_V3_INDEXED_SRC,
+            "sgemv_q6k_bf16_v3_indexed",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&slot)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q6k_bf16_v3_indexed::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Indexed BF16 SGEMV. # Safety  expert weights are `[N, K]` row-major BF16.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sgemv_bf16_bf16_indexed(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        slot: i32,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_bf16_bf16_indexed: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_bf16_indexed,
+            SGEMV_BF16_BF16_INDEXED_SRC,
+            "sgemv_bf16_bf16_indexed",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 64 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&slot)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_bf16_bf16_indexed::launch",
+        })?;
+        Ok(())
+    }
+
+    /// `y[i] += alpha_dev[slot] * x[i]`. `alpha_dev` is a device-resident
+    /// BF16 vector (top-K weights for routed experts, or 1-elem post-sigmoid
+    /// shared-expert weight). Eliminates the host readback that the
+    /// existing `scaled_add_inplace_bf16(alpha: f32)` requires.
+    ///
+    /// # Safety  Same as `scaled_add_inplace_bf16` for y/x/n. `alpha_dev`
+    /// is a device pointer to ≥ `slot+1` BF16 elements.
+    pub unsafe fn scaled_add_inplace_bf16_devscalar(
+        &self,
+        stream: &Arc<CudaStream>,
+        y: u64,
+        x: u64,
+        alpha_dev: u64,
+        slot: i32,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.scaled_add_inplace_devscalar,
+            SCALED_ADD_INPLACE_BF16_DEVSCALAR_SRC,
+            "scaled_add_inplace_bf16_devscalar",
+        )?;
+        let block_dim: u32 = 256;
+        let grid_dim: u32 = (n as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&y).arg(&x).arg(&alpha_dev).arg(&slot).arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "scaled_add_inplace_bf16_devscalar::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Zero a BF16 vector of length `n`. # Safety : `y` is `n` BF16 elements.
+    pub unsafe fn zero_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        y: u64,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(&self.zero_bf16, ZERO_BF16_SRC, "zero_bf16")?;
+        let block_dim: u32 = 256;
+        let grid_dim: u32 = (n as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&y).arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "zero_bf16::launch",
+        })?;
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -7998,6 +8865,208 @@ mod parity_tests {
                 diff,
                 tol
             );
+        }
+    }
+
+    /// T246.8 A2.1 — Indexed Q4_K v3 SGEMV parity vs non-indexed v3.
+    ///
+    /// Build a small "MoE FFN" : 3 experts (Q4_K), each with N=8, K=256.
+    /// Pre-cache device-pointer array, fake topk_indices = [2, 0], slot=0
+    /// then slot=1. Compare against direct call to `sgemv_q4k_bf16_v3` on
+    /// the corresponding expert.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn sgemv_q4k_bf16_v3_indexed_matches_v3() {
+        use cudarc::driver::DevicePtrMut;
+        let n_experts = 3usize;
+        let n = 8usize;
+        let k = 256usize;
+        let row_bytes = (k / 256) * 144;
+        let expert_bytes = n * row_bytes;
+
+        let mut state: u64 = 0xa2_b3_4d_e5;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // Build n_experts independent Q4_K weight blobs.
+        let mut all_w: Vec<Vec<u8>> = Vec::with_capacity(n_experts);
+        for _ in 0..n_experts {
+            let mut w = vec![0u8; expert_bytes];
+            for b in &mut w {
+                *b = (next() & 0xFF) as u8;
+            }
+            for row in 0..n {
+                for blk in 0..(k / 256) {
+                    let off = row * row_bytes + blk * 144;
+                    let d = half::f16::from_f32(0.05).to_le_bytes();
+                    let dmin = half::f16::from_f32(0.025).to_le_bytes();
+                    w[off] = d[0];
+                    w[off + 1] = d[1];
+                    w[off + 2] = dmin[0];
+                    w[off + 3] = dmin[1];
+                    for i in 0..12 {
+                        w[off + 4 + i] &= 0x3F;
+                    }
+                }
+            }
+            all_w.push(w);
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        // Upload each expert independently → collect device base pointers.
+        let mut exp_dev: Vec<cudarc::driver::CudaSlice<u8>> = Vec::new();
+        for w in &all_w {
+            exp_dev.push(stream.memcpy_stod(w).expect("upload expert"));
+        }
+        // Build device-pointer array.
+        let mut ptrs: Vec<u64> = Vec::with_capacity(n_experts);
+        for d in &exp_dev {
+            let (p, _g) = d.device_ptr(&stream);
+            ptrs.push(p);
+        }
+        let ptrs_dev = stream.memcpy_stod(&ptrs).expect("upload ptrs");
+
+        // Activation x.
+        let x_bf: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.01).sin()))
+            .collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+
+        // Top-K indices (slot 0 → expert 2, slot 1 → expert 0).
+        let topk: Vec<i32> = vec![2, 0];
+        let topk_dev = stream.memcpy_stod(&topk).expect("upload topk");
+
+        let mut y_ref = stream.alloc_zeros::<half::bf16>(n).expect("alloc y_ref");
+        let mut y_idx = stream.alloc_zeros::<half::bf16>(n).expect("alloc y_idx");
+
+        for (slot, &e_idx) in topk.iter().enumerate() {
+            // Reference : direct v3 on expert e_idx.
+            unsafe {
+                let (w_p, _g) = exp_dev[e_idx as usize].device_ptr(&stream);
+                let (x_p, _g2) = x_dev.device_ptr(&stream);
+                let (y_p, _g3) = y_ref.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q4k_bf16_v3(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                    .expect("v3");
+            }
+            // Indexed.
+            unsafe {
+                let (pp, _g) = ptrs_dev.device_ptr(&stream);
+                let (tp, _g2) = topk_dev.device_ptr(&stream);
+                let (x_p, _g3) = x_dev.device_ptr(&stream);
+                let (y_p, _g4) = y_idx.device_ptr_mut(&stream);
+                kernels
+                    .sgemv_q4k_bf16_v3_indexed(
+                        &stream,
+                        pp,
+                        tp,
+                        slot as i32,
+                        x_p,
+                        y_p,
+                        n as i32,
+                        k as i32,
+                    )
+                    .expect("v3_indexed");
+            }
+            let r_ref: Vec<half::bf16> = stream.memcpy_dtov(&y_ref).expect("dtov ref");
+            let r_idx: Vec<half::bf16> = stream.memcpy_dtov(&y_idx).expect("dtov idx");
+            for i in 0..n {
+                assert_eq!(
+                    r_ref[i].to_bits(),
+                    r_idx[i].to_bits(),
+                    "slot={slot} (expert {e_idx}) row[{i}] ref={} idx={}",
+                    r_ref[i].to_f32(),
+                    r_idx[i].to_f32(),
+                );
+            }
+        }
+    }
+
+    /// T246.8 A2.1 — `scaled_add_inplace_bf16_devscalar` parity vs the
+    /// existing host-alpha variant.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn scaled_add_inplace_bf16_devscalar_matches_host_alpha() {
+        use cudarc::driver::DevicePtrMut;
+        let n = 1024usize;
+        let alpha = 0.314_f32;
+        let alphas: Vec<half::bf16> = vec![half::bf16::from_f32(0.0), half::bf16::from_f32(alpha)];
+
+        let mut state: u64 = 0xfeed_beef;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (((state >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5
+        };
+        let y_init: Vec<half::bf16> = (0..n).map(|_| half::bf16::from_f32(next())).collect();
+        let x_data: Vec<half::bf16> = (0..n).map(|_| half::bf16::from_f32(next())).collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let alphas_dev = stream.memcpy_stod(&alphas).expect("upload alphas");
+        let x_dev = stream.memcpy_stod(&x_data).expect("upload x");
+
+        let mut y_host_a = stream.memcpy_stod(&y_init).expect("upload y host");
+        let mut y_dev_a = stream.memcpy_stod(&y_init).expect("upload y dev");
+        unsafe {
+            let (xp, _g0) = x_dev.device_ptr(&stream);
+            let (yp_h, _g1) = y_host_a.device_ptr_mut(&stream);
+            kernels
+                .scaled_add_inplace_bf16(&stream, yp_h, xp, alpha, n as i32)
+                .expect("host-alpha");
+
+            let (ap, _g2) = alphas_dev.device_ptr(&stream);
+            let (yp_d, _g3) = y_dev_a.device_ptr_mut(&stream);
+            kernels
+                .scaled_add_inplace_bf16_devscalar(&stream, yp_d, xp, ap, 1, n as i32)
+                .expect("devscalar");
+        }
+
+        let r_h: Vec<half::bf16> = stream.memcpy_dtov(&y_host_a).expect("dtov h");
+        let r_d: Vec<half::bf16> = stream.memcpy_dtov(&y_dev_a).expect("dtov d");
+        for i in 0..n {
+            // BF16 round-tripping the alpha through device storage may flip
+            // ULPs ; allow 1 ULP diff on the result.
+            let h = r_h[i].to_f32();
+            let d = r_d[i].to_f32();
+            let diff = (h - d).abs();
+            assert!(
+                diff <= h.abs() * 1e-2 + 1e-3,
+                "i={i} host={h} dev={d} diff={diff}",
+            );
+        }
+    }
+
+    /// T246.8 A2.1 — `zero_bf16` writes zeros.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn zero_bf16_writes_zeros() {
+        use cudarc::driver::DevicePtrMut;
+        let n = 1024usize;
+        let init: Vec<half::bf16> = (0..n).map(|i| half::bf16::from_f32(i as f32)).collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let mut buf = stream.memcpy_stod(&init).expect("upload");
+        unsafe {
+            let (p, _g) = buf.device_ptr_mut(&stream);
+            kernels.zero_bf16(&stream, p, n as i32).expect("zero");
+        }
+        let r: Vec<half::bf16> = stream.memcpy_dtov(&buf).expect("dtov");
+        for (i, v) in r.iter().enumerate() {
+            assert_eq!(v.to_f32(), 0.0, "i={i} got {}", v.to_f32());
         }
     }
 
