@@ -215,6 +215,23 @@ pub(crate) struct SsmState {
     pub(crate) conv_state: CudaSlice<half::bf16>,
 }
 
+/// Convert a global layer index into its position in `ssm_states` Vec.
+fn get_ssm_layer_idx(cfg: &Qwen35Config, global_li: usize) -> usize {
+    cfg.ssm_indices
+        .iter()
+        .position(|&i| i == global_li)
+        .unwrap_or_else(|| panic!("layer {global_li} not in ssm_indices"))
+}
+
+/// Convert a global layer index into its position in `kv_caches` Vec.
+#[allow(dead_code)]
+fn get_attn_layer_idx(cfg: &Qwen35Config, global_li: usize) -> usize {
+    cfg.attention_indices
+        .iter()
+        .position(|&i| i == global_li)
+        .unwrap_or_else(|| panic!("layer {global_li} not in attention_indices"))
+}
+
 /// CUDA-resident Qwen3.5/3.6 hybrid model with Q4_K_M weights.
 pub struct Qwen35ModelCudaQ4K {
     pub config: Qwen35Config,
@@ -459,12 +476,410 @@ impl Qwen35ModelCudaQ4K {
         Ok(())
     }
 
-    /// Decode one token. **STATUS T246.1** : returns Err. Implementation
-    /// in T246.2 (SSM block), T246.3 (attn block), T246.4 (FFN + sample).
-    pub fn decode_step(&mut self, _token_id: u32) -> Result<u32, LlmError> {
-        Err(LlmError::Backend(
-            "Qwen35ModelCudaQ4K::decode_step not yet implemented (T246.2-4)".into(),
-        ))
+    /// Decode one token. T246.2-4 implementation : full Qwen3.6 forward
+    /// (hybrid SSM + Attention) at M=1, returning next token id.
+    pub fn decode_step(&mut self, token_id: u32) -> Result<u32, LlmError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+        let cfg = self.config.clone();
+        let d = cfg.d;
+        let f = cfg.f;
+        let n_q = cfg.n_q_heads;
+        let n_kv = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim();
+        let q_dim = n_q * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let head_kv = cfg.ssm_state;
+        let n_k = cfg.ssm_groups;
+        let n_v = cfg.ssm_dt_rank;
+        let key_dim = head_kv * n_k;
+        let value_dim = head_kv * n_v;
+        let conv_dim = 2 * key_dim + value_dim;
+        let conv_kernel = cfg.ssm_conv_kernel;
+        let eps = cfg.rms_eps;
+
+        // ---- Allocate per-step scratch buffers ----
+        let alloc_bf16 = |size: usize| -> Result<cudarc::driver::CudaSlice<half::bf16>, LlmError> {
+            self.stream
+                .alloc_zeros::<half::bf16>(size)
+                .map_err(|e| LlmError::Backend(format!("alloc {size}: {e:?}")))
+        };
+        let mut h = alloc_bf16(d)?; // hidden state
+        let mut h_norm = alloc_bf16(d)?; // RMSNorm output (resident)
+        let mut residual = alloc_bf16(d)?;
+
+        // SSM-block scratch
+        let mut qkv_mixed = alloc_bf16(conv_dim)?;
+        let mut conv_out = alloc_bf16(conv_dim)?;
+        let mut z = alloc_bf16(value_dim)?;
+        let mut alpha = alloc_bf16(n_v)?;
+        let mut beta = alloc_bf16(n_v)?;
+        let mut q_v = alloc_bf16(n_v * head_kv)?; // broadcasted q
+        let mut k_v = alloc_bf16(n_v * head_kv)?; // broadcasted k
+        let mut ssm_out_buf = alloc_bf16(n_v * head_kv)?;
+
+        // Attn-block scratch
+        let mut q_buf = alloc_bf16(q_dim)?;
+        let mut k_buf = alloc_bf16(kv_dim)?;
+        let mut v_buf = alloc_bf16(kv_dim)?;
+        let mut attn_out = alloc_bf16(q_dim)?;
+
+        // FFN scratch
+        let mut gate_buf = alloc_bf16(f)?;
+        let mut up_buf = alloc_bf16(f)?;
+        let mut down_buf = alloc_bf16(d)?;
+
+        // Logits
+        let mut logits = alloc_bf16(cfg.vocab)?;
+
+        // Token id on device for argmax output.
+        let mut next_token_dev: cudarc::driver::CudaSlice<u32> = self
+            .stream
+            .alloc_zeros::<u32>(1)
+            .map_err(|e| LlmError::Backend(format!("alloc token: {e:?}")))?;
+
+        // ---- Step 0 : Load h from token_emb[token_id, :] ----
+        // Use embedding lookup OR direct copy of one row.
+        // token_emb is [V, D] BF16 row-major. Copy d BF16 from offset token_id*d.
+        unsafe {
+            let (te_p, _g) = self.token_emb.device_ptr(&self.stream);
+            let (h_p, _g2) = h.device_ptr_mut(&self.stream);
+            self.kernels
+                .copy_bf16(
+                    &self.stream,
+                    h_p,
+                    te_p + (token_id as u64) * (d as u64) * 2,
+                    d as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("copy embed: {e:?}")))?;
+        }
+
+        // Pre-extract device pointers for re-use (drop guards).
+        let (
+            h_p,
+            h_norm_p,
+            res_p,
+            qkv_mixed_p,
+            conv_out_p,
+            z_p,
+            alpha_p,
+            beta_p,
+            qv_p,
+            kv_v_p,
+            sso_p,
+            q_p,
+            k_p,
+            v_p,
+            ao_p,
+            gate_p,
+            up_p,
+            down_p,
+            logits_p,
+            tok_p,
+            final_norm_p,
+        ) = unsafe {
+            let (a, _g0) = h.device_ptr_mut(&self.stream);
+            let (b, _g1) = h_norm.device_ptr_mut(&self.stream);
+            let (c, _g2) = residual.device_ptr_mut(&self.stream);
+            let (d_, _g3) = qkv_mixed.device_ptr_mut(&self.stream);
+            let (e, _g4) = conv_out.device_ptr_mut(&self.stream);
+            let (f_, _g5) = z.device_ptr_mut(&self.stream);
+            let (g, _g6) = alpha.device_ptr_mut(&self.stream);
+            let (h_, _g7) = beta.device_ptr_mut(&self.stream);
+            let (i, _g8) = q_v.device_ptr_mut(&self.stream);
+            let (j, _g9) = k_v.device_ptr_mut(&self.stream);
+            let (k_, _g10) = ssm_out_buf.device_ptr_mut(&self.stream);
+            let (l, _g11) = q_buf.device_ptr_mut(&self.stream);
+            let (m, _g12) = k_buf.device_ptr_mut(&self.stream);
+            let (n_, _g13) = v_buf.device_ptr_mut(&self.stream);
+            let (o, _g14) = attn_out.device_ptr_mut(&self.stream);
+            let (p, _g15) = gate_buf.device_ptr_mut(&self.stream);
+            let (q_, _g16) = up_buf.device_ptr_mut(&self.stream);
+            let (r, _g17) = down_buf.device_ptr_mut(&self.stream);
+            let (s, _g18) = logits.device_ptr_mut(&self.stream);
+            let (t, _g19) = next_token_dev.device_ptr_mut(&self.stream);
+            let (u, _g20) = self.final_norm.device_ptr(&self.stream);
+            (
+                a, b, c, d_, e, f_, g, h_, i, j, k_, l, m, n_, o, p, q_, r, s, t, u,
+            )
+        };
+
+        // ---- Iterate over all 64 layers ----
+        for (li, block) in self.blocks.iter_mut().enumerate() {
+            // residual = h
+            unsafe {
+                self.kernels
+                    .copy_bf16(&self.stream, res_p, h_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("copy res: {e:?}")))?;
+            }
+
+            match block {
+                BlockQ4K::Ssm(ssm) => {
+                    // 1. h_norm = rms_norm(h, attn_norm)
+                    unsafe {
+                        let (an, _g) = ssm.attn_norm.device_ptr(&self.stream);
+                        // rms_norm_bf16 is in-place on x; copy h → h_norm first.
+                        self.kernels
+                            .copy_bf16(&self.stream, h_norm_p, h_p, d as i32)
+                            .map_err(|e| LlmError::Backend(format!("copy h_norm: {e:?}")))?;
+                        self.kernels
+                            .rms_norm_bf16(&self.stream, h_norm_p, an, eps, d as i32, 1)
+                            .map_err(|e| LlmError::Backend(format!("rms_norm: {e:?}")))?;
+                    }
+
+                    // 2. qkv_mixed = w_qkv @ h_norm
+                    ssm.w_qkv.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        h_norm_p,
+                        qkv_mixed_p,
+                    )?;
+
+                    // 3. z = w_gate @ h_norm
+                    ssm.w_gate
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, z_p)?;
+
+                    // 4. alpha = w_alpha @ h_norm
+                    ssm.w_alpha.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        h_norm_p,
+                        alpha_p,
+                    )?;
+
+                    // 5. beta_logit = w_beta @ h_norm ; beta = sigmoid
+                    ssm.w_beta
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, beta_p)?;
+                    unsafe {
+                        self.kernels
+                            .sigmoid_inplace_bf16(&self.stream, beta_p, n_v as i32)
+                            .map_err(|e| LlmError::Backend(format!("sigmoid: {e:?}")))?;
+                    }
+
+                    // 6. alpha += dt_bias ; softplus(alpha) ; alpha *= ssm_a → gate_h
+                    unsafe {
+                        let (db, _g) = ssm.dt_bias.device_ptr(&self.stream);
+                        self.kernels
+                            .add_inplace_bf16(&self.stream, alpha_p, db, n_v as i32)
+                            .map_err(|e| LlmError::Backend(format!("alpha+dt_bias: {e:?}")))?;
+                        self.kernels
+                            .softplus_inplace_bf16(&self.stream, alpha_p, n_v as i32)
+                            .map_err(|e| LlmError::Backend(format!("softplus: {e:?}")))?;
+                        let (sa, _g2) = ssm.ssm_a.device_ptr(&self.stream);
+                        self.kernels
+                            .mul_inplace_bf16(&self.stream, alpha_p, sa, n_v as i32)
+                            .map_err(|e| LlmError::Backend(format!("mul ssm_a: {e:?}")))?;
+                    }
+                    // alpha is now gate_h (alpha_softplus * ssm_a).
+
+                    // 7. conv_out = conv1d_depthwise(conv1d, conv_state, qkv_mixed)
+                    let ssm_state_layer = &mut self.ssm_states[get_ssm_layer_idx(&cfg, li)];
+                    unsafe {
+                        let (cw, _g) = ssm.conv1d.device_ptr(&self.stream);
+                        let (cs, _g2) = ssm_state_layer.conv_state.device_ptr_mut(&self.stream);
+                        self.kernels
+                            .conv1d_depthwise_bf16(
+                                &self.stream,
+                                cw,
+                                cs,
+                                qkv_mixed_p,
+                                conv_out_p,
+                                conv_dim as i32,
+                                conv_kernel as i32,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("conv1d: {e:?}")))?;
+                    }
+
+                    // 8. silu(conv_out)
+                    unsafe {
+                        self.kernels
+                            .silu_bf16(&self.stream, conv_out_p, conv_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("silu conv: {e:?}")))?;
+                    }
+
+                    // 9. q,k,v = split(conv_out)
+                    let q_ptr = conv_out_p;
+                    let k_ptr = conv_out_p + (key_dim * 2) as u64;
+                    let v_ptr = conv_out_p + (2 * key_dim * 2) as u64;
+
+                    // 10. l2_norm_per_head on q (n_k heads of head_kv) and k
+                    unsafe {
+                        self.kernels
+                            .l2_norm_per_head_bf16(
+                                &self.stream,
+                                q_ptr,
+                                n_k as i32,
+                                head_kv as i32,
+                                eps,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("l2 q: {e:?}")))?;
+                        self.kernels
+                            .l2_norm_per_head_bf16(
+                                &self.stream,
+                                k_ptr,
+                                n_k as i32,
+                                head_kv as i32,
+                                eps,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("l2 k: {e:?}")))?;
+                    }
+
+                    // 11. Broadcast q,k from n_k to n_v heads (factor n_v / n_k)
+                    let q_for_delta = if n_k == n_v {
+                        q_ptr
+                    } else {
+                        unsafe {
+                            self.kernels
+                                .repeat_heads_bf16(
+                                    &self.stream,
+                                    q_ptr,
+                                    qv_p,
+                                    n_k as i32,
+                                    n_v as i32,
+                                    head_kv as i32,
+                                )
+                                .map_err(|e| LlmError::Backend(format!("repeat q: {e:?}")))?;
+                        }
+                        qv_p
+                    };
+                    let k_for_delta = if n_k == n_v {
+                        k_ptr
+                    } else {
+                        unsafe {
+                            self.kernels
+                                .repeat_heads_bf16(
+                                    &self.stream,
+                                    k_ptr,
+                                    kv_v_p,
+                                    n_k as i32,
+                                    n_v as i32,
+                                    head_kv as i32,
+                                )
+                                .map_err(|e| LlmError::Backend(format!("repeat k: {e:?}")))?;
+                        }
+                        kv_v_p
+                    };
+
+                    // 12. delta_net_step : state update + out
+                    unsafe {
+                        let (st, _g) = ssm_state_layer.state.device_ptr_mut(&self.stream);
+                        self.kernels
+                            .delta_net_step_bf16(
+                                &self.stream,
+                                q_for_delta,
+                                k_for_delta,
+                                v_ptr,
+                                alpha_p, // gate_h
+                                beta_p,
+                                st,
+                                sso_p,
+                                n_v as i32,
+                                head_kv as i32,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("delta_net: {e:?}")))?;
+                    }
+
+                    // 13. ssm_norm per head + multiply by silu(z)
+                    unsafe {
+                        let (sn, _g) = ssm.ssm_norm.device_ptr(&self.stream);
+                        // RMSNorm per head : we have rms_norm_bf16 with batch parameter.
+                        // Use n_v batches, each of size head_kv, with same gamma.
+                        self.kernels
+                            .rms_norm_bf16(&self.stream, sso_p, sn, eps, head_kv as i32, n_v as i32)
+                            .map_err(|e| LlmError::Backend(format!("ssm_norm: {e:?}")))?;
+                        // silu(z) inplace
+                        self.kernels
+                            .silu_bf16(&self.stream, z_p, value_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("silu z: {e:?}")))?;
+                        // out *= silu(z)
+                        self.kernels
+                            .mul_inplace_bf16(&self.stream, sso_p, z_p, value_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("mul gated: {e:?}")))?;
+                    }
+
+                    // 14. h = ssm_out @ gated  (overwrites h)
+                    ssm.ssm_out
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, sso_p, h_p)?;
+
+                    // 15. residual : h += residual
+                    unsafe {
+                        self.kernels
+                            .add_inplace_bf16(&self.stream, h_p, res_p, d as i32)
+                            .map_err(|e| LlmError::Backend(format!("ssm residual: {e:?}")))?;
+                    }
+                },
+                BlockQ4K::Attn(_attn) => {
+                    // T246.3 — full attention block. For now : pass-through (h unchanged
+                    // beyond residual already copied). Hack so SSM-only layers
+                    // can be debugged first.
+                    return Err(LlmError::Backend(format!(
+                        "attention block layer {li} not yet implemented (T246.3)"
+                    )));
+                },
+            }
+
+            // ---- FFN dense (T246.4) ----
+            let (gate_w, up_w, down_w, post_norm) = match block {
+                BlockQ4K::Ssm(s) => (&s.w_gate_ffn, &s.w_up_ffn, &s.w_down_ffn, &s.post_norm),
+                BlockQ4K::Attn(a) => (&a.w_gate_ffn, &a.w_up_ffn, &a.w_down_ffn, &a.post_norm),
+            };
+            // residual = h (pre-FFN value, after attn/ssm + first residual)
+            unsafe {
+                self.kernels
+                    .copy_bf16(&self.stream, res_p, h_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("copy res ffn: {e:?}")))?;
+            }
+            // h_norm = rms_norm(h, post_norm)
+            unsafe {
+                let (pn, _g) = post_norm.device_ptr(&self.stream);
+                self.kernels
+                    .copy_bf16(&self.stream, h_norm_p, h_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("copy h_norm ffn: {e:?}")))?;
+                self.kernels
+                    .rms_norm_bf16(&self.stream, h_norm_p, pn, eps, d as i32, 1)
+                    .map_err(|e| LlmError::Backend(format!("rms_norm post: {e:?}")))?;
+            }
+            // gate = w_gate @ h_norm ; up = w_up @ h_norm ; gate = silu(gate) * up
+            gate_w.dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, gate_p)?;
+            up_w.dispatch_matmul_m1(&self.kernels, &self.stream, h_norm_p, up_p)?;
+            unsafe {
+                self.kernels
+                    .swiglu_bf16(&self.stream, gate_p, up_p, gate_p, f as i32)
+                    .map_err(|e| LlmError::Backend(format!("swiglu: {e:?}")))?;
+            }
+            // h = w_down @ gate
+            down_w.dispatch_matmul_m1(&self.kernels, &self.stream, gate_p, h_p)?;
+            // h += residual
+            unsafe {
+                self.kernels
+                    .add_inplace_bf16(&self.stream, h_p, res_p, d as i32)
+                    .map_err(|e| LlmError::Backend(format!("ffn residual: {e:?}")))?;
+            }
+        }
+
+        // ---- Final RMSNorm + LM head ----
+        unsafe {
+            self.kernels
+                .rms_norm_bf16(&self.stream, h_p, final_norm_p, eps, d as i32, 1)
+                .map_err(|e| LlmError::Backend(format!("final_norm: {e:?}")))?;
+        }
+        self.lm_head
+            .dispatch_matmul_m1(&self.kernels, &self.stream, h_p, logits_p)?;
+
+        // ---- Sample (argmax for now) ----
+        unsafe {
+            self.kernels
+                .argmax_bf16(&self.stream, logits_p, tok_p, cfg.vocab as i32)
+                .map_err(|e| LlmError::Backend(format!("argmax: {e:?}")))?;
+        }
+        self.stream.synchronize().ok();
+
+        let next_id_host: Vec<u32> = self
+            .stream
+            .memcpy_dtov(&next_token_dev)
+            .map_err(|e| LlmError::Backend(format!("dl token: {e:?}")))?;
+        self.position += 1;
+        Ok(next_id_host[0])
     }
 
     /// Process a prompt at once. **STATUS T246.1** : returns Err. T246.5.

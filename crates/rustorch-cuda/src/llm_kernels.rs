@@ -227,6 +227,84 @@ extern "C" __global__ void add_inplace_bf16(
 }
 "#;
 
+// T246.2 — element-wise utility kernels for SSM block forward.
+
+#[cfg(feature = "cuda")]
+const SOFTPLUS_INPLACE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// x[i] = log1p(exp(x[i]))
+// Uses numerically stable formulation : softplus(x) = max(x, 0) + log1p(exp(-|x|))
+extern "C" __global__ void softplus_inplace_bf16(
+    __nv_bfloat16* __restrict__ x,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = (float)x[i];
+    float a = v > 0.0f ? v : 0.0f;
+    float b = log1pf(expf(-fabsf(v)));
+    x[i] = (__nv_bfloat16)(a + b);
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const SIGMOID_INPLACE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void sigmoid_inplace_bf16(
+    __nv_bfloat16* __restrict__ x,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = (float)x[i];
+    float s = 1.0f / (1.0f + expf(-v));
+    x[i] = (__nv_bfloat16)s;
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_INPLACE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// y[i] *= x[i]
+extern "C" __global__ void mul_inplace_bf16(
+    __nv_bfloat16* __restrict__ y,
+    const __nv_bfloat16* __restrict__ x,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float a = (float)y[i];
+    float b = (float)x[i];
+    y[i] = (__nv_bfloat16)(a * b);
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const REPEAT_HEADS_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// Broadcast K/Q heads from n_in heads to n_out heads (n_out / n_in repeat).
+// src is [n_in, head_dim], dst is [n_out, head_dim].
+// dst[h, j] = src[h / repeat, j]   where repeat = n_out / n_in.
+extern "C" __global__ void repeat_heads_bf16(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16* __restrict__ dst,
+    int n_in,
+    int n_out,
+    int head_dim
+) {
+    int h_out = blockIdx.x;
+    int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j >= head_dim) return;
+    int repeat = n_out / n_in;
+    int h_in = h_out / repeat;
+    dst[h_out * head_dim + j] = src[h_in * head_dim + j];
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const TRANSPOSE_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -1766,6 +1844,10 @@ pub struct LlmKernels {
     sgemv_q6k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemm_q6k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    softplus_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sigmoid_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    repeat_heads: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     conv1d_depthwise: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     l2_norm_per_head: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     delta_net_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -1800,6 +1882,10 @@ impl LlmKernels {
             sgemv_q6k_v2: std::sync::OnceLock::new(),
             sgemm_q6k_m8: std::sync::OnceLock::new(),
             sgemv_bf16: std::sync::OnceLock::new(),
+            softplus_inplace: std::sync::OnceLock::new(),
+            sigmoid_inplace: std::sync::OnceLock::new(),
+            mul_inplace: std::sync::OnceLock::new(),
+            repeat_heads: std::sync::OnceLock::new(),
             conv1d_depthwise: std::sync::OnceLock::new(),
             l2_norm_per_head: std::sync::OnceLock::new(),
             delta_net_step: std::sync::OnceLock::new(),
@@ -2082,6 +2168,124 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "add_inplace_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.2 — softplus inplace : x[i] = log1p(exp(x[i])).
+    pub unsafe fn softplus_inplace_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: u64,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.softplus_inplace,
+            SOFTPLUS_INPLACE_BF16_SRC,
+            "softplus_inplace_bf16",
+        )?;
+        let block_dim = 256u32;
+        let grid_dim = (n as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&x).arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "softplus_inplace_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.2 — sigmoid inplace : x[i] = 1 / (1 + exp(-x[i])).
+    pub unsafe fn sigmoid_inplace_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: u64,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.sigmoid_inplace,
+            SIGMOID_INPLACE_BF16_SRC,
+            "sigmoid_inplace_bf16",
+        )?;
+        let block_dim = 256u32;
+        let grid_dim = (n as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&x).arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sigmoid_inplace_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.2 — element-wise multiply inplace : y[i] *= x[i].
+    pub unsafe fn mul_inplace_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        y: u64,
+        x: u64,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) =
+            self.compile_or_get(&self.mul_inplace, MUL_INPLACE_BF16_SRC, "mul_inplace_bf16")?;
+        let block_dim = 256u32;
+        let grid_dim = (n as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&y).arg(&x).arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_inplace_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.2 — broadcast Q/K heads from n_in to n_out (n_out / n_in factor).
+    pub unsafe fn repeat_heads_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: u64,
+        dst: u64,
+        n_in: i32,
+        n_out: i32,
+        head_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.repeat_heads,
+            REPEAT_HEADS_BF16_SRC,
+            "repeat_heads_bf16",
+        )?;
+        let block_dim = 128u32;
+        let grid_y = (head_dim as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_out as u32, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&src)
+            .arg(&dst)
+            .arg(&n_in)
+            .arg(&n_out)
+            .arg(&head_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "repeat_heads_bf16::launch",
         })?;
         Ok(())
     }
