@@ -2072,6 +2072,110 @@ extern "C" __global__ void delta_net_step_bf16(
 "#;
 
 #[cfg(feature = "cuda")]
+const DELTA_NET_STEP_TREE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// T246.7 TrackC.1 — Tree-aware Gated DeltaNet recurrent step.
+//
+// Mirrors `delta_net_step_bf16` exactly but operates on a draft tree :
+// each tree node carries its own SSM state slot. The kernel reads the
+// *parent's* state (per the `parents[]` array, BFS order, parents[i] < i
+// for i > 0) into a thread-local copy of the [head_dim] row, applies the
+// same delta-net update, and writes the resulting state into the *child's*
+// slot. This way per-branch state forking is automatic : two siblings
+// sharing parent p both fork from `tree_states[p]` independently.
+//
+// Layout (tree-aware) :
+//   q, k, v       : [tree_size, n_heads, head_dim] BF16
+//   gate, beta    : [tree_size, n_heads]            BF16 (per-row scalars)
+//   parents       : [tree_size]                     i32 (-1 for root, 0..i for i>0)
+//   tree_states   : [tree_size, n_heads, head_dim, head_dim] BF16
+//   out           : [tree_size, n_heads, head_dim] BF16
+//
+// IMPORTANT — root state (`parents[i] == -1`) reads from `tree_states[i]`
+// itself. The Rust caller MUST pre-load the model's current per-layer SSM
+// state into `tree_states[root_index]` (typically index 0) BEFORE calling
+// this kernel. After acceptance the caller copies the deepest accepted
+// node's slot back into the model's per-layer SSM state.
+//
+// Each TG handles ONE (wave-position, head) pair, with head_dim threads each
+// handling ONE row r of the state[h] matrix. With wave_size=1 +
+// wave_indices=[0] + parents[0]=-1 + state pre-loaded into slot 0, this
+// MUST produce a result bit-exact equivalent to the scalar
+// `delta_net_step_bf16` kernel (parity gate).
+//
+// CRITICAL — caller MUST launch one kernel per BFS depth wave. All nodes
+// at depth d MUST execute strictly after all nodes at depth d-1 (so child
+// reads see committed parent writes). Because BFS guarantees parents[i] < i
+// and depths[parent] < depths[child], grouping by depth and serializing
+// across depths via separate kernel launches gives the necessary read-
+// after-write ordering. Within a wave, all nodes have parents in earlier
+// waves so there is no intra-wave ordering requirement.
+extern "C" __global__ void delta_net_step_tree_bf16(
+    const __nv_bfloat16* __restrict__ q,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ k,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ v,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ gate,        // [tree_size, n_heads]
+    const __nv_bfloat16* __restrict__ beta,        // [tree_size, n_heads]
+    const int*           __restrict__ parents,     // [tree_size]
+    const int*           __restrict__ wave_indices,// [wave_size] — tree-row indices in this depth wave
+    __nv_bfloat16*       __restrict__ tree_states, // [tree_size, n_heads, head_dim, head_dim]
+    __nv_bfloat16*       __restrict__ out,         // [tree_size, n_heads, head_dim]
+    int wave_size,
+    int n_heads,
+    int head_dim
+) {
+    int wp = blockIdx.y;
+    int h  = blockIdx.x;
+    if (wp >= wave_size || h >= n_heads) return;
+    int tr = wave_indices[wp];      // tree row
+    int r  = threadIdx.x;           // state-matrix row
+    if (r >= head_dim) return;
+
+    long long state_per_node = (long long)n_heads * head_dim * head_dim;
+    long long io_per_node    = (long long)n_heads * head_dim;
+    long long g_per_node     = (long long)n_heads;
+
+    int parent = parents[tr];
+    long long src_node = (parent < 0) ? (long long)tr : (long long)parent;
+
+    long long base_io  = (long long)tr * io_per_node + (long long)h * head_dim;
+    long long base_g   = (long long)tr * g_per_node  + h;
+    long long base_dst = (long long)tr * state_per_node + (long long)h * head_dim * head_dim
+                         + (long long)r * head_dim;
+    long long base_src = src_node * state_per_node + (long long)h * head_dim * head_dim
+                         + (long long)r * head_dim;
+
+    float g_exp = expf((float)gate[base_g]);
+    float b     = (float)beta[base_g];
+    float v_r   = (float)v[base_io + r];
+
+    // Broadcast q across threads in this TG via shmem.
+    extern __shared__ float q_shared[];
+    if (r < head_dim) {
+        q_shared[r] = (float)q[base_io + r];
+    }
+    __syncthreads();
+
+    // Stream over `c`. For src_node == tr (root) the read and write hit the
+    // SAME address — pure same-thread RMW, no aliasing (thread r owns row r
+    // exclusively across the whole TG and across the kernel grid since each
+    // (tr, h) pair is a unique TG). For src_node != tr the addresses are in
+    // disjoint slots → also safe. Layout matches the scalar kernel.
+    float out_acc = 0.0f;
+    for (int c = 0; c < head_dim; ++c) {
+        float k_c     = (float)k[base_io + c];
+        float old     = (float)tree_states[base_src + c];
+        float updated = g_exp * old + b * v_r * k_c;
+        tree_states[base_dst + c] = (__nv_bfloat16)updated;
+        out_acc += updated * q_shared[c];
+    }
+
+    out[base_io + r] = (__nv_bfloat16)out_acc;
+}
+"#;
+
+#[cfg(feature = "cuda")]
 const SGEMV_Q6K_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -3772,6 +3876,8 @@ pub struct LlmKernels {
     conv1d_depthwise: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     l2_norm_per_head: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     delta_net_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.7 TrackC.1 — tree-aware DeltaNet step for SSM-hybrid Lookahead
+    delta_net_step_tree: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.5.3 — devcnt variants & helpers for CUDA Graph capture
     rope_partial_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     gqa_decode_online_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -3852,6 +3958,7 @@ impl LlmKernels {
             conv1d_depthwise: std::sync::OnceLock::new(),
             l2_norm_per_head: std::sync::OnceLock::new(),
             delta_net_step: std::sync::OnceLock::new(),
+            delta_net_step_tree: std::sync::OnceLock::new(),
             rope_partial_devcnt: std::sync::OnceLock::new(),
             gqa_decode_online_devcnt: std::sync::OnceLock::new(),
             increment_u32_dev: std::sync::OnceLock::new(),
@@ -5223,6 +5330,78 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "delta_net_step_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.7 TrackC.1 — tree-aware Gated DeltaNet recurrent step for one
+    /// BFS depth wave. The caller invokes this once per depth (root wave
+    /// first, then depth-1, depth-2, …) ; `wave_indices_dev` lists the
+    /// tree-row indices to process in this wave.
+    ///
+    /// Per-branch state forking is automatic : when `parents[tr] >= 0` the
+    /// kernel reads the source state from `tree_states[parents[tr]]` and
+    /// writes to `tree_states[tr]`. Sibling branches sharing a parent
+    /// thus fork independently. For the root (parents[tr] < 0) the source
+    /// equals the destination ; the caller MUST pre-load the model's
+    /// current per-layer SSM state into the root slot before launching.
+    ///
+    /// # Safety
+    /// Caller ensures :
+    ///   - `q, k, v` are valid for `tree_size × n_heads × head_dim` BF16 each.
+    ///   - `gate, beta` are valid for `tree_size × n_heads` BF16 each.
+    ///   - `parents` is a `tree_size`-long `i32` device array, BFS order
+    ///     (`parents[i] < i` for `i > 0`, `parents[0] == -1`).
+    ///   - `wave_indices` is a `wave_size`-long `i32` device array of
+    ///     tree-row indices in this depth wave.
+    ///   - `tree_states` is `tree_size × n_heads × head_dim²` BF16, with
+    ///     the root slot pre-loaded with the model's current state.
+    ///   - `out` is `tree_size × n_heads × head_dim` BF16.
+    ///   - `head_dim ≤ 256`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn delta_net_step_tree_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k: u64,
+        v: u64,
+        gate: u64,
+        beta: u64,
+        parents: u64,
+        wave_indices: u64,
+        tree_states: u64,
+        out: u64,
+        wave_size: i32,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.delta_net_step_tree,
+            DELTA_NET_STEP_TREE_BF16_SRC,
+            "delta_net_step_tree_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, wave_size as u32, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: (head_dim as u32) * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&q)
+            .arg(&k)
+            .arg(&v)
+            .arg(&gate)
+            .arg(&beta)
+            .arg(&parents)
+            .arg(&wave_indices)
+            .arg(&tree_states)
+            .arg(&out)
+            .arg(&wave_size)
+            .arg(&n_heads)
+            .arg(&head_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "delta_net_step_tree_bf16::launch",
         })?;
         Ok(())
     }

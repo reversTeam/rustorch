@@ -821,7 +821,9 @@ pub fn load_metal_model(
 
         // FFN sub-block — same on both layer kinds.
         let ffn = match cfg.variant {
-            Qwen35Variant::Qwen3PureTransformer | Qwen35Variant::Dense => {
+            Qwen35Variant::Qwen2PureTransformer
+            | Qwen35Variant::Qwen3PureTransformer
+            | Qwen35Variant::Dense => {
                 let w_gate = load_2d(&format!("blk.{li}.ffn_gate.weight"), &mut stats)?;
                 let w_up = load_2d(&format!("blk.{li}.ffn_up.weight"), &mut stats)?;
                 let w_down = load_2d(&format!("blk.{li}.ffn_down.weight"), &mut stats)?;
