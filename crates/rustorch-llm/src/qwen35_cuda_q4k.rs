@@ -18,6 +18,12 @@
 use crate::qwen35::{LayerKind, Qwen35Config, Qwen35Variant};
 use crate::LlmError;
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+
+/// T246.5.7 — number of kv-len splits in the FlashDecode-V2 GQA kernel.
+/// 4 gives a 4× boost in attention-block parallelism (32 heads × 4 splits =
+/// 128 blocks/layer vs 32 with the serial online kernel) and is fixed at
+/// capture time so the staging buffers can be sized once.
+const GQA_N_SPLIT: usize = 4;
 use cudarc::driver::{CudaContext, CudaGraph, CudaSlice, CudaStream, PinnedHostSlice};
 use rustorch_cuda::cublas_lt::LtSession;
 use rustorch_cuda::llm_kernels::LlmKernels;
@@ -290,6 +296,13 @@ pub(crate) struct DecodeScratch {
     /// dp4a Q4_K matmul path). Sized to accommodate the largest K seen in
     /// any matmul of the model: `(max_k / 32) * 36` bytes.
     pub(crate) x_q8_scratch: CudaSlice<u8>,
+    /// T246.5.7 — FlashDecode split-K staging buffers.
+    /// `[n_q_heads, N_SPLIT]` floats — partial max scores per (head, split).
+    pub(crate) gqa_partial_m: CudaSlice<f32>,
+    /// `[n_q_heads, N_SPLIT]` floats — partial l (sum of expf weights).
+    pub(crate) gqa_partial_l: CudaSlice<f32>,
+    /// `[n_q_heads, N_SPLIT, head_dim]` bf16 — partial output.
+    pub(crate) gqa_partial_o: CudaSlice<half::bf16>,
 }
 
 /// CUDA-resident Qwen3.5/3.6 hybrid model with Q4_K_M weights.
@@ -639,6 +652,16 @@ impl Qwen35ModelCudaQ4K {
                     .alloc_zeros::<u8>(max_k_blocks * 36)
                     .map_err(|e| LlmError::Backend(format!("scratch x_q8: {e:?}")))?
             },
+            // T246.5.7 — FlashDecode split-K staging.
+            gqa_partial_m: stream
+                .alloc_zeros::<f32>(cfg.n_q_heads * GQA_N_SPLIT)
+                .map_err(|e| LlmError::Backend(format!("scratch gqa_m: {e:?}")))?,
+            gqa_partial_l: stream
+                .alloc_zeros::<f32>(cfg.n_q_heads * GQA_N_SPLIT)
+                .map_err(|e| LlmError::Backend(format!("scratch gqa_l: {e:?}")))?,
+            gqa_partial_o: stream
+                .alloc_zeros::<half::bf16>(cfg.n_q_heads * GQA_N_SPLIT * cfg.head_dim())
+                .map_err(|e| LlmError::Backend(format!("scratch gqa_o: {e:?}")))?,
         };
 
         // T246.5.3 — device-resident counters for CUDA Graph capture.
@@ -874,6 +897,9 @@ impl Qwen35ModelCudaQ4K {
             tok_p,
             final_norm_p,
             x_q8_p,
+            gqa_m_p,
+            gqa_l_p,
+            gqa_o_p,
         ) = unsafe {
             let (a, _g0) = self.scratch.h.device_ptr_mut(&self.stream);
             let (b, _g1) = self.scratch.h_norm.device_ptr_mut(&self.stream);
@@ -905,8 +931,13 @@ impl Qwen35ModelCudaQ4K {
             } else {
                 0u64
             };
+            // T246.5.7 — FlashDecode split-K staging ptrs.
+            let (gm_, _g22) = self.scratch.gqa_partial_m.device_ptr_mut(&self.stream);
+            let (gl_, _g23) = self.scratch.gqa_partial_l.device_ptr_mut(&self.stream);
+            let (go_, _g24) = self.scratch.gqa_partial_o.device_ptr_mut(&self.stream);
             (
-                a, b, c, d_, e, f_, g, h_, i, j, k_, l, m, n_, o, p, q_, r, s, t, u, v,
+                a, b, c, d_, e, f_, g, h_, i, j, k_, l, m, n_, o, p, q_, r, s, t, u, v, gm_, gl_,
+                go_,
             )
         };
 
@@ -1325,27 +1356,32 @@ impl Qwen35ModelCudaQ4K {
                             .map_err(|e| LlmError::Backend(format!("kv append: {e:?}")))?;
                     }
 
-                    // 8. GQA decode online softmax.
-                    // T246.5.3 — devcnt variant reads `kv_len` from kv_len_dev.
+                    // 8. GQA decode — T246.5.7 FlashDecode-V2 split-K kernel
+                    // (4× more SM occupancy than the serial online kernel by
+                    // splitting kv_len work across GQA_N_SPLIT blocks/head).
                     let _ = position; // kept for the host-side KV append above
                     unsafe {
                         let (kc_p, _g1) = kv_cache.k.device_ptr(&self.stream);
                         let (vc_p, _g2) = kv_cache.v.device_ptr(&self.stream);
                         let (kv_len_p, _g3) = self.kv_len_dev.device_ptr(&self.stream);
                         self.kernels
-                            .gqa_decode_online_bf16_devcnt(
+                            .gqa_decode_split_bf16(
                                 &self.stream,
                                 q_p,
                                 kc_p,
                                 vc_p,
                                 gate_p, // attn raw output (size f ≥ q_dim)
+                                gqa_m_p,
+                                gqa_l_p,
+                                gqa_o_p,
                                 n_q as i32,
                                 n_kv as i32,
                                 kv_len_p,
                                 head_dim as i32,
                                 self.max_seq as i32,
+                                GQA_N_SPLIT as i32,
                             )
-                            .map_err(|e| LlmError::Backend(format!("gqa_decode: {e:?}")))?;
+                            .map_err(|e| LlmError::Backend(format!("gqa_decode_split: {e:?}")))?;
                     }
 
                     // 9. sigmoid(gate) ; attn_out *= gate

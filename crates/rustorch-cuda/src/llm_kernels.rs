@@ -2111,6 +2111,161 @@ extern "C" __global__ void gqa_decode_online_bf16_devcnt(
 }
 "#;
 
+// T246.5.7 — FlashDecode-V2 split-K GQA decode (M=1).
+// Splits each head's kv_len work across `n_split` thread blocks → better SM
+// occupancy on Blackwell (32 heads × 4 splits = 128 blocks vs the 32 of the
+// online kernel). Each block walks ~kv_len/n_split keys with online softmax,
+// then a combine kernel merges the partials per head.
+//
+// Layout (n_split is a launch param, typically 4):
+//   gridDim  = (n_heads, n_split)
+//   blockDim = (head_dim)
+//   shmem    = head_dim * 4 bytes (reduction buffer)
+//
+// Outputs (per-block):
+//   partial_m  : [n_heads, n_split]               float
+//   partial_l  : [n_heads, n_split]               float
+//   partial_o  : [n_heads, n_split, head_dim]     bf16  (NOT yet divided by l)
+#[cfg(feature = "cuda")]
+const GQA_DECODE_SPLIT_PARTIAL_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void gqa_decode_split_partial_bf16(
+    const __nv_bfloat16* __restrict__ q,           // [n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ k_cache,     // [n_kv, max_seq, head_dim]
+    const __nv_bfloat16* __restrict__ v_cache,     // [n_kv, max_seq, head_dim]
+    float*               __restrict__ partial_m,   // [n_heads, n_split]
+    float*               __restrict__ partial_l,   // [n_heads, n_split]
+    __nv_bfloat16*       __restrict__ partial_o,   // [n_heads, n_split, head_dim]
+    int n_heads,
+    int n_kv,
+    const int* __restrict__ kv_len_dev,
+    int head_dim,
+    int max_seq,
+    int n_split,
+    float scale
+) {
+    int h  = blockIdx.x;
+    int sp = blockIdx.y;
+    if (h >= n_heads || sp >= n_split) return;
+    int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+
+    int kv_len       = *kv_len_dev;
+    int kv_per_split = (kv_len + n_split - 1) / n_split;
+    int t_start      = sp * kv_per_split;
+    int t_end        = t_start + kv_per_split;
+    if (t_end > kv_len) t_end = kv_len;
+
+    int slot = h * n_split + sp;
+
+    // Empty split (kv_len=0 or t_start beyond range).
+    if (t_start >= t_end) {
+        if (tid == 0) {
+            partial_m[slot] = -1e30f;
+            partial_l[slot] = 0.0f;
+        }
+        partial_o[slot * head_dim + tid] = (__nv_bfloat16)0.0f;
+        return;
+    }
+
+    int kv_h = h * n_kv / n_heads;
+
+    extern __shared__ float sdata[];
+
+    float q_i = (float)q[h * head_dim + tid];
+    float m   = -1e30f;
+    float l   = 0.0f;
+    float o   = 0.0f;
+
+    for (int t = t_start; t < t_end; ++t) {
+        // Score = Q · K[kv_h, t]
+        float k_i     = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+        float partial = q_i * k_i;
+        sdata[tid] = partial;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s && tid + s < head_dim) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+        float s_t = sdata[0] * scale;
+        __syncthreads();
+
+        // Online softmax update.
+        float new_m     = fmaxf(m, s_t);
+        float correction = expf(m - new_m);
+        float p          = expf(s_t - new_m);
+        float v_i        = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+        o = o * correction + p * v_i;
+        l = l * correction + p;
+        m = new_m;
+    }
+
+    // Write partials. Note: o is NOT yet divided by l — combine kernel does that
+    // after merging across splits (via log-sum-exp re-weighting).
+    if (tid == 0) {
+        partial_m[slot] = m;
+        partial_l[slot] = l;
+    }
+    partial_o[slot * head_dim + tid] = (__nv_bfloat16)o;
+}
+"#;
+
+// T246.5.7 — combine kernel: merges per-split partials (m, l, o) for each head
+// using log-sum-exp normalization, writes the final attention output.
+//
+//   gridDim  = (n_heads)
+//   blockDim = (head_dim)
+#[cfg(feature = "cuda")]
+const GQA_DECODE_SPLIT_COMBINE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void gqa_decode_split_combine_bf16(
+    const float*         __restrict__ partial_m,    // [n_heads, n_split]
+    const float*         __restrict__ partial_l,    // [n_heads, n_split]
+    const __nv_bfloat16* __restrict__ partial_o,    // [n_heads, n_split, head_dim]
+    __nv_bfloat16*       __restrict__ out,           // [n_heads, head_dim]
+    int n_heads,
+    int head_dim,
+    int n_split
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+
+    // Phase 1: find global max m across splits (broadcast via shmem).
+    extern __shared__ float gm_buf[];
+    if (tid == 0) {
+        float gm = -1e30f;
+        for (int sp = 0; sp < n_split; ++sp) {
+            float pm = partial_m[h * n_split + sp];
+            if (pm > gm) gm = pm;
+        }
+        gm_buf[0] = gm;
+    }
+    __syncthreads();
+    float global_m = gm_buf[0];
+
+    // Phase 2: combine — each thread accumulates its dim across splits.
+    float o_sum = 0.0f;
+    float l_sum = 0.0f;
+    for (int sp = 0; sp < n_split; ++sp) {
+        int slot = h * n_split + sp;
+        float pm = partial_m[slot];
+        float pl = partial_l[slot];
+        float w  = expf(pm - global_m);
+        float po = (float)partial_o[slot * head_dim + tid];
+        o_sum += po * w;
+        l_sum += pl * w;
+    }
+
+    out[h * head_dim + tid] = (__nv_bfloat16)(o_sum / fmaxf(l_sum, 1e-12f));
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const GQA_DECODE_NAIVE_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -2232,6 +2387,9 @@ pub struct LlmKernels {
     // T246.5.5 — dp4a-based Q4_K × Q8_1 path (port of llama.cpp vec_dot_q4_K_q8_1)
     quantize_q8_1: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q4k_q8_1_dp4a: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.5.7 — FlashDecode-V2 split-K GQA decode
+    gqa_split_partial: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    gqa_split_combine: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2278,6 +2436,8 @@ impl LlmKernels {
             kv_append_devcnt: std::sync::OnceLock::new(),
             quantize_q8_1: std::sync::OnceLock::new(),
             sgemv_q4k_q8_1_dp4a: std::sync::OnceLock::new(),
+            gqa_split_partial: std::sync::OnceLock::new(),
+            gqa_split_combine: std::sync::OnceLock::new(),
         }
     }
 
@@ -3558,6 +3718,102 @@ impl LlmKernels {
             code: format!("{e:?}").len() as i32,
             location: "gqa_decode_online_bf16_devcnt::launch",
         })?;
+        Ok(())
+    }
+
+    /// T246.5.7 — FlashDecode-V2 split-K GQA decode (M=1).
+    ///
+    /// Replaces the serial `gqa_decode_online_bf16_devcnt` kernel by splitting
+    /// each head's `kv_len` work across `n_split` blocks (4×N more parallelism)
+    /// and merging via a per-head combine kernel.
+    ///
+    /// Caller must provide three staging buffers (re-used across calls,
+    /// allocated once at model init):
+    /// - `partial_m_dev` : `n_heads * n_split` floats
+    /// - `partial_l_dev` : `n_heads * n_split` floats
+    /// - `partial_o_dev` : `n_heads * n_split * head_dim` bf16
+    ///
+    /// `n_split` must match the size of the staging buffers ; typical value 4.
+    ///
+    /// # Safety  Caller ensures all device pointers are valid for the kernel
+    /// lifetime and matching shapes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gqa_decode_split_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k_cache: u64,
+        v_cache: u64,
+        out: u64,
+        partial_m_dev: u64,
+        partial_l_dev: u64,
+        partial_o_dev: u64,
+        n_heads: i32,
+        n_kv: i32,
+        kv_len_dev: u64,
+        head_dim: i32,
+        max_seq: i32,
+        n_split: i32,
+    ) -> Result<(), CudaError> {
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let block_dim = head_dim as u32;
+
+        // Phase 1 — partial.
+        let (_m_p, fn_p) = self.compile_or_get(
+            &self.gqa_split_partial,
+            GQA_DECODE_SPLIT_PARTIAL_BF16_SRC,
+            "gqa_decode_split_partial_bf16",
+        )?;
+        let cfg_p = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, n_split as u32, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * 4,
+        };
+        let mut launcher_p = stream.launch_builder(&fn_p);
+        launcher_p
+            .arg(&q)
+            .arg(&k_cache)
+            .arg(&v_cache)
+            .arg(&partial_m_dev)
+            .arg(&partial_l_dev)
+            .arg(&partial_o_dev)
+            .arg(&n_heads)
+            .arg(&n_kv)
+            .arg(&kv_len_dev)
+            .arg(&head_dim)
+            .arg(&max_seq)
+            .arg(&n_split)
+            .arg(&scale);
+        launcher_p.launch(cfg_p).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gqa_decode_split_partial_bf16::launch",
+        })?;
+
+        // Phase 2 — combine.
+        let (_m_c, fn_c) = self.compile_or_get(
+            &self.gqa_split_combine,
+            GQA_DECODE_SPLIT_COMBINE_BF16_SRC,
+            "gqa_decode_split_combine_bf16",
+        )?;
+        let cfg_c = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 4,
+        };
+        let mut launcher_c = stream.launch_builder(&fn_c);
+        launcher_c
+            .arg(&partial_m_dev)
+            .arg(&partial_l_dev)
+            .arg(&partial_o_dev)
+            .arg(&out)
+            .arg(&n_heads)
+            .arg(&head_dim)
+            .arg(&n_split);
+        launcher_c.launch(cfg_c).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gqa_decode_split_combine_bf16::launch",
+        })?;
+
         Ok(())
     }
 
