@@ -7344,7 +7344,9 @@ impl LlmKernels {
         Ok(())
     }
 
-    /// Indexed Q5_K v3 SGEMV. # Safety same as Q4_K indexed (Q5_K layout
+    /// Indexed Q5_K v3 SGEMV.
+    ///
+    /// # Safety  Same as `sgemv_q4k_bf16_v3_indexed` (Q5_K layout
     /// = `(K/256)*176` bytes per expert).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn sgemv_q5k_bf16_v3_indexed(
@@ -7391,7 +7393,9 @@ impl LlmKernels {
         Ok(())
     }
 
-    /// Indexed Q6_K v3 SGEMV. # Safety same as Q4_K indexed (Q6_K layout
+    /// Indexed Q6_K v3 SGEMV.
+    ///
+    /// # Safety  Same as `sgemv_q4k_bf16_v3_indexed` (Q6_K layout
     /// = `(K/256)*210` bytes per expert).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn sgemv_q6k_bf16_v3_indexed(
@@ -7438,7 +7442,11 @@ impl LlmKernels {
         Ok(())
     }
 
-    /// Indexed BF16 SGEMV. # Safety  expert weights are `[N, K]` row-major BF16.
+    /// Indexed BF16 SGEMV.
+    ///
+    /// # Safety  Expert weights are `[N, K]` row-major BF16. See
+    /// `sgemv_q4k_bf16_v3_indexed` for the `expert_ptrs` / `topk_indices`
+    /// contract.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn sgemv_bf16_bf16_indexed(
         &self,
