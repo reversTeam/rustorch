@@ -66,6 +66,130 @@ extern "C" __global__ void rms_norm_bf16(
 }
 "#;
 
+// T246.6.3 — `y[i] += alpha * x[i]` for two BF16 vectors, alpha float.
+// Used to accumulate weighted expert outputs in MoE FFN forward.
+#[cfg(feature = "cuda")]
+const SCALED_ADD_INPLACE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void scaled_add_inplace_bf16(
+    __nv_bfloat16*       __restrict__ y,
+    const __nv_bfloat16* __restrict__ x,
+    float alpha,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float yi = (float)y[i];
+    float xi = (float)x[i];
+    y[i] = (__nv_bfloat16)(yi + alpha * xi);
+}
+"#;
+
+// T246.6.2 — Top-K softmax routing kernel for MoE FFN (Qwen3.6-35B-A3B).
+//
+// Input  : raw scores from `gate_inp @ h` of shape [n_experts] (BF16).
+// Output : top-K expert indices + renormalized softmax weights such that
+//          `sum(weights[0..K]) == 1`.
+//
+// Algorithm (single block, 32 threads — sufficient since n_experts ≤ 256):
+//   1. Each thread loads a stride of scores → finds local max
+//   2. Warp-reduce to global max
+//   3. Each thread computes partial sum-exp of its strided values
+//   4. Warp-reduce to total Z
+//   5. Probabilities = exp(s - max) / Z
+//   6. K-rank selection : K rounds, each finds the global argmax over
+//      not-yet-selected slots, marks it selected (sets prob to -inf),
+//      writes (idx, prob) to output, and accumulates renorm Z2
+//   7. Final pass : weights[i] /= Z2
+//
+// This is sufficient up to n_experts = 1024. For larger n_experts a
+// multi-block version with shared-memory partial sorts would be needed.
+#[cfg(feature = "cuda")]
+const TOPK_SOFTMAX_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void topk_softmax_bf16(
+    const __nv_bfloat16* __restrict__ scores,    // [n_experts]
+    int*                 __restrict__ indices,    // [k]   (output)
+    __nv_bfloat16*       __restrict__ weights,    // [k]   (output, renormalized)
+    int n_experts,
+    int k
+) {
+    extern __shared__ float sh[];
+    // sh[0..n_experts] : scratch for probabilities (mutable for K-selection)
+    // sh[n_experts]    : global max
+    // sh[n_experts+1]  : Z (sum-exp)
+    // sh[n_experts+2]  : Z2 (renorm)
+
+    int tid = threadIdx.x;
+
+    // ---- 1. Find max ----
+    float local_max = -1e30f;
+    for (int i = tid; i < n_experts; i += blockDim.x) {
+        float v = (float)scores[i];
+        if (v > local_max) local_max = v;
+    }
+    sh[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] = fmaxf(sh[tid], sh[tid + s]);
+        __syncthreads();
+    }
+    float gmax = sh[0];
+    __syncthreads();
+
+    // ---- 2. Sum-exp for full softmax ----
+    float local_sum = 0.0f;
+    for (int i = tid; i < n_experts; i += blockDim.x) {
+        float v = (float)scores[i];
+        local_sum += expf(v - gmax);
+    }
+    sh[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    float Z = sh[0];
+    __syncthreads();
+
+    // ---- 3. Compute probs[i] in shared scratch ----
+    // Reuse sh[0..n_experts] for probs (different scope from reduction).
+    for (int i = tid; i < n_experts; i += blockDim.x) {
+        float v = (float)scores[i];
+        sh[i] = expf(v - gmax) / Z;
+    }
+    __syncthreads();
+
+    // ---- 4. K rounds : find argmax of remaining probs, mark selected ----
+    // Single-thread (tid==0) does the K rounds : K is typically ≤ 8 so this
+    // O(K * n_experts) loop is fine. Could parallelize via warp reductions
+    // if K > ~16.
+    if (tid == 0) {
+        float Z2 = 0.0f;
+        for (int kk = 0; kk < k; ++kk) {
+            float best_p = -1.0f;
+            int   best_i = 0;
+            for (int i = 0; i < n_experts; ++i) {
+                float p = sh[i];
+                if (p > best_p) { best_p = p; best_i = i; }
+            }
+            indices[kk] = best_i;
+            weights[kk] = (__nv_bfloat16)best_p;  // un-normalized for now
+            sh[best_i] = -1.0f;                    // mark consumed
+            Z2 += best_p;
+        }
+        // Renormalize.
+        float inv_Z2 = (Z2 > 0.0f) ? (1.0f / Z2) : 0.0f;
+        for (int kk = 0; kk < k; ++kk) {
+            float w = (float)weights[kk];
+            weights[kk] = (__nv_bfloat16)(w * inv_Z2);
+        }
+    }
+}
+"#;
+
 // T247.7 — GQA decode backward (Flash-Attention style, M=1).
 //
 // Inputs (from training-aware forward) :
@@ -2872,6 +2996,10 @@ pub struct LlmKernels {
     sgemv_q4k_grad_dx: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T247.7 — GQA decode backward (Flash-Attention style)
     gqa_decode_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.6.2 — Top-K softmax router for MoE FFN
+    topk_softmax: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.6.3 — scaled add-in-place (used by MoE expert weighted accumulation)
+    scaled_add_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2927,6 +3055,8 @@ impl LlmKernels {
             embedding_lookup_grad: std::sync::OnceLock::new(),
             sgemv_q4k_grad_dx: std::sync::OnceLock::new(),
             gqa_decode_grad: std::sync::OnceLock::new(),
+            topk_softmax: std::sync::OnceLock::new(),
+            scaled_add_inplace: std::sync::OnceLock::new(),
         }
     }
 
@@ -4355,6 +4485,82 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "rms_norm_grad_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.6.3 — `y[i] += alpha · x[i]` for length-n bf16 vectors.
+    /// Used by MoE FFN forward to accumulate weighted expert outputs.
+    ///
+    /// # Safety  Both pointers must reference length-n bf16 device buffers.
+    pub unsafe fn scaled_add_inplace_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        y: u64,
+        x: u64,
+        alpha: f32,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.scaled_add_inplace,
+            SCALED_ADD_INPLACE_BF16_SRC,
+            "scaled_add_inplace_bf16",
+        )?;
+        let block_dim: u32 = 256;
+        let grid_dim = ((n as u32) + block_dim - 1) / block_dim;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&y).arg(&x).arg(&alpha).arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "scaled_add_inplace_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.6.2 — Top-K softmax routing for MoE FFN. Given raw scores
+    /// `[n_experts]`, returns top-K indices and renormalized softmax
+    /// weights such that `sum(weights[0..K]) == 1`.
+    ///
+    /// # Safety  Caller ensures `scores` is bf16 length `n_experts`,
+    /// `indices` is i32 length k, `weights` is bf16 length k. All device-
+    /// resident. n_experts ≤ 1024.
+    pub unsafe fn topk_softmax_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        scores: u64,
+        indices: u64,
+        weights: u64,
+        n_experts: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.topk_softmax,
+            TOPK_SOFTMAX_BF16_SRC,
+            "topk_softmax_bf16",
+        )?;
+        let block_dim: u32 = 32;
+        // shmem: n_experts probs + 3 scratch (max, Z, Z2)
+        let shmem = ((n_experts as u32) + 3) * 4;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: shmem,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&scores)
+            .arg(&indices)
+            .arg(&weights)
+            .arg(&n_experts)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "topk_softmax_bf16::launch",
         })?;
         Ok(())
     }
@@ -5934,6 +6140,96 @@ mod parity_tests {
                 "dup[{i}] ref={} cuda={} diff={} tol={}",
                 dup_ref[i],
                 dup_cuda[i],
+                diff,
+                tol
+            );
+        }
+    }
+
+    /// T246.6.2 — Top-K softmax router parity test.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn topk_softmax_bf16_matches_cpu_reference() {
+        let n_experts = 64usize;
+        let k = 8usize;
+
+        let mut state: u64 = 0xa3b1234;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (((state >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5
+        };
+        let scores_f32: Vec<f32> = (0..n_experts).map(|_| next() * 4.0).collect();
+
+        // CPU reference : softmax → top-K → renormalize.
+        let max_s = scores_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scores_f32.iter().map(|&v| (v - max_s).exp()).collect();
+        let z: f32 = exps.iter().sum();
+        let probs: Vec<f32> = exps.iter().map(|&e| e / z).collect();
+        let mut idx_p: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+        idx_p.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        idx_p.truncate(k);
+        let sum_topk: f32 = idx_p.iter().map(|(_, p)| *p).sum();
+        for (_, p) in idx_p.iter_mut() {
+            *p /= sum_topk;
+        }
+        let indices_ref: Vec<i32> = idx_p.iter().map(|(i, _)| *i as i32).collect();
+        let weights_ref: Vec<f32> = idx_p.iter().map(|(_, p)| *p).collect();
+
+        // CUDA path.
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let scores_bf: Vec<half::bf16> = scores_f32
+            .iter()
+            .copied()
+            .map(half::bf16::from_f32)
+            .collect();
+        let scores_dev = stream.memcpy_stod(&scores_bf).expect("upload scores");
+        let mut indices_dev = stream.alloc_zeros::<i32>(k).expect("alloc idx");
+        let mut weights_dev = stream.alloc_zeros::<half::bf16>(k).expect("alloc w");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (sp, _g0) = scores_dev.device_ptr(&stream);
+            let (ip, _g1) = indices_dev.device_ptr_mut(&stream);
+            let (wp, _g2) = weights_dev.device_ptr_mut(&stream);
+            kernels
+                .topk_softmax_bf16(&stream, sp, ip, wp, n_experts as i32, k as i32)
+                .expect("topk");
+        }
+
+        let indices_cuda: Vec<i32> = stream.memcpy_dtov(&indices_dev).expect("dtov idx");
+        let weights_cuda: Vec<f32> = stream
+            .memcpy_dtov(&weights_dev)
+            .expect("dtov w")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        // Indices should match exactly (same sort).
+        assert_eq!(
+            indices_cuda, indices_ref,
+            "top-K indices mismatch: cuda={:?}, ref={:?}",
+            indices_cuda, indices_ref
+        );
+
+        // Weights should sum to 1 and match per-element.
+        let sum_cuda: f32 = weights_cuda.iter().sum();
+        assert!(
+            (sum_cuda - 1.0).abs() < 0.02,
+            "weights should sum to 1, got {sum_cuda}"
+        );
+        for i in 0..k {
+            let diff = (weights_ref[i] - weights_cuda[i]).abs();
+            let tol = weights_ref[i].abs() * 1.5e-2 + 5e-3;
+            assert!(
+                diff <= tol,
+                "weights[{i}] ref={} cuda={} diff={} tol={}",
+                weights_ref[i],
+                weights_cuda[i],
                 diff,
                 tol
             );
