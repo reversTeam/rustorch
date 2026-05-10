@@ -731,6 +731,50 @@ impl Qwen35ModelCudaQ4K {
         // Force sync after zeroing scratch.
         self.stream.synchronize().ok();
 
+        // T246.4.3 — DEBUG : if env var set, dump KV cache + SSM state values
+        // BEFORE any computation, to verify alloc_zeros gave us actual zeros.
+        if self.position == 0 && std::env::var("RUSTORCH_DEBUG_INIT").is_ok() {
+            if let Some(kv) = self.kv_caches.first() {
+                let k_bytes: Vec<half::bf16> = self
+                    .stream
+                    .memcpy_dtov(&kv.k)
+                    .map_err(|e| LlmError::Backend(format!("dl k: {e:?}")))?;
+                let nz = k_bytes
+                    .iter()
+                    .take(1024)
+                    .filter(|&&v| v.to_f32() != 0.0)
+                    .count();
+                let sample: Vec<f32> = k_bytes.iter().take(8).map(|v| v.to_f32()).collect();
+                eprintln!("[debug-init] kv0.k first 8 = {sample:?} ({nz}/1024 nonzero)");
+            }
+            if let Some(ss) = self.ssm_states.first() {
+                let s_bytes: Vec<half::bf16> = self
+                    .stream
+                    .memcpy_dtov(&ss.state)
+                    .map_err(|e| LlmError::Backend(format!("dl state: {e:?}")))?;
+                let nz = s_bytes
+                    .iter()
+                    .take(1024)
+                    .filter(|&&v| v.to_f32() != 0.0)
+                    .count();
+                let sample: Vec<f32> = s_bytes.iter().take(8).map(|v| v.to_f32()).collect();
+                eprintln!("[debug-init] ssm0.state first 8 = {sample:?} ({nz}/1024 nonzero)");
+            }
+            // Also dump token_emb row for token_id=1 to verify deterministic load.
+            let te_bytes: Vec<half::bf16> = self
+                .stream
+                .memcpy_dtov(&self.token_emb)
+                .map_err(|e| LlmError::Backend(format!("dl te: {e:?}")))?;
+            let row_off = (token_id as usize) * d;
+            let sample: Vec<f32> = te_bytes
+                .iter()
+                .skip(row_off)
+                .take(8)
+                .map(|v| v.to_f32())
+                .collect();
+            eprintln!("[debug-init] token_emb[token_id={token_id}] first 8 = {sample:?}");
+        }
+
         // ---- Step 0 : Load h from token_emb[token_id, :] ----
         unsafe {
             let (te_p, _g) = self.token_emb.device_ptr(&self.stream);

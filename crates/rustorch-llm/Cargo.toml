@@ -112,3 +112,8 @@ required-features = ["cuda"]
 name = "qwen36_cuda_parity_check"
 path = "examples/qwen36_cuda_parity_check.rs"
 required-features = ["cuda"]
+
+[[example]]
+name = "qwen36_cuda_determinism_test"
+path = "examples/qwen36_cuda_determinism_test.rs"
+required-features = ["cuda"]
