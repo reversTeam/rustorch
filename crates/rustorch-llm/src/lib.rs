@@ -53,6 +53,8 @@ pub mod qwen35;
 pub mod qwen35_cpu;
 pub mod qwen35_cuda;
 #[cfg(feature = "cuda")]
+pub mod qwen35_cuda_q4k;
+#[cfg(feature = "cuda")]
 pub use cuda_backend::LlamaModelCuda;
 pub use gguf_loader::{GgufBlockWeights, GgufWeights};
 pub use model::LlamaModel;
