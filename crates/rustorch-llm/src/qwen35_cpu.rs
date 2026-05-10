@@ -1296,9 +1296,210 @@ pub fn ffn_dense_forward(w: &DenseFfnWeights, x: &[f32]) -> Vec<f32> {
     out
 }
 
-/// **STUB** — Moe FFN forward. Will be implemented in T142.
-pub fn ffn_moe_forward(_w: &MoeFfnWeights, x: &[f32], _cfg: &Qwen35Config) -> Vec<f32> {
-    // T142 — to be implemented. For now, return zeros so the residual
-    // connection at least doesn't panic.
-    vec![0.0_f32; x.len()]
+/// MoE FFN forward (Qwen3.6-35B-A3B). Top-K routed experts + parallel
+/// shared expert :
+///
+/// ```text
+///   raw_scores = ffn_gate_inp @ h                     [n_experts]
+///   probs      = softmax(raw_scores)
+///   topk_e, topk_p = top-K(probs, K)
+///   topk_p_n   = topk_p / sum(topk_p)                 (renormalize)
+///
+///   y_routed   = Σ_{i=0..K} topk_p_n[i] · expert_swiglu(topk_e[i], h)
+///   shexp_w    = sigmoid(ffn_gate_inp_shexp · h)
+///   y_shexp    = shexp_w · shared_swiglu(h)
+///   y          = y_routed + y_shexp
+/// ```
+///
+/// where `expert_swiglu(e, h) = ffn_down_exps[e] @ (silu(ffn_gate_exps[e] @ h)
+/// * (ffn_up_exps[e] @ h))` and `shared_swiglu(h)` is the same form on the
+/// `*_shexp` weights.
+pub fn ffn_moe_forward(w: &MoeFfnWeights, x: &[f32], cfg: &Qwen35Config) -> Vec<f32> {
+    let d = cfg.d;
+    let ef = cfg.expert_f;
+    let n_experts = cfg.n_experts;
+    let k = cfg.n_experts_used;
+    assert_eq!(x.len(), d, "x dim mismatch");
+    assert_eq!(w.gate_inp.rows(), n_experts);
+    assert_eq!(w.gate_inp.cols(), d);
+
+    // ---- 1. Router : raw_scores = gate_inp @ x ; probs = softmax(raw) ----
+    let mut raw_scores = vec![0.0_f32; n_experts];
+    gemv(&w.gate_inp.data, x, &mut raw_scores, n_experts, d);
+    // softmax with max-shift for numerical stability
+    let max_r = raw_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs = vec![0.0_f32; n_experts];
+    let mut z = 0.0_f32;
+    for e in 0..n_experts {
+        probs[e] = (raw_scores[e] - max_r).exp();
+        z += probs[e];
+    }
+    for p in &mut probs {
+        *p /= z;
+    }
+
+    // ---- 2. Top-K + renormalize ----
+    let mut idx_p: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+    // Stable partial sort: keep top-K by probability descending.
+    idx_p.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    idx_p.truncate(k);
+    let sum_topk: f32 = idx_p.iter().map(|(_, p)| *p).sum();
+    let inv_sum = if sum_topk > 0.0 { 1.0 / sum_topk } else { 0.0 };
+    for (_, p) in idx_p.iter_mut() {
+        *p *= inv_sum;
+    }
+
+    // ---- 3. Routed experts : Σ_e w_e · expert_swiglu(e, x) ----
+    let mut y_routed = vec![0.0_f32; d];
+    let mut gate_buf = vec![0.0_f32; ef];
+    let mut up_buf = vec![0.0_f32; ef];
+    let mut hidden_buf = vec![0.0_f32; ef];
+    let mut down_buf = vec![0.0_f32; d];
+    for &(e, w_e) in &idx_p {
+        // gate = silu(ffn_gate_exps[e] @ x)
+        gemv(&w.gate_exps[e].data, x, &mut gate_buf, ef, d);
+        silu(&mut gate_buf);
+        // up = ffn_up_exps[e] @ x
+        gemv(&w.up_exps[e].data, x, &mut up_buf, ef, d);
+        // hidden = gate * up
+        for i in 0..ef {
+            hidden_buf[i] = gate_buf[i] * up_buf[i];
+        }
+        // out = ffn_down_exps[e] @ hidden
+        for v in down_buf.iter_mut() {
+            *v = 0.0;
+        }
+        gemv(&w.down_exps[e].data, &hidden_buf, &mut down_buf, d, ef);
+        // accumulate w_e * out into y_routed
+        for i in 0..d {
+            y_routed[i] += w_e * down_buf[i];
+        }
+    }
+
+    // ---- 4. Shared expert (parallel) ----
+    // shexp_w = sigmoid(gate_inp_shexp · x)  (scalar)
+    let dot: f32 = w
+        .gate_inp_shexp
+        .iter()
+        .zip(x.iter())
+        .map(|(a, b)| a * b)
+        .sum();
+    let shexp_w = 1.0 / (1.0 + (-dot).exp());
+    // gate_shexp_out = silu(gate_shexp @ x)
+    gemv(&w.gate_shexp.data, x, &mut gate_buf, ef, d);
+    silu(&mut gate_buf);
+    // up_shexp_out = up_shexp @ x
+    gemv(&w.up_shexp.data, x, &mut up_buf, ef, d);
+    for i in 0..ef {
+        hidden_buf[i] = gate_buf[i] * up_buf[i];
+    }
+    let mut y_shexp = vec![0.0_f32; d];
+    gemv(&w.down_shexp.data, &hidden_buf, &mut y_shexp, d, ef);
+    for v in y_shexp.iter_mut() {
+        *v *= shexp_w;
+    }
+
+    // ---- 5. y = y_routed + y_shexp ----
+    for i in 0..d {
+        y_routed[i] += y_shexp[i];
+    }
+    y_routed
+}
+
+#[cfg(test)]
+mod moe_tests {
+    use super::*;
+    use crate::qwen35::Qwen35Variant;
+
+    fn make_cfg(d: usize, ef: usize, n_e: usize, k: usize) -> Qwen35Config {
+        Qwen35Config {
+            variant: Qwen35Variant::Moe,
+            n_layers: 1,
+            d,
+            f: 0,
+            n_q_heads: 1,
+            n_kv_heads: 1,
+            rope_dim: 1,
+            vocab: 1,
+            max_context: 1,
+            rms_eps: 1e-6,
+            rope_base: 10000.0,
+            ssm_inner: 1,
+            ssm_state: 1,
+            ssm_dt_rank: 1,
+            ssm_groups: 1,
+            ssm_conv_kernel: 1,
+            n_experts: n_e,
+            n_experts_used: k,
+            expert_f: ef,
+            attn_head_dim: 1,
+            attention_indices: vec![],
+            ssm_indices: vec![0],
+        }
+    }
+
+    fn dense(rows: usize, cols: usize, fill: f32) -> DenseWeight {
+        DenseWeight {
+            data: vec![fill; rows * cols],
+            shape: vec![rows, cols],
+        }
+    }
+
+    /// Smoke test : MoE forward should return non-zero output for non-zero
+    /// input + non-zero weights, and produce different routing for
+    /// different inputs.
+    #[test]
+    fn ffn_moe_forward_basic_smoke() {
+        let d = 4;
+        let ef = 6;
+        let n_e = 3;
+        let k = 2;
+        let cfg = make_cfg(d, ef, n_e, k);
+
+        // Distinct gate_inp rows so different inputs route to different experts.
+        let mut gate_inp = dense(n_e, d, 0.0);
+        // expert 0 prefers x[0] high, expert 1 prefers x[1] high, expert 2 prefers x[2].
+        // Sparse identity-ish: expert e prefers x[e] high.
+        gate_inp.data[0] = 2.0;
+        gate_inp.data[d + 1] = 2.0;
+        gate_inp.data[2 * d + 2] = 2.0;
+
+        let w = MoeFfnWeights {
+            gate_inp,
+            gate_exps: (0..n_e)
+                .map(|e| dense(ef, d, 0.1 * (e + 1) as f32))
+                .collect(),
+            up_exps: (0..n_e)
+                .map(|e| dense(ef, d, 0.05 * (e + 1) as f32))
+                .collect(),
+            down_exps: (0..n_e)
+                .map(|e| dense(d, ef, 0.07 * (e + 1) as f32))
+                .collect(),
+            gate_inp_shexp: vec![0.0; d],
+            gate_shexp: dense(ef, d, 0.1),
+            up_shexp: dense(ef, d, 0.05),
+            down_shexp: dense(d, ef, 0.07),
+        };
+
+        let x_a = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let x_b = vec![0.0_f32, 0.0, 1.0, 0.0];
+        let y_a = ffn_moe_forward(&w, &x_a, &cfg);
+        let y_b = ffn_moe_forward(&w, &x_b, &cfg);
+        assert_eq!(y_a.len(), d);
+        assert_eq!(y_b.len(), d);
+        // Different inputs should produce different outputs (different
+        // experts get selected → different effective FFN).
+        let same: bool = y_a.iter().zip(&y_b).all(|(a, b)| (a - b).abs() < 1e-6);
+        assert!(
+            !same,
+            "MoE forward should route differently for different inputs ; y_a={:?}, y_b={:?}",
+            y_a, y_b
+        );
+        // Output should be non-zero for non-zero input + non-zero weights.
+        assert!(
+            y_a.iter().any(|v| v.abs() > 1e-6),
+            "y_a should be non-zero, got {:?}",
+            y_a
+        );
+    }
 }
