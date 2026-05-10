@@ -67,9 +67,10 @@ impl QuantTensor {
                 },
                 QuantTensor::Q6K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);
+                    // T244.4 — use V2 kernel (1.39× V1, 95→135 GB/s).
                     kernels
-                        .sgemv_q6k_bf16(stream, w, x, y, *n as i32, *k as i32)
-                        .map_err(|e| LlmError::Backend(format!("sgemv_q6k: {e:?}")))?;
+                        .sgemv_q6k_bf16_v2(stream, w, x, y, *n as i32, *k as i32)
+                        .map_err(|e| LlmError::Backend(format!("sgemv_q6k_v2: {e:?}")))?;
                 },
             }
         }
