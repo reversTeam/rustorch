@@ -103,9 +103,12 @@ impl QuantTensor {
                             )
                             .map_err(|e| LlmError::Backend(format!("sgemv_q4k_dp4a: {e:?}")))
                     } else {
+                        // T246.6.7 — V3 (4-row-per-block, per-thread scale,
+                        // __launch_bounds__) targets 60-70% peak BW vs V2's
+                        // ~38%. Parity-tested vs V2.
                         kernels
-                            .sgemv_q4k_bf16_v2(stream, w, x, y, *n as i32, *k as i32)
-                            .map_err(|e| LlmError::Backend(format!("sgemv_q4k: {e:?}")))
+                            .sgemv_q4k_bf16_v3(stream, w, x, y, *n as i32, *k as i32)
+                            .map_err(|e| LlmError::Backend(format!("sgemv_q4k_v3: {e:?}")))
                     }
                 },
                 QuantTensor::Q5K { bytes, n, k } => {
