@@ -228,12 +228,15 @@ pub(crate) enum FfnQ4K {
 pub(crate) struct AttnBlockQ4K {
     /// `[D]` BF16 — pre-attention RMSNorm gain.
     pub(crate) attn_norm: CudaSlice<half::bf16>,
-    /// `[D]` BF16 — post-attention RMSNorm gain (HF naming `post_attention_norm`).
+    /// `[D]` BF16 — post-attention RMSNorm gain (HF naming `post_attention_norm`,
+    /// or `ffn_norm` for qwen2 / qwen3 pure-transformer variants).
     pub(crate) post_norm: CudaSlice<half::bf16>,
     /// `[head_dim]` BF16 — per-head Q normalization gain (RMSNorm applied per head).
-    pub(crate) q_norm: CudaSlice<half::bf16>,
+    /// `None` for qwen2 (no QK-norm).
+    pub(crate) q_norm: Option<CudaSlice<half::bf16>>,
     /// `[head_dim]` BF16 — per-head K normalization gain.
-    pub(crate) k_norm: CudaSlice<half::bf16>,
+    /// `None` for qwen2 (no QK-norm).
+    pub(crate) k_norm: Option<CudaSlice<half::bf16>>,
     /// `[n_q_heads * head_dim, D]` quantized — Q projection.
     pub(crate) w_q: QuantTensor,
     /// `[n_kv_heads * head_dim, D]` quantized — K projection.
@@ -242,6 +245,12 @@ pub(crate) struct AttnBlockQ4K {
     pub(crate) w_v: QuantTensor,
     /// `[D, n_q_heads * head_dim]` quantized — output projection.
     pub(crate) w_o: QuantTensor,
+    /// `[q_dim]` BF16 — Q projection bias (qwen2 only).
+    pub(crate) b_q: Option<CudaSlice<half::bf16>>,
+    /// `[kv_dim]` BF16 — K projection bias (qwen2 only).
+    pub(crate) b_k: Option<CudaSlice<half::bf16>>,
+    /// `[kv_dim]` BF16 — V projection bias (qwen2 only).
+    pub(crate) b_v: Option<CudaSlice<half::bf16>>,
     /// FFN — dense (Qwen3.6-27B) or MoE (Qwen3.6-35B-A3B).
     pub(crate) ffn: FfnQ4K,
 }
@@ -725,7 +734,9 @@ impl Qwen35ModelCudaQ4K {
         let load_ffn = |li: usize| -> Result<FfnQ4K, LlmError> {
             let key = |s: &str| format!("blk.{li}.{s}");
             match cfg.variant {
-                Qwen35Variant::Dense | Qwen35Variant::Qwen3PureTransformer => Ok(FfnQ4K::Dense {
+                Qwen35Variant::Dense
+                | Qwen35Variant::Qwen2PureTransformer
+                | Qwen35Variant::Qwen3PureTransformer => Ok(FfnQ4K::Dense {
                     gate: load_quant(&key("ffn_gate.weight"))?,
                     up: load_quant(&key("ffn_up.weight"))?,
                     down: load_quant(&key("ffn_down.weight"))?,
@@ -804,15 +815,41 @@ impl Qwen35ModelCudaQ4K {
             let key = |s: &str| format!("blk.{li}.{s}");
             let block = match kind {
                 LayerKind::Attention => {
+                    // P1.5 — Qwen2 has no QK-norm, has Q/K/V biases, uses
+                    // `ffn_norm` as the FFN pre-norm. Qwen3 / Qwen3.5 / 3.6
+                    // keep the legacy paths.
+                    let post_norm_name = format!("{}.weight", cfg.variant.ffn_pre_norm_name());
+                    let q_norm = if cfg.variant.attn_has_qk_norm() {
+                        Some(load_bf16(&key("attn_q_norm.weight"))?)
+                    } else {
+                        None
+                    };
+                    let k_norm = if cfg.variant.attn_has_qk_norm() {
+                        Some(load_bf16(&key("attn_k_norm.weight"))?)
+                    } else {
+                        None
+                    };
+                    let (b_q, b_k, b_v) = if cfg.variant.attn_has_qkv_bias() {
+                        (
+                            Some(load_bf16(&key("attn_q.bias"))?),
+                            Some(load_bf16(&key("attn_k.bias"))?),
+                            Some(load_bf16(&key("attn_v.bias"))?),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
                     let attn = AttnBlockQ4K {
                         attn_norm: load_bf16(&key("attn_norm.weight"))?,
-                        post_norm: load_bf16(&key("post_attention_norm.weight"))?,
-                        q_norm: load_bf16(&key("attn_q_norm.weight"))?,
-                        k_norm: load_bf16(&key("attn_k_norm.weight"))?,
+                        post_norm: load_bf16(&key(&post_norm_name))?,
+                        q_norm,
+                        k_norm,
                         w_q: load_quant(&key("attn_q.weight"))?,
                         w_k: load_quant(&key("attn_k.weight"))?,
                         w_v: load_quant(&key("attn_v.weight"))?,
                         w_o: load_quant(&key("attn_output.weight"))?,
+                        b_q,
+                        b_k,
+                        b_v,
                         ffn: load_ffn(li)?,
                     };
                     // Allocate KV cache for this layer.
@@ -1679,6 +1716,8 @@ impl Qwen35ModelCudaQ4K {
                 },
                 BlockQ4K::Attn(attn) => {
                     // T246.3 — full attention block forward at M=1.
+                    // P1.5 — Qwen2 path : no Q+gate, has Q/K/V biases, no QK-norm,
+                    // no sigmoid output gate. Branch on cfg.variant flags.
 
                     // 1. h_norm = rms_norm(h, attn_norm)
                     unsafe {
@@ -1691,39 +1730,43 @@ impl Qwen35ModelCudaQ4K {
                             .map_err(|e| LlmError::Backend(format!("rms_norm attn: {e:?}")))?;
                     }
 
-                    // 2. qg = w_q @ h_norm    (output dim 2*q_dim, fused Q + per-head gate)
-                    let (qg_n, _qg_k) = attn.w_q.shape();
-                    debug_assert_eq!(qg_n, 2 * q_dim);
-                    // Use the conv_out_p buffer as a scratch (size conv_dim ≥ 2*q_dim
-                    // typically) — except for Qwen3.6-27B where conv_dim=10240 and
-                    // 2*q_dim=12288. We need a dedicated buffer. Use qkv_mixed (conv_dim)
-                    // and check it fits, else use h_norm... Hmm.
-                    // Safer : allocate a fresh scratch sized for 2*q_dim.
-                    // For decode (single token) this is small.
-
-                    // Reuse `up_buf` (size f=17408 ≥ 2*q_dim) as QG scratch.
-                    let qg_p = up_p;
-                    attn.w_q.dispatch_matmul_m1(
-                        &self.kernels,
-                        &self.stream,
-                        h_norm_p,
-                        qg_p,
-                        x_q8_p,
-                    )?;
-
-                    // 3. Split qg into q (q_dim) and gate (q_dim, used as sigmoid gate).
-                    //    Use q_buf and (reuse) attn_out as gate buffer.
-                    unsafe {
-                        self.kernels
-                            .split_qg_bf16(
-                                &self.stream,
-                                qg_p,
-                                q_p,
-                                ao_p, // store gate here temporarily
-                                n_q as i32,
-                                head_dim as i32,
-                            )
-                            .map_err(|e| LlmError::Backend(format!("split_qg: {e:?}")))?;
+                    // 2. Q projection. With Q+gate (Qwen3Next) it produces a
+                    //    `2*q_dim` blob that we split. Without it (qwen2 / qwen3
+                    //    pure transformer) it produces just `q_dim` directly.
+                    if cfg.variant.attn_has_output_gate() {
+                        let (qg_n, _qg_k) = attn.w_q.shape();
+                        debug_assert_eq!(qg_n, 2 * q_dim);
+                        // Reuse `up_buf` (size f=17408 ≥ 2*q_dim) as QG scratch.
+                        let qg_p = up_p;
+                        attn.w_q.dispatch_matmul_m1(
+                            &self.kernels,
+                            &self.stream,
+                            h_norm_p,
+                            qg_p,
+                            x_q8_p,
+                        )?;
+                        // 3. Split qg into q (q_dim) and gate (q_dim, used as sigmoid gate).
+                        //    Use q_buf and (reuse) attn_out as gate buffer.
+                        unsafe {
+                            self.kernels
+                                .split_qg_bf16(
+                                    &self.stream,
+                                    qg_p,
+                                    q_p,
+                                    ao_p, // store gate here temporarily
+                                    n_q as i32,
+                                    head_dim as i32,
+                                )
+                                .map_err(|e| LlmError::Backend(format!("split_qg: {e:?}")))?;
+                        }
+                    } else {
+                        attn.w_q.dispatch_matmul_m1(
+                            &self.kernels,
+                            &self.stream,
+                            h_norm_p,
+                            q_p,
+                            x_q8_p,
+                        )?;
                     }
 
                     // 4. K, V projections.
@@ -1742,17 +1785,72 @@ impl Qwen35ModelCudaQ4K {
                         x_q8_p,
                     )?;
 
+                    // 4b. Qwen2 — add QKV biases.
+                    if cfg.variant.attn_has_qkv_bias() {
+                        unsafe {
+                            let (bq, _gbq) = attn
+                                .b_q
+                                .as_ref()
+                                .expect("qwen2: b_q present")
+                                .device_ptr(&self.stream);
+                            let (bk, _gbk) = attn
+                                .b_k
+                                .as_ref()
+                                .expect("qwen2: b_k present")
+                                .device_ptr(&self.stream);
+                            let (bv, _gbv) = attn
+                                .b_v
+                                .as_ref()
+                                .expect("qwen2: b_v present")
+                                .device_ptr(&self.stream);
+                            self.kernels
+                                .add_inplace_bf16(&self.stream, q_p, bq, q_dim as i32)
+                                .map_err(|e| LlmError::Backend(format!("q_bias: {e:?}")))?;
+                            self.kernels
+                                .add_inplace_bf16(&self.stream, k_p, bk, kv_dim as i32)
+                                .map_err(|e| LlmError::Backend(format!("k_bias: {e:?}")))?;
+                            self.kernels
+                                .add_inplace_bf16(&self.stream, v_p, bv, kv_dim as i32)
+                                .map_err(|e| LlmError::Backend(format!("v_bias: {e:?}")))?;
+                        }
+                    }
+
                     // 5. Per-head Q-norm and K-norm (RMSNorm with shared gamma).
-                    unsafe {
-                        let (qn, _g1) = attn.q_norm.device_ptr(&self.stream);
-                        let (kn, _g2) = attn.k_norm.device_ptr(&self.stream);
-                        // rms_norm_bf16(x, gamma, eps, n, batch) where each batch is size n.
-                        self.kernels
-                            .rms_norm_bf16(&self.stream, q_p, qn, eps, head_dim as i32, n_q as i32)
-                            .map_err(|e| LlmError::Backend(format!("q_norm: {e:?}")))?;
-                        self.kernels
-                            .rms_norm_bf16(&self.stream, k_p, kn, eps, head_dim as i32, n_kv as i32)
-                            .map_err(|e| LlmError::Backend(format!("k_norm: {e:?}")))?;
+                    //    Skipped for qwen2 (no QK-norm).
+                    if cfg.variant.attn_has_qk_norm() {
+                        unsafe {
+                            let (qn, _g1) = attn
+                                .q_norm
+                                .as_ref()
+                                .expect("qk_norm variant: q_norm present")
+                                .device_ptr(&self.stream);
+                            let (kn, _g2) = attn
+                                .k_norm
+                                .as_ref()
+                                .expect("qk_norm variant: k_norm present")
+                                .device_ptr(&self.stream);
+                            // rms_norm_bf16(x, gamma, eps, n, batch) where each batch is size n.
+                            self.kernels
+                                .rms_norm_bf16(
+                                    &self.stream,
+                                    q_p,
+                                    qn,
+                                    eps,
+                                    head_dim as i32,
+                                    n_q as i32,
+                                )
+                                .map_err(|e| LlmError::Backend(format!("q_norm: {e:?}")))?;
+                            self.kernels
+                                .rms_norm_bf16(
+                                    &self.stream,
+                                    k_p,
+                                    kn,
+                                    eps,
+                                    head_dim as i32,
+                                    n_kv as i32,
+                                )
+                                .map_err(|e| LlmError::Backend(format!("k_norm: {e:?}")))?;
+                        }
                     }
 
                     // 6. RoPE on q (n_q heads) and k (n_kv heads).
@@ -1838,13 +1936,16 @@ impl Qwen35ModelCudaQ4K {
                     }
 
                     // 9. sigmoid(gate) ; attn_out *= gate
-                    unsafe {
-                        self.kernels
-                            .sigmoid_inplace_bf16(&self.stream, ao_p, q_dim as i32)
-                            .map_err(|e| LlmError::Backend(format!("sigmoid gate: {e:?}")))?;
-                        self.kernels
-                            .mul_inplace_bf16(&self.stream, gate_p, ao_p, q_dim as i32)
-                            .map_err(|e| LlmError::Backend(format!("attn*gate: {e:?}")))?;
+                    //    Qwen2 has no output gate, so just skip this step.
+                    if cfg.variant.attn_has_output_gate() {
+                        unsafe {
+                            self.kernels
+                                .sigmoid_inplace_bf16(&self.stream, ao_p, q_dim as i32)
+                                .map_err(|e| LlmError::Backend(format!("sigmoid gate: {e:?}")))?;
+                            self.kernels
+                                .mul_inplace_bf16(&self.stream, gate_p, ao_p, q_dim as i32)
+                                .map_err(|e| LlmError::Backend(format!("attn*gate: {e:?}")))?;
+                        }
                     }
 
                     // 10. h = w_o @ gated_attn  (output dim d)
@@ -2104,7 +2205,7 @@ impl Qwen35ModelCudaQ4K {
         // own forked SSM state, then commit-the-accepted-branch at the
         // end. That design lands in a follow-up task ; see note
         // f0477041-1bf0-4f91-ab1c-83f7843a4a82.
-        if !matches!(self.config.variant, Qwen35Variant::Qwen3PureTransformer) {
+        if !self.config.variant.is_pure_transformer() {
             return Err(LlmError::Backend(format!(
                 "decode_step_tree multi-token (tree_size={tree_size}): SSM-hybrid \
                  variants need state forking — see note f0477041 for the design \
@@ -2299,8 +2400,9 @@ impl Qwen35ModelCudaQ4K {
                 BlockQ4K::Ssm(_) => {
                     return Err(LlmError::Backend(format!(
                         "decode_step_tree_pure_transformer: layer {li} is SSM \
-                         but variant=Qwen3PureTransformer should have only \
-                         Attn layers (loader/config bug)"
+                         but variant={:?} should have only Attn layers \
+                         (loader/config bug)",
+                        self.config.variant
                     )));
                 },
             };
@@ -2338,31 +2440,77 @@ impl Qwen35ModelCudaQ4K {
                     .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, v_r, x_q8_p)?;
             }
 
+            // P1.5 — Qwen2 : add Q/K/V biases per row (broadcast over rows).
+            if cfg.variant.attn_has_qkv_bias() {
+                unsafe {
+                    let (bq, _gbq) = attn
+                        .b_q
+                        .as_ref()
+                        .expect("qwen2: b_q present")
+                        .device_ptr(&self.stream);
+                    let (bk, _gbk) = attn
+                        .b_k
+                        .as_ref()
+                        .expect("qwen2: b_k present")
+                        .device_ptr(&self.stream);
+                    let (bv, _gbv) = attn
+                        .b_v
+                        .as_ref()
+                        .expect("qwen2: b_v present")
+                        .device_ptr(&self.stream);
+                    for r in 0..tree_size {
+                        let q_r = tq_p + (r as u64) * row_q;
+                        let k_r = tk_p + (r as u64) * row_kv;
+                        let v_r = tv_p + (r as u64) * row_kv;
+                        self.kernels
+                            .add_inplace_bf16(&self.stream, q_r, bq, q_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("tree q_bias: {e:?}")))?;
+                        self.kernels
+                            .add_inplace_bf16(&self.stream, k_r, bk, kv_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("tree k_bias: {e:?}")))?;
+                        self.kernels
+                            .add_inplace_bf16(&self.stream, v_r, bv, kv_dim as i32)
+                            .map_err(|e| LlmError::Backend(format!("tree v_bias: {e:?}")))?;
+                    }
+                }
+            }
+
             // Per-head Q-norm and K-norm — one call per row covering all
             // heads (rms_norm_bf16 with batch=n_q / n_kv).
-            unsafe {
-                let (qn, _g1) = attn.q_norm.device_ptr(&self.stream);
-                let (kn, _g2) = attn.k_norm.device_ptr(&self.stream);
-                self.kernels
-                    .rms_norm_bf16(
-                        &self.stream,
-                        tq_p,
-                        qn,
-                        eps,
-                        head_dim as i32,
-                        (tree_size * n_q) as i32,
-                    )
-                    .map_err(|e| LlmError::Backend(format!("tree q_norm: {e:?}")))?;
-                self.kernels
-                    .rms_norm_bf16(
-                        &self.stream,
-                        tk_p,
-                        kn,
-                        eps,
-                        head_dim as i32,
-                        (tree_size * n_kv) as i32,
-                    )
-                    .map_err(|e| LlmError::Backend(format!("tree k_norm: {e:?}")))?;
+            // Skipped for qwen2 (no QK-norm).
+            if cfg.variant.attn_has_qk_norm() {
+                unsafe {
+                    let (qn, _g1) = attn
+                        .q_norm
+                        .as_ref()
+                        .expect("qk_norm variant: q_norm present")
+                        .device_ptr(&self.stream);
+                    let (kn, _g2) = attn
+                        .k_norm
+                        .as_ref()
+                        .expect("qk_norm variant: k_norm present")
+                        .device_ptr(&self.stream);
+                    self.kernels
+                        .rms_norm_bf16(
+                            &self.stream,
+                            tq_p,
+                            qn,
+                            eps,
+                            head_dim as i32,
+                            (tree_size * n_q) as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("tree q_norm: {e:?}")))?;
+                    self.kernels
+                        .rms_norm_bf16(
+                            &self.stream,
+                            tk_p,
+                            kn,
+                            eps,
+                            head_dim as i32,
+                            (tree_size * n_kv) as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("tree k_norm: {e:?}")))?;
+                }
             }
 
             // RoPE per row with explicit pos = base_position + depths[r].

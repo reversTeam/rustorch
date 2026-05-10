@@ -90,11 +90,18 @@ use std::path::Path;
 use rustorch_gguf::{GgmlType, GgufFile};
 
 /// Qwen architecture variant. Despite the module name (`qwen35`), this
-/// also covers the legacy `qwen3` (pure transformer) family so the
-/// loader and forward pipeline can dispatch all three Qwen flavours
-/// (14B / 27B / 35B-A3B) from a single binary.
+/// also covers the legacy `qwen2` and `qwen3` (pure transformer)
+/// families so the loader and forward pipeline can dispatch all four
+/// Qwen flavours (Qwen2.5-7B / Qwen3-14B / Qwen3.6-27B / Qwen3.6-35B-A3B)
+/// from a single binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qwen35Variant {
+    /// `qwen2` — legacy Qwen2 pure transformer (Qwen2 / Qwen2.5 family).
+    /// Differs from `qwen3` by : (1) Q/K/V projections carry a bias
+    /// vector ; (2) NO per-head Q-norm / K-norm ; (3) NO sigmoid output
+    /// gate on attention. FFN pre-norm uses `ffn_norm` (same as qwen3),
+    /// dense SwiGLU FFN.
+    Qwen2PureTransformer,
     /// `qwen3` — pure transformer (no SSM), single-width `attn_q` (no
     /// Q+gate combine), dense FFN, `ffn_norm` for the FFN pre-norm.
     /// Used by Qwen3-14B and other Qwen3 family checkpoints.
@@ -113,6 +120,7 @@ impl Qwen35Variant {
     /// String key used in GGUF metadata under `<arch>.<param>` paths.
     pub fn arch_str(self) -> &'static str {
         match self {
+            Qwen35Variant::Qwen2PureTransformer => "qwen2",
             Qwen35Variant::Qwen3PureTransformer => "qwen3",
             Qwen35Variant::Dense => "qwen35",
             Qwen35Variant::Moe => "qwen35moe",
@@ -120,24 +128,57 @@ impl Qwen35Variant {
     }
 
     /// True if attention's `wq` carries Q+gate combined (Qwen3Next style).
-    /// False for legacy Qwen3 where `wq` outputs only Q.
+    /// False for legacy Qwen2/Qwen3 where `wq` outputs only Q.
     pub fn has_q_gate(self) -> bool {
-        !matches!(self, Qwen35Variant::Qwen3PureTransformer)
+        matches!(self, Qwen35Variant::Dense | Qwen35Variant::Moe)
     }
 
     /// True if any SSM (gated delta net) layers are present. For pure
     /// transformer variants this is always false.
     pub fn has_ssm(self) -> bool {
-        !matches!(self, Qwen35Variant::Qwen3PureTransformer)
+        matches!(self, Qwen35Variant::Dense | Qwen35Variant::Moe)
     }
 
-    /// Tensor name used for the FFN pre-norm. `qwen3` calls it
+    /// Tensor name used for the FFN pre-norm. `qwen2` and `qwen3` call it
     /// `ffn_norm`; `qwen35*` calls it `post_attention_norm`.
     pub fn ffn_pre_norm_name(self) -> &'static str {
         match self {
-            Qwen35Variant::Qwen3PureTransformer => "ffn_norm",
+            Qwen35Variant::Qwen2PureTransformer | Qwen35Variant::Qwen3PureTransformer => "ffn_norm",
             _ => "post_attention_norm",
         }
+    }
+
+    /// True if the attention projections (Q, K, V) carry a bias vector.
+    /// True only for Qwen2 ; Qwen3 / Qwen3.5 / Qwen3.6 are all bias-free.
+    pub fn attn_has_qkv_bias(self) -> bool {
+        matches!(self, Qwen35Variant::Qwen2PureTransformer)
+    }
+
+    /// True if per-head Q-norm / K-norm RMSNorm is applied after the
+    /// Q / K projections. False for Qwen2, true for everything else.
+    pub fn attn_has_qk_norm(self) -> bool {
+        !matches!(self, Qwen35Variant::Qwen2PureTransformer)
+    }
+
+    /// True if the attention output carries a sigmoid output gate
+    /// (Qwen3Next style). True for Qwen3 / Qwen3.5 / Qwen3.6 (the gate
+    /// is the second half of `attn_q` 's `2*q_dim` output). False for
+    /// Qwen2 (no gate at all — `attn_q` width is exactly `q_dim`).
+    pub fn attn_has_output_gate(self) -> bool {
+        matches!(
+            self,
+            Qwen35Variant::Qwen3PureTransformer | Qwen35Variant::Dense | Qwen35Variant::Moe
+        )
+    }
+
+    /// Pure-transformer variants — no SSM, every layer is attention.
+    /// Used to pick the `decode_step_tree_pure_transformer` fast path
+    /// (introduced in T246.7 P1.4a, extended to qwen2 in P1.5).
+    pub fn is_pure_transformer(self) -> bool {
+        matches!(
+            self,
+            Qwen35Variant::Qwen2PureTransformer | Qwen35Variant::Qwen3PureTransformer
+        )
     }
 }
 
@@ -322,6 +363,7 @@ pub fn parse_config(path: &Path) -> Result<Qwen35Config, Qwen35LoadError> {
         .ok_or_else(|| Qwen35LoadError::MissingMeta("general.architecture".to_string()))?
         .to_string();
     let variant = match arch_str.as_str() {
+        "qwen2" => Qwen35Variant::Qwen2PureTransformer,
         "qwen3" => Qwen35Variant::Qwen3PureTransformer,
         "qwen35" => Qwen35Variant::Dense,
         "qwen35moe" => Qwen35Variant::Moe,
@@ -567,10 +609,17 @@ pub fn expected_tensor_names(li: usize, kind: LayerKind, variant: Qwen35Variant)
                 p("attn_q.weight"),
                 p("attn_k.weight"),
                 p("attn_v.weight"),
-                p("attn_q_norm.weight"),
-                p("attn_k_norm.weight"),
                 p("attn_output.weight"),
             ]);
+            if variant.attn_has_qk_norm() {
+                v.push(p("attn_q_norm.weight"));
+                v.push(p("attn_k_norm.weight"));
+            }
+            if variant.attn_has_qkv_bias() {
+                v.push(p("attn_q.bias"));
+                v.push(p("attn_k.bias"));
+                v.push(p("attn_v.bias"));
+            }
         },
         LayerKind::Ssm => {
             v.extend([
@@ -587,7 +636,9 @@ pub fn expected_tensor_names(li: usize, kind: LayerKind, variant: Qwen35Variant)
         },
     }
     match variant {
-        Qwen35Variant::Qwen3PureTransformer | Qwen35Variant::Dense => {
+        Qwen35Variant::Qwen2PureTransformer
+        | Qwen35Variant::Qwen3PureTransformer
+        | Qwen35Variant::Dense => {
             v.extend([
                 p("ffn_gate.weight"),
                 p("ffn_up.weight"),
