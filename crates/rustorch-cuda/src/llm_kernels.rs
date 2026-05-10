@@ -3416,8 +3416,8 @@ const GQA_DECODE_SPLIT_PARTIAL_BF16_SRC: &str = r#"
 
 extern "C" __global__ void gqa_decode_split_partial_bf16(
     const __nv_bfloat16* __restrict__ q,           // [n_heads, head_dim]
-    const __nv_bfloat16* __restrict__ k_cache,     // [n_kv, max_seq, head_dim]
-    const __nv_bfloat16* __restrict__ v_cache,     // [n_kv, max_seq, head_dim]
+    const __nv_bfloat16* __restrict__ k_cache,     // [max_seq, kv_dim] (P1.5 — Layout A)
+    const __nv_bfloat16* __restrict__ v_cache,     // [max_seq, kv_dim] (P1.5 — Layout A)
     float*               __restrict__ partial_m,   // [n_heads, n_split]
     float*               __restrict__ partial_l,   // [n_heads, n_split]
     __nv_bfloat16*       __restrict__ partial_o,   // [n_heads, n_split, head_dim]
@@ -3454,6 +3454,7 @@ extern "C" __global__ void gqa_decode_split_partial_bf16(
     }
 
     int kv_h = h * n_kv / n_heads;
+    int kv_dim = n_kv * head_dim;
 
     extern __shared__ float sdata[];
 
@@ -3463,8 +3464,11 @@ extern "C" __global__ void gqa_decode_split_partial_bf16(
     float o   = 0.0f;
 
     for (int t = t_start; t < t_end; ++t) {
-        // Score = Q · K[kv_h, t]
-        float k_i     = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+        // Score = Q · K[t, kv_h]   (Layout A : k_cache[t, kv_h, i] = k_cache[t*kv_dim + kv_h*head_dim + i])
+        long long kv_off = (long long)t * (long long)kv_dim
+                         + (long long)kv_h * (long long)head_dim
+                         + (long long)tid;
+        float k_i     = (float)k_cache[kv_off];
         float partial = q_i * k_i;
         sdata[tid] = partial;
         __syncthreads();
@@ -3481,7 +3485,7 @@ extern "C" __global__ void gqa_decode_split_partial_bf16(
         float new_m     = fmaxf(m, s_t);
         float correction = expf(m - new_m);
         float p          = expf(s_t - new_m);
-        float v_i        = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+        float v_i        = (float)v_cache[kv_off];
         o = o * correction + p * v_i;
         l = l * correction + p;
         m = new_m;
@@ -3583,7 +3587,7 @@ const GQA_DECODE_TREE_PARTIAL_BF16_SRC: &str = r#"
 
 extern "C" __global__ void gqa_decode_tree_partial_bf16(
     const __nv_bfloat16* __restrict__ q,           // [tree_size, n_heads, head_dim]
-    const __nv_bfloat16* __restrict__ k_cache,     // [n_kv, max_seq, head_dim] (cf. existing convention)
+    const __nv_bfloat16* __restrict__ k_cache,     // [max_seq, kv_dim] = [max_seq, n_kv, head_dim] (P1.5 — Layout A, matches kv_append_*_devcnt)
     const __nv_bfloat16* __restrict__ v_cache,
     const int*           __restrict__ parents,     // [tree_size]
     const unsigned char* __restrict__ depths,      // [tree_size]
@@ -3626,14 +3630,39 @@ extern "C" __global__ void gqa_decode_tree_partial_bf16(
 
     extern __shared__ float sdata[];
 
+    // P1.5 — empty-split handling : when n_split > kv_len, splits beyond
+    // the data range have nothing to do. Combine kernel reads partial_m /
+    // partial_l / partial_o from the same buffer slot regardless ; we MUST
+    // initialize them to the neutral element (-inf, 0, 0) or stale values
+    // from the previous decode_step_tree call corrupt the combine result.
+    // Phase B (tree positions) only runs in split 0, so non-zero splits
+    // with t_start >= t_end have nothing to contribute.
+    if (sp != 0 && t_start >= t_end) {
+        if (tid == 0) {
+            partial_m[slot] = -1e30f;
+            partial_l[slot] = 0.0f;
+        }
+        partial_o[slot * (long long)head_dim + tid] = (__nv_bfloat16)0.0f;
+        return;
+    }
+
     float q_i = (float)q[((long long)rnod * (long long)n_heads + (long long)h) * (long long)head_dim + tid];
     float m   = -1e30f;
     float l   = 0.0f;
     float o   = 0.0f;
 
+    // P1.5 — KV cache layout is [max_seq, kv_dim] (Layout A) where
+    // kv_dim = n_kv * head_dim and a slot at position `t` for head `kv_h`
+    // lives at offset `t * kv_dim + kv_h * head_dim + i`. This matches
+    // `kv_append_bf16_devcnt` and `kv_append_tree_bf16` (both Layout A).
+    int kv_dim = n_kv * head_dim;
+
     // ── Phase A : base context [t_start..t_end) ────────────────────────
     for (int t = t_start; t < t_end; ++t) {
-        float k_i     = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+        long long kv_off = (long long)t * (long long)kv_dim
+                         + (long long)kv_h * (long long)head_dim
+                         + (long long)tid;
+        float k_i     = (float)k_cache[kv_off];
         float partial = q_i * k_i;
         sdata[tid] = partial;
         __syncthreads();
@@ -3649,7 +3678,7 @@ extern "C" __global__ void gqa_decode_tree_partial_bf16(
         float new_m      = fmaxf(m, s_t);
         float correction = expf(m - new_m);
         float p          = expf(s_t - new_m);
-        float v_i        = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+        float v_i        = (float)v_cache[kv_off];
         o = o * correction + p * v_i;
         l = l * correction + p;
         m = new_m;
@@ -3672,7 +3701,10 @@ extern "C" __global__ void gqa_decode_tree_partial_bf16(
                 anc = parents[anc];
             }
             int t = kv_len + anc - 1;
-            float k_i     = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+            long long kv_off = (long long)t * (long long)kv_dim
+                             + (long long)kv_h * (long long)head_dim
+                             + (long long)tid;
+            float k_i     = (float)k_cache[kv_off];
             float partial = q_i * k_i;
             sdata[tid] = partial;
             __syncthreads();
@@ -3688,7 +3720,7 @@ extern "C" __global__ void gqa_decode_tree_partial_bf16(
             float new_m      = fmaxf(m, s_t);
             float correction = expf(m - new_m);
             float p          = expf(s_t - new_m);
-            float v_i        = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+            float v_i        = (float)v_cache[kv_off];
             o = o * correction + p * v_i;
             l = l * correction + p;
             m = new_m;
