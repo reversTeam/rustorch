@@ -4080,6 +4080,145 @@ mod parity_tests {
         }
     }
 
+    /// T246.4.4 — REGRESSION TEST for race conditions in quantized SGEMV
+    /// kernels. Each kernel must produce IDENTICAL output across two runs
+    /// with the same input. Caught by compute-sanitizer racecheck once,
+    /// this guards against any future regression by re-running the kernel
+    /// 4 times and checking bit-exact output equality.
+    ///
+    /// Background : V2 quantized matmul kernels iterate over super-blocks.
+    /// Per iter, thread 0 writes scale prefactors to shmem, syncthreads,
+    /// then all threads read. Without a __syncthreads at END of iteration,
+    /// next iter's write races with this iter's read → non-deterministic.
+    #[test]
+    fn sgemv_quantized_kernels_are_deterministic() {
+        use rustorch_gguf::dequant::{Q4_K_BYTES, Q5_K_BYTES, Q6_K_BYTES, QK_K};
+
+        let n = 32usize;
+        let k = 1024usize; // 4 super-blocks per row, exposes the race
+        let blocks_per_row = k / QK_K;
+
+        let mut state: u64 = 0x12345678abcd;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Generate Q4_K, Q5_K, Q6_K weights with sane d/dmin/scales.
+        let row_bytes_q4 = blocks_per_row * Q4_K_BYTES;
+        let row_bytes_q5 = blocks_per_row * Q5_K_BYTES;
+        let row_bytes_q6 = blocks_per_row * Q6_K_BYTES;
+        let mut w_q4 = vec![0u8; n * row_bytes_q4];
+        let mut w_q5 = vec![0u8; n * row_bytes_q5];
+        let mut w_q6 = vec![0u8; n * row_bytes_q6];
+        for b in &mut w_q4 {
+            *b = (next() & 0xFF) as u8;
+        }
+        for b in &mut w_q5 {
+            *b = (next() & 0xFF) as u8;
+        }
+        for b in &mut w_q6 {
+            *b = (next() & 0xFF) as u8;
+        }
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off4 = row * row_bytes_q4 + blk * Q4_K_BYTES;
+                let d4 = half::f16::from_f32(0.05).to_le_bytes();
+                let dmin4 = half::f16::from_f32(0.025).to_le_bytes();
+                w_q4[off4] = d4[0];
+                w_q4[off4 + 1] = d4[1];
+                w_q4[off4 + 2] = dmin4[0];
+                w_q4[off4 + 3] = dmin4[1];
+                for i in 0..12 {
+                    w_q4[off4 + 4 + i] &= 0x3F;
+                }
+                let off5 = row * row_bytes_q5 + blk * Q5_K_BYTES;
+                w_q5[off5] = d4[0];
+                w_q5[off5 + 1] = d4[1];
+                w_q5[off5 + 2] = dmin4[0];
+                w_q5[off5 + 3] = dmin4[1];
+                for i in 0..12 {
+                    w_q5[off5 + 4 + i] &= 0x3F;
+                }
+                let off6 = row * row_bytes_q6 + blk * Q6_K_BYTES;
+                let d6 = half::f16::from_f32(0.04).to_le_bytes();
+                w_q6[off6 + 208] = d6[0];
+                w_q6[off6 + 209] = d6[1];
+                for i in 0..16 {
+                    w_q6[off6 + 192 + i] = (next() as i8 / 8) as u8;
+                }
+            }
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let w4_dev = stream.memcpy_stod(&w_q4).expect("");
+        let w5_dev = stream.memcpy_stod(&w_q5).expect("");
+        let w6_dev = stream.memcpy_stod(&w_q6).expect("");
+        let x_bf: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32((i as f32 * 0.013).sin() * 0.3))
+            .collect();
+        let x_dev = stream.memcpy_stod(&x_bf).expect("");
+
+        let (w4_p, w5_p, w6_p, x_p) = unsafe {
+            use cudarc::driver::DevicePtr;
+            (
+                w4_dev.device_ptr(&stream).0,
+                w5_dev.device_ptr(&stream).0,
+                w6_dev.device_ptr(&stream).0,
+                x_dev.device_ptr(&stream).0,
+            )
+        };
+
+        // For each kernel, run 4 times and check identical output.
+        let kernels_to_test: [(&str, Box<dyn Fn(u64) -> Result<(), CudaError>>); 4] = [
+            (
+                "sgemv_q4k_bf16_v2",
+                Box::new(|y: u64| unsafe {
+                    kernels.sgemv_q4k_bf16_v2(&stream, w4_p, x_p, y, n as i32, k as i32)
+                }),
+            ),
+            (
+                "sgemv_q5k_bf16",
+                Box::new(|y: u64| unsafe {
+                    kernels.sgemv_q5k_bf16(&stream, w5_p, x_p, y, n as i32, k as i32)
+                }),
+            ),
+            (
+                "sgemv_q6k_bf16",
+                Box::new(|y: u64| unsafe {
+                    kernels.sgemv_q6k_bf16(&stream, w6_p, x_p, y, n as i32, k as i32)
+                }),
+            ),
+            (
+                "sgemv_q6k_bf16_v2",
+                Box::new(|y: u64| unsafe {
+                    kernels.sgemv_q6k_bf16_v2(&stream, w6_p, x_p, y, n as i32, k as i32)
+                }),
+            ),
+        ];
+
+        for (name, run) in kernels_to_test.iter() {
+            let mut prev: Option<Vec<half::bf16>> = None;
+            for trial in 0..4 {
+                let mut y_dev = stream.alloc_zeros::<half::bf16>(n).expect("alloc y");
+                let y_p = unsafe {
+                    use cudarc::driver::DevicePtrMut;
+                    let (p, _g) = y_dev.device_ptr_mut(&stream);
+                    p
+                };
+                run(y_p).unwrap_or_else(|e| panic!("{name} trial {trial}: {e:?}"));
+                let y_host: Vec<half::bf16> = stream.memcpy_dtov(&y_dev).expect("dtov");
+                if let Some(p) = &prev {
+                    assert_eq!(p, &y_host, "{name} non-deterministic at trial {trial}");
+                }
+                prev = Some(y_host);
+            }
+        }
+    }
+
     /// T244.4 — sgemv_q6k_bf16_v2 parity test : V2 must match V1 (and CPU
     /// reference) within BF16 tolerance.
     #[test]
