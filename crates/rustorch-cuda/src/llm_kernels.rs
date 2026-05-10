@@ -2185,6 +2185,109 @@ extern "C" __global__ void sgemv_q6k_bf16_v2(
 }
 "#;
 
+// T246.6.8 — sgemv_q6k_bf16 V4 — same speedup pattern as Q4_K V3, but
+// keeping V2's 64-thread/row layout (less register pressure than V3)
+// + 4-row multi-row blocks → 256 threads/block.
+//
+// V3 regressed on the LM head (9.32 vs V2's 9.50 tok/s on 27B) because
+// 32-lane-per-row layout forced each lane to handle 16 weights/super-
+// block — too much register pressure for Q6_K's 6-bit decode + 16
+// distinct scales. V4 reuses V2's 64 threads/row (each handles 4
+// weights, 4 scales) but stacks 4 rows in 1 block.
+#[cfg(feature = "cuda")]
+const SGEMV_Q6K_BF16_V4_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(256, 4)
+__global__ void sgemv_q6k_bf16_v4(
+    const unsigned char* __restrict__ w_q6k,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int N,
+    int K
+) {
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 6;        // 0..3 (4 rows × 64 threads = 256)
+    int row_tid      = tid & 63;          // 0..63 (V2's per-row tid)
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 210;
+
+    // V2-like tile mapping (per row).
+    int half          = row_tid >> 5;   // 0 or 1
+    int l             = row_tid & 31;   // 0..31
+    int half_offset_x = half << 7;      // 0 or 128
+    int ql_base       = half << 6;      // 0 or 64
+    int qh_base       = half << 5;      // 0 or 32
+    int sb            = half << 3;      // 0 or 8
+    int l16           = l >> 4;         // 0 or 1
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 210;
+        const unsigned char* blk = w_q6k + blk_off;
+
+        // Header : d (super-block float scale) — broadcast load via L1.
+        unsigned short d_bits = blk[208] | (blk[209] << 8);
+        float d = __half2float(__ushort_as_half(d_bits));
+
+        // Per-thread scale unpack — 4 distinct scales used by this thread.
+        const signed char* scales = (const signed char*)(blk + 192);
+        float sc0 = d * (float)scales[sb + 0 + l16];
+        float sc2 = d * (float)scales[sb + 2 + l16];
+        float sc4 = d * (float)scales[sb + 4 + l16];
+        float sc6 = d * (float)scales[sb + 6 + l16];
+
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+
+        unsigned char ql_a = ql[ql_base + l];
+        unsigned char ql_b = ql[ql_base + l + 32];
+        unsigned char qh_b = qh[qh_base + l];
+
+        int q0 = (ql_a & 0x0F) | (((qh_b)      & 0x03) << 4);
+        int q1 = (ql_b & 0x0F) | (((qh_b >> 2) & 0x03) << 4);
+        int q2 = (ql_a >> 4)   | (((qh_b >> 4) & 0x03) << 4);
+        int q3 = (ql_b >> 4)   | (((qh_b >> 6) & 0x03) << 4);
+
+        const __nv_bfloat16* x_ptr = x + b * 256 + half_offset_x;
+        float x0 = (float)x_ptr[l];
+        float x1 = (float)x_ptr[l + 32];
+        float x2 = (float)x_ptr[l + 64];
+        float x3 = (float)x_ptr[l + 96];
+
+        acc += sc0 * (float)(q0 - 32) * x0;
+        acc += sc2 * (float)(q1 - 32) * x1;
+        acc += sc4 * (float)(q2 - 32) * x2;
+        acc += sc6 * (float)(q3 - 32) * x3;
+        // No __syncthreads — per-thread scale eliminates V2's race.
+    }
+
+    // Per-row reduction over 64 threads (2 warps).
+    // Step 1: warp-shuffle within each warp.
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    // Step 2: cross-warp via 4*2 = 8 shmem slots (4 rows × 2 warps).
+    extern __shared__ float sdata[];  // [4 * 2] = 8 floats
+    int warp_in_row = (row_tid >> 5) & 1;  // 0 or 1
+    if ((row_tid & 31) == 0) {
+        sdata[row_in_block * 2 + warp_in_row] = acc;
+    }
+    __syncthreads();
+    if (row_tid == 0) {
+        float total = sdata[row_in_block * 2 + 0] + sdata[row_in_block * 2 + 1];
+        y[row] = (__nv_bfloat16)total;
+    }
+}
+"#;
+
 // T246.6.7 — sgemv_q6k_bf16 V3 — same multi-row + per-thread-scale pattern
 // as Q4_K V3, adapted to Q6_K's 6-bit packed layout. Targets the LM head
 // (N=152064) which is 27% of GPU time on 27B Q4_K_M (1 huge call/token).
@@ -2281,6 +2384,141 @@ __global__ void sgemv_q6k_bf16_v3(
     }
 
     // Warp-shuffle reduction within row's 32 lanes.
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        y[row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+// T246.6.9 — sgemv_q5k_bf16 V3 — same multi-row + per-thread scale pattern
+// as Q4_K V3, with qh-bit extraction for the 5th bit per weight.
+// Each lane covers BOTH sub-blocks of a pair (sub_a = 2*pair via low
+// nibble + sub_b = 2*pair+1 via high nibble), using their distinct qh
+// bit positions (2*pair vs 2*pair+1).
+#[cfg(feature = "cuda")]
+const SGEMV_Q5K_BF16_V3_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(128, 8)
+__global__ void sgemv_q5k_bf16_v3(
+    const unsigned char* __restrict__ w_q5k,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int N,
+    int K
+) {
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 176;
+
+    int group     = lane >> 3;            // 0..3 — pair_idx
+    int pos_base  = (lane & 7) << 2;      // 0..28 step 4
+    int byte_base = (group << 5) + pos_base;
+    unsigned int qh_mask_a = 1u << (2 * group);       // sub_a (low nibble half)
+    unsigned int qh_mask_b = 1u << (2 * group + 1);   // sub_b (high nibble half)
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 176;
+        const unsigned char* blk = w_q5k + blk_off;
+
+        // Header.
+        unsigned short d_bits    = blk[0] | (blk[1] << 8);
+        unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_bits));
+        float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+        // Per-thread scale unpack for both sub-blocks of this pair.
+        const unsigned char* scales = blk + 4;
+        int sub_a = group * 2;
+        int sub_b = sub_a + 1;
+        unsigned char sc_a, m_a, sc_b, m_b;
+        if (sub_a < 4) {
+            sc_a = scales[sub_a]     & 0x3F;
+            m_a  = scales[sub_a + 4] & 0x3F;
+        } else {
+            int ga = sub_a - 4;
+            sc_a = (scales[ga + 8] & 0x0F) | ((scales[ga]     >> 6) << 4);
+            m_a  = (scales[ga + 8] >> 4)   | ((scales[ga + 4] >> 6) << 4);
+        }
+        if (sub_b < 4) {
+            sc_b = scales[sub_b]     & 0x3F;
+            m_b  = scales[sub_b + 4] & 0x3F;
+        } else {
+            int gb = sub_b - 4;
+            sc_b = (scales[gb + 8] & 0x0F) | ((scales[gb]     >> 6) << 4);
+            m_b  = (scales[gb + 8] >> 4)   | ((scales[gb + 4] >> 6) << 4);
+        }
+        float scale_a = d    * (float)sc_a;
+        float min_a   = dmin * (float)m_a;
+        float scale_b = d    * (float)sc_b;
+        float min_b   = dmin * (float)m_b;
+
+        const unsigned char* qh = blk + 16;       // 32 bytes high bits
+        const unsigned char* ql = blk + 16 + 32;  // 128 bytes low nibbles
+
+        // 4 ql bytes (uint32) covering byte_base..byte_base+3.
+        unsigned int qlbytes = *(const unsigned int*)(ql + byte_base);
+        // 4 qh bytes (uint32) at the same pos_base — qh has 32 bytes per
+        // super-block (1 byte per pos in 0..31), shared by all pair_idxs.
+        unsigned int qhbytes = *(const unsigned int*)(qh + pos_base);
+
+        // Load BF16 x for sub_a and sub_b.
+        const __nv_bfloat16* xa_ptr = x + b * 256 + sub_a * 32 + pos_base;
+        const __nv_bfloat16* xb_ptr = x + b * 256 + sub_b * 32 + pos_base;
+        uint2 xa = *(const uint2*)xa_ptr;
+        uint2 xb = *(const uint2*)xb_ptr;
+        float xa0 = (float)__ushort_as_bfloat16((unsigned short)(xa.x & 0xFFFFu));
+        float xa1 = (float)__ushort_as_bfloat16((unsigned short)(xa.x >> 16));
+        float xa2 = (float)__ushort_as_bfloat16((unsigned short)(xa.y & 0xFFFFu));
+        float xa3 = (float)__ushort_as_bfloat16((unsigned short)(xa.y >> 16));
+        float xb0 = (float)__ushort_as_bfloat16((unsigned short)(xb.x & 0xFFFFu));
+        float xb1 = (float)__ushort_as_bfloat16((unsigned short)(xb.x >> 16));
+        float xb2 = (float)__ushort_as_bfloat16((unsigned short)(xb.y & 0xFFFFu));
+        float xb3 = (float)__ushort_as_bfloat16((unsigned short)(xb.y >> 16));
+
+        // Decode 4 weights for sub_a (LOW nibbles + qh_mask_a bit) and 4
+        // for sub_b (HIGH nibbles + qh_mask_b bit).
+        unsigned char qb0 = (qlbytes      ) & 0xFFu;
+        unsigned char qb1 = (qlbytes >>  8) & 0xFFu;
+        unsigned char qb2 = (qlbytes >> 16) & 0xFFu;
+        unsigned char qb3 = (qlbytes >> 24) & 0xFFu;
+        unsigned char hb0 = (qhbytes      ) & 0xFFu;
+        unsigned char hb1 = (qhbytes >>  8) & 0xFFu;
+        unsigned char hb2 = (qhbytes >> 16) & 0xFFu;
+        unsigned char hb3 = (qhbytes >> 24) & 0xFFu;
+
+        int qa0 = (qb0 & 0x0F) + ((hb0 & qh_mask_a) ? 16 : 0);
+        int qa1 = (qb1 & 0x0F) + ((hb1 & qh_mask_a) ? 16 : 0);
+        int qa2 = (qb2 & 0x0F) + ((hb2 & qh_mask_a) ? 16 : 0);
+        int qa3 = (qb3 & 0x0F) + ((hb3 & qh_mask_a) ? 16 : 0);
+        int qbq0 = (qb0 >>   4) + ((hb0 & qh_mask_b) ? 16 : 0);
+        int qbq1 = (qb1 >>   4) + ((hb1 & qh_mask_b) ? 16 : 0);
+        int qbq2 = (qb2 >>   4) + ((hb2 & qh_mask_b) ? 16 : 0);
+        int qbq3 = (qb3 >>   4) + ((hb3 & qh_mask_b) ? 16 : 0);
+
+        acc += (scale_a * (float)qa0  - min_a) * xa0;
+        acc += (scale_a * (float)qa1  - min_a) * xa1;
+        acc += (scale_a * (float)qa2  - min_a) * xa2;
+        acc += (scale_a * (float)qa3  - min_a) * xa3;
+        acc += (scale_b * (float)qbq0 - min_b) * xb0;
+        acc += (scale_b * (float)qbq1 - min_b) * xb1;
+        acc += (scale_b * (float)qbq2 - min_b) * xb2;
+        acc += (scale_b * (float)qbq3 - min_b) * xb3;
+    }
+
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_xor_sync(0xffffffffu, acc, offset);
@@ -3208,10 +3446,12 @@ pub struct LlmKernels {
     sgemv_q4k_v3: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemm_q4k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q5k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemv_q5k_v3: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemm_q5k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k_v3: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    sgemv_q6k_v4: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemm_q6k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     softplus_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -3279,10 +3519,12 @@ impl LlmKernels {
             sgemv_q4k_v3: std::sync::OnceLock::new(),
             sgemm_q4k_m8: std::sync::OnceLock::new(),
             sgemv_q5k: std::sync::OnceLock::new(),
+            sgemv_q5k_v3: std::sync::OnceLock::new(),
             sgemm_q5k_m8: std::sync::OnceLock::new(),
             sgemv_q6k: std::sync::OnceLock::new(),
             sgemv_q6k_v2: std::sync::OnceLock::new(),
             sgemv_q6k_v3: std::sync::OnceLock::new(),
+            sgemv_q6k_v4: std::sync::OnceLock::new(),
             sgemm_q6k_m8: std::sync::OnceLock::new(),
             sgemv_bf16: std::sync::OnceLock::new(),
             softplus_inplace: std::sync::OnceLock::new(),
@@ -4317,6 +4559,46 @@ impl LlmKernels {
         Ok(())
     }
 
+    /// T246.6.9 — Q5_K SGEMV V3 (multi-row + per-thread scale +
+    /// __launch_bounds__). Same speedup pattern as Q4_K V3, with qh-bit
+    /// extraction for the 5th bit per weight.
+    ///
+    /// # Safety  Same contract as `sgemv_q5k_bf16`.
+    pub unsafe fn sgemv_q5k_bf16_v3(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q5k: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q5k_bf16_v3: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q5k_v3,
+            SGEMV_Q5K_BF16_V3_SRC,
+            "sgemv_q5k_bf16_v3",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q5k).arg(&x).arg(&y).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q5k_bf16_v3::launch",
+        })?;
+        Ok(())
+    }
+
     /// T244.4 — Q6_K V2 (warp-shuffle, 64 threads/TG, vector decode).
     /// Target : match Q4K_V2 bandwidth (~165 GB/s) on Qwen-7B FFN shape.
     ///
@@ -4351,6 +4633,46 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemv_q6k_bf16_v2::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.6.8 — Q6_K SGEMV V4 (V2's 64-thread/row layout + 4-row blocks
+    /// + per-thread scale + __launch_bounds__). Avoids V3's register
+    /// pressure regression by keeping V2's per-thread weight count.
+    ///
+    /// # Safety  Same contract as `sgemv_q6k_bf16_v2`.
+    pub unsafe fn sgemv_q6k_bf16_v4(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q6k: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q6k_bf16_v4: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q6k_v4,
+            SGEMV_Q6K_BF16_V4_SRC,
+            "sgemv_q6k_bf16_v4",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 4 * 2 * 4, // 4 rows × 2 warps = 8 float slots
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q6k).arg(&x).arg(&y).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q6k_bf16_v4::launch",
         })?;
         Ok(())
     }

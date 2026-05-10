@@ -113,17 +113,25 @@ impl QuantTensor {
                 },
                 QuantTensor::Q5K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);
-                    kernels
-                        .sgemv_q5k_bf16(stream, w, x, y, *n as i32, *k as i32)
-                        .map_err(|e| LlmError::Backend(format!("sgemv_q5k: {e:?}")))
+                    // T246.6.9 — Heuristic: V3 (multi-row) when N is large
+                    // enough to saturate SMs ; V2 for small SSM α/β matmuls
+                    // where V3's 4-row block underutilizes occupancy.
+                    if *n >= 256 {
+                        kernels
+                            .sgemv_q5k_bf16_v3(stream, w, x, y, *n as i32, *k as i32)
+                            .map_err(|e| LlmError::Backend(format!("sgemv_q5k_v3: {e:?}")))
+                    } else {
+                        kernels
+                            .sgemv_q5k_bf16(stream, w, x, y, *n as i32, *k as i32)
+                            .map_err(|e| LlmError::Backend(format!("sgemv_q5k: {e:?}")))
+                    }
                 },
                 QuantTensor::Q6K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);
                     kernels
-                        // T246.6.7 — Q6_K V3 was slower than V2 in early
-                        // measurements (9.31 vs 9.48 tok/s on 27B). Keeping
-                        // the kernel + wrapper but using V2 here until V3
-                        // is debugged or rewritten.
+                        // T246.6.8 — V4 measured equal to V2 (no win) on the
+                        // LM head shape (N=152064 × K=5120). V4 kernel kept
+                        // for future investigation. Sticking with V2.
                         .sgemv_q6k_bf16_v2(stream, w, x, y, *n as i32, *k as i32)
                         .map_err(|e| LlmError::Backend(format!("sgemv_q6k_v2: {e:?}")))
                 },
