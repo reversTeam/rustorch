@@ -961,6 +961,72 @@ extern "C" __global__ void increment_u32_dev(int* p) {
 }
 "#;
 
+// T246.7 P1.3c — atomic-style add of a host-supplied int value to a 1-elt
+// device buffer. 1 thread, 1 block, no synchronization needed (called
+// between distinct stream ops in decode_step_tree).
+#[cfg(feature = "cuda")]
+const ADD_U32_DEV_SRC: &str = r#"
+extern "C" __global__ void add_u32_dev(int* p, int value) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *p = *p + value;
+    }
+}
+"#;
+
+// T246.7 P1.3c — write a host-supplied int value to a 1-elt device buffer.
+// 1 thread, 1 block.
+#[cfg(feature = "cuda")]
+const SET_U32_DEV_SRC: &str = r#"
+extern "C" __global__ void set_u32_dev(int* p, int value) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *p = value;
+    }
+}
+"#;
+
+// T246.7 P1.3c — argmax over `tree_size` independent rows of `vocab` BF16
+// logits each. One block per row, block_dim = 256. Bit-equivalent to
+// calling `argmax_bf16` `tree_size` times (uses the same reduction).
+#[cfg(feature = "cuda")]
+const ARGMAX_LOGITS_TREE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void argmax_logits_tree_bf16(
+    const __nv_bfloat16* __restrict__ logits,   // [tree_size, vocab]
+    unsigned int*        __restrict__ tokens,   // [tree_size]
+    int tree_size,
+    int vocab
+) {
+    extern __shared__ float sdata[];
+    int* sidx = (int*)(sdata + blockDim.x);
+
+    int row = blockIdx.x;
+    if (row >= tree_size) return;
+    const __nv_bfloat16* row_ptr = logits + (long long)row * (long long)vocab;
+
+    float local_max = -1e30f;
+    int   local_idx = 0;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+        float v = (float)row_ptr[i];
+        if (v > local_max) { local_max = v; local_idx = i; }
+    }
+    sdata[threadIdx.x] = local_max;
+    sidx[threadIdx.x]  = local_idx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (sdata[threadIdx.x + s] > sdata[threadIdx.x]) {
+                sdata[threadIdx.x] = sdata[threadIdx.x + s];
+                sidx[threadIdx.x]  = sidx[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) tokens[row] = (unsigned int)sidx[0];
+}
+"#;
+
 // T246.5.3 — append K and V vectors to the cache at slot `*pos_dev`.
 // Cache layout (matches the existing host-side append in decode_step):
 //   k_cache, v_cache : [max_seq, kv_dim] BF16, contiguous, seq-major.
@@ -984,6 +1050,40 @@ extern "C" __global__ void kv_append_bf16_devcnt(
     long long off = (long long)pos * (long long)kv_dim + (long long)tid;
     k_cache[off] = k[tid];
     v_cache[off] = v[tid];
+}
+"#;
+
+// T246.7 P1.3a — tree-aware KV append. Writes `tree_size` consecutive K/V
+// rows starting at slot `*pos_dev`. Layout matches `kv_append_bf16_devcnt`
+// exactly so the (tree_size=1) case is bit-equivalent.
+//   k_in, v_in : [tree_size, kv_dim]            BF16
+//   k_cache, v_cache : [max_seq, kv_dim]        BF16
+// For row r in [0..tree_size), writes to slot `*pos_dev + r`.
+// Grid : (ceil(kv_dim/256), tree_size, 1)   Block : (256, 1, 1).
+#[cfg(feature = "cuda")]
+const KV_APPEND_TREE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void kv_append_tree_bf16(
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ k_in,
+    const __nv_bfloat16* __restrict__ v_in,
+    const int* __restrict__ pos_dev,
+    int tree_size,
+    int kv_dim,
+    int max_seq
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y;
+    if (tid >= kv_dim) return;
+    if (row >= tree_size) return;
+    int pos = *pos_dev + row;
+    if (pos >= max_seq) return;
+    long long off_cache = (long long)pos * (long long)kv_dim + (long long)tid;
+    long long off_in    = (long long)row * (long long)kv_dim + (long long)tid;
+    k_cache[off_cache] = k_in[off_in];
+    v_cache[off_cache] = v_in[off_in];
 }
 "#;
 
@@ -3346,6 +3446,215 @@ extern "C" __global__ void gqa_decode_split_combine_bf16(
 }
 "#;
 
+// T246.7 P1.3b — tree-attention partial kernel (FlashDecode-V2 split-K with
+// per-token tree-mask). For each draft token in [0..tree_size), runs the
+// same online-softmax FlashDecode pass but visible KV positions are :
+//   (a) all base context : [0 .. *kv_len_dev)
+//   (b) the token's ancestor chain in the draft tree (excluding root, which
+//       is already covered by Phase A), mapped to slots [kv_len + anc - 1].
+//
+// Cache slot mapping : tree node `x` (BFS index) writes its K/V at slot
+// `*pos_dev + x` (via `kv_append_tree_bf16`). With the existing convention
+// `*kv_len_dev = *pos_dev + 1`, slot for node x is `*kv_len_dev + x - 1`.
+// In particular slot for x=0 is `kv_len - 1` ∈ [0, kv_len), so Phase A
+// already attends to the root's KV — root needs NO Phase B, making
+// `tree_size=1, parent=[-1]` bit-equivalent to `gqa_decode_split_bf16`.
+//
+// For r > 0 : Phase B walks the parent chain from r up to root and attends
+// to slot kv_len + anc - 1 for every ancestor anc with anc >= 1 (skipping
+// the root anc=0 since it's already in Phase A). The chain includes r itself.
+//
+// Tree encoding :
+//   parents : [tree_size] i32  — parent index in BFS order, root = -1.
+//   depths  : [tree_size] u8   — depth of each node (root depth = 0).
+//
+// Grid : (n_q_heads, n_split, tree_size).  Block : (head_dim, 1, 1).
+// Outputs (per-block) :
+//   partial_m : [tree_size, n_q, n_split]            float
+//   partial_l : [tree_size, n_q, n_split]            float
+//   partial_o : [tree_size, n_q, n_split, head_dim]  bf16
+#[cfg(feature = "cuda")]
+const GQA_DECODE_TREE_PARTIAL_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void gqa_decode_tree_partial_bf16(
+    const __nv_bfloat16* __restrict__ q,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ k_cache,     // [n_kv, max_seq, head_dim] (cf. existing convention)
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int*           __restrict__ parents,     // [tree_size]
+    const unsigned char* __restrict__ depths,      // [tree_size]
+    float*               __restrict__ partial_m,   // [tree_size, n_heads, n_split]
+    float*               __restrict__ partial_l,   // [tree_size, n_heads, n_split]
+    __nv_bfloat16*       __restrict__ partial_o,   // [tree_size, n_heads, n_split, head_dim]
+    int n_heads,
+    int n_kv,
+    const int* __restrict__ kv_len_dev,
+    int head_dim,
+    int max_seq,
+    int n_split,
+    int tree_size,
+    float scale
+) {
+    int h    = blockIdx.x;
+    int sp   = blockIdx.y;
+    int rnod = blockIdx.z;
+    if (h >= n_heads || sp >= n_split || rnod >= tree_size) return;
+    int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+
+    int kv_len = *kv_len_dev;
+
+    // Total visible positions = kv_len base + (depth(rnod) + 1) tree positions.
+    // Tree positions are encoded virtually : we map them to cache slots
+    // kv_len + ancestor_index. We split the `kv_len` base context across
+    // n_split, and the (depth+1) tree positions are appended as a tail
+    // walked entirely by split 0 (the small tail is cheap → no benefit
+    // from splitting it further).
+    int kv_per_split = (kv_len + n_split - 1) / n_split;
+    int t_start      = sp * kv_per_split;
+    int t_end        = t_start + kv_per_split;
+    if (t_end > kv_len) t_end = kv_len;
+
+    // partial slot indexing : (rnod, h, sp)
+    long long slot = ((long long)rnod * (long long)n_heads + (long long)h) * (long long)n_split + (long long)sp;
+
+    int kv_h = h * n_kv / n_heads;
+
+    extern __shared__ float sdata[];
+
+    float q_i = (float)q[((long long)rnod * (long long)n_heads + (long long)h) * (long long)head_dim + tid];
+    float m   = -1e30f;
+    float l   = 0.0f;
+    float o   = 0.0f;
+
+    // ── Phase A : base context [t_start..t_end) ────────────────────────
+    for (int t = t_start; t < t_end; ++t) {
+        float k_i     = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+        float partial = q_i * k_i;
+        sdata[tid] = partial;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s && tid + s < head_dim) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+        float s_t = sdata[0] * scale;
+        __syncthreads();
+
+        float new_m      = fmaxf(m, s_t);
+        float correction = expf(m - new_m);
+        float p          = expf(s_t - new_m);
+        float v_i        = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+        o = o * correction + p * v_i;
+        l = l * correction + p;
+        m = new_m;
+    }
+
+    // ── Phase B : ancestor tree positions, ONLY in split 0 ─────────────
+    // Walk parent chain from root → rnod (causal order). Tree node x lives
+    // at cache slot kv_len + x - 1. The root (x=0) maps to slot kv_len - 1,
+    // already covered by Phase A → skip it. Max chain length = depths[rnod]+1.
+    // Recompute the j-th ancestor on the fly via a reverse walk from rnod
+    // (O(depth) per j → O(depth^2) total ; depth ≤ 32 → ≤ 1024 cheap ops,
+    // dwarfed by the kv_len dot-product loop above).
+    if (sp == 0) {
+        int chain_len = (int)depths[rnod] + 1;
+        // Iterate j from 1 (skip root at j=0) to chain_len-1 (rnod itself).
+        for (int j = 1; j < chain_len; ++j) {
+            // anc = the j-th ancestor of rnod in root-first order.
+            int anc = rnod;
+            for (int k = chain_len - 1; k > j; --k) {
+                anc = parents[anc];
+            }
+            int t = kv_len + anc - 1;
+            float k_i     = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+            float partial = q_i * k_i;
+            sdata[tid] = partial;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s && tid + s < head_dim) {
+                    sdata[tid] += sdata[tid + s];
+                }
+                __syncthreads();
+            }
+            float s_t = sdata[0] * scale;
+            __syncthreads();
+
+            float new_m      = fmaxf(m, s_t);
+            float correction = expf(m - new_m);
+            float p          = expf(s_t - new_m);
+            float v_i        = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+            o = o * correction + p * v_i;
+            l = l * correction + p;
+            m = new_m;
+        }
+    }
+
+    if (tid == 0) {
+        partial_m[slot] = m;
+        partial_l[slot] = l;
+    }
+    partial_o[slot * (long long)head_dim + tid] = (__nv_bfloat16)o;
+}
+"#;
+
+// T246.7 P1.3b — tree-attention combine kernel : merges per-split partials
+// for each (tree node, head) pair. Mirrors `gqa_decode_split_combine_bf16`
+// with an extra outer loop over tree_size.
+//   gridDim  = (n_heads, tree_size)
+//   blockDim = (head_dim)
+#[cfg(feature = "cuda")]
+const GQA_DECODE_TREE_COMBINE_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void gqa_decode_tree_combine_bf16(
+    const float*         __restrict__ partial_m,    // [tree_size, n_heads, n_split]
+    const float*         __restrict__ partial_l,    // [tree_size, n_heads, n_split]
+    const __nv_bfloat16* __restrict__ partial_o,    // [tree_size, n_heads, n_split, head_dim]
+    __nv_bfloat16*       __restrict__ out,           // [tree_size, n_heads, head_dim]
+    int n_heads,
+    int head_dim,
+    int n_split,
+    int tree_size
+) {
+    int h    = blockIdx.x;
+    int rnod = blockIdx.y;
+    if (h >= n_heads || rnod >= tree_size) return;
+    int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+
+    long long row_off = ((long long)rnod * (long long)n_heads + (long long)h) * (long long)n_split;
+
+    extern __shared__ float gm_buf[];
+    if (tid == 0) {
+        float gm = -1e30f;
+        for (int sp = 0; sp < n_split; ++sp) {
+            float pm = partial_m[row_off + sp];
+            if (pm > gm) gm = pm;
+        }
+        gm_buf[0] = gm;
+    }
+    __syncthreads();
+    float global_m = gm_buf[0];
+
+    float o_sum = 0.0f;
+    float l_sum = 0.0f;
+    for (int sp = 0; sp < n_split; ++sp) {
+        long long slot = row_off + sp;
+        float pm = partial_m[slot];
+        float pl = partial_l[slot];
+        float w  = expf(pm - global_m);
+        float po = (float)partial_o[slot * (long long)head_dim + tid];
+        o_sum += po * w;
+        l_sum += pl * w;
+    }
+
+    long long out_off = ((long long)rnod * (long long)n_heads + (long long)h) * (long long)head_dim + tid;
+    out[out_off] = (__nv_bfloat16)(o_sum / fmaxf(l_sum, 1e-12f));
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const GQA_DECODE_NAIVE_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -3492,6 +3801,13 @@ pub struct LlmKernels {
     topk_softmax: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.6.3 — scaled add-in-place (used by MoE expert weighted accumulation)
     scaled_add_inplace: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.7 P1.3 — Lookahead Decoding tree-attention kernels
+    kv_append_tree: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    gqa_decode_tree_partial: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    gqa_decode_tree_combine: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    argmax_logits_tree: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    add_u32_dev: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    set_u32_dev: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -3553,6 +3869,13 @@ impl LlmKernels {
             gqa_decode_grad: std::sync::OnceLock::new(),
             topk_softmax: std::sync::OnceLock::new(),
             scaled_add_inplace: std::sync::OnceLock::new(),
+            // T246.7 P1.3 — Lookahead tree kernels
+            kv_append_tree: std::sync::OnceLock::new(),
+            gqa_decode_tree_partial: std::sync::OnceLock::new(),
+            gqa_decode_tree_combine: std::sync::OnceLock::new(),
+            argmax_logits_tree: std::sync::OnceLock::new(),
+            add_u32_dev: std::sync::OnceLock::new(),
+            set_u32_dev: std::sync::OnceLock::new(),
         }
     }
 
@@ -5617,6 +5940,240 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "gqa_decode_naive_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  T246.7 P1.3 — Lookahead Decoding tree kernels
+    // ════════════════════════════════════════════════════════════════════
+
+    /// T246.7 P1.3a — append `tree_size` consecutive K/V rows to the cache
+    /// starting at slot `*pos_dev`. Bit-equivalent to `tree_size` calls of
+    /// `kv_append_bf16_devcnt` when tree_size=1.
+    ///
+    /// # Safety  Caller assures `k_cache`/`v_cache` valides pour
+    /// `max_seq * kv_dim` BF16, `k_in`/`v_in` for `tree_size * kv_dim`,
+    /// `pos_dev` pointe vers 1 i32 device. `*pos_dev + tree_size <= max_seq`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn kv_append_tree_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        k_cache: u64,
+        v_cache: u64,
+        k_in: u64,
+        v_in: u64,
+        pos_dev: u64,
+        tree_size: i32,
+        kv_dim: i32,
+        max_seq: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.kv_append_tree,
+            KV_APPEND_TREE_BF16_SRC,
+            "kv_append_tree_bf16",
+        )?;
+        let block_dim = 256u32;
+        let grid_x = (kv_dim as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_x, tree_size as u32, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&k_cache)
+            .arg(&v_cache)
+            .arg(&k_in)
+            .arg(&v_in)
+            .arg(&pos_dev)
+            .arg(&tree_size)
+            .arg(&kv_dim)
+            .arg(&max_seq);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "kv_append_tree_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.7 P1.3b — tree-aware GQA decode (FlashDecode-V2 split-K with
+    /// per-token tree-attention mask). Two-phase like `gqa_decode_split_bf16`.
+    ///
+    /// # Safety  Same as `gqa_decode_split_bf16`, plus `parents_dev`
+    /// (i32 [tree_size]) and `depths_dev` (u8 [tree_size]) device pointers.
+    /// Partial buffer sizes : m/l = tree_size * n_q * n_split floats ;
+    /// o = tree_size * n_q * n_split * head_dim BF16.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gqa_decode_tree_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k_cache: u64,
+        v_cache: u64,
+        out: u64,
+        parents_dev: u64,
+        depths_dev: u64,
+        partial_m_dev: u64,
+        partial_l_dev: u64,
+        partial_o_dev: u64,
+        n_heads: i32,
+        n_kv: i32,
+        kv_len_dev: u64,
+        head_dim: i32,
+        max_seq: i32,
+        n_split: i32,
+        tree_size: i32,
+    ) -> Result<(), CudaError> {
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let block_dim = head_dim as u32;
+
+        // Phase 1 — partial.
+        let (_m_p, fn_p) = self.compile_or_get(
+            &self.gqa_decode_tree_partial,
+            GQA_DECODE_TREE_PARTIAL_BF16_SRC,
+            "gqa_decode_tree_partial_bf16",
+        )?;
+        let cfg_p = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, n_split as u32, tree_size as u32),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * 4,
+        };
+        let mut launcher_p = stream.launch_builder(&fn_p);
+        launcher_p
+            .arg(&q)
+            .arg(&k_cache)
+            .arg(&v_cache)
+            .arg(&parents_dev)
+            .arg(&depths_dev)
+            .arg(&partial_m_dev)
+            .arg(&partial_l_dev)
+            .arg(&partial_o_dev)
+            .arg(&n_heads)
+            .arg(&n_kv)
+            .arg(&kv_len_dev)
+            .arg(&head_dim)
+            .arg(&max_seq)
+            .arg(&n_split)
+            .arg(&tree_size)
+            .arg(&scale);
+        launcher_p.launch(cfg_p).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gqa_decode_tree_partial_bf16::launch",
+        })?;
+
+        // Phase 2 — combine.
+        let (_m_c, fn_c) = self.compile_or_get(
+            &self.gqa_decode_tree_combine,
+            GQA_DECODE_TREE_COMBINE_BF16_SRC,
+            "gqa_decode_tree_combine_bf16",
+        )?;
+        let cfg_c = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, tree_size as u32, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 4,
+        };
+        let mut launcher_c = stream.launch_builder(&fn_c);
+        launcher_c
+            .arg(&partial_m_dev)
+            .arg(&partial_l_dev)
+            .arg(&partial_o_dev)
+            .arg(&out)
+            .arg(&n_heads)
+            .arg(&head_dim)
+            .arg(&n_split)
+            .arg(&tree_size);
+        launcher_c.launch(cfg_c).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gqa_decode_tree_combine_bf16::launch",
+        })?;
+
+        Ok(())
+    }
+
+    /// T246.7 P1.3c — argmax over `tree_size` independent rows of `vocab`
+    /// BF16 logits. Bit-equivalent to looping `argmax_bf16` `tree_size` times.
+    ///
+    /// # Safety  `logits` valid for tree_size × vocab BF16 ; `tokens_out`
+    /// valid for tree_size u32.
+    pub unsafe fn argmax_logits_tree_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        logits: u64,
+        tokens_out: u64,
+        tree_size: i32,
+        vocab: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.argmax_logits_tree,
+            ARGMAX_LOGITS_TREE_BF16_SRC,
+            "argmax_logits_tree_bf16",
+        )?;
+        let block_dim = 256u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (tree_size as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * 8, // float + int per thread
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&logits)
+            .arg(&tokens_out)
+            .arg(&tree_size)
+            .arg(&vocab);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "argmax_logits_tree_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.7 P1.3c — `*p += value` (atomic-style, single thread).
+    ///
+    /// # Safety  `p` must point to 1 i32 device-resident.
+    pub unsafe fn add_u32_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        p: u64,
+        value: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) =
+            self.compile_or_get(&self.add_u32_dev, ADD_U32_DEV_SRC, "add_u32_dev")?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&p).arg(&value);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "add_u32_dev::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.7 P1.3c — `*p = value`.
+    ///
+    /// # Safety  `p` must point to 1 i32 device-resident.
+    pub unsafe fn set_u32_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        p: u64,
+        value: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) =
+            self.compile_or_get(&self.set_u32_dev, SET_U32_DEV_SRC, "set_u32_dev")?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&p).arg(&value);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "set_u32_dev::launch",
         })?;
         Ok(())
     }
