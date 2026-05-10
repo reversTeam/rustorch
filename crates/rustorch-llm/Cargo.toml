@@ -107,3 +107,8 @@ required-features = ["cuda"]
 name = "qwen36_cuda_decode_smoke"
 path = "examples/qwen36_cuda_decode_smoke.rs"
 required-features = ["cuda"]
+
+[[example]]
+name = "qwen36_cuda_parity_check"
+path = "examples/qwen36_cuda_parity_check.rs"
+required-features = ["cuda"]

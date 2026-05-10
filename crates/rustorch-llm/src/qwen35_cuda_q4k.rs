@@ -237,6 +237,30 @@ fn get_attn_layer_idx(cfg: &Qwen35Config, global_li: usize) -> usize {
         .unwrap_or_else(|| panic!("layer {global_li} not in attention_indices"))
 }
 
+/// Pre-allocated scratch buffers for decode_step (hoisted out of the hot path).
+pub(crate) struct DecodeScratch {
+    pub(crate) h: CudaSlice<half::bf16>,
+    pub(crate) h_norm: CudaSlice<half::bf16>,
+    pub(crate) residual: CudaSlice<half::bf16>,
+    pub(crate) qkv_mixed: CudaSlice<half::bf16>,
+    pub(crate) conv_out: CudaSlice<half::bf16>,
+    pub(crate) z: CudaSlice<half::bf16>,
+    pub(crate) alpha: CudaSlice<half::bf16>,
+    pub(crate) beta: CudaSlice<half::bf16>,
+    pub(crate) q_v: CudaSlice<half::bf16>,
+    pub(crate) k_v: CudaSlice<half::bf16>,
+    pub(crate) ssm_out_buf: CudaSlice<half::bf16>,
+    pub(crate) q_buf: CudaSlice<half::bf16>,
+    pub(crate) k_buf: CudaSlice<half::bf16>,
+    pub(crate) v_buf: CudaSlice<half::bf16>,
+    pub(crate) attn_out: CudaSlice<half::bf16>,
+    pub(crate) gate_buf: CudaSlice<half::bf16>,
+    pub(crate) up_buf: CudaSlice<half::bf16>,
+    pub(crate) down_buf: CudaSlice<half::bf16>,
+    pub(crate) logits: CudaSlice<half::bf16>,
+    pub(crate) next_token: CudaSlice<u32>,
+}
+
 /// CUDA-resident Qwen3.5/3.6 hybrid model with Q4_K_M weights.
 pub struct Qwen35ModelCudaQ4K {
     pub config: Qwen35Config,
@@ -263,6 +287,8 @@ pub struct Qwen35ModelCudaQ4K {
     pub(crate) max_seq: usize,
     /// Current decode position (incremented after each forward_token).
     pub(crate) position: usize,
+    /// Pre-allocated scratch buffers (one-time alloc).
+    pub(crate) scratch: DecodeScratch,
 }
 
 impl Qwen35ModelCudaQ4K {
@@ -455,6 +481,76 @@ impl Qwen35ModelCudaQ4K {
             blocks.push(block);
         }
 
+        // ---- Pre-allocate decode scratch buffers (one-time) ----
+        let kv_dim_attn = cfg.n_kv_heads * cfg.head_dim();
+        let q_dim = cfg.n_q_heads * cfg.head_dim();
+        // up_buf is (re)used as QG buffer (size 2*q_dim) ; gate_buf used as
+        // attn raw output (size q_dim). Both must fit f for FFN AND 2*q_dim for QG.
+        let scratch_up = cfg.f.max(2 * q_dim);
+        let scratch_gate = cfg.f.max(q_dim);
+        let scratch = DecodeScratch {
+            h: stream
+                .alloc_zeros::<half::bf16>(cfg.d)
+                .map_err(|e| LlmError::Backend(format!("scratch h: {e:?}")))?,
+            h_norm: stream
+                .alloc_zeros::<half::bf16>(cfg.d)
+                .map_err(|e| LlmError::Backend(format!("scratch h_norm: {e:?}")))?,
+            residual: stream
+                .alloc_zeros::<half::bf16>(cfg.d)
+                .map_err(|e| LlmError::Backend(format!("scratch residual: {e:?}")))?,
+            qkv_mixed: stream
+                .alloc_zeros::<half::bf16>(2 * key_dim + value_dim)
+                .map_err(|e| LlmError::Backend(format!("scratch qkv: {e:?}")))?,
+            conv_out: stream
+                .alloc_zeros::<half::bf16>(2 * key_dim + value_dim)
+                .map_err(|e| LlmError::Backend(format!("scratch conv_out: {e:?}")))?,
+            z: stream
+                .alloc_zeros::<half::bf16>(value_dim)
+                .map_err(|e| LlmError::Backend(format!("scratch z: {e:?}")))?,
+            alpha: stream
+                .alloc_zeros::<half::bf16>(cfg.ssm_dt_rank)
+                .map_err(|e| LlmError::Backend(format!("scratch alpha: {e:?}")))?,
+            beta: stream
+                .alloc_zeros::<half::bf16>(cfg.ssm_dt_rank)
+                .map_err(|e| LlmError::Backend(format!("scratch beta: {e:?}")))?,
+            q_v: stream
+                .alloc_zeros::<half::bf16>(cfg.ssm_dt_rank * cfg.ssm_state)
+                .map_err(|e| LlmError::Backend(format!("scratch q_v: {e:?}")))?,
+            k_v: stream
+                .alloc_zeros::<half::bf16>(cfg.ssm_dt_rank * cfg.ssm_state)
+                .map_err(|e| LlmError::Backend(format!("scratch k_v: {e:?}")))?,
+            ssm_out_buf: stream
+                .alloc_zeros::<half::bf16>(cfg.ssm_dt_rank * cfg.ssm_state)
+                .map_err(|e| LlmError::Backend(format!("scratch ssm_out: {e:?}")))?,
+            q_buf: stream
+                .alloc_zeros::<half::bf16>(q_dim)
+                .map_err(|e| LlmError::Backend(format!("scratch q_buf: {e:?}")))?,
+            k_buf: stream
+                .alloc_zeros::<half::bf16>(kv_dim_attn)
+                .map_err(|e| LlmError::Backend(format!("scratch k_buf: {e:?}")))?,
+            v_buf: stream
+                .alloc_zeros::<half::bf16>(kv_dim_attn)
+                .map_err(|e| LlmError::Backend(format!("scratch v_buf: {e:?}")))?,
+            attn_out: stream
+                .alloc_zeros::<half::bf16>(q_dim)
+                .map_err(|e| LlmError::Backend(format!("scratch attn_out: {e:?}")))?,
+            gate_buf: stream
+                .alloc_zeros::<half::bf16>(scratch_gate)
+                .map_err(|e| LlmError::Backend(format!("scratch gate: {e:?}")))?,
+            up_buf: stream
+                .alloc_zeros::<half::bf16>(scratch_up)
+                .map_err(|e| LlmError::Backend(format!("scratch up: {e:?}")))?,
+            down_buf: stream
+                .alloc_zeros::<half::bf16>(cfg.d)
+                .map_err(|e| LlmError::Backend(format!("scratch down: {e:?}")))?,
+            logits: stream
+                .alloc_zeros::<half::bf16>(cfg.vocab)
+                .map_err(|e| LlmError::Backend(format!("scratch logits: {e:?}")))?,
+            next_token: stream
+                .alloc_zeros::<u32>(1)
+                .map_err(|e| LlmError::Backend(format!("scratch token: {e:?}")))?,
+        };
+
         Ok(Self {
             config: cfg,
             ctx,
@@ -470,6 +566,7 @@ impl Qwen35ModelCudaQ4K {
             ssm_states,
             max_seq,
             position: 0,
+            scratch,
         })
     }
 
@@ -517,63 +614,71 @@ impl Qwen35ModelCudaQ4K {
         let conv_kernel = cfg.ssm_conv_kernel;
         let eps = cfg.rms_eps;
 
-        // ---- Allocate per-step scratch buffers ----
-        let alloc_bf16 = |size: usize| -> Result<cudarc::driver::CudaSlice<half::bf16>, LlmError> {
-            self.stream
-                .alloc_zeros::<half::bf16>(size)
-                .map_err(|e| LlmError::Backend(format!("alloc {size}: {e:?}")))
-        };
-        let mut h = alloc_bf16(d)?; // hidden state
-        let mut h_norm = alloc_bf16(d)?; // RMSNorm output (resident)
-        let mut residual = alloc_bf16(d)?;
+        // ---- Use pre-allocated scratch (no per-step alloc, T246.4.1) ----
+        let _ = (conv_dim, value_dim, n_v, head_kv, q_dim, kv_dim, f);
 
-        // SSM-block scratch
-        let mut qkv_mixed = alloc_bf16(conv_dim)?;
-        let mut conv_out = alloc_bf16(conv_dim)?;
-        let mut z = alloc_bf16(value_dim)?;
-        let mut alpha = alloc_bf16(n_v)?;
-        let mut beta = alloc_bf16(n_v)?;
-        let mut q_v = alloc_bf16(n_v * head_kv)?; // broadcasted q
-        let mut k_v = alloc_bf16(n_v * head_kv)?; // broadcasted k
-        let mut ssm_out_buf = alloc_bf16(n_v * head_kv)?;
+        // T246.4.2 — zero scratch buffers at start of each step. Without this,
+        // residual reads of stale buffers cause non-deterministic output across
+        // runs even with the same input.
+        self.stream
+            .memset_zeros(&mut self.scratch.h)
+            .map_err(|e| LlmError::Backend(format!("zero h: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.h_norm)
+            .map_err(|e| LlmError::Backend(format!("zero h_norm: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.residual)
+            .map_err(|e| LlmError::Backend(format!("zero residual: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.qkv_mixed)
+            .map_err(|e| LlmError::Backend(format!("zero qkv_mixed: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.conv_out)
+            .map_err(|e| LlmError::Backend(format!("zero conv_out: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.z)
+            .map_err(|e| LlmError::Backend(format!("zero z: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.alpha)
+            .map_err(|e| LlmError::Backend(format!("zero alpha: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.beta)
+            .map_err(|e| LlmError::Backend(format!("zero beta: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.q_v)
+            .map_err(|e| LlmError::Backend(format!("zero q_v: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.k_v)
+            .map_err(|e| LlmError::Backend(format!("zero k_v: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.ssm_out_buf)
+            .map_err(|e| LlmError::Backend(format!("zero ssm_out: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.q_buf)
+            .map_err(|e| LlmError::Backend(format!("zero q_buf: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.k_buf)
+            .map_err(|e| LlmError::Backend(format!("zero k_buf: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.v_buf)
+            .map_err(|e| LlmError::Backend(format!("zero v_buf: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.attn_out)
+            .map_err(|e| LlmError::Backend(format!("zero attn_out: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.gate_buf)
+            .map_err(|e| LlmError::Backend(format!("zero gate: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.up_buf)
+            .map_err(|e| LlmError::Backend(format!("zero up: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.down_buf)
+            .map_err(|e| LlmError::Backend(format!("zero down: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.logits)
+            .map_err(|e| LlmError::Backend(format!("zero logits: {e:?}")))?;
 
-        // Attn-block scratch
-        let mut q_buf = alloc_bf16(q_dim)?;
-        let mut k_buf = alloc_bf16(kv_dim)?;
-        let mut v_buf = alloc_bf16(kv_dim)?;
-        let mut attn_out = alloc_bf16(q_dim)?;
-
-        // FFN scratch
-        let mut gate_buf = alloc_bf16(f)?;
-        let mut up_buf = alloc_bf16(f)?;
-        let mut down_buf = alloc_bf16(d)?;
-
-        // Logits
-        let mut logits = alloc_bf16(cfg.vocab)?;
-
-        // Token id on device for argmax output.
-        let mut next_token_dev: cudarc::driver::CudaSlice<u32> = self
-            .stream
-            .alloc_zeros::<u32>(1)
-            .map_err(|e| LlmError::Backend(format!("alloc token: {e:?}")))?;
-
-        // ---- Step 0 : Load h from token_emb[token_id, :] ----
-        // Use embedding lookup OR direct copy of one row.
-        // token_emb is [V, D] BF16 row-major. Copy d BF16 from offset token_id*d.
-        unsafe {
-            let (te_p, _g) = self.token_emb.device_ptr(&self.stream);
-            let (h_p, _g2) = h.device_ptr_mut(&self.stream);
-            self.kernels
-                .copy_bf16(
-                    &self.stream,
-                    h_p,
-                    te_p + (token_id as u64) * (d as u64) * 2,
-                    d as i32,
-                )
-                .map_err(|e| LlmError::Backend(format!("copy embed: {e:?}")))?;
-        }
-
-        // Pre-extract device pointers for re-use (drop guards).
+        // Pre-extract device pointers from scratch (drop guards).
         let (
             h_p,
             h_norm_p,
@@ -592,36 +697,53 @@ impl Qwen35ModelCudaQ4K {
             ao_p,
             gate_p,
             up_p,
-            down_p,
+            _down_p,
             logits_p,
             tok_p,
             final_norm_p,
         ) = unsafe {
-            let (a, _g0) = h.device_ptr_mut(&self.stream);
-            let (b, _g1) = h_norm.device_ptr_mut(&self.stream);
-            let (c, _g2) = residual.device_ptr_mut(&self.stream);
-            let (d_, _g3) = qkv_mixed.device_ptr_mut(&self.stream);
-            let (e, _g4) = conv_out.device_ptr_mut(&self.stream);
-            let (f_, _g5) = z.device_ptr_mut(&self.stream);
-            let (g, _g6) = alpha.device_ptr_mut(&self.stream);
-            let (h_, _g7) = beta.device_ptr_mut(&self.stream);
-            let (i, _g8) = q_v.device_ptr_mut(&self.stream);
-            let (j, _g9) = k_v.device_ptr_mut(&self.stream);
-            let (k_, _g10) = ssm_out_buf.device_ptr_mut(&self.stream);
-            let (l, _g11) = q_buf.device_ptr_mut(&self.stream);
-            let (m, _g12) = k_buf.device_ptr_mut(&self.stream);
-            let (n_, _g13) = v_buf.device_ptr_mut(&self.stream);
-            let (o, _g14) = attn_out.device_ptr_mut(&self.stream);
-            let (p, _g15) = gate_buf.device_ptr_mut(&self.stream);
-            let (q_, _g16) = up_buf.device_ptr_mut(&self.stream);
-            let (r, _g17) = down_buf.device_ptr_mut(&self.stream);
-            let (s, _g18) = logits.device_ptr_mut(&self.stream);
-            let (t, _g19) = next_token_dev.device_ptr_mut(&self.stream);
+            let (a, _g0) = self.scratch.h.device_ptr_mut(&self.stream);
+            let (b, _g1) = self.scratch.h_norm.device_ptr_mut(&self.stream);
+            let (c, _g2) = self.scratch.residual.device_ptr_mut(&self.stream);
+            let (d_, _g3) = self.scratch.qkv_mixed.device_ptr_mut(&self.stream);
+            let (e, _g4) = self.scratch.conv_out.device_ptr_mut(&self.stream);
+            let (f_, _g5) = self.scratch.z.device_ptr_mut(&self.stream);
+            let (g, _g6) = self.scratch.alpha.device_ptr_mut(&self.stream);
+            let (h_, _g7) = self.scratch.beta.device_ptr_mut(&self.stream);
+            let (i, _g8) = self.scratch.q_v.device_ptr_mut(&self.stream);
+            let (j, _g9) = self.scratch.k_v.device_ptr_mut(&self.stream);
+            let (k_, _g10) = self.scratch.ssm_out_buf.device_ptr_mut(&self.stream);
+            let (l, _g11) = self.scratch.q_buf.device_ptr_mut(&self.stream);
+            let (m, _g12) = self.scratch.k_buf.device_ptr_mut(&self.stream);
+            let (n_, _g13) = self.scratch.v_buf.device_ptr_mut(&self.stream);
+            let (o, _g14) = self.scratch.attn_out.device_ptr_mut(&self.stream);
+            let (p, _g15) = self.scratch.gate_buf.device_ptr_mut(&self.stream);
+            let (q_, _g16) = self.scratch.up_buf.device_ptr_mut(&self.stream);
+            let (r, _g17) = self.scratch.down_buf.device_ptr_mut(&self.stream);
+            let (s, _g18) = self.scratch.logits.device_ptr_mut(&self.stream);
+            let (t, _g19) = self.scratch.next_token.device_ptr_mut(&self.stream);
             let (u, _g20) = self.final_norm.device_ptr(&self.stream);
             (
                 a, b, c, d_, e, f_, g, h_, i, j, k_, l, m, n_, o, p, q_, r, s, t, u,
             )
         };
+
+        // Force sync after zeroing scratch.
+        self.stream.synchronize().ok();
+
+        // ---- Step 0 : Load h from token_emb[token_id, :] ----
+        unsafe {
+            let (te_p, _g) = self.token_emb.device_ptr(&self.stream);
+            self.kernels
+                .copy_bf16(
+                    &self.stream,
+                    h_p,
+                    te_p + (token_id as u64) * (d as u64) * 2,
+                    d as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("copy embed: {e:?}")))?;
+        }
+        self.stream.synchronize().ok();
 
         // ---- Iterate over all 64 layers ----
         for (li, block) in self.blocks.iter_mut().enumerate() {
@@ -1045,8 +1167,44 @@ impl Qwen35ModelCudaQ4K {
 
         let next_id_host: Vec<u32> = self
             .stream
-            .memcpy_dtov(&next_token_dev)
+            .memcpy_dtov(&self.scratch.next_token)
             .map_err(|e| LlmError::Backend(format!("dl token: {e:?}")))?;
+        let _ = (tok_p, logits_p, final_norm_p); // silence unused warnings
+
+        // T246.4.2 — DEBUG : print first few logits to diagnose non-determinism.
+        if self.position == 0 && std::env::var("RUSTORCH_DEBUG_LOGITS").is_ok() {
+            let logits_host: Vec<half::bf16> = self
+                .stream
+                .memcpy_dtov(&self.scratch.logits)
+                .map_err(|e| LlmError::Backend(format!("dl logits: {e:?}")))?;
+            eprintln!(
+                "[debug] first 5 logits : {:?}",
+                logits_host
+                    .iter()
+                    .take(5)
+                    .map(|v| v.to_f32())
+                    .collect::<Vec<_>>()
+            );
+            eprintln!(
+                "[debug] argmax token   : {} (logit {:.4})",
+                next_id_host[0],
+                logits_host[next_id_host[0] as usize].to_f32()
+            );
+            // Sample some h state in scratch.
+            let h_host: Vec<half::bf16> = self
+                .stream
+                .memcpy_dtov(&self.scratch.h)
+                .map_err(|e| LlmError::Backend(format!("dl h: {e:?}")))?;
+            eprintln!(
+                "[debug] first 5 h     : {:?}",
+                h_host
+                    .iter()
+                    .take(5)
+                    .map(|v| v.to_f32())
+                    .collect::<Vec<_>>()
+            );
+        }
+
         self.position += 1;
         Ok(next_id_host[0])
     }
