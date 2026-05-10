@@ -24,6 +24,12 @@ use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 /// 128 blocks/layer vs 32 with the serial online kernel) and is fixed at
 /// capture time so the staging buffers can be sized once.
 const GQA_N_SPLIT: usize = 4;
+
+/// T246.7 P1.3 — maximum draft tree size accepted by `decode_step_tree`.
+/// Sized to give headroom over the (W=5, L=5) Jacobi window which yields
+/// at most 21 tree nodes (1 + W*(L-1)). 32 leaves room for (W=5, L=7) and
+/// future tweaks without re-allocating the tree scratch buffers.
+pub const MAX_TREE_SIZE: usize = 32;
 use cudarc::driver::{CudaContext, CudaGraph, CudaSlice, CudaStream, PinnedHostSlice};
 use rustorch_cuda::cublas_lt::LtSession;
 use rustorch_cuda::llm_kernels::LlmKernels;
@@ -360,6 +366,21 @@ pub(crate) struct DecodeScratch {
     pub(crate) moe_expert_out: CudaSlice<half::bf16>,
     /// `[1]` BF16 — shared-expert sigmoid dot product scratch.
     pub(crate) moe_shexp_dot: CudaSlice<half::bf16>,
+    // ── T246.7 P1.3 — Lookahead Decoding tree-attention scratch ──
+    /// `[MAX_TREE_SIZE]` u32 — input draft tokens for `decode_step_tree`.
+    pub(crate) tree_drafts: CudaSlice<u32>,
+    /// `[MAX_TREE_SIZE]` i32 — parent pointer per tree node, root = -1.
+    pub(crate) tree_parents: CudaSlice<i32>,
+    /// `[MAX_TREE_SIZE]` u8 — depth per tree node, root = 0.
+    pub(crate) tree_depths: CudaSlice<u8>,
+    /// `[MAX_TREE_SIZE]` u32 — argmax token per tree node row of logits.
+    pub(crate) tree_argmax: CudaSlice<u32>,
+    /// `[MAX_TREE_SIZE, n_q, n_split]` f32 — partial m for tree GQA.
+    pub(crate) tree_gqa_partial_m: CudaSlice<f32>,
+    /// `[MAX_TREE_SIZE, n_q, n_split]` f32 — partial l for tree GQA.
+    pub(crate) tree_gqa_partial_l: CudaSlice<f32>,
+    /// `[MAX_TREE_SIZE, n_q, n_split, head_dim]` BF16 — partial o for tree GQA.
+    pub(crate) tree_gqa_partial_o: CudaSlice<half::bf16>,
 }
 
 /// CUDA-resident Qwen3.5/3.6 hybrid model with Q4_K_M weights.
@@ -884,6 +905,30 @@ impl Qwen35ModelCudaQ4K {
             moe_shexp_dot: stream
                 .alloc_zeros::<half::bf16>(1)
                 .map_err(|e| LlmError::Backend(format!("scratch moe_shexp_dot: {e:?}")))?,
+            // T246.7 P1.3 — Lookahead Decoding tree-attention scratch.
+            tree_drafts: stream
+                .alloc_zeros::<u32>(MAX_TREE_SIZE)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_drafts: {e:?}")))?,
+            tree_parents: stream
+                .alloc_zeros::<i32>(MAX_TREE_SIZE)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_parents: {e:?}")))?,
+            tree_depths: stream
+                .alloc_zeros::<u8>(MAX_TREE_SIZE)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_depths: {e:?}")))?,
+            tree_argmax: stream
+                .alloc_zeros::<u32>(MAX_TREE_SIZE)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_argmax: {e:?}")))?,
+            tree_gqa_partial_m: stream
+                .alloc_zeros::<f32>(MAX_TREE_SIZE * cfg.n_q_heads * GQA_N_SPLIT)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_gqa_m: {e:?}")))?,
+            tree_gqa_partial_l: stream
+                .alloc_zeros::<f32>(MAX_TREE_SIZE * cfg.n_q_heads * GQA_N_SPLIT)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_gqa_l: {e:?}")))?,
+            tree_gqa_partial_o: stream
+                .alloc_zeros::<half::bf16>(
+                    MAX_TREE_SIZE * cfg.n_q_heads * GQA_N_SPLIT * cfg.head_dim(),
+                )
+                .map_err(|e| LlmError::Backend(format!("scratch tree_gqa_o: {e:?}")))?,
         };
 
         // T246.5.3 — device-resident counters for CUDA Graph capture.
@@ -1790,6 +1835,117 @@ impl Qwen35ModelCudaQ4K {
         Err(LlmError::Backend(
             "Qwen35ModelCudaQ4K::prefill_tokens not yet implemented (T246.5)".into(),
         ))
+    }
+
+    /// T246.7 P1.3d — tree-aware decode step for Lookahead Decoding (RFC
+    /// f0e68045, design D1).
+    ///
+    /// Takes a draft tree encoded as a flat BFS-ordered array :
+    /// - `drafts[r]`  = the token id at tree node r ; `drafts[0]` is the
+    ///   "seed" (the most-recently-accepted token from the previous step).
+    /// - `parents[r]` = parent node index in the tree, root (r=0) has -1.
+    /// - `depths[r]`  = depth of node r (root depth = 0).
+    ///
+    /// All inputs must have the same length, ≤ `MAX_TREE_SIZE`. Returns the
+    /// accepted token suffix `[1..=accept_len]` ; the seed (`drafts[0]`)
+    /// itself is NOT returned (it was already in the model's KV state).
+    ///
+    /// **Phase 1 scope** : tree_size = 1 is a strict drop-in replacement for
+    /// `decode_step(drafts[0])` — full kernel parity (including CUDA Graph
+    /// replay) and bit-exact output. tree_size > 1 returns `LlmError::Backend`
+    /// for now ; the multi-branch forward + acceptance walk lands in P1.4
+    /// alongside the full Lookahead manager loop. The CUDA primitives needed
+    /// for tree_size > 1 (`kv_append_tree_bf16`, `gqa_decode_tree_bf16`,
+    /// `argmax_logits_tree_bf16`, `add_u32_dev`, `set_u32_dev`) are already
+    /// in place ; only the per-tree-token forward orchestration is deferred.
+    ///
+    /// Per RFC design decisions :
+    ///   - D1 : NEW method, never modifies `decode_step`.
+    ///   - D2 : write-then-truncate KV (no scratch cache copy).
+    ///   - D4 : no graph capture for verify (the inner `decode_step` call
+    ///          may use its own captured graph for tree_size=1 ; tree_size>1
+    ///          would explicitly disable capture).
+    pub fn decode_step_tree(
+        &mut self,
+        drafts: &[u32],
+        parents: &[i32],
+        depths: &[u8],
+    ) -> Result<Vec<u32>, LlmError> {
+        // ── Validation ───────────────────────────────────────────────────
+        if drafts.is_empty() {
+            return Err(LlmError::Backend(
+                "decode_step_tree: drafts must be non-empty".into(),
+            ));
+        }
+        if drafts.len() != parents.len() || drafts.len() != depths.len() {
+            return Err(LlmError::Backend(format!(
+                "decode_step_tree: length mismatch — drafts={}, parents={}, depths={}",
+                drafts.len(),
+                parents.len(),
+                depths.len()
+            )));
+        }
+        if drafts.len() > MAX_TREE_SIZE {
+            return Err(LlmError::Backend(format!(
+                "decode_step_tree: tree_size {} exceeds MAX_TREE_SIZE {}",
+                drafts.len(),
+                MAX_TREE_SIZE
+            )));
+        }
+        if parents[0] != -1 {
+            return Err(LlmError::Backend(format!(
+                "decode_step_tree: root must have parent=-1, got {}",
+                parents[0]
+            )));
+        }
+        if depths[0] != 0 {
+            return Err(LlmError::Backend(format!(
+                "decode_step_tree: root must have depth=0, got {}",
+                depths[0]
+            )));
+        }
+        for (r, &p) in parents.iter().enumerate().skip(1) {
+            if p < 0 || (p as usize) >= r {
+                return Err(LlmError::Backend(format!(
+                    "decode_step_tree: parents[{r}] = {p} must be in [0, {r})"
+                )));
+            }
+            let expected_depth = depths[p as usize] + 1;
+            if depths[r] != expected_depth {
+                return Err(LlmError::Backend(format!(
+                    "decode_step_tree: depths[{r}] = {} must equal depths[parent={}] + 1 = {}",
+                    depths[r], p, expected_depth
+                )));
+            }
+        }
+
+        let tree_size = drafts.len();
+
+        // ── tree_size = 1 : delegate to decode_step (bit-exact equivalence) ──
+        // The root's own KV is at slot kv_len-1, fully covered by Phase A
+        // of the existing M=1 attention path. The "tree" semantics
+        // degenerate to a single forward pass on drafts[0], whose output
+        // we return as the accepted token suffix of length 1.
+        if tree_size == 1 {
+            let tok = self.decode_step(drafts[0])?;
+            return Ok(vec![tok]);
+        }
+
+        // ── tree_size > 1 : full multi-token tree forward (P1.4) ─────────
+        // The CUDA primitives are wired and parity-tested — see the
+        // `kv_append_tree_bf16`, `gqa_decode_tree_bf16`, `argmax_logits_tree_bf16`,
+        // `add_u32_dev`, `set_u32_dev` kernels. The orchestration of the
+        // per-tree-token forward (loop-batched embedding/RMSNorm/QKV/RoPE
+        // + tree-aware attention + per-token gate/W_o/FFN, then host-side
+        // acceptance walk + position counter advance) ships in P1.4 along
+        // with the host-side Lookahead manager that produces non-trivial
+        // tree topologies.
+        Err(LlmError::Backend(format!(
+            "decode_step_tree: tree_size > 1 (got {tree_size}) is not yet implemented; \
+             P1.3 ships the CUDA kernels and the tree_size=1 path. Full multi-token \
+             forward lands in P1.4 alongside the Lookahead manager. Use \
+             decode_step(drafts[0]) for now."
+        )))
     }
 }
 
