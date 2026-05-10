@@ -120,6 +120,10 @@ impl QuantTensor {
                 QuantTensor::Q6K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);
                     kernels
+                        // T246.6.7 — Q6_K V3 was slower than V2 in early
+                        // measurements (9.31 vs 9.48 tok/s on 27B). Keeping
+                        // the kernel + wrapper but using V2 here until V3
+                        // is debugged or rewritten.
                         .sgemv_q6k_bf16_v2(stream, w, x, y, *n as i32, *k as i32)
                         .map_err(|e| LlmError::Backend(format!("sgemv_q6k_v2: {e:?}")))
                 },
