@@ -111,9 +111,12 @@ impl QuantTensor {
             match self {
                 QuantTensor::Bf16 { weights, n, k } => {
                     let (w, _g) = weights.device_ptr(stream);
+                    // T246.8 A3 — dispatch routes V2 (mma.sync m16n8k16
+                    // tensor-core SGEMV) for N >= 128 + K%16==0 ; V1 for
+                    // small N or unsupported K.
                     kernels
-                        .sgemv_bf16_bf16(stream, w, x, y, *n as i32, *k as i32)
-                        .map_err(|e| LlmError::Backend(format!("sgemv_bf16: {e:?}")))
+                        .sgemv_bf16_bf16_dispatch(stream, w, x, y, *n as i32, *k as i32)
+                        .map_err(|e| LlmError::Backend(format!("sgemv_bf16_dispatch: {e:?}")))
                 },
                 QuantTensor::Q4K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);

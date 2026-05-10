@@ -6138,7 +6138,11 @@ impl LlmKernels {
     /// Falls back to V1 via `sgemv_bf16_bf16_dispatch` for K not multiple
     /// of 16 (mma constraint) or N < 128 (mma overhead exceeds win).
     ///
-    /// # Safety  Caller ensures pointers valid, K multiple of 16.
+    /// # Safety
+    ///
+    /// Caller ensures pointers `w`, `x`, `y` are valid for the lifetime of
+    /// the kernel and reference at least `N*K`, `K`, and `N` BF16 elements
+    /// respectively. K must be a multiple of 16 (mma m16n8k16 constraint).
     pub unsafe fn sgemv_bf16_bf16_v2(
         &self,
         stream: &Arc<CudaStream>,
@@ -6180,7 +6184,10 @@ impl LlmKernels {
     /// since its only constraint is K % 16 == 0 ; otherwise we propagate the
     /// V1 error to surface the unsupported shape.
     ///
-    /// # Safety  Same as `sgemv_bf16_bf16` / `sgemv_bf16_bf16_v2`.
+    /// # Safety
+    ///
+    /// Same contract as `sgemv_bf16_bf16` / `sgemv_bf16_bf16_v2` : pointers
+    /// must be valid for the duration of the kernel.
     pub unsafe fn sgemv_bf16_bf16_dispatch(
         &self,
         stream: &Arc<CudaStream>,
