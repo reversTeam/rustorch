@@ -381,6 +381,39 @@ pub(crate) struct DecodeScratch {
     pub(crate) tree_gqa_partial_l: CudaSlice<f32>,
     /// `[MAX_TREE_SIZE, n_q, n_split, head_dim]` BF16 — partial o for tree GQA.
     pub(crate) tree_gqa_partial_o: CudaSlice<half::bf16>,
+    // ── T246.7 P1.4 — Lookahead Decoding multi-token forward scratch ──
+    //
+    // These buffers hold per-tree-row activations for `decode_step_tree`
+    // when `tree_size > 1`. They are sized for `MAX_TREE_SIZE` rows so the
+    // capacity is fixed at construction time.
+    //
+    // For `tree_size = 1` the existing per-token buffers (`h`, `q_buf`,
+    // ...) are used for a strict drop-in to `decode_step` — these tree
+    // buffers are touched only when `tree_size > 1`.
+    /// `[MAX_TREE_SIZE, D]` BF16 — per-tree-row residual stream.
+    pub(crate) tree_h: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, D]` BF16 — per-tree-row normalized hidden state.
+    pub(crate) tree_h_norm: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, D]` BF16 — per-tree-row residual snapshot.
+    pub(crate) tree_residual: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, q_dim]` BF16 — per-tree-row Q projection.
+    pub(crate) tree_q_buf: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, kv_dim]` BF16 — per-tree-row K projection.
+    pub(crate) tree_k_buf: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, kv_dim]` BF16 — per-tree-row V projection.
+    pub(crate) tree_v_buf: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, q_dim]` BF16 — per-tree-row attention output.
+    pub(crate) tree_attn_out: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, max(f, q_dim, 2*q_dim)]` BF16 — per-tree-row
+    /// scratch for FFN gate / QG (re-used across the forward).
+    pub(crate) tree_gate_buf: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, max(f, 2*q_dim)]` BF16 — per-tree-row scratch
+    /// for FFN up / QG (re-used across the forward).
+    pub(crate) tree_up_buf: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, vocab]` BF16 — per-tree-row LM-head logits.
+    pub(crate) tree_logits: CudaSlice<half::bf16>,
+    /// Host-pinned `[MAX_TREE_SIZE]` u32 — DtoH target for tree argmax tokens.
+    pub(crate) tree_argmax_host_pinned: PinnedHostSlice<u32>,
 }
 
 /// CUDA-resident Qwen3.5/3.6 hybrid model with Q4_K_M weights.
@@ -929,6 +962,39 @@ impl Qwen35ModelCudaQ4K {
                     MAX_TREE_SIZE * cfg.n_q_heads * GQA_N_SPLIT * cfg.head_dim(),
                 )
                 .map_err(|e| LlmError::Backend(format!("scratch tree_gqa_o: {e:?}")))?,
+            // T246.7 P1.4 — multi-token forward scratch.
+            tree_h: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.d)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_h: {e:?}")))?,
+            tree_h_norm: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.d)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_h_norm: {e:?}")))?,
+            tree_residual: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.d)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_residual: {e:?}")))?,
+            tree_q_buf: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * q_dim)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_q_buf: {e:?}")))?,
+            tree_k_buf: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * kv_dim_attn)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_k_buf: {e:?}")))?,
+            tree_v_buf: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * kv_dim_attn)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_v_buf: {e:?}")))?,
+            tree_attn_out: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * q_dim)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_attn_out: {e:?}")))?,
+            tree_gate_buf: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * scratch_gate)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_gate_buf: {e:?}")))?,
+            tree_up_buf: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * scratch_up)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_up_buf: {e:?}")))?,
+            tree_logits: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.vocab)
+                .map_err(|e| LlmError::Backend(format!("scratch tree_logits: {e:?}")))?,
+            tree_argmax_host_pinned: unsafe { ctx.alloc_pinned::<u32>(MAX_TREE_SIZE) }
+                .map_err(|e| LlmError::Backend(format!("alloc_pinned tree_argmax: {e:?}")))?,
         };
 
         // T246.5.3 — device-resident counters for CUDA Graph capture.
@@ -1860,11 +1926,11 @@ impl Qwen35ModelCudaQ4K {
     /// in place ; only the per-tree-token forward orchestration is deferred.
     ///
     /// Per RFC design decisions :
-    ///   - D1 : NEW method, never modifies `decode_step`.
-    ///   - D2 : write-then-truncate KV (no scratch cache copy).
-    ///   - D4 : no graph capture for verify (the inner `decode_step` call
-    ///          may use its own captured graph for tree_size=1 ; tree_size>1
-    ///          would explicitly disable capture).
+    /// - D1 : NEW method, never modifies `decode_step`.
+    /// - D2 : write-then-truncate KV (no scratch cache copy).
+    /// - D4 : no graph capture for verify (the inner `decode_step` call
+    ///   may use its own captured graph for tree_size=1 ; tree_size>1
+    ///   would explicitly disable capture).
     pub fn decode_step_tree(
         &mut self,
         drafts: &[u32],
@@ -1931,21 +1997,583 @@ impl Qwen35ModelCudaQ4K {
             return Ok(vec![tok]);
         }
 
-        // ── tree_size > 1 : full multi-token tree forward (P1.4) ─────────
-        // The CUDA primitives are wired and parity-tested — see the
-        // `kv_append_tree_bf16`, `gqa_decode_tree_bf16`, `argmax_logits_tree_bf16`,
-        // `add_u32_dev`, `set_u32_dev` kernels. The orchestration of the
-        // per-tree-token forward (loop-batched embedding/RMSNorm/QKV/RoPE
-        // + tree-aware attention + per-token gate/W_o/FFN, then host-side
-        // acceptance walk + position counter advance) ships in P1.4 along
-        // with the host-side Lookahead manager that produces non-trivial
-        // tree topologies.
-        Err(LlmError::Backend(format!(
-            "decode_step_tree: tree_size > 1 (got {tree_size}) is not yet implemented; \
-             P1.3 ships the CUDA kernels and the tree_size=1 path. Full multi-token \
-             forward lands in P1.4 alongside the Lookahead manager. Use \
-             decode_step(drafts[0]) for now."
-        )))
+        // ── tree_size > 1 : SSM-hybrid variants are NOT yet supported ────
+        // The kv-append + gqa-decode primitives handle the attention layers
+        // for any number of tree positions in one kernel each. SSM layers
+        // (gated delta net) are recurrent — each verify branch needs its
+        // own forked SSM state, then commit-the-accepted-branch at the
+        // end. That design lands in a follow-up task ; see note
+        // f0477041-1bf0-4f91-ab1c-83f7843a4a82.
+        if !matches!(self.config.variant, Qwen35Variant::Qwen3PureTransformer) {
+            return Err(LlmError::Backend(format!(
+                "decode_step_tree multi-token (tree_size={tree_size}): SSM-hybrid \
+                 variants need state forking — see note f0477041 for the design \
+                 deferral. Use decode_step or wait for the SSM-fork task."
+            )));
+        }
+
+        // ── tree_size > 1 : pure-transformer multi-token forward (P1.4a) ─
+        self.decode_step_tree_pure_transformer(drafts, parents, depths)
+    }
+
+    /// T246.7 P1.4 — multi-token tree forward for the pure-transformer
+    /// variant (Qwen3PureTransformer / qwen2 / qwen3 family).
+    ///
+    /// Implements the full forward pass for a `tree_size`-node draft tree :
+    ///
+    /// 1. Embedding lookup for all `tree_size` tokens (one batched call ;
+    ///    `embedding_lookup_bf16` already supports `seq` argument).
+    /// 2. Per attention layer (every layer is attention for pure
+    ///    transformer) :
+    ///    - a. RMSNorm + QKV + per-head Q/K-norm + RoPE — looped per row,
+    ///      since these are HBM-bound and N small kernels pipeline well.
+    ///      RoPE uses `rope_partial_bf16` (explicit pos = base + depth[r]).
+    ///    - b. `kv_append_tree_bf16` — ONE call writes all tree positions.
+    ///    - c. `gqa_decode_tree_bf16` — ONE call computes attention for all
+    ///      tree rows with parents/depths-aware causal mask.
+    ///    - d. w_o + residual add per row.
+    ///    - e. RMSNorm + Dense FFN (gate/up/down + SwiGLU) per row + residual.
+    /// 3. Final RMSNorm + LM head per row.
+    /// 4. `argmax_logits_tree_bf16` — ONE call writes all tree_size
+    ///    argmax tokens.
+    /// 5. DtoH the argmax tokens → host buffer.
+    /// 6. CPU-side acceptance walk (per design decision db18cf7a) :
+    ///    starting from root, find the child whose token equals the
+    ///    model's prediction at the parent row, accept, recurse.
+    /// 7. Compact accepted KV slots into contiguous positions
+    ///    `[pos_dev .. pos_dev + accept_len)` (BFS guarantees src ≥ dst,
+    ///    so a forward in-place copy is safe).
+    /// 8. Advance device counters via `add_u32_dev`.
+    ///
+    /// Per RFC design decision D4 : graph capture is NOT used for the
+    /// verify pass (variable input shape). The single-token decode_step
+    /// graph is preserved across calls.
+    #[allow(clippy::too_many_lines)]
+    fn decode_step_tree_pure_transformer(
+        &mut self,
+        drafts: &[u32],
+        parents: &[i32],
+        depths: &[u8],
+    ) -> Result<Vec<u32>, LlmError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+        let cfg = self.config.clone();
+        let d = cfg.d;
+        let f = cfg.f;
+        let n_q = cfg.n_q_heads;
+        let n_kv = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim();
+        let q_dim = n_q * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let eps = cfg.rms_eps;
+        let rope_dim = cfg.rope_dim;
+        let vocab = cfg.vocab;
+        let tree_size = drafts.len();
+        debug_assert!(tree_size > 1 && tree_size <= MAX_TREE_SIZE);
+
+        // Snapshot the base position before this verify pass so we can
+        // recover per-row absolute positions for RoPE (= base + depth[r]).
+        let base_position = self.position;
+
+        // ── 0. Upload tree descriptors (drafts / parents / depths) ────────
+        // `tree_drafts` and friends are sized MAX_TREE_SIZE ; only the
+        // first tree_size entries are read by the kernels.
+        self.stream
+            .memcpy_htod(drafts, &mut self.scratch.tree_drafts)
+            .map_err(|e| LlmError::Backend(format!("upload tree_drafts: {e:?}")))?;
+        self.stream
+            .memcpy_htod(parents, &mut self.scratch.tree_parents)
+            .map_err(|e| LlmError::Backend(format!("upload tree_parents: {e:?}")))?;
+        self.stream
+            .memcpy_htod(depths, &mut self.scratch.tree_depths)
+            .map_err(|e| LlmError::Backend(format!("upload tree_depths: {e:?}")))?;
+
+        // ── 1. Zero per-tree scratch (sized MAX_TREE_SIZE × per-token) ────
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_h)
+            .map_err(|e| LlmError::Backend(format!("zero tree_h: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_h_norm)
+            .map_err(|e| LlmError::Backend(format!("zero tree_h_norm: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_residual)
+            .map_err(|e| LlmError::Backend(format!("zero tree_residual: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_q_buf)
+            .map_err(|e| LlmError::Backend(format!("zero tree_q_buf: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_k_buf)
+            .map_err(|e| LlmError::Backend(format!("zero tree_k_buf: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_v_buf)
+            .map_err(|e| LlmError::Backend(format!("zero tree_v_buf: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_attn_out)
+            .map_err(|e| LlmError::Backend(format!("zero tree_attn_out: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_gate_buf)
+            .map_err(|e| LlmError::Backend(format!("zero tree_gate_buf: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_up_buf)
+            .map_err(|e| LlmError::Backend(format!("zero tree_up_buf: {e:?}")))?;
+        self.stream
+            .memset_zeros(&mut self.scratch.tree_logits)
+            .map_err(|e| LlmError::Backend(format!("zero tree_logits: {e:?}")))?;
+
+        // Pre-extract device pointers & their gigantic guard locks (drop
+        // at end of unsafe block). The `tree_*` buffers are sized
+        // MAX_TREE_SIZE-rows ; row r lives at offset r*per_row.
+        let (
+            th_p,
+            thn_p,
+            tres_p,
+            tq_p,
+            tk_p,
+            tv_p,
+            tao_p,
+            tgate_p,
+            tup_p,
+            tlogits_p,
+            tdrafts_p,
+            tparents_p,
+            tdepths_p,
+            targmax_p,
+            tgqa_m_p,
+            tgqa_l_p,
+            tgqa_o_p,
+            x_q8_p,
+        ) = {
+            let (a, _g0) = self.scratch.tree_h.device_ptr_mut(&self.stream);
+            let (b, _g1) = self.scratch.tree_h_norm.device_ptr_mut(&self.stream);
+            let (c, _g2) = self.scratch.tree_residual.device_ptr_mut(&self.stream);
+            let (d_, _g3) = self.scratch.tree_q_buf.device_ptr_mut(&self.stream);
+            let (e, _g4) = self.scratch.tree_k_buf.device_ptr_mut(&self.stream);
+            let (f_, _g5) = self.scratch.tree_v_buf.device_ptr_mut(&self.stream);
+            let (g, _g6) = self.scratch.tree_attn_out.device_ptr_mut(&self.stream);
+            let (h, _g7) = self.scratch.tree_gate_buf.device_ptr_mut(&self.stream);
+            let (i, _g8) = self.scratch.tree_up_buf.device_ptr_mut(&self.stream);
+            let (j, _g9) = self.scratch.tree_logits.device_ptr_mut(&self.stream);
+            let (k, _g10) = self.scratch.tree_drafts.device_ptr(&self.stream);
+            let (l, _g11) = self.scratch.tree_parents.device_ptr(&self.stream);
+            let (m, _g12) = self.scratch.tree_depths.device_ptr(&self.stream);
+            let (n_, _g13) = self.scratch.tree_argmax.device_ptr_mut(&self.stream);
+            let (o, _g14) = self.scratch.tree_gqa_partial_m.device_ptr_mut(&self.stream);
+            let (p, _g15) = self.scratch.tree_gqa_partial_l.device_ptr_mut(&self.stream);
+            let (q, _g16) = self.scratch.tree_gqa_partial_o.device_ptr_mut(&self.stream);
+            let q8 = if self.use_dp4a_q4k {
+                let (s, _g17) = self.scratch.x_q8_scratch.device_ptr_mut(&self.stream);
+                s
+            } else {
+                0u64
+            };
+            (a, b, c, d_, e, f_, g, h, i, j, k, l, m, n_, o, p, q, q8)
+        };
+
+        // Per-row byte offsets (BF16 = 2 bytes).
+        let bf16_sz = std::mem::size_of::<half::bf16>() as u64;
+        let row_h = (d as u64) * bf16_sz;
+        let row_q = (q_dim as u64) * bf16_sz;
+        let row_kv = (kv_dim as u64) * bf16_sz;
+        let row_logits = (vocab as u64) * bf16_sz;
+
+        // ── 2. Embedding lookup for all tree_size tokens ──────────────────
+        unsafe {
+            let (te_p, _g) = self.token_emb.device_ptr(&self.stream);
+            self.kernels
+                .embedding_lookup_bf16(
+                    &self.stream,
+                    te_p,
+                    tdrafts_p,
+                    th_p,
+                    tree_size as i32,
+                    d as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("tree embed: {e:?}")))?;
+        }
+
+        // ── 3. Per-layer forward (every layer is attention for pure
+        //       transformer ; FFN is dense SwiGLU) ──────────────────────────
+        for (li, block) in self.blocks.iter_mut().enumerate() {
+            let attn = match block {
+                BlockQ4K::Attn(a) => a,
+                BlockQ4K::Ssm(_) => {
+                    return Err(LlmError::Backend(format!(
+                        "decode_step_tree_pure_transformer: layer {li} is SSM \
+                         but variant=Qwen3PureTransformer should have only \
+                         Attn layers (loader/config bug)"
+                    )));
+                },
+            };
+
+            // residual <- h (per row)
+            unsafe {
+                self.kernels
+                    .copy_bf16(&self.stream, tres_p, th_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("tree copy res: {e:?}")))?;
+            }
+
+            // RMSNorm h_norm = rms_norm(h, attn_norm) — per row, vectorized
+            // via the rms_norm_bf16 batch arg (one call for tree_size rows).
+            unsafe {
+                let (an, _g) = attn.attn_norm.device_ptr(&self.stream);
+                self.kernels
+                    .copy_bf16(&self.stream, thn_p, th_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("tree copy h_norm: {e:?}")))?;
+                self.kernels
+                    .rms_norm_bf16(&self.stream, thn_p, an, eps, d as i32, tree_size as i32)
+                    .map_err(|e| LlmError::Backend(format!("tree rms_norm attn: {e:?}")))?;
+            }
+
+            // Per-row Q, K, V projections (loop tree_size times).
+            for r in 0..tree_size {
+                let hn_r = thn_p + (r as u64) * row_h;
+                let q_r = tq_p + (r as u64) * row_q;
+                let k_r = tk_p + (r as u64) * row_kv;
+                let v_r = tv_p + (r as u64) * row_kv;
+                attn.w_q
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, q_r, x_q8_p)?;
+                attn.w_k
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, k_r, x_q8_p)?;
+                attn.w_v
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, v_r, x_q8_p)?;
+            }
+
+            // Per-head Q-norm and K-norm — one call per row covering all
+            // heads (rms_norm_bf16 with batch=n_q / n_kv).
+            unsafe {
+                let (qn, _g1) = attn.q_norm.device_ptr(&self.stream);
+                let (kn, _g2) = attn.k_norm.device_ptr(&self.stream);
+                self.kernels
+                    .rms_norm_bf16(
+                        &self.stream,
+                        tq_p,
+                        qn,
+                        eps,
+                        head_dim as i32,
+                        (tree_size * n_q) as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("tree q_norm: {e:?}")))?;
+                self.kernels
+                    .rms_norm_bf16(
+                        &self.stream,
+                        tk_p,
+                        kn,
+                        eps,
+                        head_dim as i32,
+                        (tree_size * n_kv) as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("tree k_norm: {e:?}")))?;
+            }
+
+            // RoPE per row with explicit pos = base_position + depths[r].
+            // base_position is the snapshot before this call ; that is the
+            // root's position. Children at depth d use base_position + d.
+            unsafe {
+                let (inv_p, _g_inv) = self.rope_freqs.inv_freq.device_ptr(&self.stream);
+                for (r, &dep) in depths.iter().enumerate().take(tree_size) {
+                    let pos_r = base_position as i32 + dep as i32;
+                    let q_r = tq_p + (r as u64) * row_q;
+                    let k_r = tk_p + (r as u64) * row_kv;
+                    self.kernels
+                        .rope_partial_bf16(
+                            &self.stream,
+                            q_r,
+                            inv_p,
+                            pos_r,
+                            n_q as i32,
+                            head_dim as i32,
+                            rope_dim as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("tree rope q: {e:?}")))?;
+                    self.kernels
+                        .rope_partial_bf16(
+                            &self.stream,
+                            k_r,
+                            inv_p,
+                            pos_r,
+                            n_kv as i32,
+                            head_dim as i32,
+                            rope_dim as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("tree rope k: {e:?}")))?;
+                }
+            }
+
+            // Append all tree positions to KV cache in ONE kernel.
+            // pos_dev currently points at the next free slot (= old pos +
+            // 1 in the existing convention). kv_append_tree writes at
+            // [pos_dev + r] for r in 0..tree_size.
+            let attn_idx = get_attn_layer_idx(&cfg, li);
+            let kv_cache = &mut self.kv_caches[attn_idx];
+            unsafe {
+                let (kc_p, _g1) = kv_cache.k.device_ptr_mut(&self.stream);
+                let (vc_p, _g2) = kv_cache.v.device_ptr_mut(&self.stream);
+                let (pos_p, _g3) = self.position_dev.device_ptr(&self.stream);
+                self.kernels
+                    .kv_append_tree_bf16(
+                        &self.stream,
+                        kc_p,
+                        vc_p,
+                        tk_p,
+                        tv_p,
+                        pos_p,
+                        tree_size as i32,
+                        kv_dim as i32,
+                        self.max_seq as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("tree kv_append: {e:?}")))?;
+            }
+
+            // Tree-aware GQA decode in ONE kernel pair (partial + combine).
+            unsafe {
+                let (kc_p, _g1) = kv_cache.k.device_ptr(&self.stream);
+                let (vc_p, _g2) = kv_cache.v.device_ptr(&self.stream);
+                let (kv_len_p, _g3) = self.kv_len_dev.device_ptr(&self.stream);
+                self.kernels
+                    .gqa_decode_tree_bf16(
+                        &self.stream,
+                        tq_p,
+                        kc_p,
+                        vc_p,
+                        tao_p,
+                        tparents_p,
+                        tdepths_p,
+                        tgqa_m_p,
+                        tgqa_l_p,
+                        tgqa_o_p,
+                        n_q as i32,
+                        n_kv as i32,
+                        kv_len_p,
+                        head_dim as i32,
+                        self.max_seq as i32,
+                        GQA_N_SPLIT as i32,
+                        tree_size as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("tree gqa_decode: {e:?}")))?;
+            }
+
+            // w_o per row : h_r = w_o @ attn_out_r. We re-use tree_h as
+            // the destination since residual is in tree_residual already.
+            for r in 0..tree_size {
+                let ao_r = tao_p + (r as u64) * row_q;
+                let h_r = th_p + (r as u64) * row_h;
+                attn.w_o
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, ao_r, h_r, x_q8_p)?;
+            }
+
+            // h += residual (per row, single batched call).
+            unsafe {
+                self.kernels
+                    .add_inplace_bf16(&self.stream, th_p, tres_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("tree attn residual: {e:?}")))?;
+            }
+
+            // ── FFN block ───────────────────────────────────────────────
+            // residual <- h (post-attention value)
+            unsafe {
+                self.kernels
+                    .copy_bf16(&self.stream, tres_p, th_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("tree copy res ffn: {e:?}")))?;
+            }
+            // h_norm = rms_norm(h, post_norm) — batched over tree_size rows.
+            unsafe {
+                let (pn, _g) = attn.post_norm.device_ptr(&self.stream);
+                self.kernels
+                    .copy_bf16(&self.stream, thn_p, th_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("tree copy h_norm ffn: {e:?}")))?;
+                self.kernels
+                    .rms_norm_bf16(&self.stream, thn_p, pn, eps, d as i32, tree_size as i32)
+                    .map_err(|e| LlmError::Backend(format!("tree rms_norm post: {e:?}")))?;
+            }
+
+            // Dense SwiGLU FFN per row : gate, up, swiglu, down.
+            // Per-row buffer offsets in tree_gate_buf / tree_up_buf use the
+            // FFN scratch row size (max(f, q_dim, 2*q_dim)).
+            let row_ffn_gate = (self.scratch.tree_gate_buf.len() / MAX_TREE_SIZE) as u64 * bf16_sz;
+            let row_ffn_up = (self.scratch.tree_up_buf.len() / MAX_TREE_SIZE) as u64 * bf16_sz;
+            match &attn.ffn {
+                FfnQ4K::Dense { gate, up, down } => {
+                    for r in 0..tree_size {
+                        let hn_r = thn_p + (r as u64) * row_h;
+                        let gate_r = tgate_p + (r as u64) * row_ffn_gate;
+                        let up_r = tup_p + (r as u64) * row_ffn_up;
+                        let h_r = th_p + (r as u64) * row_h;
+                        gate.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, gate_r, x_q8_p)?;
+                        up.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, up_r, x_q8_p)?;
+                        unsafe {
+                            self.kernels
+                                .swiglu_bf16(&self.stream, gate_r, up_r, gate_r, f as i32)
+                                .map_err(|e| {
+                                    LlmError::Backend(format!("tree swiglu r{r}: {e:?}"))
+                                })?;
+                        }
+                        down.dispatch_matmul_m1(&self.kernels, &self.stream, gate_r, h_r, x_q8_p)?;
+                    }
+                },
+                FfnQ4K::Moe(_) => {
+                    return Err(LlmError::Backend(
+                        "decode_step_tree_pure_transformer: MoE FFN not \
+                         supported for pure-transformer variant"
+                            .into(),
+                    ));
+                },
+            }
+
+            // h += residual (post-FFN).
+            unsafe {
+                self.kernels
+                    .add_inplace_bf16(&self.stream, th_p, tres_p, (tree_size * d) as i32)
+                    .map_err(|e| LlmError::Backend(format!("tree ffn residual: {e:?}")))?;
+            }
+        }
+
+        // ── 4. Final RMSNorm + LM head per row ────────────────────────────
+        unsafe {
+            let (fn_p, _g) = self.final_norm.device_ptr(&self.stream);
+            self.kernels
+                .rms_norm_bf16(&self.stream, th_p, fn_p, eps, d as i32, tree_size as i32)
+                .map_err(|e| LlmError::Backend(format!("tree final_norm: {e:?}")))?;
+        }
+        for r in 0..tree_size {
+            let h_r = th_p + (r as u64) * row_h;
+            let logits_r = tlogits_p + (r as u64) * row_logits;
+            self.lm_head
+                .dispatch_matmul_m1(&self.kernels, &self.stream, h_r, logits_r, x_q8_p)?;
+        }
+
+        // ── 5. Argmax over all tree_size logits rows ──────────────────────
+        unsafe {
+            self.kernels
+                .argmax_logits_tree_bf16(
+                    &self.stream,
+                    tlogits_p,
+                    targmax_p,
+                    tree_size as i32,
+                    vocab as i32,
+                )
+                .map_err(|e| LlmError::Backend(format!("tree argmax: {e:?}")))?;
+        }
+
+        // ── 6. DtoH the argmax tokens to pinned host buffer ───────────────
+        self.stream
+            .memcpy_dtoh(
+                &self.scratch.tree_argmax,
+                &mut self.scratch.tree_argmax_host_pinned,
+            )
+            .map_err(|e| LlmError::Backend(format!("dtoh tree_argmax: {e:?}")))?;
+        let argmax_host = self
+            .scratch
+            .tree_argmax_host_pinned
+            .as_slice()
+            .map_err(|e| LlmError::Backend(format!("read pinned tree_argmax: {e:?}")))?;
+
+        // ── 7. CPU acceptance walk ────────────────────────────────────────
+        // For each tree node r in [0, tree_size), `argmax_host[r]` is the
+        // model's prediction for the next token if it had been fed the
+        // ancestor chain ending at r (root → ... → r).
+        //
+        // Acceptance walk : start at root (cur=0). The model's prediction
+        // for the position AFTER the root is `argmax_host[0]`. If any
+        // child of root has token == argmax_host[0], accept that child,
+        // recurse from there. The first accepted token is always
+        // argmax_host[0] (since it's whatever the model would have
+        // sampled with the standard decode_step on `drafts[0]`).
+        //
+        // Build a child-list once : children[parent] = Vec<child_idx>.
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
+        for (r, &p) in parents.iter().enumerate().skip(1) {
+            children[p as usize].push(r);
+        }
+
+        let mut accepted_indices: Vec<usize> = vec![0]; // root
+        let mut accepted_tokens: Vec<u32> = vec![argmax_host[0]];
+        let mut cur = 0usize;
+        loop {
+            let next_tok = argmax_host[cur];
+            // Look for a child of cur whose draft token equals next_tok.
+            let mut found: Option<usize> = None;
+            for &c in &children[cur] {
+                if drafts[c] == next_tok {
+                    found = Some(c);
+                    break;
+                }
+            }
+            match found {
+                Some(c) => {
+                    // The child's *own* prediction (argmax_host[c]) is the
+                    // token AFTER c. So push c's index and the prediction
+                    // for one step beyond c.
+                    accepted_indices.push(c);
+                    accepted_tokens.push(argmax_host[c]);
+                    cur = c;
+                },
+                None => break,
+            }
+        }
+        let accept_len = accepted_tokens.len();
+        debug_assert!(accept_len >= 1);
+        debug_assert_eq!(accepted_indices.len(), accept_len);
+
+        // ── 8. Compact accepted KV slots into [pos_dev .. pos_dev+accept_len)
+        // For each i in 1..accept_len, the accepted node's K/V was written
+        // at slot pos_dev + accepted_indices[i] (BFS index ≥ i). We need
+        // it at slot pos_dev + i. Per BFS invariant src ≥ dst, so a
+        // forward in-place copy (smallest dst first) is safe.
+        for (li, block) in self.blocks.iter_mut().enumerate() {
+            if !matches!(block, BlockQ4K::Attn(_)) {
+                continue;
+            }
+            let attn_idx = get_attn_layer_idx(&cfg, li);
+            let kv_cache = &mut self.kv_caches[attn_idx];
+            unsafe {
+                let (kc_p, _g1) = kv_cache.k.device_ptr_mut(&self.stream);
+                let (vc_p, _g2) = kv_cache.v.device_ptr_mut(&self.stream);
+                for (i, &src) in accepted_indices.iter().enumerate().take(accept_len).skip(1) {
+                    if src == i {
+                        continue;
+                    }
+                    let src_off = (base_position as u64 + src as u64) * (kv_dim as u64);
+                    let dst_off = (base_position as u64 + i as u64) * (kv_dim as u64);
+                    // copy_bf16(dst, src, n) — n is element count.
+                    self.kernels
+                        .copy_bf16(
+                            &self.stream,
+                            kc_p + dst_off * bf16_sz,
+                            kc_p + src_off * bf16_sz,
+                            kv_dim as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("tree compact K l{li}: {e:?}")))?;
+                    self.kernels
+                        .copy_bf16(
+                            &self.stream,
+                            vc_p + dst_off * bf16_sz,
+                            vc_p + src_off * bf16_sz,
+                            kv_dim as i32,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("tree compact V l{li}: {e:?}")))?;
+                }
+            }
+        }
+
+        // ── 9. Advance device counters by accept_len ──────────────────────
+        unsafe {
+            let (pos_p, _g_pos) = self.position_dev.device_ptr_mut(&self.stream);
+            self.kernels
+                .add_u32_dev(&self.stream, pos_p, accept_len as i32)
+                .map_err(|e| LlmError::Backend(format!("add_u32_dev pos: {e:?}")))?;
+        }
+        unsafe {
+            let (kvl_p, _g_kvl) = self.kv_len_dev.device_ptr_mut(&self.stream);
+            self.kernels
+                .add_u32_dev(&self.stream, kvl_p, accept_len as i32)
+                .map_err(|e| LlmError::Backend(format!("add_u32_dev kv_len: {e:?}")))?;
+        }
+        self.position += accept_len;
+
+        // The CUDA Graph (if any was captured for the single-token path) is
+        // still valid : we did not modify any buffer it references.
+
+        Ok(accepted_tokens)
     }
 }
 
