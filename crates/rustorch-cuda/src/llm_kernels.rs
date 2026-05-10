@@ -66,6 +66,183 @@ extern "C" __global__ void rms_norm_bf16(
 }
 "#;
 
+// T247.6 — Q4_K SGEMV backward, dx only (W is frozen for LoRA fine-tuning).
+//
+// Forward:  y = W·x         where W is [N,K] in Q4_K, x BF16 [K], y BF16 [N]
+// Backward: dx = Wᵀ·dy      so each output dx[k] = Σ_n W[n,k] · dy[n]
+//
+// Each thread handles 1 output column k of W (= 1 element of dx). It
+// iterates over rows n=0..N, dequantizes W[n,k] from the Q4_K block format,
+// multiplies by dy[n], accumulates. This is intentionally a column-major
+// access pattern over W (uncoalesced) — pilot focused on correctness, not
+// perf. Production uses tile-based or pre-transpose.
+//
+// Q4_K column-→nibble decode (mirroring the V2 forward tile mapping):
+//   sb       = k / 256              — super-block in row
+//   within   = k % 256
+//   sub      = within / 32          — sub-block index 0..7
+//   pos      = within % 32          — position within sub-block
+//   pair_idx = sub / 2
+//   nib_lo   = (sub & 1) == 0       — low nibble for even sub-blocks
+//   byte_off = 16 + pair_idx*32 + pos
+//   nibble   = nib_lo ? (byte & 0xF) : (byte >> 4)
+//
+// Scale unpacking : if sub < 4, sc/m direct from `scales[sub]`/`scales[sub+4]`
+// masked with 0x3F. If sub >= 4, reconstructed from the upper 2 bits of
+// `scales[sub-4]`/`scales[sub]` and `scales[sub+4]` (matches V2 forward).
+#[cfg(feature = "cuda")]
+const SGEMV_Q4K_GRAD_DX_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemv_q4k_grad_dx_bf16(
+    const unsigned char* __restrict__ w_q4k,
+    const __nv_bfloat16* __restrict__ dy,
+    __nv_bfloat16*       __restrict__ dx,
+    int N,
+    int K
+) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= K) return;
+
+    int blocks_per_row = K / 256;
+    int sb        = k / 256;
+    int within    = k - sb * 256;
+    int sub       = within >> 5;
+    int pos       = within & 31;
+    int pair_idx  = sub >> 1;
+    int sub_in_pair = sub & 1;       // 0 = low nibble, 1 = high
+    int byte_off  = 16 + pair_idx * 32 + pos;
+
+    float acc = 0.0f;
+
+    for (int n = 0; n < N; ++n) {
+        const unsigned char* blk =
+            w_q4k + ((size_t)n * blocks_per_row + sb) * 144;
+
+        unsigned short d_bits    = blk[0] | (blk[1] << 8);
+        unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_bits));
+        float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+        const unsigned char* scales = blk + 4;
+        unsigned char sc_i, m_i;
+        if (sub < 4) {
+            sc_i = scales[sub]     & 0x3F;
+            m_i  = scales[sub + 4] & 0x3F;
+        } else {
+            int s = sub - 4;
+            sc_i = (scales[s + 8] & 0x0F) | ((scales[s]     >> 6) << 4);
+            m_i  = (scales[s + 8] >> 4)   | ((scales[s + 4] >> 6) << 4);
+        }
+        float scale = d    * (float)sc_i;
+        float min_v = dmin * (float)m_i;
+
+        unsigned char byte = blk[byte_off];
+        int nibble = sub_in_pair ? (byte >> 4) : (byte & 0x0F);
+
+        float w_val = scale * (float)nibble - min_v;
+        acc += w_val * (float)dy[n];
+    }
+
+    dx[k] = (__nv_bfloat16)acc;
+}
+"#;
+
+// T247.5 — Embedding lookup backward (sparse scatter via atomicAdd).
+//
+// Forward : `out[i] = embed_table[token_id, i]`
+// Backward: `d_embed_accum[token_id, i] += dy[i]`  (atomic, float accumulator)
+//
+// The accumulator is float32 (atomicAdd on float is universally supported and
+// avoids the precision pitfalls of bf16/half atomic adds). Caller zeroes the
+// accumulator before the first call of an iteration ; multi-token batches
+// accumulate via repeated calls.
+#[cfg(feature = "cuda")]
+const EMBEDDING_LOOKUP_GRAD_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void embedding_lookup_grad_bf16(
+    const __nv_bfloat16* __restrict__ dy,             // [d]
+    int                              token_id,
+    float*               __restrict__ d_embed_accum,  // [vocab, d]
+    int d
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d) return;
+    float dy_i = (float)dy[i];
+    atomicAdd(&d_embed_accum[(long long)token_id * d + i], dy_i);
+}
+"#;
+
+// T247.4 — Cross-entropy from logits, fused forward + backward.
+// Single-row : given a logits vector of length `vocab` and a `target` token id,
+// computes (a) the scalar loss = -log(softmax(logits)[target]) and (b) the
+// gradient dlogits[i] = softmax(logits)[i] - δ_{i,target}.
+//
+// Numerically stable : max-shift before exp.
+// Three passes over `vocab` : max-reduce, sum-exp, write.
+//
+// Block dim should be a power of 2 ≤ 1024. Single block per call.
+#[cfg(feature = "cuda")]
+const CROSS_ENTROPY_LOSS_GRAD_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void cross_entropy_loss_grad_bf16(
+    const __nv_bfloat16* __restrict__ logits,   // [vocab]
+    int target,
+    float*               __restrict__ loss_out, // [1]
+    __nv_bfloat16*       __restrict__ dlogits,  // [vocab]
+    int vocab
+) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+
+    // ---- Pass 1 : find max(logits) for numerical stability ----
+    float local_max = -1e30f;
+    for (int i = tid; i < vocab; i += blockDim.x) {
+        float v = (float)logits[i];
+        if (v > local_max) local_max = v;
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_l = sdata[0];
+    __syncthreads();
+
+    // ---- Pass 2 : sum_i exp(l_i - max) ----
+    float local_sum = 0.0f;
+    for (int i = tid; i < vocab; i += blockDim.x) {
+        float v = (float)logits[i];
+        local_sum += expf(v - max_l);
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float Z     = sdata[0];
+    float log_Z = logf(Z);
+    __syncthreads();
+
+    // ---- Pass 3 : loss + dlogits ----
+    if (tid == 0) {
+        float l_target = (float)logits[target];
+        *loss_out = -(l_target - max_l - log_Z);
+    }
+    for (int i = tid; i < vocab; i += blockDim.x) {
+        float v = (float)logits[i];
+        float p = expf(v - max_l) / Z;
+        float g = p - ((i == target) ? 1.0f : 0.0f);
+        dlogits[i] = (__nv_bfloat16)g;
+    }
+}
+"#;
+
 // T247.3 — RoPE partial backward kernel (BF16). Same layout as forward
 // (pairs (k, k+half)) but applies the inverse rotation matrix.
 //   Forward (per pair):
@@ -2548,6 +2725,12 @@ pub struct LlmKernels {
     swiglu_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T247.3 — RoPE partial backward kernel
     rope_partial_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T247.4 — fused cross-entropy loss + gradient
+    cross_entropy_loss_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T247.5 — embedding lookup backward (sparse scatter)
+    embedding_lookup_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T247.6 — Q4_K SGEMV backward dx (frozen W)
+    sgemv_q4k_grad_dx: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2599,6 +2782,9 @@ impl LlmKernels {
             rms_norm_grad: std::sync::OnceLock::new(),
             swiglu_grad: std::sync::OnceLock::new(),
             rope_partial_grad: std::sync::OnceLock::new(),
+            cross_entropy_loss_grad: std::sync::OnceLock::new(),
+            embedding_lookup_grad: std::sync::OnceLock::new(),
+            sgemv_q4k_grad_dx: std::sync::OnceLock::new(),
         }
     }
 
@@ -4031,6 +4217,126 @@ impl LlmKernels {
         Ok(())
     }
 
+    /// T247.6 — Q4_K SGEMV backward, dx only (W frozen for LoRA fine-tune).
+    /// Computes `dx[k] = Σ_n W[n,k] · dy[n]`. Pilot impl is correctness-
+    /// focused (column-major access over W — uncoalesced) ; production
+    /// optimization (tile / pre-transpose) tracked in T247.6 follow-up.
+    ///
+    /// # Safety  K must be multiple of 256 ; `w_q4k` is row-major Q4_K
+    /// `N * K/256 * 144` bytes ; `dy` length N bf16 ; `dx` length K bf16.
+    pub unsafe fn sgemv_q4k_grad_dx_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q4k: u64,
+        dy: u64,
+        dx: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q4k_grad_dx_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_q4k_grad_dx,
+            SGEMV_Q4K_GRAD_DX_BF16_SRC,
+            "sgemv_q4k_grad_dx_bf16",
+        )?;
+        let block_dim: u32 = 256;
+        let grid_dim = ((k as u32) + block_dim - 1) / block_dim;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q4k).arg(&dy).arg(&dx).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q4k_grad_dx_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T247.5 — Embedding lookup backward — atomic scatter into a float
+    /// accumulator. Caller zeroes `d_embed_accum` (length `vocab * d`)
+    /// before the first call of a training iteration.
+    ///
+    /// # Safety  `dy` is length-`d` bf16, `d_embed_accum` is length-`vocab*d`
+    /// float, both device-resident.
+    pub unsafe fn embedding_lookup_grad_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        dy: u64,
+        token_id: i32,
+        d_embed_accum: u64,
+        d: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.embedding_lookup_grad,
+            EMBEDDING_LOOKUP_GRAD_BF16_SRC,
+            "embedding_lookup_grad_bf16",
+        )?;
+        let block_dim: u32 = 256;
+        let grid_dim = ((d as u32) + block_dim - 1) / block_dim;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&dy).arg(&token_id).arg(&d_embed_accum).arg(&d);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "embedding_lookup_grad_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T247.4 — Cross-entropy from logits, fused forward + backward.
+    ///
+    /// Returns scalar loss in `loss_out` and the gradient w.r.t. logits in
+    /// `dlogits`. Numerically stable via max-shift.
+    ///
+    /// # Safety  `logits` and `dlogits` are length-`vocab` bf16 buffers,
+    /// `loss_out` is a length-1 float buffer, all device-resident.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn cross_entropy_loss_grad_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        logits: u64,
+        target: i32,
+        loss_out: u64,
+        dlogits: u64,
+        vocab: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.cross_entropy_loss_grad,
+            CROSS_ENTROPY_LOSS_GRAD_BF16_SRC,
+            "cross_entropy_loss_grad_bf16",
+        )?;
+        // Pick max-power-of-2 block dim ≤ 1024 such that block_dim ≤ vocab.
+        let bd = (vocab as u32).next_power_of_two().min(1024).max(32);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (bd, 1, 1),
+            shared_mem_bytes: bd * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&logits)
+            .arg(&target)
+            .arg(&loss_out)
+            .arg(&dlogits)
+            .arg(&vocab);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "cross_entropy_loss_grad_bf16::launch",
+        })?;
+        Ok(())
+    }
+
     /// T247.3 — RoPE partial backward kernel. Inverse rotation per pair.
     ///
     /// # Safety  All bf16 buffers length `n_heads * head_dim`.
@@ -5418,6 +5724,299 @@ mod parity_tests {
                 "dup[{i}] ref={} cuda={} diff={} tol={}",
                 dup_ref[i],
                 dup_cuda[i],
+                diff,
+                tol
+            );
+        }
+    }
+
+    /// T247.6 — Q4_K backward dx parity test : compares the CUDA kernel to
+    /// a CPU reference computed via the official `rustorch_gguf::dequant`
+    /// dequantizer + scalar Wᵀ·dy. Tolerance accounts for BF16 + minor
+    /// reduction order differences.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn sgemv_q4k_grad_dx_bf16_matches_cpu_reference() {
+        use rustorch_gguf::dequant::{dequant_q4_k, Q4_K_BYTES, QK_K};
+
+        let n = 64usize;
+        let k = 512usize;
+        let blocks_per_row = k / QK_K;
+        let row_bytes = blocks_per_row * Q4_K_BYTES;
+
+        let mut state: u64 = 0xfeedbeef;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut w_bytes = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q4_K_BYTES;
+                let d = half::f16::from_f32(0.07).to_le_bytes();
+                let dmin = half::f16::from_f32(0.03).to_le_bytes();
+                w_bytes[off] = d[0];
+                w_bytes[off + 1] = d[1];
+                w_bytes[off + 2] = dmin[0];
+                w_bytes[off + 3] = dmin[1];
+                for i in 0..12 {
+                    w_bytes[off + 4 + i] = (next() & 0x3F) as u8;
+                }
+                for i in 0..128 {
+                    w_bytes[off + 16 + i] = (next() & 0xFF) as u8;
+                }
+            }
+        }
+
+        // Random dy. Round-trip through bf16 so the CPU reference sees the
+        // same quantized values the kernel reads (the kernel casts bf16→f32
+        // internally ; without this round-trip the cumulative bf16-rounding
+        // error inflates parity diff at small dx values).
+        let dy_f32: Vec<f32> = (0..n)
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.13).sin()) * 0.5).to_f32())
+            .collect();
+
+        // CPU reference : dequant each row, then dx[k] = Σ_n W[n,k]·dy[n].
+        let mut block_buf = [0.0_f32; QK_K];
+        let mut w_dequant = vec![0.0_f32; n * k];
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let blk_off = row * row_bytes + blk * Q4_K_BYTES;
+                dequant_q4_k(&w_bytes[blk_off..blk_off + Q4_K_BYTES], &mut block_buf)
+                    .expect("dequant_q4_k");
+                let dst = &mut w_dequant[row * k + blk * QK_K..row * k + (blk + 1) * QK_K];
+                dst.copy_from_slice(&block_buf);
+            }
+        }
+        let mut dx_ref = vec![0.0_f32; k];
+        for kk in 0..k {
+            let mut acc = 0.0_f32;
+            for nn in 0..n {
+                acc += w_dequant[nn * k + kk] * dy_f32[nn];
+            }
+            dx_ref[kk] = acc;
+        }
+
+        // CUDA path.
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let dy_bf: Vec<half::bf16> = dy_f32.iter().copied().map(half::bf16::from_f32).collect();
+
+        let w_dev = stream.memcpy_stod(&w_bytes).expect("upload w");
+        let dy_dev = stream.memcpy_stod(&dy_bf).expect("upload dy");
+        let mut dx_dev = stream.alloc_zeros::<half::bf16>(k).expect("alloc dx");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (wp, _g0) = w_dev.device_ptr(&stream);
+            let (dyp, _g1) = dy_dev.device_ptr(&stream);
+            let (dxp, _g2) = dx_dev.device_ptr_mut(&stream);
+            kernels
+                .sgemv_q4k_grad_dx_bf16(&stream, wp, dyp, dxp, n as i32, k as i32)
+                .expect("sgemv_q4k_grad_dx");
+        }
+
+        let dx_cuda: Vec<f32> = stream
+            .memcpy_dtov(&dx_dev)
+            .expect("dtov dx")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        for i in 0..k {
+            let diff = (dx_ref[i] - dx_cuda[i]).abs();
+            // BF16 quant on dy + W dequant scale path accumulates ~2-4% over
+            // a 64-row reduction. Match the established tolerance from the
+            // forward parity test `sgemv_q4k_bf16_v2_matches_v1` (5% + 0.5).
+            let tol = dx_ref[i].abs() * 5e-2 + 1e-2;
+            assert!(
+                diff <= tol,
+                "dx[{i}] ref={} cuda={} diff={} tol={}",
+                dx_ref[i],
+                dx_cuda[i],
+                diff,
+                tol
+            );
+        }
+    }
+
+    /// T247.5 — Embedding lookup backward (atomic scatter) parity test.
+    /// Verifies multi-token accumulation : 3 token_ids (one repeated) →
+    /// the accumulator should hold dy_a + dy_c at row token_a (since we
+    /// reuse it twice) and dy_b at row token_b.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn embedding_lookup_grad_bf16_accumulates() {
+        let vocab = 64usize;
+        let d = 128usize;
+
+        let mut state: u64 = 0xdeadbeef;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (((state >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5
+        };
+
+        let dy_a: Vec<f32> = (0..d).map(|_| next() * 0.5).collect();
+        let dy_b: Vec<f32> = (0..d).map(|_| next() * 0.5).collect();
+        let dy_c: Vec<f32> = (0..d).map(|_| next() * 0.5).collect();
+        let tok_a: i32 = 7;
+        let tok_b: i32 = 23;
+        let tok_c: i32 = 7; // repeated → accumulates with dy_a
+
+        // CPU reference (full vocab × d).
+        let mut accum_ref = vec![0.0_f32; vocab * d];
+        for i in 0..d {
+            accum_ref[(tok_a as usize) * d + i] += dy_a[i];
+            accum_ref[(tok_b as usize) * d + i] += dy_b[i];
+            accum_ref[(tok_c as usize) * d + i] += dy_c[i];
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let to_bf = |v: &[f32]| -> Vec<half::bf16> {
+            v.iter().copied().map(half::bf16::from_f32).collect()
+        };
+        let dy_a_dev = stream.memcpy_stod(&to_bf(&dy_a)).expect("upload dy_a");
+        let dy_b_dev = stream.memcpy_stod(&to_bf(&dy_b)).expect("upload dy_b");
+        let dy_c_dev = stream.memcpy_stod(&to_bf(&dy_c)).expect("upload dy_c");
+        let mut accum_dev = stream.alloc_zeros::<f32>(vocab * d).expect("alloc accum");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            // Each scatter scoped so the `accum_dev` mutable borrow guard
+            // drops before the next call (Rust forbids 2 mut borrows
+            // simultaneously).
+            {
+                let (a_p, _g0) = dy_a_dev.device_ptr(&stream);
+                let (acc_p, _g1) = accum_dev.device_ptr_mut(&stream);
+                kernels
+                    .embedding_lookup_grad_bf16(&stream, a_p, tok_a, acc_p, d as i32)
+                    .expect("scatter a");
+            }
+            {
+                let (b_p, _g2) = dy_b_dev.device_ptr(&stream);
+                let (acc_p, _g3) = accum_dev.device_ptr_mut(&stream);
+                kernels
+                    .embedding_lookup_grad_bf16(&stream, b_p, tok_b, acc_p, d as i32)
+                    .expect("scatter b");
+            }
+            {
+                let (c_p, _g4) = dy_c_dev.device_ptr(&stream);
+                let (acc_p, _g5) = accum_dev.device_ptr_mut(&stream);
+                kernels
+                    .embedding_lookup_grad_bf16(&stream, c_p, tok_c, acc_p, d as i32)
+                    .expect("scatter c");
+            }
+        }
+
+        let accum_cuda: Vec<f32> = stream.memcpy_dtov(&accum_dev).expect("dtov accum");
+
+        // Tolerance accounts for bf16-quant of dy + float accum.
+        for i in 0..vocab * d {
+            let diff = (accum_ref[i] - accum_cuda[i]).abs();
+            let tol = accum_ref[i].abs() * 1.5e-2 + 5e-3;
+            assert!(
+                diff <= tol,
+                "accum[{i}] (vocab_row={}) ref={} cuda={} diff={} tol={}",
+                i / d,
+                accum_ref[i],
+                accum_cuda[i],
+                diff,
+                tol
+            );
+        }
+    }
+
+    /// T247.4 — Cross-entropy fused forward+backward parity test.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn cross_entropy_loss_grad_bf16_matches_cpu_reference() {
+        let vocab = 4096usize;
+        let target: i32 = 1234;
+
+        let mut state: u64 = 0xfeed1234;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (((state >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5
+        };
+        let logits_f32: Vec<f32> = (0..vocab).map(|_| next() * 4.0).collect();
+
+        // CPU reference (numerically stable).
+        let max_l = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits_f32.iter().map(|&v| (v - max_l).exp()).collect();
+        let z: f32 = exps.iter().sum();
+        let log_z = z.ln();
+        let loss_ref = -(logits_f32[target as usize] - max_l - log_z);
+        let dlogits_ref: Vec<f32> = logits_f32
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let p = (v - max_l).exp() / z;
+                p - if i == target as usize { 1.0 } else { 0.0 }
+            })
+            .collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let logits_bf: Vec<half::bf16> = logits_f32
+            .iter()
+            .copied()
+            .map(half::bf16::from_f32)
+            .collect();
+        let logits_dev = stream.memcpy_stod(&logits_bf).expect("upload logits");
+        let mut loss_dev = stream.alloc_zeros::<f32>(1).expect("alloc loss");
+        let mut dlogits_dev = stream
+            .alloc_zeros::<half::bf16>(vocab)
+            .expect("alloc dlogits");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (lp, _g0) = logits_dev.device_ptr(&stream);
+            let (loss_p, _g1) = loss_dev.device_ptr_mut(&stream);
+            let (dlp, _g2) = dlogits_dev.device_ptr_mut(&stream);
+            kernels
+                .cross_entropy_loss_grad_bf16(&stream, lp, target, loss_p, dlp, vocab as i32)
+                .expect("xent");
+        }
+
+        let loss_cuda: f32 = stream.memcpy_dtov(&loss_dev).expect("dtov loss")[0];
+        let dlogits_cuda: Vec<f32> = stream
+            .memcpy_dtov(&dlogits_dev)
+            .expect("dtov dlogits")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        // Loss is a scalar — float32 precision, very tight.
+        assert!(
+            (loss_ref - loss_cuda).abs() <= loss_ref.abs() * 1e-4 + 1e-4,
+            "loss ref={} cuda={} diff={}",
+            loss_ref,
+            loss_cuda,
+            (loss_ref - loss_cuda).abs(),
+        );
+
+        // dlogits — BF16 quantized.
+        for i in 0..vocab {
+            let diff = (dlogits_ref[i] - dlogits_cuda[i]).abs();
+            let tol = dlogits_ref[i].abs() * 2e-2 + 5e-3;
+            assert!(
+                diff <= tol,
+                "dlogits[{i}] ref={} cuda={} diff={} tol={}",
+                dlogits_ref[i],
+                dlogits_cuda[i],
                 diff,
                 tol
             );
