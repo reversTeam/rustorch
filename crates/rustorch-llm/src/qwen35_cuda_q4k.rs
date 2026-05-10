@@ -1133,19 +1133,26 @@ impl Qwen35ModelCudaQ4K {
                             .map_err(|e| LlmError::Backend(format!("rope k: {e:?}")))?;
                     }
 
-                    // 7. Append k, v to KV cache at `position`.
+                    // 7. Append k, v to KV cache at slot `*position_dev`.
+                    // T246.5.3 — single graph-capturable kernel handles both
+                    // K and V, with slot index read from device pointer.
                     let attn_idx = get_attn_layer_idx(&cfg, li);
                     let kv_cache = &mut self.kv_caches[attn_idx];
                     unsafe {
                         let (kc_p, _g1) = kv_cache.k.device_ptr_mut(&self.stream);
                         let (vc_p, _g2) = kv_cache.v.device_ptr_mut(&self.stream);
-                        let dst_offset = (position as u64) * (kv_dim as u64) * 2; // BF16 = 2 bytes
+                        let (pos_p, _g3) = self.position_dev.device_ptr(&self.stream);
                         self.kernels
-                            .copy_bf16(&self.stream, kc_p + dst_offset, k_p, kv_dim as i32)
-                            .map_err(|e| LlmError::Backend(format!("kv append k: {e:?}")))?;
-                        self.kernels
-                            .copy_bf16(&self.stream, vc_p + dst_offset, v_p, kv_dim as i32)
-                            .map_err(|e| LlmError::Backend(format!("kv append v: {e:?}")))?;
+                            .kv_append_bf16_devcnt(
+                                &self.stream,
+                                kc_p,
+                                vc_p,
+                                k_p,
+                                v_p,
+                                pos_p,
+                                kv_dim as i32,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("kv append: {e:?}")))?;
                     }
 
                     // 8. GQA decode online softmax.

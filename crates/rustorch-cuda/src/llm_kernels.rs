@@ -369,6 +369,32 @@ extern "C" __global__ void increment_u32_dev(int* p) {
 }
 "#;
 
+// T246.5.3 — append K and V vectors to the cache at slot `*pos_dev`.
+// Cache layout (matches the existing host-side append in decode_step):
+//   k_cache, v_cache : [max_seq, kv_dim] BF16, contiguous, seq-major.
+// Writes k[0..kv_dim] → k_cache[(*pos_dev) * kv_dim ..], same for v.
+// Single kernel handles both K and V (1 thread per kv_dim element).
+#[cfg(feature = "cuda")]
+const KV_APPEND_BF16_DEVCNT_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void kv_append_bf16_devcnt(
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const int* __restrict__ pos_dev,
+    int kv_dim
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= kv_dim) return;
+    int pos = *pos_dev;
+    long long off = (long long)pos * (long long)kv_dim + (long long)tid;
+    k_cache[off] = k[tid];
+    v_cache[off] = v[tid];
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const SPLIT_QG_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -2053,6 +2079,7 @@ pub struct LlmKernels {
     rope_partial_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     gqa_decode_online_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     increment_u32_dev: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    kv_append_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2096,6 +2123,7 @@ impl LlmKernels {
             rope_partial_devcnt: std::sync::OnceLock::new(),
             gqa_decode_online_devcnt: std::sync::OnceLock::new(),
             increment_u32_dev: std::sync::OnceLock::new(),
+            kv_append_devcnt: std::sync::OnceLock::new(),
         }
     }
 
@@ -3296,6 +3324,51 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "gqa_decode_online_bf16_devcnt::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.5.3 — append K and V vectors to KV cache at slot `*pos_dev`.
+    /// Replaces `copy_bf16(kc + pos*kv_dim*2, k, kv_dim)` ×2 with a single
+    /// graph-capturable launch (since `pos` is read from device memory).
+    ///
+    /// # Safety  Caller assure `k_cache`/`v_cache` valides pour
+    /// `max_seq * kv_dim` BF16 each, `k`/`v` valides pour `kv_dim` BF16,
+    /// `pos_dev` pointe vers 1 i32 device contenant la slot index.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn kv_append_bf16_devcnt(
+        &self,
+        stream: &Arc<CudaStream>,
+        k_cache: u64,
+        v_cache: u64,
+        k: u64,
+        v: u64,
+        pos_dev: u64,
+        kv_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.kv_append_devcnt,
+            KV_APPEND_BF16_DEVCNT_SRC,
+            "kv_append_bf16_devcnt",
+        )?;
+        let block_dim = 256u32;
+        let grid_dim = (kv_dim as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&k_cache)
+            .arg(&v_cache)
+            .arg(&k)
+            .arg(&v)
+            .arg(&pos_dev)
+            .arg(&kv_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "kv_append_bf16_devcnt::launch",
         })?;
         Ok(())
     }
