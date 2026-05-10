@@ -66,6 +66,83 @@ extern "C" __global__ void rms_norm_bf16(
 }
 "#;
 
+// T247.1 — RMSNorm backward kernel (BF16). Pilot for the training-ready
+// CUDA backward path. Single-row (outer=1) implementation suitable for the
+// LLM decode regime. Multi-row training (outer > 1) requires either an
+// atomic dgamma accumulator or a per-row partial buffer + reduce kernel.
+//
+// Math :
+//   r       = sqrt(mean(x²) + eps)
+//   inv_r   = 1/r
+//   s_acc   = sum(dy_i * gamma_i * x_i)
+//   dx_i    = inv_r * dy_i * gamma_i  -  x_i * s_acc / (d * r³)
+//   dgamma_i = dy_i * x_i * inv_r
+//
+// Kernel uses 2 sequential warp reductions (sum_sq, then s_acc) within a
+// single block per row.
+#[cfg(feature = "cuda")]
+const RMS_NORM_GRAD_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void rms_norm_grad_bf16(
+    const __nv_bfloat16* __restrict__ x,         // [d]
+    const __nv_bfloat16* __restrict__ gamma,     // [d]
+    const __nv_bfloat16* __restrict__ dy,        // [d]
+    __nv_bfloat16*       __restrict__ dx,        // [d]
+    __nv_bfloat16*       __restrict__ dgamma,    // [d]
+    int d,
+    float eps
+) {
+    extern __shared__ float sdata[];
+
+    // ---- Pass 1 : sum of squares (for r). Grid-stride loop. ----
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float xi = (float)x[i];
+        sum_sq += xi * xi;
+    }
+    sdata[threadIdx.x] = sum_sq;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float r     = sqrtf(sdata[0] / (float)d + eps);
+    float inv_r = 1.0f / r;
+    __syncthreads();
+
+    // ---- Pass 2 : s_acc = sum(dy * gamma * x). ----
+    float s_local = 0.0f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float xi  = (float)x[i];
+        float gi  = (float)gamma[i];
+        float dyi = (float)dy[i];
+        s_local += dyi * gi * xi;
+    }
+    sdata[threadIdx.x] = s_local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float s_acc = sdata[0];
+    __syncthreads();
+
+    // ---- Pass 3 : write dx and dgamma. ----
+    float r3_inv = inv_r * inv_r * inv_r;  // 1/r³
+    float coeff  = s_acc / (float)d * r3_inv;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float xi  = (float)x[i];
+        float gi  = (float)gamma[i];
+        float dyi = (float)dy[i];
+        float dx_i  = inv_r * dyi * gi - xi * coeff;
+        float dg_i  = dyi * xi * inv_r;
+        dx[i]     = (__nv_bfloat16)dx_i;
+        dgamma[i] = (__nv_bfloat16)dg_i;
+    }
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const SILU_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -2390,6 +2467,8 @@ pub struct LlmKernels {
     // T246.5.7 — FlashDecode-V2 split-K GQA decode
     gqa_split_partial: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     gqa_split_combine: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T247.1 — RMSNorm backward kernel (training-ready pilot)
+    rms_norm_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2438,6 +2517,7 @@ impl LlmKernels {
             sgemv_q4k_q8_1_dp4a: std::sync::OnceLock::new(),
             gqa_split_partial: std::sync::OnceLock::new(),
             gqa_split_combine: std::sync::OnceLock::new(),
+            rms_norm_grad: std::sync::OnceLock::new(),
         }
     }
 
@@ -3817,6 +3897,59 @@ impl LlmKernels {
         Ok(())
     }
 
+    /// T247.1 — RMSNorm backward kernel (single-row, training-ready pilot).
+    ///
+    /// Computes `dx[i]` and `dgamma[i]` given `x`, `gamma`, `dy`. Math :
+    ///   dx_i     = (dy_i * gamma_i) / r  -  x_i * sum(dy*gamma*x) / (d * r³)
+    ///   dgamma_i = dy_i * x_i / r
+    /// where r = sqrt(mean(x²) + eps).
+    ///
+    /// Single-row (outer=1). For multi-row training, wrap with a per-row
+    /// loop or extend to grid_dim.x = outer with atomic dgamma reduction.
+    ///
+    /// # Safety  Pointers must be valid bf16 buffers of length d (or d²)
+    /// for the kernel lifetime.
+    pub unsafe fn rms_norm_grad_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: u64,
+        gamma: u64,
+        dy: u64,
+        dx: u64,
+        dgamma: u64,
+        d: i32,
+        eps: f32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.rms_norm_grad,
+            RMS_NORM_GRAD_BF16_SRC,
+            "rms_norm_grad_bf16",
+        )?;
+        // Pick a power-of-2 block dim ≥ 32, ≤ 1024. For d ≤ 1024, block = d
+        // (rounded up to next power of 2 for the tree reduction). For d > 1024,
+        // use 1024 and let the grid-stride loop handle the rest.
+        let bd = (d as u32).next_power_of_two().clamp(32, 1024);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (bd, 1, 1),
+            shared_mem_bytes: bd * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&x)
+            .arg(&gamma)
+            .arg(&dy)
+            .arg(&dx)
+            .arg(&dgamma)
+            .arg(&d)
+            .arg(&eps);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "rms_norm_grad_bf16::launch",
+        })?;
+        Ok(())
+    }
+
     /// T246.5.3 — append K and V vectors to KV cache at slot `*pos_dev`.
     /// Replaces `copy_bf16(kc + pos*kv_dim*2, k, kv_dim)` ×2 with a single
     /// graph-capturable launch (since `pos` is read from device memory).
@@ -4907,6 +5040,124 @@ mod parity_tests {
                 "row[{i}] ref={} dp4a={} diff={} tol={}",
                 r_ref[i],
                 r_dp4a[i],
+                diff,
+                tol
+            );
+        }
+    }
+
+    /// T247.1 — RMSNorm backward kernel parity test.
+    ///
+    /// CPU reference computes (dx, dgamma) from the closed-form gradient ;
+    /// CUDA kernel result must match within BF16 quantization tolerance.
+    /// This is the pilot proving the training-ready CUDA path : a kernel can
+    /// produce numerically correct gradients for an LLM operator on GPU.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn rms_norm_grad_bf16_matches_cpu_reference() {
+        let d = 256usize;
+        let eps = 1e-6_f32;
+
+        let mut state: u64 = 0xc0ffee;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (((state >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5
+        };
+
+        let x_f32: Vec<f32> = (0..d).map(|_| next() * 2.0).collect();
+        let g_f32: Vec<f32> = (0..d).map(|_| 0.5 + next() * 0.4).collect();
+        let dy_f32: Vec<f32> = (0..d).map(|_| next() * 0.3).collect();
+
+        // CPU reference.
+        let mean_sq: f32 = x_f32.iter().map(|v| v * v).sum::<f32>() / d as f32;
+        let r = (mean_sq + eps).sqrt();
+        let inv_r = 1.0 / r;
+        let s_acc: f32 = x_f32
+            .iter()
+            .zip(&g_f32)
+            .zip(&dy_f32)
+            .map(|((&xi, &gi), &dyi)| dyi * gi * xi)
+            .sum();
+        let coeff = s_acc / (d as f32) * inv_r * inv_r * inv_r;
+        let dx_ref: Vec<f32> = x_f32
+            .iter()
+            .zip(&g_f32)
+            .zip(&dy_f32)
+            .map(|((&xi, &gi), &dyi)| inv_r * dyi * gi - xi * coeff)
+            .collect();
+        let dg_ref: Vec<f32> = x_f32
+            .iter()
+            .zip(&dy_f32)
+            .map(|(&xi, &dyi)| dyi * xi * inv_r)
+            .collect();
+
+        // CUDA path.
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let to_bf = |v: &[f32]| -> Vec<half::bf16> {
+            v.iter().copied().map(half::bf16::from_f32).collect()
+        };
+        let x_bf = to_bf(&x_f32);
+        let g_bf = to_bf(&g_f32);
+        let dy_bf = to_bf(&dy_f32);
+
+        let x_dev = stream.memcpy_stod(&x_bf).expect("upload x");
+        let g_dev = stream.memcpy_stod(&g_bf).expect("upload gamma");
+        let dy_dev = stream.memcpy_stod(&dy_bf).expect("upload dy");
+        let mut dx_dev = stream.alloc_zeros::<half::bf16>(d).expect("alloc dx");
+        let mut dg_dev = stream.alloc_zeros::<half::bf16>(d).expect("alloc dgamma");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (xp, _g0) = x_dev.device_ptr(&stream);
+            let (gp, _g1) = g_dev.device_ptr(&stream);
+            let (dyp, _g2) = dy_dev.device_ptr(&stream);
+            let (dxp, _g3) = dx_dev.device_ptr_mut(&stream);
+            let (dgp, _g4) = dg_dev.device_ptr_mut(&stream);
+            kernels
+                .rms_norm_grad_bf16(&stream, xp, gp, dyp, dxp, dgp, d as i32, eps)
+                .expect("rms_norm_grad");
+        }
+
+        let dx_cuda: Vec<f32> = stream
+            .memcpy_dtov(&dx_dev)
+            .expect("dtov dx")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+        let dg_cuda: Vec<f32> = stream
+            .memcpy_dtov(&dg_dev)
+            .expect("dtov dgamma")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+
+        // Compare. BF16 has ~7 mantissa bits → ~1% rel error. Add small abs
+        // slack for very-small reference values (subnormals).
+        for i in 0..d {
+            let diff = (dx_ref[i] - dx_cuda[i]).abs();
+            let tol = dx_ref[i].abs() * 1.5e-2 + 5e-3;
+            assert!(
+                diff <= tol,
+                "dx[{i}] ref={} cuda={} diff={} tol={}",
+                dx_ref[i],
+                dx_cuda[i],
+                diff,
+                tol
+            );
+        }
+        for i in 0..d {
+            let diff = (dg_ref[i] - dg_cuda[i]).abs();
+            let tol = dg_ref[i].abs() * 1.5e-2 + 5e-3;
+            assert!(
+                diff <= tol,
+                "dgamma[{i}] ref={} cuda={} diff={} tol={}",
+                dg_ref[i],
+                dg_cuda[i],
                 diff,
                 tol
             );
