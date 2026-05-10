@@ -66,6 +66,145 @@ extern "C" __global__ void rms_norm_bf16(
 }
 "#;
 
+// T247.7 — GQA decode backward (Flash-Attention style, M=1).
+//
+// Inputs (from training-aware forward) :
+//   q          : [n_heads, head_dim]            BF16
+//   k_cache    : [n_kv, max_seq, head_dim]      BF16
+//   v_cache    : [n_kv, max_seq, head_dim]      BF16
+//   m_saved    : [n_heads]                      float (max score from softmax)
+//   l_saved    : [n_heads]                      float (sum-exp from softmax)
+//   do         : [n_heads, head_dim]            BF16  (output gradient)
+// Outputs :
+//   dq         : [n_heads, head_dim]            BF16  (overwritten)
+//   dk_accum   : [n_kv, max_seq, head_dim]      float (atomic-summed)
+//   dv_accum   : [n_kv, max_seq, head_dim]      float (atomic-summed)
+//
+// Probabilities `p_t = exp(s_t - m) / l` are recomputed inside the kernel
+// from `m_saved`, `l_saved` and the dot product Q·K_t (avoids storing the
+// full P matrix per layer).
+//
+// Caller zeroes `dk_accum` and `dv_accum` before the first call of an
+// iteration (multi-layer training accumulates via atomic adds across calls
+// — but for the per-layer dQ output, each call OWNS its slot and overwrites).
+//
+// Math :
+//   dV_t = p_t · do                 (atomic add into dv_accum[kv_h, t])
+//   dp_t = do · V_t                 (sum over head_dim)
+//   D    = Σ_t p_t · dp_t           (scalar per head)
+//   ds_t = p_t · (dp_t - D)
+//   dQ   = scale · Σ_t ds_t · K_t   (per head_dim)
+//   dK_t = scale · ds_t · Q         (atomic add into dk_accum[kv_h, t])
+//
+// Single block per head, `head_dim` threads. 3 passes over kv_len (compute
+// D, then per-t for dV/dK/dQ-accum).
+#[cfg(feature = "cuda")]
+const GQA_DECODE_GRAD_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void gqa_decode_grad_bf16(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const float*         __restrict__ m_saved,
+    const float*         __restrict__ l_saved,
+    const __nv_bfloat16* __restrict__ do_,
+    __nv_bfloat16*       __restrict__ dq,
+    float*               __restrict__ dk_accum,
+    float*               __restrict__ dv_accum,
+    int n_heads,
+    int n_kv,
+    int kv_len,
+    int head_dim,
+    int max_seq,
+    float scale
+) {
+    int h   = blockIdx.x;
+    if (h >= n_heads) return;
+    int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+    int kv_h = h * n_kv / n_heads;
+
+    extern __shared__ float sdata[];
+
+    float qd  = (float)q[h * head_dim + tid];
+    float dod = (float)do_[h * head_dim + tid];
+    float m_h = m_saved[h];
+    float l_h = l_saved[h];
+    float inv_l = 1.0f / l_h;
+
+    // ---- Pass 1 : D = Σ_t p_t · (do · V_t) ----
+    float D_local = 0.0f;
+    for (int t = 0; t < kv_len; ++t) {
+        // Recompute s_t = scale · Q · K_t (per-thread partial then reduce).
+        float kd = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+        sdata[tid] = qd * kd;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s && tid + s < head_dim) sdata[tid] += sdata[tid + s];
+            __syncthreads();
+        }
+        float s_t = sdata[0] * scale;
+        __syncthreads();
+
+        float p_t = expf(s_t - m_h) * inv_l;
+
+        // dp_t · do_d component for this dim (scaled by p_t)
+        float vd = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+        D_local += p_t * vd * dod;
+    }
+    sdata[tid] = D_local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < head_dim) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float D = sdata[0];
+    __syncthreads();
+
+    // ---- Pass 2 : per-t writes (dV, dK, accum dQ) ----
+    float dq_acc = 0.0f;
+    for (int t = 0; t < kv_len; ++t) {
+        float kd = (float)k_cache[(kv_h * max_seq + t) * head_dim + tid];
+        float vd = (float)v_cache[(kv_h * max_seq + t) * head_dim + tid];
+
+        // Recompute s_t and p_t (needed again because we don't store them).
+        sdata[tid] = qd * kd;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s && tid + s < head_dim) sdata[tid] += sdata[tid + s];
+            __syncthreads();
+        }
+        float s_t = sdata[0] * scale;
+        __syncthreads();
+        float p_t = expf(s_t - m_h) * inv_l;
+
+        // dp_t = do · V_t (reduce over head_dim).
+        sdata[tid] = vd * dod;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s && tid + s < head_dim) sdata[tid] += sdata[tid + s];
+            __syncthreads();
+        }
+        float dp_t = sdata[0];
+        __syncthreads();
+
+        float ds_t = p_t * (dp_t - D);
+
+        // dQ accumulation (own this dim, no atomic needed).
+        dq_acc += scale * ds_t * kd;
+
+        // dK[kv_h, t, dim] += scale · ds_t · Q[h, dim]    (atomic — GQA share)
+        atomicAdd(&dk_accum[(kv_h * max_seq + t) * head_dim + tid], scale * ds_t * qd);
+
+        // dV[kv_h, t, dim] += p_t · do[h, dim]            (atomic — GQA share)
+        atomicAdd(&dv_accum[(kv_h * max_seq + t) * head_dim + tid], p_t * dod);
+    }
+
+    dq[h * head_dim + tid] = (__nv_bfloat16)dq_acc;
+}
+"#;
+
 // T247.6 — Q4_K SGEMV backward, dx only (W is frozen for LoRA fine-tuning).
 //
 // Forward:  y = W·x         where W is [N,K] in Q4_K, x BF16 [K], y BF16 [N]
@@ -2731,6 +2870,8 @@ pub struct LlmKernels {
     embedding_lookup_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T247.6 — Q4_K SGEMV backward dx (frozen W)
     sgemv_q4k_grad_dx: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T247.7 — GQA decode backward (Flash-Attention style)
+    gqa_decode_grad: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2785,6 +2926,7 @@ impl LlmKernels {
             cross_entropy_loss_grad: std::sync::OnceLock::new(),
             embedding_lookup_grad: std::sync::OnceLock::new(),
             sgemv_q4k_grad_dx: std::sync::OnceLock::new(),
+            gqa_decode_grad: std::sync::OnceLock::new(),
         }
     }
 
@@ -4213,6 +4355,74 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "rms_norm_grad_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T247.7 — GQA decode backward (Flash-Attention style, M=1).
+    ///
+    /// Computes dQ/dK/dV for one decode step given the saved softmax
+    /// statistics (m, l) from a training-aware forward pass. The backward
+    /// recomputes the attention probabilities `p` on the fly from
+    /// `m_saved`, `l_saved`, and `Q·K_t` — avoids storing the full P
+    /// matrix per layer.
+    ///
+    /// # Safety  All bf16 buffers are sized for n_heads × head_dim
+    /// (q, do, dq) or n_kv × max_seq × head_dim (k_cache, v_cache).
+    /// `m_saved`, `l_saved` are length-`n_heads` floats. `dk_accum` and
+    /// `dv_accum` are float accumulators of size `n_kv × max_seq × head_dim`,
+    /// caller must zero them before the first call of an iteration.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gqa_decode_grad_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k_cache: u64,
+        v_cache: u64,
+        m_saved: u64,
+        l_saved: u64,
+        do_: u64,
+        dq: u64,
+        dk_accum: u64,
+        dv_accum: u64,
+        n_heads: i32,
+        n_kv: i32,
+        kv_len: i32,
+        head_dim: i32,
+        max_seq: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.gqa_decode_grad,
+            GQA_DECODE_GRAD_BF16_SRC,
+            "gqa_decode_grad_bf16",
+        )?;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let block_dim = head_dim as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&q)
+            .arg(&k_cache)
+            .arg(&v_cache)
+            .arg(&m_saved)
+            .arg(&l_saved)
+            .arg(&do_)
+            .arg(&dq)
+            .arg(&dk_accum)
+            .arg(&dv_accum)
+            .arg(&n_heads)
+            .arg(&n_kv)
+            .arg(&kv_len)
+            .arg(&head_dim)
+            .arg(&max_seq)
+            .arg(&scale);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gqa_decode_grad_bf16::launch",
         })?;
         Ok(())
     }
@@ -5726,6 +5936,228 @@ mod parity_tests {
                 dup_cuda[i],
                 diff,
                 tol
+            );
+        }
+    }
+
+    /// T247.7 — GQA attention backward parity test.
+    ///
+    /// Runs a CPU forward (saving m, l, p), a CPU backward (computing
+    /// dQ/dK/dV from p, do, Q, K, V), and the CUDA kernel ; compares.
+    /// Uses small dims (n_heads=2, n_kv=1, kv_len=4, head_dim=8) so the
+    /// CPU reference is hand-traceable.
+    #[test]
+    #[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+    fn gqa_decode_grad_bf16_matches_cpu_reference() {
+        let n_heads = 2usize;
+        let n_kv = 1usize;
+        let kv_len = 4usize;
+        let max_seq = 8usize;
+        let head_dim = 8usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mut state: u64 = 0xc0ffeecafe;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (((state >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5
+        };
+
+        // Random Q [n_heads, head_dim], K/V [n_kv, max_seq, head_dim], do
+        let q_f32: Vec<f32> = (0..n_heads * head_dim).map(|_| next()).collect();
+        let k_full: Vec<f32> = (0..n_kv * max_seq * head_dim).map(|_| next()).collect();
+        let v_full: Vec<f32> = (0..n_kv * max_seq * head_dim).map(|_| next()).collect();
+        let do_f32: Vec<f32> = (0..n_heads * head_dim).map(|_| next() * 0.3).collect();
+
+        // Round-trip Q/K/V/do through bf16 for apples-to-apples
+        let to_bf = |v: &[f32]| -> Vec<half::bf16> {
+            v.iter().copied().map(half::bf16::from_f32).collect()
+        };
+        let q_bf = to_bf(&q_f32);
+        let k_bf = to_bf(&k_full);
+        let v_bf = to_bf(&v_full);
+        let do_bf = to_bf(&do_f32);
+        let q_q: Vec<f32> = q_bf.iter().map(|b| b.to_f32()).collect();
+        let k_q: Vec<f32> = k_bf.iter().map(|b| b.to_f32()).collect();
+        let v_q: Vec<f32> = v_bf.iter().map(|b| b.to_f32()).collect();
+        let do_q: Vec<f32> = do_bf.iter().map(|b| b.to_f32()).collect();
+
+        // ---- CPU forward (compute m, l, p) ----
+        let mut m_saved = vec![0.0_f32; n_heads];
+        let mut l_saved = vec![0.0_f32; n_heads];
+        let mut p_saved = vec![0.0_f32; n_heads * kv_len];
+        for h in 0..n_heads {
+            let kv_h = h * n_kv / n_heads;
+            // Compute scores
+            let mut s = vec![0.0_f32; kv_len];
+            for t in 0..kv_len {
+                let mut dot = 0.0;
+                for d in 0..head_dim {
+                    dot += q_q[h * head_dim + d] * k_q[(kv_h * max_seq + t) * head_dim + d];
+                }
+                s[t] = dot * scale;
+            }
+            let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0;
+            let mut p = vec![0.0_f32; kv_len];
+            for t in 0..kv_len {
+                p[t] = (s[t] - m).exp();
+                sum_exp += p[t];
+            }
+            for t in 0..kv_len {
+                p[t] /= sum_exp;
+                p_saved[h * kv_len + t] = p[t];
+            }
+            m_saved[h] = m;
+            l_saved[h] = sum_exp;
+        }
+
+        // ---- CPU backward reference ----
+        let mut dq_ref = vec![0.0_f32; n_heads * head_dim];
+        let mut dk_ref = vec![0.0_f32; n_kv * max_seq * head_dim];
+        let mut dv_ref = vec![0.0_f32; n_kv * max_seq * head_dim];
+        for h in 0..n_heads {
+            let kv_h = h * n_kv / n_heads;
+            // dp_t = do_h · V_t
+            let mut dp = vec![0.0_f32; kv_len];
+            for t in 0..kv_len {
+                let mut acc = 0.0;
+                for d in 0..head_dim {
+                    acc += do_q[h * head_dim + d] * v_q[(kv_h * max_seq + t) * head_dim + d];
+                }
+                dp[t] = acc;
+            }
+            // D = Σ_t p_t · dp_t
+            let big_d: f32 = (0..kv_len).map(|t| p_saved[h * kv_len + t] * dp[t]).sum();
+            // ds_t = p_t · (dp_t - D)
+            let ds: Vec<f32> = (0..kv_len)
+                .map(|t| p_saved[h * kv_len + t] * (dp[t] - big_d))
+                .collect();
+            // dQ = scale · Σ_t ds_t · K_t
+            for d in 0..head_dim {
+                let mut acc = 0.0;
+                for t in 0..kv_len {
+                    acc += ds[t] * k_q[(kv_h * max_seq + t) * head_dim + d];
+                }
+                dq_ref[h * head_dim + d] = scale * acc;
+            }
+            // dK_t = scale · ds_t · Q_h    (atomic accumulate across heads sharing kv_h)
+            // dV_t = p_t · do_h
+            for t in 0..kv_len {
+                for d in 0..head_dim {
+                    dk_ref[(kv_h * max_seq + t) * head_dim + d] +=
+                        scale * ds[t] * q_q[h * head_dim + d];
+                    dv_ref[(kv_h * max_seq + t) * head_dim + d] +=
+                        p_saved[h * kv_len + t] * do_q[h * head_dim + d];
+                }
+            }
+        }
+
+        // ---- CUDA kernel ----
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+
+        let q_dev = stream.memcpy_stod(&q_bf).expect("upload q");
+        let k_dev = stream.memcpy_stod(&k_bf).expect("upload k");
+        let v_dev = stream.memcpy_stod(&v_bf).expect("upload v");
+        let m_dev = stream.memcpy_stod(&m_saved).expect("upload m");
+        let l_dev = stream.memcpy_stod(&l_saved).expect("upload l");
+        let do_dev = stream.memcpy_stod(&do_bf).expect("upload do");
+        let mut dq_dev = stream
+            .alloc_zeros::<half::bf16>(n_heads * head_dim)
+            .expect("alloc dq");
+        let mut dk_dev = stream
+            .alloc_zeros::<f32>(n_kv * max_seq * head_dim)
+            .expect("alloc dk");
+        let mut dv_dev = stream
+            .alloc_zeros::<f32>(n_kv * max_seq * head_dim)
+            .expect("alloc dv");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (q_p, _g0) = q_dev.device_ptr(&stream);
+            let (k_p, _g1) = k_dev.device_ptr(&stream);
+            let (v_p, _g2) = v_dev.device_ptr(&stream);
+            let (m_p, _g3) = m_dev.device_ptr(&stream);
+            let (l_p, _g4) = l_dev.device_ptr(&stream);
+            let (do_p, _g5) = do_dev.device_ptr(&stream);
+            let (dq_p, _g6) = dq_dev.device_ptr_mut(&stream);
+            let (dk_p, _g7) = dk_dev.device_ptr_mut(&stream);
+            let (dv_p, _g8) = dv_dev.device_ptr_mut(&stream);
+            kernels
+                .gqa_decode_grad_bf16(
+                    &stream,
+                    q_p,
+                    k_p,
+                    v_p,
+                    m_p,
+                    l_p,
+                    do_p,
+                    dq_p,
+                    dk_p,
+                    dv_p,
+                    n_heads as i32,
+                    n_kv as i32,
+                    kv_len as i32,
+                    head_dim as i32,
+                    max_seq as i32,
+                )
+                .expect("gqa_decode_grad");
+        }
+
+        let dq_cuda: Vec<f32> = stream
+            .memcpy_dtov(&dq_dev)
+            .expect("dtov dq")
+            .into_iter()
+            .map(|b: half::bf16| b.to_f32())
+            .collect();
+        let dk_cuda: Vec<f32> = stream.memcpy_dtov(&dk_dev).expect("dtov dk");
+        let dv_cuda: Vec<f32> = stream.memcpy_dtov(&dv_dev).expect("dtov dv");
+
+        // dQ — bf16 quantized output, accumulate over kv_len terms.
+        for i in 0..n_heads * head_dim {
+            let diff = (dq_ref[i] - dq_cuda[i]).abs();
+            let tol = dq_ref[i].abs() * 5e-2 + 1e-2;
+            assert!(
+                diff <= tol,
+                "dQ[{i}] ref={} cuda={} diff={} tol={}",
+                dq_ref[i],
+                dq_cuda[i],
+                diff,
+                tol
+            );
+        }
+        // dK / dV are float accumulators — tighter tolerance.
+        for i in 0..n_kv * max_seq * head_dim {
+            // Skip slots where t >= kv_len (kernel doesn't touch them).
+            let slot_in_kv = i / head_dim;
+            let t = slot_in_kv % max_seq;
+            if t >= kv_len {
+                assert!(dk_cuda[i].abs() < 1e-6, "dK at unused t should be 0");
+                assert!(dv_cuda[i].abs() < 1e-6, "dV at unused t should be 0");
+                continue;
+            }
+            let diff_k = (dk_ref[i] - dk_cuda[i]).abs();
+            let tol_k = dk_ref[i].abs() * 1e-2 + 1e-3;
+            assert!(
+                diff_k <= tol_k,
+                "dK[{i}] ref={} cuda={} diff={} tol={}",
+                dk_ref[i],
+                dk_cuda[i],
+                diff_k,
+                tol_k
+            );
+            let diff_v = (dv_ref[i] - dv_cuda[i]).abs();
+            let tol_v = dv_ref[i].abs() * 1e-2 + 1e-3;
+            assert!(
+                diff_v <= tol_v,
+                "dV[{i}] ref={} cuda={} diff={} tol={}",
+                dv_ref[i],
+                dv_cuda[i],
+                diff_v,
+                tol_v
             );
         }
     }
