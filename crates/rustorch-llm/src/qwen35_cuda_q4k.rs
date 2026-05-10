@@ -18,7 +18,7 @@
 use crate::qwen35::{LayerKind, Qwen35Config, Qwen35Variant};
 use crate::LlmError;
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
-use cudarc::driver::{CudaContext, CudaGraph, CudaSlice, CudaStream};
+use cudarc::driver::{CudaContext, CudaGraph, CudaSlice, CudaStream, PinnedHostSlice};
 use rustorch_cuda::cublas_lt::LtSession;
 use rustorch_cuda::llm_kernels::LlmKernels;
 use rustorch_gguf::reader::GgufFile;
@@ -343,6 +343,14 @@ pub struct Qwen35ModelCudaQ4K {
     /// than v2 today. Set `RUSTORCH_USE_DP4A_Q4K=1` at process start to
     /// enable for benchmarking / iterative kernel optimization.
     pub(crate) use_dp4a_q4k: bool,
+    /// T246.5.6 — pinned host buffer (1× u32) for the per-step next-token
+    /// DtoH. Replacing `memcpy_dtov` (Vec<u32> on pageable mem, which
+    /// the driver implicitly synchronizes) with `memcpy_dtoh` to this
+    /// pinned slice keeps the DtoH truly async and lets the driver DMA
+    /// directly into host memory ; the only sync point becomes the
+    /// `as_slice()` call which waits on a dedicated event instead of the
+    /// full stream.
+    pub(crate) next_token_host_pinned: PinnedHostSlice<u32>,
 }
 
 impl Qwen35ModelCudaQ4K {
@@ -644,6 +652,11 @@ impl Qwen35ModelCudaQ4K {
             .memcpy_stod(&[0u32])
             .map_err(|e| LlmError::Backend(format!("current_token_dev: {e:?}")))?;
 
+        // T246.5.6 — 1× u32 pinned host buffer for async next-token DtoH
+        // (allocated before the struct ctor to avoid moving `ctx` early).
+        let next_token_host_pinned = unsafe { ctx.alloc_pinned::<u32>(1) }
+            .map_err(|e| LlmError::Backend(format!("alloc_pinned next_token: {e:?}")))?;
+
         Ok(Self {
             config: cfg,
             ctx,
@@ -667,6 +680,7 @@ impl Qwen35ModelCudaQ4K {
             use_dp4a_q4k: std::env::var("RUSTORCH_USE_DP4A_Q4K")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
+            next_token_host_pinned,
         })
     }
 
@@ -742,12 +756,17 @@ impl Qwen35ModelCudaQ4K {
             graph
                 .launch()
                 .map_err(|e| LlmError::Backend(format!("graph launch: {e:?}")))?;
-            let next_tokens: Vec<u32> = self
-                .stream
-                .memcpy_dtov(&self.scratch.next_token)
-                .map_err(|e| LlmError::Backend(format!("dtov next_token: {e:?}")))?;
+            // T246.5.6 — async DtoH into pinned host buffer ; sync only on
+            // the dedicated event when reading the value back.
+            self.stream
+                .memcpy_dtoh(&self.scratch.next_token, &mut self.next_token_host_pinned)
+                .map_err(|e| LlmError::Backend(format!("dtoh next_token: {e:?}")))?;
+            let token_id = self
+                .next_token_host_pinned
+                .as_slice()
+                .map_err(|e| LlmError::Backend(format!("read pinned: {e:?}")))?[0];
             self.position += 1;
-            return Ok(next_tokens[0]);
+            return Ok(token_id);
         }
 
         // T246.5.3 — Capture path: on the 2nd decode call (position == 1),
@@ -1445,14 +1464,18 @@ impl Qwen35ModelCudaQ4K {
             self.decode_graph = Some(graph);
         }
 
-        // Read back next token (host op, OUTSIDE any capture).
-        let next_id_host: Vec<u32> = self
-            .stream
-            .memcpy_dtov(&self.scratch.next_token)
-            .map_err(|e| LlmError::Backend(format!("dl token: {e:?}")))?;
+        // Read back next token (host op, OUTSIDE any capture). T246.5.6 —
+        // async DtoH to pinned host memory + event-based sync.
+        self.stream
+            .memcpy_dtoh(&self.scratch.next_token, &mut self.next_token_host_pinned)
+            .map_err(|e| LlmError::Backend(format!("dtoh token: {e:?}")))?;
+        let token_id = self
+            .next_token_host_pinned
+            .as_slice()
+            .map_err(|e| LlmError::Backend(format!("read pinned: {e:?}")))?[0];
 
         self.position += 1;
-        Ok(next_id_host[0])
+        Ok(token_id)
     }
 
     /// Process a prompt at once. **STATUS T246.1** : returns Err. T246.5.
