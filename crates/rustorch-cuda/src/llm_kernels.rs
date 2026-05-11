@@ -5201,6 +5201,265 @@ extern "C" __global__ void mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16(
 }
 "#;
 
+// ─── TrackE.3 — sort-permutation Group-GEMM (cache-reuse win) ─────────────
+//
+// Two kernels port the llama.cpp mmid.cu + mmvq.cu mul_mat_vec_q_moe pattern :
+//
+//   1. mm_ids_helper_bf16<8>   : one block per expert, scans the [M, k_used]
+//      topk_indices tensor and emits compact-by-expert permutation arrays
+//      `ids_src1[M*k_used]`, `ids_dst[M*k_used]`, `expert_bounds[n_experts+1]`.
+//      The compact layout has all slots routed to expert 0 first, then expert 1,
+//      etc. — so the consumer kernel below can iterate slot 0..M*k_used and
+//      adjacent blocks share the SAME expert → L1/L2 weight reuse.
+//
+//   2. mul_mm_id_gemm_q4_k_sorted_bf16 : same per-(slot, row) body as
+//      mul_mm_id_gemm_q4_k_bf16 (warp-shuffle Q4_K BF16 dot product), but
+//      gridZ iterates the COMPACT slot index. Each block reads
+//      `ids_src1[c] → token_src` (= which token's [K] activation row to read)
+//      and `ids_dst[c] → dst_index` (= which (token, slot_orig) position in
+//      the output [M, k_used, N] to write). Expert pointer is selected via
+//      `expert_id` which is implicit in the sorted order — we look it up
+//      from the original topk_indices using `ids_src1[c]` and `ids_dst[c]`.
+//
+// CRITICAL : the FP arithmetic in the inner loop is byte-for-byte identical
+// to TrackE.2's `mul_mm_id_gemm_q4_k_bf16` — only the schedule differs.
+// → bit-exact parity is REQUIRED and tested.
+
+#[cfg(feature = "cuda")]
+const MM_IDS_HELPER_BF16_SRC: &str = r#"
+#ifndef INT_MAX
+#define INT_MAX 0x7FFFFFFF
+#endif
+// One block per expert. Block has 1 warp (32 threads). Scans the [M, k_used]
+// topk_indices tensor and emits :
+//   ids_src1[M*k_used] : compact_idx → source token (which row of x to read).
+//   ids_dst [M*k_used] : compact_idx → destination row in [M, k_used] flat layout
+//                        (= token_src * k_used + slot_orig).
+//   expert_bounds[n_experts+1] : prefix-sum offsets per expert (last is total slots).
+//
+// Templated on k_used (Qwen3.6 uses k_used=8 ; pad to next power-of-2 for warp scan).
+// For k_used=8, neu_padded = 8 ; 32/8 = 4 tokens processed per warp-iteration.
+
+extern "C" __global__ void mm_ids_helper_bf16(
+    const int* __restrict__ topk_indices,  // [n_tokens, k_used]
+    int*       __restrict__ ids_src1,      // [n_tokens * k_used]
+    int*       __restrict__ ids_dst,       // [n_tokens * k_used]
+    int*       __restrict__ expert_bounds, // [n_experts + 1]
+    int n_tokens,
+    int k_used
+) {
+    const int expert = blockIdx.x;
+    const int n_experts = gridDim.x;
+    const int warp_size = 32;
+    const int neu_padded = (k_used == 6) ? 8 : k_used;
+    const int tid = threadIdx.x;
+
+    extern __shared__ unsigned int smem_store[]; // [n_tokens] packed (token:22, slot:10)
+
+    int nex_prev   = 0;
+    int it_compact = 0;
+
+    // Iterate tokens, warp_size / neu_padded tokens per warp-iteration.
+    for (int it0 = 0; it0 < n_tokens; it0 += warp_size / neu_padded) {
+        int it  = it0 + tid / neu_padded;
+        int iex = tid % neu_padded;
+
+        int expert_used;
+        if (iex < k_used && it < n_tokens) {
+            expert_used = topk_indices[it * k_used + iex];
+        } else {
+            expert_used = INT_MAX;
+        }
+
+        int iex_used = (expert_used == expert) ? iex : -1;
+        nex_prev += (expert_used < expert);
+
+        // Per-token presence flag : whether ANY thread in this token's group
+        // selected the expert.
+        unsigned int mask_padded = (1u << neu_padded) - 1u;
+        unsigned int group_mask = mask_padded << ((tid / neu_padded) * neu_padded);
+        int it_compact_add_self = (__ballot_sync(0xFFFFFFFFu, iex_used != -1) & group_mask) ? 1 : 0;
+
+        // Scan over LOWER token positions in the warp (warp prefix sum).
+        int it_compact_add_lower = 0;
+        #pragma unroll
+        for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
+            int tmp = __shfl_up_sync(0xFFFFFFFFu, it_compact_add_self, offset, warp_size);
+            if (tid >= (unsigned)offset) {
+                it_compact_add_lower += tmp;
+            }
+        }
+
+        if (iex_used != -1) {
+            // Pack (token:22, slot:10) into a single uint32 for compact smem.
+            unsigned int packed =
+                ((unsigned int)it & 0x003FFFFFu) |
+                ((unsigned int)iex_used << 22);
+            smem_store[it_compact + it_compact_add_lower] = packed;
+        }
+
+        // Total tokens in this iteration : the highest-laned thread has the
+        // full warp sum.
+        int batch_total = __shfl_sync(
+            0xFFFFFFFFu,
+            it_compact_add_lower + it_compact_add_self,
+            warp_size - 1, warp_size);
+        it_compact += batch_total;
+    }
+
+    // Warp-reduce nex_prev (total slots routed to experts with lower id).
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        nex_prev += __shfl_xor_sync(0xFFFFFFFFu, nex_prev, offset);
+    }
+
+    // Write our slice of (ids_src1, ids_dst) — one entry per compact slot for this expert.
+    for (int itc = tid; itc < it_compact; itc += warp_size) {
+        unsigned int packed = smem_store[itc];
+        int token    = (int)(packed & 0x003FFFFFu);
+        int slot_orig = (int)(packed >> 22);
+        ids_src1[nex_prev + itc] = token;
+        // ids_dst is the linear index in the [M, k_used] flat output layout :
+        ids_dst[nex_prev + itc] = token * k_used + slot_orig;
+    }
+
+    if (tid != 0) return;
+    expert_bounds[expert] = nex_prev;
+    if (expert == n_experts - 1) {
+        expert_bounds[n_experts] = nex_prev + it_compact;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_GEMM_Q4_K_SORTED_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+// Sort-permutation Q4_K group-GEMM. Same per-(slot, row) inner body as
+// mul_mm_id_gemm_q4_k_bf16, but iterates the COMPACT slot index in gridZ.
+// `ids_src1[compact_idx]` gives the source token. `ids_dst[compact_idx]`
+// gives the destination flat row index in [M, k_used]. Expert pointer is
+// recovered via topk_indices[ids_src1[c] * k_used + (ids_dst[c] mod k_used)].
+//
+// FP arithmetic IDENTICAL to mul_mm_id_gemm_q4_k_bf16 → bit-exact parity.
+
+extern "C" __global__ void mul_mm_id_gemm_q4_k_sorted_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices,  // [M, k_used]
+    const int*                __restrict__ ids_src1,      // [n_slots] (compact_idx → token)
+    const int*                __restrict__ ids_dst,       // [n_slots] (compact_idx → token*k_used+slot)
+    const __nv_bfloat16*      __restrict__ x,             // [M, K]
+    __nv_bfloat16*            __restrict__ y,             // [M, k_used, N]
+    int N,
+    int K,
+    int k_used
+) {
+    int compact_idx = blockIdx.z;
+    int token   = ids_src1[compact_idx];
+    int dst_lin = ids_dst[compact_idx];
+    int slot    = dst_lin - token * k_used; // == dst_lin % k_used, but cheap
+    int e_idx = topk_indices[token * k_used + slot];
+    const unsigned char* __restrict__ w_q4k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 144;
+
+    int group     = lane >> 3;
+    int pos_base  = (lane & 7) << 2;
+    int byte_base = (group << 5) + pos_base;
+
+    const __nv_bfloat16* x_tok = x + (long long)token * K;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 144;
+        const unsigned char* blk = w_q4k + blk_off;
+
+        unsigned short d_bits    = blk[0] | (blk[1] << 8);
+        unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_bits));
+        float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+        const unsigned char* scales = blk + 4;
+        int sub_a = group * 2;
+        int sub_b = sub_a + 1;
+        unsigned char sc_a, m_a, sc_b, m_b;
+        if (sub_a < 4) {
+            sc_a = scales[sub_a]     & 0x3F;
+            m_a  = scales[sub_a + 4] & 0x3F;
+        } else {
+            int ga = sub_a - 4;
+            sc_a = (scales[ga + 8] & 0x0F) | ((scales[ga]     >> 6) << 4);
+            m_a  = (scales[ga + 8] >> 4)   | ((scales[ga + 4] >> 6) << 4);
+        }
+        if (sub_b < 4) {
+            sc_b = scales[sub_b]     & 0x3F;
+            m_b  = scales[sub_b + 4] & 0x3F;
+        } else {
+            int gb = sub_b - 4;
+            sc_b = (scales[gb + 8] & 0x0F) | ((scales[gb]     >> 6) << 4);
+            m_b  = (scales[gb + 8] >> 4)   | ((scales[gb + 4] >> 6) << 4);
+        }
+        float scale_a = d    * (float)sc_a;
+        float min_a   = dmin * (float)m_a;
+        float scale_b = d    * (float)sc_b;
+        float min_b   = dmin * (float)m_b;
+
+        const unsigned char* qs = blk + 16;
+        unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
+
+        const __nv_bfloat16* xa_ptr = x_tok + b * 256 + sub_a * 32 + pos_base;
+        const __nv_bfloat16* xb_ptr = x_tok + b * 256 + sub_b * 32 + pos_base;
+        uint2 xa = *(const uint2*)xa_ptr;
+        uint2 xb = *(const uint2*)xb_ptr;
+        float xa0 = (float)__ushort_as_bfloat16((unsigned short)(xa.x & 0xFFFFu));
+        float xa1 = (float)__ushort_as_bfloat16((unsigned short)(xa.x >> 16));
+        float xa2 = (float)__ushort_as_bfloat16((unsigned short)(xa.y & 0xFFFFu));
+        float xa3 = (float)__ushort_as_bfloat16((unsigned short)(xa.y >> 16));
+        float xb0 = (float)__ushort_as_bfloat16((unsigned short)(xb.x & 0xFFFFu));
+        float xb1 = (float)__ushort_as_bfloat16((unsigned short)(xb.x >> 16));
+        float xb2 = (float)__ushort_as_bfloat16((unsigned short)(xb.y & 0xFFFFu));
+        float xb3 = (float)__ushort_as_bfloat16((unsigned short)(xb.y >> 16));
+
+        unsigned char by0 = (qbytes      ) & 0xFFu;
+        unsigned char by1 = (qbytes >>  8) & 0xFFu;
+        unsigned char by2 = (qbytes >> 16) & 0xFFu;
+        unsigned char by3 = (qbytes >> 24) & 0xFFu;
+        int na0 = by0 & 0x0F, na1 = by1 & 0x0F, na2 = by2 & 0x0F, na3 = by3 & 0x0F;
+        int nb0 = by0 >>   4, nb1 = by1 >>   4, nb2 = by2 >>   4, nb3 = by3 >>   4;
+
+        acc += (scale_a * (float)na0 - min_a) * xa0;
+        acc += (scale_a * (float)na1 - min_a) * xa1;
+        acc += (scale_a * (float)na2 - min_a) * xa2;
+        acc += (scale_a * (float)na3 - min_a) * xa3;
+        acc += (scale_b * (float)nb0 - min_b) * xb0;
+        acc += (scale_b * (float)nb1 - min_b) * xb1;
+        acc += (scale_b * (float)nb2 - min_b) * xb2;
+        acc += (scale_b * (float)nb3 - min_b) * xb3;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        // Output : y[token, slot, row] in flat [M, k_used, N] layout.
+        // dst_lin = token * k_used + slot, so y[dst_lin * N + row].
+        y[(long long)dst_lin * N + row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const MUL_MM_ID_GEMM_Q5_K_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -6782,6 +7041,9 @@ pub struct LlmKernels {
     mul_mm_id_gemm_q5_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     mul_mm_id_gemm_q6_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     mul_mm_id_gemm_bf16_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.10 TrackE.3 — sort-permutation Group-GEMM (cache reuse).
+    mm_ids_helper_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mm_id_gemm_q4_k_sorted_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     scaled_add_routed_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.9 NVFP4.2 — indexed NVFP4 SGEMV for MoE FFN forward (single-token decode)
     sgemv_nvfp4_bf16_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -6887,6 +7149,9 @@ impl LlmKernels {
             mul_mm_id_gemm_q5_k_bf16: std::sync::OnceLock::new(),
             mul_mm_id_gemm_q6_k_bf16: std::sync::OnceLock::new(),
             mul_mm_id_gemm_bf16_bf16: std::sync::OnceLock::new(),
+            // T246.10 TrackE.3 — sort-permutation Group-GEMM (cache reuse).
+            mm_ids_helper_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_gemm_q4_k_sorted_bf16: std::sync::OnceLock::new(),
             scaled_add_routed_bf16: std::sync::OnceLock::new(),
             // T246.9 NVFP4.2 — indexed/non-indexed NVFP4 SGEMV
             sgemv_nvfp4_bf16_indexed: std::sync::OnceLock::new(),
@@ -10521,6 +10786,155 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "mul_mm_id_gemm_bf16_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // TrackE.3 — sort-permutation Group-GEMM helpers + kernels
+    //
+    // 1. `mm_ids_helper_bf16` builds the compact-by-expert permutation arrays
+    //    (`ids_src1`, `ids_dst`, `expert_bounds`) on device. One launch per
+    //    layer, grid = `(n_experts, 1, 1)`, 1 warp/block, smem = `M * 4 B`.
+    //
+    // 2. `mul_mm_id_gemm_q4_k_sorted_bf16` iterates the compact slot index
+    //    in gridZ. Adjacent compact_idx values share the same expert, so
+    //    consecutive blocks reuse weight tiles in L1/L2 → cache-reuse win.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Build compact-by-expert permutation arrays from `topk_indices`.
+    ///
+    /// Outputs three device arrays of total length `n_tokens * k_used` (slots)
+    /// for the permutation tables, and `n_experts + 1` for the bounds :
+    ///
+    /// - `ids_src1[c]`     : compact_idx → source token (which row of `x`).
+    /// - `ids_dst[c]`      : compact_idx → flat dst row (`token * k_used + slot_orig`).
+    /// - `expert_bounds[e]`: start of expert `e`'s slot range in the compact arrays.
+    ///                       `expert_bounds[n_experts]` == total active slots.
+    ///
+    /// # Safety  All output pointers must be valid device allocations of the
+    /// expected size. `topk_indices` must be `[n_tokens, k_used]` i32 row-major.
+    /// `n_tokens` must fit in 22 bits, `k_used` in 10 bits.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mm_ids_helper_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        topk_indices: u64,
+        ids_src1: u64,
+        ids_dst: u64,
+        expert_bounds: u64,
+        n_tokens: i32,
+        k_used: i32,
+        n_experts: i32,
+    ) -> Result<(), CudaError> {
+        if n_tokens <= 0 || k_used <= 0 || n_experts <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!(
+                    "mm_ids_helper_bf16: n_tokens={n_tokens} k_used={k_used} n_experts={n_experts} must be > 0"
+                ),
+            });
+        }
+        if (n_tokens as u32) >= (1u32 << 22) {
+            return Err(CudaError::Unsupported {
+                msg: format!(
+                    "mm_ids_helper_bf16: n_tokens={n_tokens} exceeds 22-bit packing limit"
+                ),
+            });
+        }
+        if (k_used as u32) >= (1u32 << 10) {
+            return Err(CudaError::Unsupported {
+                msg: format!("mm_ids_helper_bf16: k_used={k_used} exceeds 10-bit packing limit"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mm_ids_helper_bf16,
+            MM_IDS_HELPER_BF16_SRC,
+            "mm_ids_helper_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_experts as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: (n_tokens as u32) * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&topk_indices)
+            .arg(&ids_src1)
+            .arg(&ids_dst)
+            .arg(&expert_bounds)
+            .arg(&n_tokens)
+            .arg(&k_used);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mm_ids_helper_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q4_K sort-permutation Group-GEMM.
+    /// `y[token, slot, :] = expert[topk[token, slot]] @ x[token, :]`
+    /// — same output layout as `mul_mm_id_gemm_q4_k_bf16`, but the kernel
+    /// iterates the COMPACT slot index from `ids_src1` / `ids_dst` produced
+    /// by `mm_ids_helper_bf16`. Adjacent compact slots share the SAME expert
+    /// → L1/L2 weight tile reuse.
+    ///
+    /// # Safety  See `mul_mm_id_gemm_q4_k_bf16`. `ids_src1` / `ids_dst` must
+    /// have been produced by a prior `mm_ids_helper_bf16` call against the
+    /// same `topk_indices` ; `n_slots == m * k_used` is the array length.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_gemm_q4_k_sorted_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        ids_src1: u64,
+        ids_dst: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_q4_k_sorted_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 || k_used <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!(
+                    "mul_mm_id_gemm_q4_k_sorted_bf16: M={m} N={n} k_used={k_used} must be > 0"
+                ),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_gemm_q4_k_sorted_bf16,
+            MUL_MM_ID_GEMM_Q4_K_SORTED_BF16_SRC,
+            "mul_mm_id_gemm_q4_k_sorted_bf16",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let n_slots = (m as u32) * (k_used as u32);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, 1, n_slots),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&ids_src1)
+            .arg(&ids_dst)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k)
+            .arg(&k_used);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_gemm_q4_k_sorted_bf16::launch",
         })?;
         Ok(())
     }
