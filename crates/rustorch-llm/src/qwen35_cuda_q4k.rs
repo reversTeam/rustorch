@@ -142,6 +142,19 @@ fn moe_group_gemm_enabled() -> bool {
 /// significant and the launch-count reduction dominates.
 const GROUP_GEMM_MIN_M: usize = 8;
 
+/// T246.10 TrackE.3 — runtime gate for the sort-permutation Group-GEMM
+/// path. Default OFF for safety. Only valid when
+/// `RUSTORCH_MOE_GROUP_GEMM=1` is also set : we then build the compact
+/// permutation arrays via `mm_ids_helper_bf16` and dispatch the gate /
+/// up Q4_K matmuls through `mul_mm_id_gemm_q4_k_sorted_bf16` so adjacent
+/// blocks share L1/L2 weight tiles.
+fn moe_group_gemm_sorted_enabled() -> bool {
+    std::env::var("RUSTORCH_MOE_GROUP_GEMM_SORTED")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// One matmul weight on GPU. Qwen3.6 Q4_K_M uses a mix of Q4_K / Q5_K /
 /// Q6_K for big matmuls and F32 (→ BF16) for small ones (ssm_alpha, ssm_beta
 /// when n_v_heads is small : n=48 typical, K=hidden_size, ≈1 MB each).
@@ -912,6 +925,20 @@ pub(crate) struct DecodeScratch {
     /// `[MAX_TREE_SIZE, K/32 * 36]` u8 — per-token Q8_1 staging for dp4a.
     pub(crate) moe_x_q8_m: CudaSlice<u8>,
 
+    // ── T246.10 TrackE.3 — sort-permutation Group-GEMM scratch ──
+    //
+    // Used only when `RUSTORCH_MOE_GROUP_GEMM_SORTED=1` is also set on top of
+    // `RUSTORCH_MOE_GROUP_GEMM=1`. The `mm_ids_helper_bf16` kernel writes
+    // permutation tables here once per layer, and the sorted Group-GEMM
+    // consumes them. Total ≈ (M*k_used + n_experts + 1) × 4 B per layer
+    // (≈ 16 KB for Qwen3.6 MAX_TREE_SIZE=512, k_used=8, n_experts=128).
+    /// `[MAX_TREE_SIZE * k_used]` i32 — compact_idx → source token.
+    pub(crate) moe_ids_src1_m: CudaSlice<i32>,
+    /// `[MAX_TREE_SIZE * k_used]` i32 — compact_idx → flat dst (token*k_used+slot).
+    pub(crate) moe_ids_dst_m: CudaSlice<i32>,
+    /// `[n_experts + 1]` i32 — prefix sums per expert.
+    pub(crate) moe_expert_bounds: CudaSlice<i32>,
+
     // ── T246.7 TrackC — SSM-hybrid Lookahead per-branch state forking ──
     //
     // For SSM-hybrid variants (Dense / MoE on Qwen3.6) every SSM layer
@@ -1661,6 +1688,17 @@ impl Qwen35ModelCudaQ4K {
                     .alloc_zeros::<u8>(total_pseudo_tok * staging_bytes_per_pseudo_tok)
                     .map_err(|e| LlmError::Backend(format!("scratch moe_x_q8_m: {e:?}")))?
             },
+
+            // ── T246.10 TrackE.3 — sort-permutation Group-GEMM scratch ──
+            moe_ids_src1_m: stream
+                .alloc_zeros::<i32>(MAX_TREE_SIZE * cfg.n_experts_used.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch moe_ids_src1_m: {e:?}")))?,
+            moe_ids_dst_m: stream
+                .alloc_zeros::<i32>(MAX_TREE_SIZE * cfg.n_experts_used.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch moe_ids_dst_m: {e:?}")))?,
+            moe_expert_bounds: stream
+                .alloc_zeros::<i32>(cfg.n_experts.max(1) + 1)
+                .map_err(|e| LlmError::Backend(format!("scratch moe_expert_bounds: {e:?}")))?,
 
             // ── T246.7 TrackC — SSM-hybrid Lookahead per-branch buffers ──
             // For SSM-hybrid models (Qwen3.6 Dense / MoE) we pre-allocate one
@@ -3534,7 +3572,18 @@ impl Qwen35ModelCudaQ4K {
                         && moe_group_gemm_enabled()
                         && moe_mega_enabled();
                     if use_group_gemm {
-                        let (mrlm_p, midxm_p, mwm_p, megm_p, meum_p, meom_p, mxq8m_p) = {
+                        let (
+                            mrlm_p,
+                            midxm_p,
+                            mwm_p,
+                            megm_p,
+                            meum_p,
+                            meom_p,
+                            mxq8m_p,
+                            ids_src1_m_p,
+                            ids_dst_m_p,
+                            expert_bounds_p,
+                        ) = {
                             let (a, _g1) = self
                                 .scratch
                                 .moe_router_logits_m
@@ -3548,8 +3597,16 @@ impl Qwen35ModelCudaQ4K {
                             let (f_, _g6) =
                                 self.scratch.moe_expert_out_m.device_ptr_mut(&self.stream);
                             let (g_, _g7) = self.scratch.moe_x_q8_m.device_ptr_mut(&self.stream);
-                            (a, b, c, d_, e_, f_, g_)
+                            let (h_, _g8) =
+                                self.scratch.moe_ids_src1_m.device_ptr_mut(&self.stream);
+                            let (i_, _g9) = self.scratch.moe_ids_dst_m.device_ptr_mut(&self.stream);
+                            let (j_, _g10) =
+                                self.scratch.moe_expert_bounds.device_ptr_mut(&self.stream);
+                            (a, b, c, d_, e_, f_, g_, h_, i_, j_)
                         };
+                        // TrackE.3 — env-gated sort-permutation Group-GEMM.
+                        // Only valid on top of the unsorted Group-GEMM path.
+                        let use_sorted = moe_group_gemm_sorted_enabled();
                         moe_ffn_forward_step_group_gemm(
                             moe,
                             &self.kernels,
@@ -3570,6 +3627,10 @@ impl Qwen35ModelCudaQ4K {
                             moe_egate_p,
                             moe_eup_p,
                             moe_eout_p,
+                            ids_src1_m_p,
+                            ids_dst_m_p,
+                            expert_bounds_p,
+                            use_sorted,
                         )?;
                     } else {
                         for r in 0..tree_size {
@@ -5865,6 +5926,14 @@ fn moe_ffn_forward_step_mega(
 /// (1 per projection, regardless of M or k_used), and the routed-reduce
 /// epilogue is a per-token loop of `scaled_add_routed_bf16`.
 ///
+/// T246.10 TrackE.3 — when `use_sorted=true` (env `RUSTORCH_MOE_GROUP_GEMM_SORTED=1`)
+/// AND the gate / up expert weights are Q4_K BF16-input variant, build a
+/// device-side compact-by-expert permutation via `mm_ids_helper_bf16` and
+/// dispatch the gate / up matmuls through `mul_mm_id_gemm_q4_k_sorted_bf16`.
+/// Adjacent compact slots share the same expert → L1/L2 weight tile reuse.
+/// Output layout is identical to the unsorted path so the rest of the
+/// pipeline (swiglu, scaled_add, down-proj, shared expert) is unchanged.
+///
 /// The shared expert keeps the per-token loop : it's a Dense FFN (one set
 /// of weights applied uniformly), so going batched there is straightforward
 /// follow-up work but not the hot path TrackE.2 targets.
@@ -5883,6 +5952,10 @@ fn moe_ffn_forward_step_mega(
 ///   `expert_gate_p`      : [ef] BF16 (single-token shared expert scratch)
 ///   `expert_up_p`        : [ef] BF16 (single-token shared expert scratch)
 ///   `expert_out_p`       : [d]  BF16 (single-token shared expert scratch)
+///   `ids_src1_m_p`       : [M*k_used] i32 scratch (TrackE.3, 0 to skip sort)
+///   `ids_dst_m_p`        : [M*k_used] i32 scratch (TrackE.3)
+///   `expert_bounds_p`    : [n_experts+1] i32 scratch (TrackE.3)
+///   `use_sorted`         : TrackE.3 gate, requires Q4_K-BF16 gate/up
 #[allow(clippy::too_many_arguments)]
 fn moe_ffn_forward_step_group_gemm(
     moe: &MoeFfnQ4K,
@@ -5905,6 +5978,11 @@ fn moe_ffn_forward_step_group_gemm(
     expert_gate_p: u64,
     expert_up_p: u64,
     expert_out_p: u64,
+    // TrackE.3 — sort-permutation scratch (0 / false to skip).
+    ids_src1_m_p: u64,
+    ids_dst_m_p: u64,
+    expert_bounds_p: u64,
+    use_sorted: bool,
 ) -> Result<(), LlmError> {
     use cudarc::driver::DevicePtr;
     let d = cfg.d as i32;
@@ -5944,6 +6022,38 @@ fn moe_ffn_forward_step_group_gemm(
             .map_err(|e| LlmError::Backend(format!("zero h_m group: {e:?}")))?;
     }
 
+    // ---- 3b. T246.10 TrackE.3 — build sort permutation (once per layer) ----
+    //
+    // Only when `use_sorted=true` AND the gate/up expert kind is Q4_K (the
+    // only quant the sorted kernel currently supports). The sorted kernel
+    // uses BF16 input directly — when active we BYPASS the dp4a path on
+    // the gate / up matmuls (A3 showed dp4a vs BF16 is a wash on this
+    // shape ; the win comes from cache reuse, not compute throughput).
+    // The down-projection always uses the unsorted dispatch (its input
+    // layout [M*k_used, ef] is already permuted, not [token, k_used]).
+    let sort_active = use_sorted
+        && ids_src1_m_p != 0
+        && ids_dst_m_p != 0
+        && expert_bounds_p != 0
+        && moe.gate_exp_kind == ExpertQuantKind::Q4K
+        && moe.up_exp_kind == ExpertQuantKind::Q4K;
+    if sort_active {
+        unsafe {
+            kernels
+                .mm_ids_helper_bf16(
+                    stream,
+                    topk_idx_m_p,
+                    ids_src1_m_p,
+                    ids_dst_m_p,
+                    expert_bounds_p,
+                    m_tokens,
+                    k,
+                    n_e,
+                )
+                .map_err(|e| LlmError::Backend(format!("mm_ids_helper group: {e:?}")))?;
+        }
+    }
+
     // ---- 4. Gate (batched Group-GEMM call covering ALL M*k slots) ----
     //
     // Per-block parity test PASSES bit-exact at Qwen3.6-A3B shape, but the
@@ -5955,36 +6065,76 @@ fn moe_ffn_forward_step_group_gemm(
     let (u_ptrs_p, _gu) = moe.up_exp_ptrs_dev.device_ptr(stream);
     let (d_ptrs_p, _gd) = moe.down_exp_ptrs_dev.device_ptr(stream);
 
-    dispatch_indexed_group_gemm(
-        kernels,
-        stream,
-        moe.gate_exp_kind,
-        g_ptrs_p,
-        topk_idx_m_p,
-        h_norm_m_p,
-        expert_gate_m_p,
-        m_tokens,
-        ef,
-        d,
-        k,
-        x_q8_m_p,
-    )?;
+    if sort_active {
+        unsafe {
+            kernels
+                .mul_mm_id_gemm_q4_k_sorted_bf16(
+                    stream,
+                    g_ptrs_p,
+                    topk_idx_m_p,
+                    ids_src1_m_p,
+                    ids_dst_m_p,
+                    h_norm_m_p,
+                    expert_gate_m_p,
+                    m_tokens,
+                    ef,
+                    d,
+                    k,
+                )
+                .map_err(|e| LlmError::Backend(format!("sorted gate q4k: {e:?}")))?;
+        }
+    } else {
+        dispatch_indexed_group_gemm(
+            kernels,
+            stream,
+            moe.gate_exp_kind,
+            g_ptrs_p,
+            topk_idx_m_p,
+            h_norm_m_p,
+            expert_gate_m_p,
+            m_tokens,
+            ef,
+            d,
+            k,
+            x_q8_m_p,
+        )?;
+    }
 
     // ---- 5. Up (batched Group-GEMM call) ----
-    dispatch_indexed_group_gemm(
-        kernels,
-        stream,
-        moe.up_exp_kind,
-        u_ptrs_p,
-        topk_idx_m_p,
-        h_norm_m_p,
-        expert_up_m_p,
-        m_tokens,
-        ef,
-        d,
-        k,
-        x_q8_m_p,
-    )?;
+    if sort_active {
+        unsafe {
+            kernels
+                .mul_mm_id_gemm_q4_k_sorted_bf16(
+                    stream,
+                    u_ptrs_p,
+                    topk_idx_m_p,
+                    ids_src1_m_p,
+                    ids_dst_m_p,
+                    h_norm_m_p,
+                    expert_up_m_p,
+                    m_tokens,
+                    ef,
+                    d,
+                    k,
+                )
+                .map_err(|e| LlmError::Backend(format!("sorted up q4k: {e:?}")))?;
+        }
+    } else {
+        dispatch_indexed_group_gemm(
+            kernels,
+            stream,
+            moe.up_exp_kind,
+            u_ptrs_p,
+            topk_idx_m_p,
+            h_norm_m_p,
+            expert_up_m_p,
+            m_tokens,
+            ef,
+            d,
+            k,
+            x_q8_m_p,
+        )?;
+    }
 
     // ---- 6. SwiGLU over M * k_used * ef in one shot ----
     unsafe {
