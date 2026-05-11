@@ -102,6 +102,23 @@ fn moe_mega_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// T246.10 A6b.3 — runtime gate for the batched GEMM prefill dispatch.
+/// Default OFF for safety. When set to 1, prefill paths (force_accept_all
+/// = true) with tree_size >= GEMM_PREFILL_MIN_M replace their per-row
+/// dispatch_matmul_m1 loops on Q/K/V/O/gate/up/down/SSM-in/SSM-out with a
+/// single dispatch_matmul_mvar call.
+fn gemm_prefill_enabled() -> bool {
+    std::env::var("RUSTORCH_GEMM_PREFILL")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Minimum M tile size below which the batched GEMM path is NOT used.
+/// Decode (M=1) and small trees stay on the SGEMV path (A2/A4 wins).
+/// At M >= 8 the M=8 / mvar path is bandwidth-positive (T245.4).
+const GEMM_PREFILL_MIN_M: usize = 8;
+
 /// One matmul weight on GPU. Qwen3.6 Q4_K_M uses a mix of Q4_K / Q5_K /
 /// Q6_K for big matmuls and F32 (→ BF16) for small ones (ssm_alpha, ssm_beta
 /// when n_v_heads is small : n=48 typical, K=hidden_size, ≈1 MB each).
@@ -245,6 +262,54 @@ impl QuantTensor {
                     kernels
                         .sgemm_q6k_bf16_m8(stream, w, x, y, *n as i32, *k as i32)
                         .map_err(|e| LlmError::Backend(format!("sgemm_q6k_m8: {e:?}")))
+                },
+            }
+        }
+    }
+
+    /// T246.10 A6b.2 — Dispatch a M-variable batched GEMM through the
+    /// appropriate kernel. Used by prefill (T246.10) when tree_size >= 8.
+    ///
+    /// Layout :
+    ///   x : [M, K] BF16 row-major
+    ///   y : [M, N] BF16 row-major
+    ///
+    /// Kernel grid is (N, ceil(M/8)) ; one super-block W read amortized
+    /// across all M m-rows (W is read 1× per (row, mtile_idx) block).
+    pub(crate) fn dispatch_matmul_mvar(
+        &self,
+        kernels: &LlmKernels,
+        stream: &Arc<CudaStream>,
+        m: usize,
+        x: u64,
+        y: u64,
+    ) -> Result<(), LlmError> {
+        unsafe {
+            use cudarc::driver::DevicePtr;
+            match self {
+                QuantTensor::Bf16 { weights, n, k } => {
+                    let (w, _g) = weights.device_ptr(stream);
+                    kernels
+                        .sgemm_bf16_bf16_mvar(stream, w, x, y, m as i32, *n as i32, *k as i32)
+                        .map_err(|e| LlmError::Backend(format!("sgemm_bf16_mvar: {e:?}")))
+                },
+                QuantTensor::Q4K { bytes, n, k } => {
+                    let (w, _g) = bytes.device_ptr(stream);
+                    kernels
+                        .sgemm_q4k_bf16_mvar(stream, w, x, y, m as i32, *n as i32, *k as i32)
+                        .map_err(|e| LlmError::Backend(format!("sgemm_q4k_mvar: {e:?}")))
+                },
+                QuantTensor::Q5K { bytes, n, k } => {
+                    let (w, _g) = bytes.device_ptr(stream);
+                    kernels
+                        .sgemm_q5k_bf16_mvar(stream, w, x, y, m as i32, *n as i32, *k as i32)
+                        .map_err(|e| LlmError::Backend(format!("sgemm_q5k_mvar: {e:?}")))
+                },
+                QuantTensor::Q6K { bytes, n, k } => {
+                    let (w, _g) = bytes.device_ptr(stream);
+                    kernels
+                        .sgemm_q6k_bf16_mvar(stream, w, x, y, m as i32, *n as i32, *k as i32)
+                        .map_err(|e| LlmError::Backend(format!("sgemm_q6k_mvar: {e:?}")))
                 },
             }
         }
@@ -2840,6 +2905,14 @@ impl Qwen35ModelCudaQ4K {
         let tree_size = drafts.len();
         debug_assert!(tree_size > 1 && tree_size <= MAX_TREE_SIZE);
 
+        // T246.10 A6b.3 — GEMM prefill : when `force_accept_all` is true AND
+        // tree_size >= GEMM_PREFILL_MIN_M AND RUSTORCH_GEMM_PREFILL=1, replace
+        // per-row dispatch_matmul_m1 loops on Q/K/V/O + SSM in/out projections
+        // with single dispatch_matmul_mvar calls (M=tree_size). The Dense FFN
+        // and MoE FFN keep per-row dispatch (MoE expert routing is per-token).
+        let use_gemm =
+            force_accept_all && tree_size >= GEMM_PREFILL_MIN_M && gemm_prefill_enabled();
+
         let base_position = self.position;
 
         // ── 0. Upload tree descriptors ────────────────────────────────────
@@ -3042,6 +3115,7 @@ impl Qwen35ModelCudaQ4K {
                     kv_dim,
                     rope_dim,
                     d,
+                    use_gemm,
                 )?;
             } else {
                 self.hybrid_ssm_layer(
@@ -3077,6 +3151,7 @@ impl Qwen35ModelCudaQ4K {
                     conv_dim,
                     conv_kernel,
                     d,
+                    use_gemm,
                 )?;
             }
 
@@ -3121,21 +3196,76 @@ impl Qwen35ModelCudaQ4K {
             let row_ffn_up = (self.scratch.tree_up_buf.len() / MAX_TREE_SIZE) as u64 * bf16_sz;
             match ffn_ref {
                 FfnQ4K::Dense { gate, up, down } => {
-                    for r in 0..tree_size {
-                        let hn_r = thn_p + (r as u64) * row_h;
-                        let gate_r = tgate_p + (r as u64) * row_ffn_gate;
-                        let up_r = tup_p + (r as u64) * row_ffn_up;
-                        let h_r = th_p + (r as u64) * row_h;
-                        gate.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, gate_r, x_q8_p)?;
-                        up.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, up_r, x_q8_p)?;
-                        unsafe {
-                            self.kernels
-                                .swiglu_bf16(&self.stream, gate_r, up_r, gate_r, f as i32)
-                                .map_err(|e| {
-                                    LlmError::Backend(format!("hyb swiglu r{r} l{li}: {e:?}"))
-                                })?;
+                    // Hybrid Dense FFN : enable GEMM only when scratch
+                    // strides match the GEMM output strides (gate.N and up.N
+                    // both == f BF16 elements). For hybrid models (Qwen3.6
+                    // Dense), scratch_up = max(f, 2*q_dim). If 2*q_dim > f
+                    // (typical for Qwen3.6 35B-A3B style) the stride
+                    // mismatches and we fall back to per-row dispatch.
+                    let gate_stride_ok = gate.shape().0 * bf16_sz as usize == row_ffn_gate as usize;
+                    let up_stride_ok = up.shape().0 * bf16_sz as usize == row_ffn_up as usize;
+                    if use_gemm && gate_stride_ok && up_stride_ok {
+                        gate.dispatch_matmul_mvar(
+                            &self.kernels,
+                            &self.stream,
+                            tree_size,
+                            thn_p,
+                            tgate_p,
+                        )?;
+                        up.dispatch_matmul_mvar(
+                            &self.kernels,
+                            &self.stream,
+                            tree_size,
+                            thn_p,
+                            tup_p,
+                        )?;
+                        for r in 0..tree_size {
+                            let gate_r = tgate_p + (r as u64) * row_ffn_gate;
+                            let up_r = tup_p + (r as u64) * row_ffn_up;
+                            unsafe {
+                                self.kernels
+                                    .swiglu_bf16(&self.stream, gate_r, up_r, gate_r, f as i32)
+                                    .map_err(|e| {
+                                        LlmError::Backend(format!("hyb swiglu r{r} l{li}: {e:?}"))
+                                    })?;
+                            }
                         }
-                        down.dispatch_matmul_m1(&self.kernels, &self.stream, gate_r, h_r, x_q8_p)?;
+                        down.dispatch_matmul_mvar(
+                            &self.kernels,
+                            &self.stream,
+                            tree_size,
+                            tgate_p,
+                            th_p,
+                        )?;
+                    } else {
+                        for r in 0..tree_size {
+                            let hn_r = thn_p + (r as u64) * row_h;
+                            let gate_r = tgate_p + (r as u64) * row_ffn_gate;
+                            let up_r = tup_p + (r as u64) * row_ffn_up;
+                            let h_r = th_p + (r as u64) * row_h;
+                            gate.dispatch_matmul_m1(
+                                &self.kernels,
+                                &self.stream,
+                                hn_r,
+                                gate_r,
+                                x_q8_p,
+                            )?;
+                            up.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, up_r, x_q8_p)?;
+                            unsafe {
+                                self.kernels
+                                    .swiglu_bf16(&self.stream, gate_r, up_r, gate_r, f as i32)
+                                    .map_err(|e| {
+                                        LlmError::Backend(format!("hyb swiglu r{r} l{li}: {e:?}"))
+                                    })?;
+                            }
+                            down.dispatch_matmul_m1(
+                                &self.kernels,
+                                &self.stream,
+                                gate_r,
+                                h_r,
+                                x_q8_p,
+                            )?;
+                        }
                     }
                 },
                 FfnQ4K::Moe(moe) => {
@@ -3458,6 +3588,7 @@ impl Qwen35ModelCudaQ4K {
         kv_dim: usize,
         rope_dim: usize,
         d: usize,
+        use_gemm: bool,
     ) -> Result<(), LlmError> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let cfg = &self.config;
@@ -3489,12 +3620,26 @@ impl Qwen35ModelCudaQ4K {
         // without output gate (qwen2), w_q outputs q_dim directly into
         // tq_p.
         if cfg.variant.attn_has_output_gate() {
-            for r in 0..tree_size {
-                let hn_r = thn_p + (r as u64) * row_h;
-                let qg_r = tup_p + (r as u64) * row_up;
-                attn.w_q
-                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, qg_r, x_q8_p)?;
+            if use_gemm {
+                // T246.10 A6b.3 — one mvar call writes M=tree_size rows of
+                // [q | gate] into tup_p (stride row_up = 2*q_dim = w_q.N).
+                attn.w_q.dispatch_matmul_mvar(
+                    &self.kernels,
+                    &self.stream,
+                    tree_size,
+                    thn_p,
+                    tup_p,
+                )?;
+            } else {
+                for r in 0..tree_size {
+                    let hn_r = thn_p + (r as u64) * row_h;
+                    let qg_r = tup_p + (r as u64) * row_up;
+                    attn.w_q
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, qg_r, x_q8_p)?;
+                }
             }
+            // split_qg per row (output_gate variants only). Per-row launch
+            // is fine — split_qg is a small element-wise op.
             for r in 0..tree_size {
                 let qg_r = tup_p + (r as u64) * row_up;
                 let q_r = tq_p + (r as u64) * row_q;
@@ -3514,6 +3659,9 @@ impl Qwen35ModelCudaQ4K {
                         })?;
                 }
             }
+        } else if use_gemm {
+            attn.w_q
+                .dispatch_matmul_mvar(&self.kernels, &self.stream, tree_size, thn_p, tq_p)?;
         } else {
             for r in 0..tree_size {
                 let hn_r = thn_p + (r as u64) * row_h;
@@ -3523,15 +3671,22 @@ impl Qwen35ModelCudaQ4K {
             }
         }
 
-        // K, V per row.
-        for r in 0..tree_size {
-            let hn_r = thn_p + (r as u64) * row_h;
-            let k_r = tk_p + (r as u64) * row_kv;
-            let v_r = tv_p + (r as u64) * row_kv;
+        // K, V projections.
+        if use_gemm {
             attn.w_k
-                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, k_r, x_q8_p)?;
+                .dispatch_matmul_mvar(&self.kernels, &self.stream, tree_size, thn_p, tk_p)?;
             attn.w_v
-                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, v_r, x_q8_p)?;
+                .dispatch_matmul_mvar(&self.kernels, &self.stream, tree_size, thn_p, tv_p)?;
+        } else {
+            for r in 0..tree_size {
+                let hn_r = thn_p + (r as u64) * row_h;
+                let k_r = tk_p + (r as u64) * row_kv;
+                let v_r = tv_p + (r as u64) * row_kv;
+                attn.w_k
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, k_r, x_q8_p)?;
+                attn.w_v
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, v_r, x_q8_p)?;
+            }
         }
 
         // QKV bias add (qwen2 only — Qwen3.6 has no bias).
@@ -3703,12 +3858,17 @@ impl Qwen35ModelCudaQ4K {
             }
         }
 
-        // w_o per row → tree_h ; residual add.
-        for r in 0..tree_size {
-            let ao_r = tao_p + (r as u64) * row_q;
-            let h_r = th_p + (r as u64) * row_h;
+        // w_o → tree_h ; residual add.
+        if use_gemm {
             attn.w_o
-                .dispatch_matmul_m1(&self.kernels, &self.stream, ao_r, h_r, x_q8_p)?;
+                .dispatch_matmul_mvar(&self.kernels, &self.stream, tree_size, tao_p, th_p)?;
+        } else {
+            for r in 0..tree_size {
+                let ao_r = tao_p + (r as u64) * row_q;
+                let h_r = th_p + (r as u64) * row_h;
+                attn.w_o
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, ao_r, h_r, x_q8_p)?;
+            }
         }
         unsafe {
             self.kernels
@@ -3754,6 +3914,7 @@ impl Qwen35ModelCudaQ4K {
         conv_dim: usize,
         conv_kernel: usize,
         d: usize,
+        use_gemm: bool,
     ) -> Result<(), LlmError> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let cfg = &self.config;
@@ -3775,21 +3936,93 @@ impl Qwen35ModelCudaQ4K {
                 .map_err(|e| LlmError::Backend(format!("hyb ssm rms_norm l{li}: {e:?}")))?;
         }
 
-        // 2-5. Per-row w_qkv, w_gate, w_alpha, w_beta projections.
-        for r in 0..tree_size {
-            let hn_r = thn_p + (r as u64) * row_h;
-            let qkv_r = tssm_qkv_p + (r as u64) * row_conv;
-            let z_r = tssm_z_p + (r as u64) * row_value;
-            let alpha_r = tssm_alpha_p + (r as u64) * row_alpha;
-            let beta_r = tssm_beta_p + (r as u64) * row_alpha;
-            ssm.w_qkv
-                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, qkv_r, x_q8_p)?;
-            ssm.w_gate
-                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, z_r, x_q8_p)?;
-            ssm.w_alpha
-                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, alpha_r, x_q8_p)?;
-            ssm.w_beta
-                .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, beta_r, x_q8_p)?;
+        // 2-5. SSM in-projections : w_qkv, w_gate, w_alpha, w_beta. Strides
+        // match (row_conv = conv_dim = w_qkv.N ; row_value = value_dim =
+        // w_gate.N ; row_alpha = n_v = w_alpha.N = w_beta.N), safe to mvar.
+        //
+        // Note : w_alpha/w_beta require K % 256 == 0 for the Q5_K mvar
+        // kernel. If hidden_size (= w_alpha.K) is not a multiple of 256, fall
+        // back to the per-row path for these two.
+        let alpha_k_ok = ssm.w_alpha.shape().1 % 256 == 0;
+        let beta_k_ok = ssm.w_beta.shape().1 % 256 == 0;
+        if use_gemm {
+            ssm.w_qkv.dispatch_matmul_mvar(
+                &self.kernels,
+                &self.stream,
+                tree_size,
+                thn_p,
+                tssm_qkv_p,
+            )?;
+            ssm.w_gate.dispatch_matmul_mvar(
+                &self.kernels,
+                &self.stream,
+                tree_size,
+                thn_p,
+                tssm_z_p,
+            )?;
+            if alpha_k_ok {
+                ssm.w_alpha.dispatch_matmul_mvar(
+                    &self.kernels,
+                    &self.stream,
+                    tree_size,
+                    thn_p,
+                    tssm_alpha_p,
+                )?;
+            } else {
+                for r in 0..tree_size {
+                    let hn_r = thn_p + (r as u64) * row_h;
+                    let alpha_r = tssm_alpha_p + (r as u64) * row_alpha;
+                    ssm.w_alpha.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        hn_r,
+                        alpha_r,
+                        x_q8_p,
+                    )?;
+                }
+            }
+            if beta_k_ok {
+                ssm.w_beta.dispatch_matmul_mvar(
+                    &self.kernels,
+                    &self.stream,
+                    tree_size,
+                    thn_p,
+                    tssm_beta_p,
+                )?;
+            } else {
+                for r in 0..tree_size {
+                    let hn_r = thn_p + (r as u64) * row_h;
+                    let beta_r = tssm_beta_p + (r as u64) * row_alpha;
+                    ssm.w_beta.dispatch_matmul_m1(
+                        &self.kernels,
+                        &self.stream,
+                        hn_r,
+                        beta_r,
+                        x_q8_p,
+                    )?;
+                }
+            }
+        } else {
+            for r in 0..tree_size {
+                let hn_r = thn_p + (r as u64) * row_h;
+                let qkv_r = tssm_qkv_p + (r as u64) * row_conv;
+                let z_r = tssm_z_p + (r as u64) * row_value;
+                let alpha_r = tssm_alpha_p + (r as u64) * row_alpha;
+                let beta_r = tssm_beta_p + (r as u64) * row_alpha;
+                ssm.w_qkv
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, qkv_r, x_q8_p)?;
+                ssm.w_gate
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, z_r, x_q8_p)?;
+                ssm.w_alpha.dispatch_matmul_m1(
+                    &self.kernels,
+                    &self.stream,
+                    hn_r,
+                    alpha_r,
+                    x_q8_p,
+                )?;
+                ssm.w_beta
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, beta_r, x_q8_p)?;
+            }
         }
 
         // 5b+6. Fused SSM pre-step (T246.8 A1.1) per row :
@@ -4068,11 +4301,22 @@ impl Qwen35ModelCudaQ4K {
         // 12. ssm_out @ gated → tree_h ; residual is already in tres_p
         //     and will be added by the dispatcher's FFN-pre block (so we
         //     do NOT add residual here).
-        for r in 0..tree_size {
-            let out_r = tssm_out_p + (r as u64) * row_value;
-            let h_r = th_p + (r as u64) * row_h;
-            ssm.ssm_out
-                .dispatch_matmul_m1(&self.kernels, &self.stream, out_r, h_r, x_q8_p)?;
+        let out_k_ok = ssm.ssm_out.shape().1 % 256 == 0;
+        if use_gemm && out_k_ok {
+            ssm.ssm_out.dispatch_matmul_mvar(
+                &self.kernels,
+                &self.stream,
+                tree_size,
+                tssm_out_p,
+                th_p,
+            )?;
+        } else {
+            for r in 0..tree_size {
+                let out_r = tssm_out_p + (r as u64) * row_value;
+                let h_r = th_p + (r as u64) * row_h;
+                ssm.ssm_out
+                    .dispatch_matmul_m1(&self.kernels, &self.stream, out_r, h_r, x_q8_p)?;
+            }
         }
         // Residual : h += residual (= pre-mixer hidden state).
         unsafe {
@@ -4153,6 +4397,13 @@ impl Qwen35ModelCudaQ4K {
         let vocab = cfg.vocab;
         let tree_size = drafts.len();
         debug_assert!(tree_size > 1 && tree_size <= MAX_TREE_SIZE);
+
+        // T246.10 A6b.3 — GEMM prefill : when `force_accept_all` is true AND
+        // tree_size >= GEMM_PREFILL_MIN_M AND RUSTORCH_GEMM_PREFILL=1, replace
+        // the per-row `dispatch_matmul_m1` loops for Q/K/V/O + gate/up/down
+        // with a single batched `dispatch_matmul_mvar` call (M=tree_size).
+        let use_gemm =
+            force_accept_all && tree_size >= GEMM_PREFILL_MIN_M && gemm_prefill_enabled();
 
         // Snapshot the base position before this verify pass so we can
         // recover per-row absolute positions for RoPE (= base + depth[r]).
@@ -4308,18 +4559,46 @@ impl Qwen35ModelCudaQ4K {
                     .map_err(|e| LlmError::Backend(format!("tree rms_norm attn: {e:?}")))?;
             }
 
-            // Per-row Q, K, V projections (loop tree_size times).
-            for r in 0..tree_size {
-                let hn_r = thn_p + (r as u64) * row_h;
-                let q_r = tq_p + (r as u64) * row_q;
-                let k_r = tk_p + (r as u64) * row_kv;
-                let v_r = tv_p + (r as u64) * row_kv;
-                attn.w_q
-                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, q_r, x_q8_p)?;
-                attn.w_k
-                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, k_r, x_q8_p)?;
-                attn.w_v
-                    .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, v_r, x_q8_p)?;
+            // Per-row Q, K, V projections.
+            if use_gemm {
+                // T246.10 A6b.3 — one mvar call per Q/K/V replaces tree_size
+                // M=1 SGEMVs. Input thn_p[tree_size, d] row-major, outputs
+                // tq_p[tree_size, q_dim], tk_p[tree_size, kv_dim],
+                // tv_p[tree_size, kv_dim] all row-major.
+                attn.w_q.dispatch_matmul_mvar(
+                    &self.kernels,
+                    &self.stream,
+                    tree_size,
+                    thn_p,
+                    tq_p,
+                )?;
+                attn.w_k.dispatch_matmul_mvar(
+                    &self.kernels,
+                    &self.stream,
+                    tree_size,
+                    thn_p,
+                    tk_p,
+                )?;
+                attn.w_v.dispatch_matmul_mvar(
+                    &self.kernels,
+                    &self.stream,
+                    tree_size,
+                    thn_p,
+                    tv_p,
+                )?;
+            } else {
+                for r in 0..tree_size {
+                    let hn_r = thn_p + (r as u64) * row_h;
+                    let q_r = tq_p + (r as u64) * row_q;
+                    let k_r = tk_p + (r as u64) * row_kv;
+                    let v_r = tv_p + (r as u64) * row_kv;
+                    attn.w_q
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, q_r, x_q8_p)?;
+                    attn.w_k
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, k_r, x_q8_p)?;
+                    attn.w_v
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, v_r, x_q8_p)?;
+                }
             }
 
             // P1.5 — Qwen2 : add Q/K/V biases per row (broadcast over rows).
@@ -4482,13 +4761,22 @@ impl Qwen35ModelCudaQ4K {
                     .map_err(|e| LlmError::Backend(format!("tree gqa_decode: {e:?}")))?;
             }
 
-            // w_o per row : h_r = w_o @ attn_out_r. We re-use tree_h as
-            // the destination since residual is in tree_residual already.
-            for r in 0..tree_size {
-                let ao_r = tao_p + (r as u64) * row_q;
-                let h_r = th_p + (r as u64) * row_h;
-                attn.w_o
-                    .dispatch_matmul_m1(&self.kernels, &self.stream, ao_r, h_r, x_q8_p)?;
+            // w_o per row : h_r = w_o @ attn_out_r.
+            if use_gemm {
+                attn.w_o.dispatch_matmul_mvar(
+                    &self.kernels,
+                    &self.stream,
+                    tree_size,
+                    tao_p,
+                    th_p,
+                )?;
+            } else {
+                for r in 0..tree_size {
+                    let ao_r = tao_p + (r as u64) * row_q;
+                    let h_r = th_p + (r as u64) * row_h;
+                    attn.w_o
+                        .dispatch_matmul_m1(&self.kernels, &self.stream, ao_r, h_r, x_q8_p)?;
+                }
             }
 
             // h += residual (per row, single batched call).
@@ -4523,21 +4811,78 @@ impl Qwen35ModelCudaQ4K {
             let row_ffn_up = (self.scratch.tree_up_buf.len() / MAX_TREE_SIZE) as u64 * bf16_sz;
             match &attn.ffn {
                 FfnQ4K::Dense { gate, up, down } => {
-                    for r in 0..tree_size {
-                        let hn_r = thn_p + (r as u64) * row_h;
-                        let gate_r = tgate_p + (r as u64) * row_ffn_gate;
-                        let up_r = tup_p + (r as u64) * row_ffn_up;
-                        let h_r = th_p + (r as u64) * row_h;
-                        gate.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, gate_r, x_q8_p)?;
-                        up.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, up_r, x_q8_p)?;
-                        unsafe {
-                            self.kernels
-                                .swiglu_bf16(&self.stream, gate_r, up_r, gate_r, f as i32)
-                                .map_err(|e| {
-                                    LlmError::Backend(format!("tree swiglu r{r}: {e:?}"))
-                                })?;
+                    // Stride guard : the mvar kernel writes y[m * N + col] for
+                    // N = gate.shape().0 (= f). The per-row scratch is strided
+                    // at scratch_gate = max(f, q_dim) and scratch_up =
+                    // max(f, 2*q_dim) BF16 elements. The GEMM path is only
+                    // bit-safe when the GEMM row stride (N) matches the scratch
+                    // row stride. Falls back to per-row when mismatched.
+                    let gate_stride_ok = gate.shape().0 * bf16_sz as usize == row_ffn_gate as usize;
+                    let up_stride_ok = up.shape().0 * bf16_sz as usize == row_ffn_up as usize;
+                    if use_gemm && gate_stride_ok && up_stride_ok {
+                        gate.dispatch_matmul_mvar(
+                            &self.kernels,
+                            &self.stream,
+                            tree_size,
+                            thn_p,
+                            tgate_p,
+                        )?;
+                        up.dispatch_matmul_mvar(
+                            &self.kernels,
+                            &self.stream,
+                            tree_size,
+                            thn_p,
+                            tup_p,
+                        )?;
+                        // SwiGLU per row : still N small launches (or could be
+                        // batched but per-row is fine, swiglu is fast).
+                        for r in 0..tree_size {
+                            let gate_r = tgate_p + (r as u64) * row_ffn_gate;
+                            let up_r = tup_p + (r as u64) * row_ffn_up;
+                            unsafe {
+                                self.kernels
+                                    .swiglu_bf16(&self.stream, gate_r, up_r, gate_r, f as i32)
+                                    .map_err(|e| {
+                                        LlmError::Backend(format!("tree swiglu r{r}: {e:?}"))
+                                    })?;
+                            }
                         }
-                        down.dispatch_matmul_m1(&self.kernels, &self.stream, gate_r, h_r, x_q8_p)?;
+                        down.dispatch_matmul_mvar(
+                            &self.kernels,
+                            &self.stream,
+                            tree_size,
+                            tgate_p,
+                            th_p,
+                        )?;
+                    } else {
+                        for r in 0..tree_size {
+                            let hn_r = thn_p + (r as u64) * row_h;
+                            let gate_r = tgate_p + (r as u64) * row_ffn_gate;
+                            let up_r = tup_p + (r as u64) * row_ffn_up;
+                            let h_r = th_p + (r as u64) * row_h;
+                            gate.dispatch_matmul_m1(
+                                &self.kernels,
+                                &self.stream,
+                                hn_r,
+                                gate_r,
+                                x_q8_p,
+                            )?;
+                            up.dispatch_matmul_m1(&self.kernels, &self.stream, hn_r, up_r, x_q8_p)?;
+                            unsafe {
+                                self.kernels
+                                    .swiglu_bf16(&self.stream, gate_r, up_r, gate_r, f as i32)
+                                    .map_err(|e| {
+                                        LlmError::Backend(format!("tree swiglu r{r}: {e:?}"))
+                                    })?;
+                            }
+                            down.dispatch_matmul_m1(
+                                &self.kernels,
+                                &self.stream,
+                                gate_r,
+                                h_r,
+                                x_q8_p,
+                            )?;
+                        }
                     }
                 },
                 FfnQ4K::Moe(_) => {
