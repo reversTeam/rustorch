@@ -2973,6 +2973,156 @@ __global__ void sgemv_q5k_bf16_v3(
 "#;
 
 // ─────────────────────────────────────────────────────────────────────────
+// T246.8 A5 — SPLIT-K Q6_K SGEMV for the lm_head ceiling.
+//
+// V2 launches N blocks (one per output row) × 64 threads/block. For
+// lm_head N=152064, K=2048 on Qwen3.6-35B-A3B this gives 152064 blocks
+// — plenty for SM count (~128 SMs on GB10) but each block reads its 4
+// rows of Q6_K weights serially over K. The kernel is bandwidth-bound
+// at ~42% HBM peak (A3 measurement, note 8e23a850).
+//
+// Split-K strategy : split K into K_CHUNKS super-block-aligned chunks.
+// For K=2048 → 8 super-blocks/row, K_CHUNKS=8 → blocks_per_chunk=1.
+// Per-block work is the same V2 body but restricted to one chunk's
+// super-blocks. Grid = (N, K_CHUNKS) blocks → 1.2M blocks for lm_head.
+// Per-(row, chunk) pair we write a FP32 partial sum to a global
+// staging buffer of layout [K_CHUNKS, N]. A reduction kernel
+// (`reduce_split_k_bf16`) then sums dim 0 → BF16 [N] output.
+//
+// FP non-associativity caveat : V2 = warp_reduce(sum_{b} per-thread)
+// while split-K = sum_{c} warp_reduce(sum_{b in c} per-thread). For 1
+// super-block per chunk both reduce to the same identity (chunks of 1
+// have no inner accumulation) so the only difference is the final
+// reducer's chunk-summation order. Target : within 1 BF16 ULP of V2.
+//
+// Kernel body : VERBATIM copy of V2's per-thread Q6_K decode + warp
+// reduce, with K range parameterized by (b_start, b_end).
+#[cfg(feature = "cuda")]
+const SGEMV_Q6K_BF16_SPLIT_K_PARTIAL_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemv_q6k_bf16_split_k_partial(
+    const unsigned char* __restrict__ w_q6k,
+    const __nv_bfloat16* __restrict__ x,
+    float*               __restrict__ partial,   // [K_CHUNKS, N] FP32
+    int N,
+    int K,
+    int K_CHUNKS                                   // = blocks_per_row / blocks_per_chunk
+) {
+    int row       = blockIdx.x;
+    int chunk_idx = blockIdx.y;
+    if (row >= N) return;
+    int tid = threadIdx.x;          // 0..63
+
+    int blocks_per_row   = K / 256;
+    int blocks_per_chunk = blocks_per_row / K_CHUNKS;
+    int b_start          = chunk_idx * blocks_per_chunk;
+    int b_end            = b_start + blocks_per_chunk;
+    int row_offset       = row * blocks_per_row * 210;
+
+    extern __shared__ float shmem[];
+    float* sc_pre = shmem;          // [16]
+    float* sdata  = shmem + 16;     // [2]
+
+    float acc = 0.0f;
+
+    int half          = tid >> 5;   // 0 or 1
+    int l             = tid & 31;   // 0..31
+    int half_offset_x = half << 7;  // 0 or 128
+    int ql_base       = half << 6;  // 0 or 64
+    int qh_base       = half << 5;  // 0 or 32
+    int sb            = half << 3;  // 0 or 8
+    int l16           = l >> 4;     // 0 or 1
+
+    for (int b = b_start; b < b_end; ++b) {
+        int blk_off = row_offset + b * 210;
+        const unsigned char* blk = w_q6k + blk_off;
+
+        if (tid == 0) {
+            unsigned short d_bits = blk[208] | (blk[209] << 8);
+            float d = __half2float(__ushort_as_half(d_bits));
+            const signed char* scales = (const signed char*)(blk + 192);
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                sc_pre[i] = d * (float)scales[i];
+            }
+        }
+        __syncthreads();
+
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+
+        unsigned char ql_a = ql[ql_base + l];
+        unsigned char ql_b = ql[ql_base + l + 32];
+        unsigned char qh_b = qh[qh_base + l];
+
+        int q0 = (ql_a & 0x0F) | (((qh_b)      & 0x03) << 4);
+        int q1 = (ql_b & 0x0F) | (((qh_b >> 2) & 0x03) << 4);
+        int q2 = (ql_a >> 4)   | (((qh_b >> 4) & 0x03) << 4);
+        int q3 = (ql_b >> 4)   | (((qh_b >> 6) & 0x03) << 4);
+
+        float w0 = sc_pre[sb + 0 + l16] * (float)(q0 - 32);
+        float w1 = sc_pre[sb + 2 + l16] * (float)(q1 - 32);
+        float w2 = sc_pre[sb + 4 + l16] * (float)(q2 - 32);
+        float w3 = sc_pre[sb + 6 + l16] * (float)(q3 - 32);
+
+        const __nv_bfloat16* x_ptr = x + b * 256 + half_offset_x;
+        float x0 = (float)x_ptr[l];
+        float x1 = (float)x_ptr[l + 32];
+        float x2 = (float)x_ptr[l + 64];
+        float x3 = (float)x_ptr[l + 96];
+
+        acc += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+
+        __syncthreads();  // RACE FIX (matches V2)
+    }
+
+    // Warp-shuffle within each warp (32 lanes).
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    if (lane_id == 0) {
+        sdata[warp_id] = acc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float total = sdata[0] + sdata[1];
+        partial[chunk_idx * N + row] = total;
+    }
+}
+"#;
+
+// Reduction kernel : sums [K_CHUNKS, N] FP32 partials → [N] BF16 output.
+// One thread per output row ; loops over K_CHUNKS (max ~16) and writes
+// the BF16 truncation of the FP32 sum. K_CHUNKS sequential adds done in
+// chunk-major order (0, 1, ..., K_CHUNKS-1).
+#[cfg(feature = "cuda")]
+const REDUCE_SPLIT_K_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void reduce_split_k_bf16(
+    const float*       __restrict__ partial,   // [K_CHUNKS, N] FP32
+    __nv_bfloat16*     __restrict__ y,         // [N] BF16
+    int N,
+    int K_CHUNKS
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= N) return;
+
+    float sum = 0.0f;
+    // Sequential chunk-major sum to match the natural V2 reduction order.
+    for (int c = 0; c < K_CHUNKS; ++c) {
+        sum += partial[c * N + row];
+    }
+    y[row] = (__nv_bfloat16)sum;
+}
+"#;
+
+// ─────────────────────────────────────────────────────────────────────────
 // T246.8 A2.1 — INDEXED SGEMV variants for MoE FFN (Qwen3.6-35B-A3B).
 //
 // Each kernel below mirrors the body of its non-indexed v3 counterpart but
@@ -5584,6 +5734,9 @@ pub struct LlmKernels {
     sgemv_nvfp4_bf16_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.9 NVFP4.2 — non-indexed NVFP4 SGEMV (single-Linear decode, no expert dispatch)
     sgemv_nvfp4_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.8 A5 — split-K Q6_K SGEMV for lm_head ceiling.
+    sgemv_q6k_split_k_partial: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    reduce_split_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -5676,6 +5829,9 @@ impl LlmKernels {
             // T246.9 NVFP4.2 — indexed/non-indexed NVFP4 SGEMV
             sgemv_nvfp4_bf16_indexed: std::sync::OnceLock::new(),
             sgemv_nvfp4_bf16: std::sync::OnceLock::new(),
+            // T246.8 A5 — split-K Q6_K SGEMV for lm_head ceiling.
+            sgemv_q6k_split_k_partial: std::sync::OnceLock::new(),
+            reduce_split_k_bf16: std::sync::OnceLock::new(),
         }
     }
 
@@ -6836,6 +6992,92 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemv_q6k_bf16_v3::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.8 A5 — Split-K Q6_K SGEMV for the lm_head matmul.
+    ///
+    /// Splits K into `k_chunks` super-block-aligned chunks. Each chunk is
+    /// processed by one (n_row, chunk) CUDA block ; the kernel writes
+    /// FP32 partials of shape `[k_chunks, N]` to `partial`. A reduction
+    /// kernel then sums dim 0 → BF16 `[N]` output. Caller provides a
+    /// pre-allocated `partial` buffer of capacity ≥ `k_chunks * N` FP32.
+    ///
+    /// Constraints :
+    /// - `k` must be a multiple of 256 (Q6_K super-block size).
+    /// - `k_chunks` must divide `k / 256` (blocks_per_row).
+    ///
+    /// # Safety  Caller ensures all device pointers are valid for the
+    /// duration of the launch, and `partial` is at least `k_chunks * n`
+    /// FP32 elements.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sgemv_q6k_bf16_split_k(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q6k: u64,
+        x: u64,
+        partial: u64, // [k_chunks, N] FP32 staging
+        y: u64,       // [N] BF16 output
+        n: i32,
+        k: i32,
+        k_chunks: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_q6k_bf16_split_k: K={k} must be multiple of 256"),
+            });
+        }
+        let blocks_per_row = k / 256;
+        if blocks_per_row % k_chunks != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!(
+                    "sgemv_q6k_bf16_split_k: blocks_per_row={blocks_per_row} not divisible by k_chunks={k_chunks}"
+                ),
+            });
+        }
+        // ---- Partial kernel : Grid = (N, k_chunks) × 64 threads/block ----
+        let (_pm, p_func) = self.compile_or_get(
+            &self.sgemv_q6k_split_k_partial,
+            SGEMV_Q6K_BF16_SPLIT_K_PARTIAL_SRC,
+            "sgemv_q6k_bf16_split_k_partial",
+        )?;
+        let p_cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, k_chunks as u32, 1),
+            block_dim: (64, 1, 1),
+            // shmem : 16 sc_pre + 2 sdata = 18 floats = 72 bytes
+            shared_mem_bytes: 18 * 4,
+        };
+        let mut p_launcher = stream.launch_builder(&p_func);
+        p_launcher
+            .arg(&w_q6k)
+            .arg(&x)
+            .arg(&partial)
+            .arg(&n)
+            .arg(&k)
+            .arg(&k_chunks);
+        p_launcher.launch(p_cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_q6k_bf16_split_k_partial::launch",
+        })?;
+        // ---- Reduction kernel : 256-thread blocks over N rows ----
+        let (_rm, r_func) = self.compile_or_get(
+            &self.reduce_split_k_bf16,
+            REDUCE_SPLIT_K_BF16_SRC,
+            "reduce_split_k_bf16",
+        )?;
+        const R_BLOCK: i32 = 256;
+        let r_grid = ((n + R_BLOCK - 1) / R_BLOCK) as u32;
+        let r_cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (r_grid, 1, 1),
+            block_dim: (R_BLOCK as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut r_launcher = stream.launch_builder(&r_func);
+        r_launcher.arg(&partial).arg(&y).arg(&n).arg(&k_chunks);
+        r_launcher.launch(r_cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "reduce_split_k_bf16::launch",
         })?;
         Ok(())
     }
