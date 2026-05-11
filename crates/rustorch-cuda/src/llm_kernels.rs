@@ -3391,55 +3391,162 @@ extern "C" __global__ void delta_net_step_tree_bf16_v2(
     float g_exp = expf((float)gate[base_g]);
     float b     = (float)beta[base_g];
 
-    // Per-lane caches : 4 cols of k and q (constants across rows).
-    // Held in scalar registers — at most cols_per_lane = head_dim / 32
-    // entries per lane (4 for head_dim=128). Use a small fixed array
-    // and unroll with #pragma unroll.
-    float k_cols[8];      // up-to head_dim=256 ⇒ 8 cols/lane
+    // Per-lane caches : `cols_per_lane` (≤8) consecutive cols of k and q.
+    // Held in scalar registers. Loaded once per kernel using BF16x2 packed
+    // loads (one __nv_bfloat162 = 2 BF16) when cols_per_lane is even.
+    float k_cols[8];
     float q_cols[8];
 
     #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        if (j < cols_per_lane) {
+    for (int j = 0; j < 8; j += 2) {
+        if (j + 1 < cols_per_lane) {
+            int c = lane_col_base + j;
+            __nv_bfloat162 kk = *reinterpret_cast<const __nv_bfloat162*>(&k[base_io + c]);
+            __nv_bfloat162 qq = *reinterpret_cast<const __nv_bfloat162*>(&q[base_io + c]);
+            k_cols[j    ] = __low2float(kk);
+            k_cols[j + 1] = __high2float(kk);
+            q_cols[j    ] = __low2float(qq);
+            q_cols[j + 1] = __high2float(qq);
+        } else if (j < cols_per_lane) {
             int c = lane_col_base + j;
             k_cols[j] = (float)k[base_io + c];
             q_cols[j] = (float)q[base_io + c];
         } else {
-            k_cols[j] = 0.0f;
-            q_cols[j] = 0.0f;
+            k_cols[j    ] = 0.0f; k_cols[j + 1] = 0.0f;
+            q_cols[j    ] = 0.0f; q_cols[j + 1] = 0.0f;
         }
     }
 
-    // Process each row owned by this warp.
-    // No inter-warp sync needed — warps own disjoint rows + state writes
-    // target disjoint cache sectors.
-    for (int r_off = 0; r_off < rows_per_warp; ++r_off) {
+    // Pre-multiply b*k_cols once — constant across rows. This lets the
+    // inner FMA chain become `updated = g_exp*old + v_r * bk_cols[j]`,
+    // saving 1 FMA per (row, col) without changing the FP order.
+    float bk_cols[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        bk_cols[j] = b * k_cols[j];
+    }
+
+    // Process owned rows two-at-a-time to extract memory ILP. Each
+    // inner iteration issues 2 independent state loads/stores per
+    // packed BF162 ⇒ the LSU can have ~4 transactions in flight,
+    // hiding more of the HBM round-trip latency.
+    //
+    // The 2 rows are independent : separate state addresses, separate
+    // v_r values, separate partial accumulators. The warp reduction is
+    // still per-row so two `__shfl_xor_sync` chains execute at the end.
+    int r_off = 0;
+    for (; r_off + 1 < rows_per_warp; r_off += 2) {
+        int r0 = warp_row_base + r_off;
+        int r1 = warp_row_base + r_off + 1;
+        float v_r0 = (float)v[base_io + r0];
+        float v_r1 = (float)v[base_io + r1];
+
+        long long row_off0 = (long long)r0 * head_dim;
+        long long row_off1 = (long long)r1 * head_dim;
+        long long src_row0 = base_h_src + row_off0;
+        long long dst_row0 = base_h_dst + row_off0;
+        long long src_row1 = base_h_src + row_off1;
+        long long dst_row1 = base_h_dst + row_off1;
+
+        float partial0 = 0.0f;
+        float partial1 = 0.0f;
+
+        #pragma unroll
+        for (int j = 0; j < 8; j += 2) {
+            if (j + 1 < cols_per_lane) {
+                int c = lane_col_base + j;
+                // Issue both loads back-to-back ; the compiler / LSU
+                // schedules them as independent transactions.
+                __nv_bfloat162 oldp0 = *reinterpret_cast<const __nv_bfloat162*>(
+                    &tree_states[src_row0 + c]);
+                __nv_bfloat162 oldp1 = *reinterpret_cast<const __nv_bfloat162*>(
+                    &tree_states[src_row1 + c]);
+
+                float o00 = __low2float(oldp0);
+                float o01 = __high2float(oldp0);
+                float o10 = __low2float(oldp1);
+                float o11 = __high2float(oldp1);
+
+                float u00 = g_exp * o00 + v_r0 * bk_cols[j    ];
+                float u01 = g_exp * o01 + v_r0 * bk_cols[j + 1];
+                float u10 = g_exp * o10 + v_r1 * bk_cols[j    ];
+                float u11 = g_exp * o11 + v_r1 * bk_cols[j + 1];
+
+                *reinterpret_cast<__nv_bfloat162*>(&tree_states[dst_row0 + c]) =
+                    __floats2bfloat162_rn(u00, u01);
+                *reinterpret_cast<__nv_bfloat162*>(&tree_states[dst_row1 + c]) =
+                    __floats2bfloat162_rn(u10, u11);
+
+                partial0 += u00 * q_cols[j    ];
+                partial0 += u01 * q_cols[j + 1];
+                partial1 += u10 * q_cols[j    ];
+                partial1 += u11 * q_cols[j + 1];
+            } else if (j < cols_per_lane) {
+                int c = lane_col_base + j;
+                float old0 = (float)tree_states[src_row0 + c];
+                float old1 = (float)tree_states[src_row1 + c];
+                float u0 = g_exp * old0 + v_r0 * bk_cols[j];
+                float u1 = g_exp * old1 + v_r1 * bk_cols[j];
+                tree_states[dst_row0 + c] = (__nv_bfloat16)u0;
+                tree_states[dst_row1 + c] = (__nv_bfloat16)u1;
+                partial0 += u0 * q_cols[j];
+                partial1 += u1 * q_cols[j];
+            }
+        }
+
+        // Two independent warp reductions ; compiler can interleave their
+        // shuffle instructions.
+        partial0 += __shfl_xor_sync(0xffffffffu, partial0, 16);
+        partial1 += __shfl_xor_sync(0xffffffffu, partial1, 16);
+        partial0 += __shfl_xor_sync(0xffffffffu, partial0,  8);
+        partial1 += __shfl_xor_sync(0xffffffffu, partial1,  8);
+        partial0 += __shfl_xor_sync(0xffffffffu, partial0,  4);
+        partial1 += __shfl_xor_sync(0xffffffffu, partial1,  4);
+        partial0 += __shfl_xor_sync(0xffffffffu, partial0,  2);
+        partial1 += __shfl_xor_sync(0xffffffffu, partial1,  2);
+        partial0 += __shfl_xor_sync(0xffffffffu, partial0,  1);
+        partial1 += __shfl_xor_sync(0xffffffffu, partial1,  1);
+
+        if (lane == 0) {
+            out[base_io + r0] = (__nv_bfloat16)partial0;
+            out[base_io + r1] = (__nv_bfloat16)partial1;
+        }
+    }
+
+    // Tail : odd row(s) — handle 1 at a time.
+    for (; r_off < rows_per_warp; ++r_off) {
         int r = warp_row_base + r_off;
         float v_r = (float)v[base_io + r];
 
         long long row_off = (long long)r * head_dim;
+        long long src_row = base_h_src + row_off;
+        long long dst_row = base_h_dst + row_off;
 
-        // Compute per-lane partial sum across owned columns.
         float partial = 0.0f;
 
-        // Per-lane RMW : load 4 BF16 from state[h, r, lane_col_base..+3],
-        // FMA-update, store back. Adjacent lanes hit adjacent BF16 ⇒
-        // fully coalesced sector access.
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            if (j < cols_per_lane) {
+        for (int j = 0; j < 8; j += 2) {
+            if (j + 1 < cols_per_lane) {
                 int c = lane_col_base + j;
-                long long addr = (parent < 0) ? (base_h_src + row_off + c)
-                                              : (base_h_src + row_off + c);
-                float old = (float)tree_states[addr];
-                float updated = g_exp * old + b * v_r * k_cols[j];
-                tree_states[base_h_dst + row_off + c] = (__nv_bfloat16)updated;
+                __nv_bfloat162 oldp = *reinterpret_cast<const __nv_bfloat162*>(
+                    &tree_states[src_row + c]);
+                float o0 = __low2float(oldp);
+                float o1 = __high2float(oldp);
+                float u0 = g_exp * o0 + v_r * bk_cols[j    ];
+                float u1 = g_exp * o1 + v_r * bk_cols[j + 1];
+                __nv_bfloat162 upd = __floats2bfloat162_rn(u0, u1);
+                *reinterpret_cast<__nv_bfloat162*>(&tree_states[dst_row + c]) = upd;
+                partial += u0 * q_cols[j    ];
+                partial += u1 * q_cols[j + 1];
+            } else if (j < cols_per_lane) {
+                int c = lane_col_base + j;
+                float old = (float)tree_states[src_row + c];
+                float updated = g_exp * old + v_r * bk_cols[j];
+                tree_states[dst_row + c] = (__nv_bfloat16)updated;
                 partial += updated * q_cols[j];
             }
         }
 
-        // Warp-reduce partial across 32 lanes ⇒ lane 0 holds out[h, r].
-        // Single warp shfl tree, no smem, no sync.
         partial += __shfl_xor_sync(0xffffffffu, partial, 16);
         partial += __shfl_xor_sync(0xffffffffu, partial,  8);
         partial += __shfl_xor_sync(0xffffffffu, partial,  4);
