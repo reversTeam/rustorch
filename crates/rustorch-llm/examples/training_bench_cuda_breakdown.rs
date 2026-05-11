@@ -37,12 +37,21 @@ fn time_op<F: FnMut() -> ()>(name: &str, iters: u32, mut f: F) {
     println!("  {name:40} : {per:?} / iter (total {total:?} over {iters} iters)");
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 fn main() {
-    let m = 8 * 512;
-    let hidden = 2048;
-    let ffn = 4096;
+    let batch = env_usize("RUSTORCH_BENCH_BATCH", 8);
+    let seq_len = env_usize("RUSTORCH_BENCH_SEQ", 512);
+    let m = batch * seq_len;
+    let hidden = env_usize("RUSTORCH_BENCH_HIDDEN", 2048);
+    let ffn = env_usize("RUSTORCH_BENCH_FFN", 4096);
     let eps = 1e-6;
-    let iters = 5;
+    let iters = env_usize("RUSTORCH_BENCH_STEPS", 5) as u32;
 
     println!("=== rustorch CUDA per-op breakdown (T246.11 TRAINING-BENCH.3) ===");
     println!("shape : tokens={m} hidden={hidden} ffn={ffn} iters={iters}");
