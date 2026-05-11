@@ -143,11 +143,13 @@ fn moe_group_gemm_enabled() -> bool {
 /// significant and the launch-count reduction dominates.
 const GROUP_GEMM_MIN_M: usize = 8;
 
-/// T246.10 TrackE.3 — runtime gate for the sort-permutation Group-GEMM
-/// path. Default OFF for safety. Only valid when
+/// T246.10 TrackE.3 / TrackE.4 — runtime gate for the sort-permutation
+/// Group-GEMM path. Default OFF for safety. Only valid when
 /// `RUSTORCH_MOE_GROUP_GEMM=1` is also set : we then build the compact
 /// permutation arrays via `mm_ids_helper_bf16` and dispatch the gate /
-/// up Q4_K matmuls through `mul_mm_id_gemm_q4_k_sorted_bf16` so adjacent
+/// up matmuls through the matching sorted kernel — Q4_K via
+/// `mul_mm_id_gemm_q4_k_sorted_bf16` (TrackE.3) and Q5_K via
+/// `mul_mm_id_gemm_q5_k_sorted_bf16` (TrackE.4) — so adjacent compact
 /// blocks share L1/L2 weight tiles.
 fn moe_group_gemm_sorted_enabled() -> bool {
     std::env::var("RUSTORCH_MOE_GROUP_GEMM_SORTED")
@@ -672,6 +674,68 @@ pub(crate) fn dispatch_indexed_group_gemm(
                     k_used,
                 )
                 .map_err(|e| LlmError::Backend(format!("mul_mm_id_gemm bf16: {e:?}"))),
+        }
+    }
+}
+
+/// T246.10 TrackE.3 / TrackE.4 — dispatch the appropriate sort-permutation
+/// Group-GEMM kernel based on the expert quant kind. Currently supports
+/// Q4_K (TrackE.3) and Q5_K (TrackE.4). For other quants the caller MUST
+/// fall back to `dispatch_indexed_group_gemm` (the `sort_active` gate in
+/// `moe_ffn_forward_step_group_gemm` enforces this).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_sorted_group_gemm(
+    kernels: &LlmKernels,
+    stream: &Arc<CudaStream>,
+    kind: ExpertQuantKind,
+    expert_ptrs_p: u64,
+    topk_indices_p: u64,
+    ids_src1_p: u64,
+    ids_dst_p: u64,
+    x: u64,
+    y: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    k_used: i32,
+    label: &'static str,
+) -> Result<(), LlmError> {
+    unsafe {
+        match kind {
+            ExpertQuantKind::Q4K => kernels
+                .mul_mm_id_gemm_q4_k_sorted_bf16(
+                    stream,
+                    expert_ptrs_p,
+                    topk_indices_p,
+                    ids_src1_p,
+                    ids_dst_p,
+                    x,
+                    y,
+                    m,
+                    n,
+                    k,
+                    k_used,
+                )
+                .map_err(|e| LlmError::Backend(format!("sorted {label} q4k: {e:?}"))),
+            ExpertQuantKind::Q5K => kernels
+                .mul_mm_id_gemm_q5_k_sorted_bf16(
+                    stream,
+                    expert_ptrs_p,
+                    topk_indices_p,
+                    ids_src1_p,
+                    ids_dst_p,
+                    x,
+                    y,
+                    m,
+                    n,
+                    k,
+                    k_used,
+                )
+                .map_err(|e| LlmError::Backend(format!("sorted {label} q5k: {e:?}"))),
+            ExpertQuantKind::Q6K | ExpertQuantKind::Bf16 => Err(LlmError::Backend(format!(
+                "dispatch_sorted_group_gemm: unsupported kind {kind:?} for {label} \
+                 — only Q4_K and Q5_K have sorted kernels"
+            ))),
         }
     }
 }
@@ -6356,10 +6420,12 @@ fn moe_ffn_forward_step_mega(
 /// (1 per projection, regardless of M or k_used), and the routed-reduce
 /// epilogue is a per-token loop of `scaled_add_routed_bf16`.
 ///
-/// T246.10 TrackE.3 — when `use_sorted=true` (env `RUSTORCH_MOE_GROUP_GEMM_SORTED=1`)
-/// AND the gate / up expert weights are Q4_K BF16-input variant, build a
+/// T246.10 TrackE.3 / TrackE.4 — when `use_sorted=true`
+/// (env `RUSTORCH_MOE_GROUP_GEMM_SORTED=1`) AND the gate / up expert
+/// weights are a SORTED-supported quant (Q4_K or Q5_K), build a
 /// device-side compact-by-expert permutation via `mm_ids_helper_bf16` and
-/// dispatch the gate / up matmuls through `mul_mm_id_gemm_q4_k_sorted_bf16`.
+/// dispatch the gate / up matmuls through the matching sorted kernel
+/// (`mul_mm_id_gemm_q4_k_sorted_bf16` / `mul_mm_id_gemm_q5_k_sorted_bf16`).
 /// Adjacent compact slots share the same expert → L1/L2 weight tile reuse.
 /// Output layout is identical to the unsorted path so the rest of the
 /// pipeline (swiglu, scaled_add, down-proj, shared expert) is unchanged.
@@ -6452,21 +6518,24 @@ fn moe_ffn_forward_step_group_gemm(
             .map_err(|e| LlmError::Backend(format!("zero h_m group: {e:?}")))?;
     }
 
-    // ---- 3b. T246.10 TrackE.3 — build sort permutation (once per layer) ----
+    // ---- 3b. T246.10 TrackE.3 / TrackE.4 — build sort permutation (once per layer) ----
     //
-    // Only when `use_sorted=true` AND the gate/up expert kind is Q4_K (the
-    // only quant the sorted kernel currently supports). The sorted kernel
-    // uses BF16 input directly — when active we BYPASS the dp4a path on
-    // the gate / up matmuls (A3 showed dp4a vs BF16 is a wash on this
-    // shape ; the win comes from cache reuse, not compute throughput).
-    // The down-projection always uses the unsorted dispatch (its input
-    // layout [M*k_used, ef] is already permuted, not [token, k_used]).
+    // Only when `use_sorted=true` AND the gate/up expert kind is one of the
+    // sorted-supported quants (Q4_K via TrackE.3, Q5_K via TrackE.4). The
+    // sorted kernels use BF16 input directly — when active we BYPASS the
+    // dp4a path on the gate / up matmuls (A3 showed dp4a vs BF16 is a wash
+    // on this shape ; the win comes from cache reuse, not compute
+    // throughput). The down-projection always uses the unsorted dispatch
+    // (its input layout `[M*k_used, ef]` is already permuted, not
+    // `[token, k_used]`).
+    let is_sorted_kind =
+        |k: ExpertQuantKind| -> bool { matches!(k, ExpertQuantKind::Q4K | ExpertQuantKind::Q5K) };
     let sort_active = use_sorted
         && ids_src1_m_p != 0
         && ids_dst_m_p != 0
         && expert_bounds_p != 0
-        && moe.gate_exp_kind == ExpertQuantKind::Q4K
-        && moe.up_exp_kind == ExpertQuantKind::Q4K;
+        && is_sorted_kind(moe.gate_exp_kind)
+        && is_sorted_kind(moe.up_exp_kind);
     if sort_active {
         unsafe {
             kernels
@@ -6496,23 +6565,22 @@ fn moe_ffn_forward_step_group_gemm(
     let (d_ptrs_p, _gd) = moe.down_exp_ptrs_dev.device_ptr(stream);
 
     if sort_active {
-        unsafe {
-            kernels
-                .mul_mm_id_gemm_q4_k_sorted_bf16(
-                    stream,
-                    g_ptrs_p,
-                    topk_idx_m_p,
-                    ids_src1_m_p,
-                    ids_dst_m_p,
-                    h_norm_m_p,
-                    expert_gate_m_p,
-                    m_tokens,
-                    ef,
-                    d,
-                    k,
-                )
-                .map_err(|e| LlmError::Backend(format!("sorted gate q4k: {e:?}")))?;
-        }
+        dispatch_sorted_group_gemm(
+            kernels,
+            stream,
+            moe.gate_exp_kind,
+            g_ptrs_p,
+            topk_idx_m_p,
+            ids_src1_m_p,
+            ids_dst_m_p,
+            h_norm_m_p,
+            expert_gate_m_p,
+            m_tokens,
+            ef,
+            d,
+            k,
+            "gate",
+        )?;
     } else {
         dispatch_indexed_group_gemm(
             kernels,
@@ -6532,23 +6600,22 @@ fn moe_ffn_forward_step_group_gemm(
 
     // ---- 5. Up (batched Group-GEMM call) ----
     if sort_active {
-        unsafe {
-            kernels
-                .mul_mm_id_gemm_q4_k_sorted_bf16(
-                    stream,
-                    u_ptrs_p,
-                    topk_idx_m_p,
-                    ids_src1_m_p,
-                    ids_dst_m_p,
-                    h_norm_m_p,
-                    expert_up_m_p,
-                    m_tokens,
-                    ef,
-                    d,
-                    k,
-                )
-                .map_err(|e| LlmError::Backend(format!("sorted up q4k: {e:?}")))?;
-        }
+        dispatch_sorted_group_gemm(
+            kernels,
+            stream,
+            moe.up_exp_kind,
+            u_ptrs_p,
+            topk_idx_m_p,
+            ids_src1_m_p,
+            ids_dst_m_p,
+            h_norm_m_p,
+            expert_up_m_p,
+            m_tokens,
+            ef,
+            d,
+            k,
+            "up",
+        )?;
     } else {
         dispatch_indexed_group_gemm(
             kernels,
