@@ -681,6 +681,7 @@ version = "0.0.1"
 dependencies = [
  "gemm",
  "half",
+ "rayon",
 ]
 
 [[package]]
@@ -738,9 +739,12 @@ dependencies = [
  "half",
  "num-traits",
  "rand",
+ "rayon",
+ "rustorch-attention",
  "rustorch-autograd",
  "rustorch-core",
  "rustorch-cpu",
+ "rustorch-fusion",
  "thiserror",
 ]
 

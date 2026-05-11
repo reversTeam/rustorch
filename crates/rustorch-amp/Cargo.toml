@@ -13,6 +13,11 @@ categories.workspace = true
 [dependencies]
 half = { workspace = true }
 
+# Parallel bf16→f32 up-cast for the GEMM dispatch path (P3.X T7).
+# Skipped on wasm32 where rayon is unsupported.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
+
 # bf16/fp16 GEMM dispatches to a single-precision GEMM after up-cast
 # (no native bf16 cblas on macOS). gemm crate handles non-macOS;
 # Accelerate FFI handles macOS. P3.X T7 (bf16 perf path).
