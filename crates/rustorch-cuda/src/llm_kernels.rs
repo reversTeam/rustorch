@@ -2493,29 +2493,34 @@ extern "C" __global__ void gemm_bf16_bf16_mma_m16n8k16(
             A3 = *reinterpret_cast<const unsigned int*>(&A_smem[row_hi][k_col_hi]);
         }
 
-        // --- Build B register fragment (tile<8,8,bf162>, ne=2 ints/thread).
+        // --- Build B register fragment (2 .b32 ints/thread, .col major).
         //
-        // Canonical Ampere B-fragment thread layout for m16n8k16 (from
-        // llama.cpp mma.cuh tile<8,8,bf162>::get_i / get_j) :
-        //   get_i(l) = lane / 4               row in B  (=K bf162 row, 0..7)
-        //   get_j(l) = (l << 2) + (lane & 3)  col in B  (=N col, 0..7)
+        // Canonical PTX B-fragment thread layout for m16n8k16 (PTX ISA
+        // 9.7.14.6, B operand for m16n8k16) :
+        //   groupID = laneid / 4   ; threadID_in_group = laneid % 4
+        //   b[0..1] : (row K = tg*2, col N = groupID), (row K = tg*2+1, col N = groupID)
+        //             → packed as R0 (bf162 over 2 K rows for one N col)
+        //   b[2..3] : (row K = tg*2+8, col N = groupID), (row K = tg*2+9, col N = groupID)
+        //             → packed as R1
         //
-        //   l = 0 : K bf162 row = lane/4 , N col = lane%4
-        //   l = 1 : K bf162 row = lane/4 , N col = lane%4 + 4
+        // Per-thread :
+        //   R0 = bf162 at  N col = lane/4 , BF16 K cols = [(lane%4)*2, (lane%4)*2+1]
+        //   R1 = bf162 at  N col = lane/4 , BF16 K cols = [(lane%4)*2+8, (lane%4)*2+9]
         //
-        // B_smem is stored [N row][K BF16 col] row-major over N. Each .b32
-        // holds 2 BF16 packed at consecutive K (so BF16 col base = 2 *
-        // K_bf162_row). Each warp owns N ∈ [warp_id*8 .. warp_id*8+7]
-        // (= n_warp_base .. n_warp_base+7 in global N).
+        // B_smem is stored [N row][K BF16 col] row-major over N. Reading
+        // `*(uint32_t*)&B_smem[n][k]` packs (B_smem[n][k], B_smem[n][k+1])
+        // as a bf162 — i.e. 2 BF16 over consecutive K cols for one N row,
+        // which matches the required B fragment packing (2 K rows for one
+        // N col). Each warp owns N ∈ [warp_id*8 .. warp_id*8+7].
         unsigned int B0, B1;
         {
-            const int lane_div_4 = lane >> 2;            // 0..7  K bf162 row
-            const int lane_mod_4 = lane & 3;             // 0..3
-            const int k_bf16_col = lane_div_4 << 1;      // 0..14 even
-            const int b_row_l0 = warp_id * 8 + lane_mod_4;       // N col for l=0
-            const int b_row_l1 = warp_id * 8 + lane_mod_4 + 4;   // N col for l=1
-            B0 = *reinterpret_cast<const unsigned int*>(&B_smem[b_row_l0][k_bf16_col]);
-            B1 = *reinterpret_cast<const unsigned int*>(&B_smem[b_row_l1][k_bf16_col]);
+            const int lane_div_4 = lane >> 2;            // 0..7  → N within warp
+            const int lane_mod_4 = lane & 3;             // 0..3  → K row pair index
+            const int b_n_row = warp_id * 8 + lane_div_4;        // 0..31 in B_smem
+            const int k_bf16_col_lo = lane_mod_4 << 1;           // 0,2,4,6
+            const int k_bf16_col_hi = (lane_mod_4 << 1) + 8;     // 8,10,12,14
+            B0 = *reinterpret_cast<const unsigned int*>(&B_smem[b_n_row][k_bf16_col_lo]);
+            B1 = *reinterpret_cast<const unsigned int*>(&B_smem[b_n_row][k_bf16_col_hi]);
         }
 
         // --- mma.sync m16n8k16 BF16×BF16 → FP32 accumulate in-place ---

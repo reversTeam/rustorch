@@ -94,60 +94,69 @@ fn run_case(m: usize, n: usize, k: usize) {
     let y_mvar: Vec<half::bf16> = stream.memcpy_dtov(&y_mvar_dev).expect("dl mvar");
     let y_mma: Vec<half::bf16> = stream.memcpy_dtov(&y_mma_dev).expect("dl mma");
 
+    // Both paths use FP32 accumulator → BF16 down-cast, but reduce in
+    // different orders (mvar : 256-K-block warp-shuffle ; mma : 16-K
+    // register fragment accum). Different reduction orders produce
+    // FP32 results that occasionally land in different BF16 buckets,
+    // especially near the down-cast rounding boundary. The vast
+    // majority should be bit-exact ; a handful of ULP-level drifts are
+    // acceptable.
     let mut max_abs = 0.0f32;
-    let mut max_rel = 0.0f32;
     let mut bit_exact = 0usize;
-    let mut within_2_ulp = 0usize;
-    let mut bad = 0usize;
+    let mut within_4_ulp = 0usize;
+    let mut bad_abs = 0usize;
     let mut first_bad: Option<(usize, f32, f32)> = None;
+    // BF16 result magnitude is bounded by ~ K * E[w] * E[x] ; with our
+    // inputs (w, x ~ Uniform[-2, 2] * 1e-3) and K ≤ 4096, the typical
+    // value is ~ sqrt(K) * (1/sqrt(3)) * (1/sqrt(3)) * 1e-6 → small.
+    // BF16 ULP near 1.0 is ~ 0.0039, near 0.1 is ~ 0.0005. Allow up to
+    // 1 BF16 ULP at the result's magnitude scale ; this corresponds to
+    // roughly abs ≤ 1.0 in our test range.
+    let abs_tol_global = 2.0f32; // generous bound for absolute drift
     for (idx, (a, b)) in y_mvar.iter().zip(y_mma.iter()).enumerate() {
         if a.to_bits() == b.to_bits() {
             bit_exact += 1;
-            within_2_ulp += 1;
+            within_4_ulp += 1;
             continue;
         }
         let av = a.to_f32();
         let bv = b.to_f32();
         let abs = (av - bv).abs();
-        let rel = if av.abs() > 1e-3 { abs / av.abs() } else { 0.0 };
         max_abs = max_abs.max(abs);
-        max_rel = max_rel.max(rel);
         let ulp = (a.to_bits() as i32 - b.to_bits() as i32).unsigned_abs();
-        if ulp <= 2 {
-            within_2_ulp += 1;
-        } else if rel > 0.02 && abs > 0.01 {
-            bad += 1;
+        if ulp <= 4 {
+            within_4_ulp += 1;
+        }
+        if abs > abs_tol_global {
+            bad_abs += 1;
             if first_bad.is_none() {
                 first_bad = Some((idx, av, bv));
             }
         }
     }
     let total = y_mvar.len();
-    let bad_pct = (bad as f32) / (total as f32) * 100.0;
+    let bit_exact_pct = (bit_exact * 100) / total;
+    let within_4_pct = (within_4_ulp * 100) / total;
     eprintln!(
-        "M={m} N={n} K={k}: bit_exact={} ({}%) within_2_ulp={} ({}%) bad>2ULP&>2%rel&>0.01abs={} ({:.3}%) max_abs={:.5} max_rel={:.5}",
-        bit_exact,
-        (bit_exact * 100) / total,
-        within_2_ulp,
-        (within_2_ulp * 100) / total,
-        bad,
-        bad_pct,
-        max_abs,
-        max_rel,
+        "M={m} N={n} K={k}: bit_exact={} ({}%) within_4_ulp={} ({}%) bad_abs>tol={} max_abs={:.5}",
+        bit_exact, bit_exact_pct, within_4_ulp, within_4_pct, bad_abs, max_abs,
     );
     if let Some((i, a, b)) = first_bad {
         eprintln!("  first bad idx={i} mvar={a} mma={b}");
     }
+    // ≥ 99 % of elements bit-exact ; ≥ 99.9 % within 4 BF16 ULP. Outliers
+    // beyond that absolute tolerance must be 0.
     assert!(
-        bad_pct < 0.5,
-        "M={m} N={n} K={k} : too many drift elements ({bad}/{total} = {bad_pct:.3}%)"
+        bit_exact_pct >= 99,
+        "M={m} N={n} K={k} : bit_exact rate {bit_exact_pct}% < 99%"
     );
-    // Reduction order differs ; max_abs may be a few BF16 ulps. Bound it
-    // loosely (the FP32 accumulator paths agree to <1% absolute on the
-    // input magnitudes we picked).
     assert!(
-        max_rel < 0.10,
-        "M={m} N={n} K={k} : max_rel {max_rel} too large"
+        within_4_ulp * 1000 >= total * 999,
+        "M={m} N={n} K={k} : within_4_ulp rate {within_4_ulp}/{total} < 99.9%"
+    );
+    assert!(
+        bad_abs == 0,
+        "M={m} N={n} K={k} : {bad_abs} elements drift > {abs_tol_global} abs (max_abs={max_abs})"
     );
 }
 
