@@ -7452,6 +7452,393 @@ extern "C" __global__ void gqa_decode_naive_bf16(
 }
 "#;
 
+// ─────────────────────────────────────────────────────────────────────────
+// MMQ_WHOLESALE — 1:1 translation of llama.cpp Q4_K MMQ INT8 mma path
+// (T246.10 / M-LLAMA-PARITY).
+//
+// Translates 5 llama.cpp source regions into a self-contained NVRTC module :
+//   1. mma.cuh                         — mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 wrapper
+//   2. quantize.cu:176-271             — quantize_mmq_q8_1<DS4> kernel (BF16 input)
+//   3. vecdotq.cuh:530-555             — vec_dot_q4_K_q8_1_impl_mmq (dp4a fallback path)
+//   4. mmq.cuh:2034-2141 (load_tiles_q4_K) — smem tile loader, MMQ_MMA_TILE_X_K_Q8_1 = 76
+//   5. mmq.cuh:1271-1397 (vec_dot_q8_1_q8_1_mma) — INT8 m16n8k16 mma matmul
+//
+// Design decisions :
+//   - Fixed instantiation : mmq_x=64, mmq_y=64, nwarps=4 (no template
+//     explosion ; the prefill regime M ∈ [64..512] is the only one where we
+//     gain over TrackG-lite BF16 mma). Smaller M falls back to TrackG-lite.
+//   - x_q8_1 produced by a SEPARATE prepass kernel (`quantize_mmq_q8_1_bf16_ds4`)
+//     using the packed `block_q8_1_mmq` layout (128 quants + 4 half2 = 144 B).
+//   - mma C-fragment write-back applies the per-Q4_K-superblock (d, dmin) +
+//     per-32-subblock (sc, m) scales in FP32 to produce final BF16 output.
+//
+// Output : Y[M, N] BF16 row-major   (M tokens × N output cols).
+//
+// Constraints :
+//   - K % 256 == 0  (Q4_K super-block size)
+//   - M % 1 OK, N % 1 OK (boundary checks at write)
+//   - Compute capability >= 6.1 for dp4a path ; >= 8.0 for the INT8 mma
+//     extension (asm wrapper kept in source for follow-up activation).
+//
+// References :
+//   - llama.cpp mma.cuh:827-847 (s8 mma m16n8k16 PTX)
+//   - llama.cpp mmq.cuh:2034-2141 (load_tiles_q4_K)
+//   - llama.cpp mmq.cuh:1325-1396 (vec_dot_q8_1_q8_1_mma NVIDIA path)
+//   - RFC note 3be23924-bf2f-449b-8de8-11fc4ff23011 (RESEARCH-mma)
+//   - RFC note a0cd33f2-e738-41b9-9b37-42663a10ee92 (RESEARCH-Q8_1)
+
+// Quantize BF16 activation row to packed Q8_1 MMQ layout (block_q8_1_mmq).
+//
+// Output layout per 128-element row segment (= 4 sub-blocks of 32 = 144 B total) :
+//   bytes  0-15  : half2 ds4[4]  → ds4[s] = (d_s, sum_s) for sub-block s ∈ {0..3}
+//   bytes 16-143 : int8 qs[128]  → 128 quantized values (4 × 32-elem sub-blocks)
+//
+// Launch params (matches llama.cpp quantize_mmq_q8_1<DS4>) :
+//   grid = (M, ceil(K / 512), 1) ; block = (128, 1, 1)
+//   each thread owns 4 consecutive BF16 elements ; per-32-elem sub-block
+//   amax/sum reduction via warp shuffles over 8 lanes.
+//
+// Reference : llama.cpp quantize.cu:176-271 (with BF16 input cast vs F32).
+#[cfg(feature = "cuda")]
+const QUANTIZE_MMQ_Q8_1_BF16_DS4_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void quantize_mmq_q8_1_bf16_ds4(
+    const __nv_bfloat16* __restrict__ x,    // [M, K] BF16 row-major
+    unsigned char*       __restrict__ y,    // [M, K/128] block_q8_1_mmq (144 B each)
+    int M,
+    int K)
+{
+    const int i0 = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
+    if (i0 >= K) return;
+
+    const int m = blockIdx.x;
+
+    const int ib  = i0 / 128;     // outer block_q8_1_mmq index in this row
+    const int iqs = i0 % 128;     // element offset within the block (0..124, step 4)
+    const int sub = iqs / 32;     // sub-block index 0..3
+
+    // Load 4 BF16 → 4 FP32.
+    const __nv_bfloat16* xp = x + (long long)m * K + i0;
+    float x0 = (float)xp[0];
+    float x1 = (float)xp[1];
+    float x2 = (float)xp[2];
+    float x3 = (float)xp[3];
+
+    float amax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+    float sum  = x0 + x1 + x2 + x3;
+
+    // Warp reduction over 8 lanes (= 32-elem sub-block, since 4 elems/thread).
+    // DS4 layout : vals_per_scale = vals_per_sum = 32 → offset start = 4.
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, off, 32));
+        sum  = sum +      __shfl_xor_sync(0xFFFFFFFF, sum,  off, 32);
+    }
+
+    float d_inv = (amax == 0.0f) ? 0.0f : 127.0f / amax;
+    int q0 = __float2int_rn(x0 * d_inv);
+    int q1 = __float2int_rn(x1 * d_inv);
+    int q2 = __float2int_rn(x2 * d_inv);
+    int q3 = __float2int_rn(x3 * d_inv);
+    if (q0 < -127) q0 = -127; if (q0 > 127) q0 = 127;
+    if (q1 < -127) q1 = -127; if (q1 > 127) q1 = 127;
+    if (q2 < -127) q2 = -127; if (q2 > 127) q2 = 127;
+    if (q3 < -127) q3 = -127; if (q3 > 127) q3 = 127;
+
+    unsigned char* y_blk = y + ((long long)m * (K / 128) + ib) * 144;
+
+    // qs[128] starts at byte offset 16 (after 4 half2 ds4[4] scales).
+    char4 q = make_char4((char)q0, (char)q1, (char)q2, (char)q3);
+    char4* yqs4 = (char4*)(y_blk + 16);
+    yqs4[iqs / 4] = q;
+
+    // First thread of each 32-elem sub-block writes the (d, sum) half2.
+    if ((iqs % 32) == 0) {
+        float d = (amax == 0.0f) ? 0.0f : (amax / 127.0f);
+        __half2* ds4 = (__half2*)y_blk;
+        ds4[sub] = __floats2half2_rn(d, sum);
+    }
+}
+"#;
+
+// Q4_K × Q8_1 INT8-staged mma matmul — 1:1 port of llama.cpp's
+// `mul_mat_q4_k_q8_1_mma` body for mmq_x=64, mmq_y=64, nwarps=4 instantiation.
+//
+// Block topology :
+//   - grid = (ceil(N/64), ceil(M/64), 1)            ← (cols-of-W tile, cols-of-X tile)
+//   - block = (32, 4, 1) = 128 threads (4 warps)
+//
+// Per-CTA work :
+//   - Computes a 64(rows of W = "i" axis = N) × 64(cols of X = "j" axis = M tokens) tile.
+//   - K iterates in chunks of MMQ_ITER_K = 256 (one Q4_K super-block).
+//
+// granularity (mmq_get_granularity_device for mmq_x=64) = 16
+//   → rows_per_warp = 2 * 16 = 32
+//   → ntx = 32 / 16 = 2 minitiles (16-row each) per warp
+//
+// Inner k01 loop : runs 8 sub-stripes of 32 K within each super-block,
+// re-staging tile_y per stripe to bound smem at MMQ_X * MMQ_TILE_Y_K ints.
+//
+// Smem layout (static) :
+//   tile_x : MMQ_Y * MMQ_MMA_TILE_X_K_Q8_1 ints = 64 * 76 = 19 456 B
+//   tile_y : MMQ_X * MMQ_TILE_Y_K ints          = 64 * 36 =  9 216 B
+//   Total                                                = 28 672 B (28 KB)
+//
+// FP arithmetic : the inner reduction uses __dp4a (1:1 port of
+// vec_dot_q4_K_q8_1_impl_mmq from vecdotq.cuh:530-555). The mma.sync s8
+// PTX wrapper is included in the source for follow-up Phase 5 activation
+// once the per-lane fragment-layout has been validated against the s8
+// ldmatrix.x4 stride semantics on sm_121.
+//
+// Reference : llama.cpp mmq.cuh:1325-1396 (vec_dot_q8_1_q8_1_mma NVIDIA)
+//             llama.cpp mmq.cuh:2034-2141 (load_tiles_q4_K Turing+)
+#[cfg(feature = "cuda")]
+const MUL_MAT_Q4_K_Q8_1_MMA_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#define MMQ_X       64
+#define MMQ_Y       64
+#define NWARPS      4
+#define WARP_SIZE   32
+#define MMQ_TILE_NE_K          32
+#define MMQ_ITER_K             256
+#define QI8_1                  8       // = QK8_1/4 = 32/4
+#define QR4_K                  2
+#define MMQ_MMA_TILE_X_K_Q8_1  76      // 2*32 + 2*32/8 + 4 = 76
+#define MMQ_TILE_Y_K           36      // = 32 + 32/8
+
+// Unpack the 12-byte Q4_K scale/min header into 8 (sc, m) uint8 pairs.
+// Mirrors unpack_scales_q45_K (mmq.cuh:2024-2032) byte-wise.
+__device__ __forceinline__ void unpack_q4k_scales(
+    const unsigned char* sr, unsigned char sc[8], unsigned char m[8])
+{
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sc[i]     = sr[i]     & 0x3F;
+        m[i]      = sr[i + 4] & 0x3F;
+        sc[i + 4] = (sr[i + 8] & 0x0F) | ((sr[i]     >> 6) << 4);
+        m[i  + 4] = (sr[i + 8] >>   4) | ((sr[i + 4] >> 6) << 4);
+    }
+}
+
+// mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 wrapper.
+// Direct port of llama.cpp mma.cuh:827-847 (Ampere+ path).
+// D[4] is the INT32 accumulator (in-place), A is 2 ints (8 packed s8),
+// B is 1 int (4 packed s8).
+__device__ __forceinline__ void mma_s8_m16n8k16(
+    int* D, unsigned int A0, unsigned int A1, unsigned int B0)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+        : "+r"(D[0]), "+r"(D[1]), "+r"(D[2]), "+r"(D[3])
+        : "r"(A0), "r"(A1), "r"(B0)
+    );
+}
+
+extern "C" __global__ __launch_bounds__(128, 1)
+void mul_mat_q4_k_q8_1_mma_kernel(
+    const unsigned char* __restrict__ W,        // [N, K/256 * 144] Q4_K row-major
+    const unsigned char* __restrict__ X_q8_1,   // [M, K/128 * 144] packed q8_1_mmq
+    __nv_bfloat16*       __restrict__ Y,        // [M, N] BF16 row-major
+    int M,
+    int N,
+    int K)
+{
+    const int n_base = blockIdx.x * MMQ_Y;     // first row of W in this CTA
+    const int m_base = blockIdx.y * MMQ_X;     // first col of X in this CTA
+    const int warp_id = threadIdx.y;           // 0..3
+    const int lane    = threadIdx.x;           // 0..31
+    const int tid     = warp_id * WARP_SIZE + lane;   // 0..127
+
+    __shared__ int tile_x[MMQ_Y * MMQ_MMA_TILE_X_K_Q8_1];     // 19 456 B
+    __shared__ int tile_y[MMQ_X * MMQ_TILE_Y_K];               // 9 216 B
+
+    // 32 FP32 accumulators per thread (= MMQ_X * MMQ_Y / (NWARPS * WARP_SIZE)).
+    float sum[32];
+    #pragma unroll
+    for (int s = 0; s < 32; ++s) sum[s] = 0.0f;
+
+    // Each warp owns rows i ∈ [i0_warp, i0_warp + rows_per_warp).
+    // ntx=2 i-minitiles per warp, each 16 rows.
+    const int i0_warp = (warp_id / 2) * 32;
+
+    const int blocks_per_row_W = K / 256;
+
+    // K-loop : iterates over Q4_K super-blocks (one per MMQ_ITER_K=256 K).
+    for (int kb = 0; kb < blocks_per_row_W; ++kb) {
+        // ========= STAGE 1 — load_tiles_q4_K Q4_K nibble payload =========
+        // Direct port of mmq.cuh:2049-2070 Turing+ path.
+        {
+            const int txi = lane;   // 0..31 (threads_per_row = MMQ_ITER_K/(4*QR4_K) = 32)
+            #pragma unroll
+            for (int i0 = 0; i0 < MMQ_Y; i0 += NWARPS) {
+                int i = i0 + warp_id;
+                int gn = n_base + i;
+                gn = (gn < N) ? gn : (N - 1);
+                const unsigned char* bxi =
+                    W + ((long long)gn * blocks_per_row_W + kb) * 144;
+                const int qs0 = ((const int*)(bxi + 16))[txi];
+                tile_x[i * MMQ_MMA_TILE_X_K_Q8_1 + 16*(txi/8) + (txi%8) + 0] = (qs0 >> 0) & 0x0F0F0F0F;
+                tile_x[i * MMQ_MMA_TILE_X_K_Q8_1 + 16*(txi/8) + (txi%8) + 8] = (qs0 >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        // ========= STAGE 2 — load (d, -dmin) * (sc, m) into x_dm =========
+        // Direct port of mmq.cuh:2072-2107 Turing+ path.
+        // Layout : x_dm[i * 76 + sizeof(int)*ksc + l] for ksc ∈ {0,1}, l ∈ {0..3}.
+        // We map (lane / 2) → row offset (rows_per_warp_local = 16),
+        // (lane & 1) → ksc.
+        {
+            const int rows_per_warp_local = WARP_SIZE / 2;
+            #pragma unroll
+            for (int i0 = 0; i0 < MMQ_Y; i0 += NWARPS * rows_per_warp_local) {
+                int i = i0 + warp_id * rows_per_warp_local + lane / 2;
+                if (i < MMQ_Y) {
+                    int gn = n_base + i;
+                    gn = (gn < N) ? gn : (N - 1);
+                    const unsigned char* bxi =
+                        W + ((long long)gn * blocks_per_row_W + kb) * 144;
+
+                    float d    = __half2float(*(const __half*)(bxi + 0));
+                    float dmin = __half2float(*(const __half*)(bxi + 2));
+
+                    const unsigned char* sr = bxi + 4;
+                    unsigned char sc8[8], m8[8];
+                    unpack_q4k_scales(sr, sc8, m8);
+
+                    int ksc = lane & 1;
+                    __half2* x_dm = (__half2*)(tile_x + i * MMQ_MMA_TILE_X_K_Q8_1 + 2*MMQ_TILE_NE_K);
+                    #pragma unroll
+                    for (int l = 0; l < 4; ++l) {
+                        float ds  = d    * (float)sc8[ksc*4 + l];
+                        float dmm = -dmin * (float)m8 [ksc*4 + l];
+                        x_dm[ksc*4 + l] = __floats2half2_rn(ds, dmm);
+                    }
+                }
+            }
+        }
+
+        // ========= STAGE 3+4 — stream 8 K-stripes of 32 (= 1 super-block) =========
+        // For each kc ∈ {0..7} : re-stage 32 K of X_q8_1 into tile_y, then
+        // run the inner dp4a accumulation for this stripe across all (i, j)
+        // fragment positions assigned to this warp.
+
+        #pragma unroll
+        for (int kc = 0; kc < 8; ++kc) {
+            const int packed_idx_in_token = kb * 2 + (kc / 4);
+            const int sub_in_packed       = kc % 4;
+
+            // Stage Q8_1 stripe into tile_y. 128 threads × 4 outer iters cover
+            // 64 tokens × 32 K = 2048 int8 = 512 ints + 64 half2 ds entries.
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const int e = tid + p * 128;
+                const int j_local = e / 8;
+                const int k_int   = e % 8;
+                const int gm = m_base + j_local;
+                const unsigned char* x_ptr = X_q8_1
+                    + ((long long)((gm < M) ? gm : (M - 1)) * (K / 128) + packed_idx_in_token) * 144;
+                const int qs_int = ((const int*)(x_ptr + 16 + sub_in_packed * 32))[k_int];
+
+                tile_y[j_local * MMQ_TILE_Y_K + 4 + k_int] = qs_int;
+
+                if (k_int == 0) {
+                    const __half2* ds_src = (const __half2*)x_ptr;
+                    __half2* tile_y_ds = (__half2*)(tile_y + j_local * MMQ_TILE_Y_K);
+                    tile_y_ds[0] = ds_src[sub_in_packed];
+                }
+            }
+
+            __syncthreads();
+
+            // ===== Inner accumulation : dp4a Q4_K × Q8_1 (1:1 port of
+            //       vecdotq.cuh:530-555 vec_dot_q4_K_q8_1_impl_mmq, but
+            //       consuming already-unpacked s8 tile_x ints).
+            //
+            // Per i-minitile n ∈ {0, 1} and j0 step (j0 ∈ {0,16,32,48}) :
+            //   - 4 fragment elements l ∈ {0..3} per (n, j0).
+            //   - Each element maps to (i_off, j_off) within the 16×8 tile_C.
+            //   - Run __dp4a over the 8 ints of the 32-K stripe.
+            //
+            // x_dm sub-block index = kc (matches the 1:1 mapping from STAGE-2's
+            // layout: x_dm[i*76 + 64 + kc] holds (d*sc[kc], -dmin*m[kc])).
+            #pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                const int i_minitile_base = i0_warp + n * 16;
+
+                #pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const int i_off = ((l >> 1) << 3) + (lane >> 2);   // 0..15
+                    const int j_off = ((lane & 3) << 1) + (l & 1);      // 0..7
+                    const int gi    = i_minitile_base + i_off;
+                    if (gi >= MMQ_Y) continue;
+
+                    const __half2* x_dm_row = (const __half2*)(tile_x
+                        + gi * MMQ_MMA_TILE_X_K_Q8_1 + 2*MMQ_TILE_NE_K);
+                    float2 dmA = __half22float2(x_dm_row[kc]);
+
+                    // W stripe int offset for this (kc, gi) :
+                    //   tile_x[gi, w_int_base..w_int_base+7] = 8 ints of s8 weights
+                    //   (low or high nibble bytes per kc%2 selector).
+                    const int w_int_base = (kc / 2) * 16 + (kc % 2) * 8;
+
+                    #pragma unroll
+                    for (int j0 = 0; j0 < MMQ_X; j0 += 16) {
+                        const int j_warp_base = j0 + (warp_id & 1) * 8;
+                        const int jg = j_warp_base + j_off;
+                        if (jg >= MMQ_X) continue;
+
+                        const __half2* y_ds_row = (const __half2*)(tile_y + jg * MMQ_TILE_Y_K);
+                        float2 dsB = __half22float2(y_ds_row[0]);
+
+                        int sumi_d = 0;
+                        #pragma unroll
+                        for (int k_int = 0; k_int < 8; ++k_int) {
+                            int v = tile_x[gi * MMQ_MMA_TILE_X_K_Q8_1 + w_int_base + k_int];
+                            int u = tile_y[jg * MMQ_TILE_Y_K + 4 + k_int];
+                            sumi_d = __dp4a(v, u, sumi_d);
+                        }
+
+                        // Canonical Q4_K × Q8_1 final reduction (mmq.cuh:1390-1391) :
+                        //   sum += dmA.x * dsB.x * dot     ← (d·sc) · d_y · Σ q4·q8
+                        //   sum += dmA.y * dsB.y           ← (-dmin·m) · sum_y
+                        sum[(j0 / 8 + n) * 4 + l] += dmA.x * dsB.x * (float)sumi_d;
+                        sum[(j0 / 8 + n) * 4 + l] += dmA.y * dsB.y;
+                    }
+                }
+            }
+
+            __syncthreads();
+        } // kc 32-K stripe loop
+    } // kb super-block loop
+
+    // ========= STAGE 5 — write back Y[M, N] =========
+    #pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        const int i_minitile_base = i0_warp + n * 16;
+        #pragma unroll
+        for (int j0 = 0; j0 < MMQ_X; j0 += 16) {
+            const int j_warp_base = j0 + (warp_id & 1) * 8;
+            #pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int i_off = ((l >> 1) << 3) + (lane >> 2);
+                const int j_off = ((lane & 3) << 1) + (l & 1);
+                const int gi = n_base + i_minitile_base + i_off;
+                const int gj = m_base + j_warp_base + j_off;
+                if (gi < N && gj < M) {
+                    float v = sum[(j0 / 8 + n) * 4 + l];
+                    Y[(long long)gj * N + gi] = __float2bfloat16(v);
+                }
+            }
+        }
+    }
+}
+"#;
+
 /// Container des kernels LLM CUDA, compilés paresseusement et cachés.
 #[cfg(feature = "cuda")]
 pub struct LlmKernels {
@@ -7580,6 +7967,9 @@ pub struct LlmKernels {
     // T246.8 A5 — split-K Q6_K SGEMV for lm_head ceiling.
     sgemv_q6k_split_k_partial: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     reduce_split_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.10 MMQ-WHOLESALE — Q4_K × Q8_1 packed mma-staged kernel.
+    quantize_mmq_q8_1_ds4: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mat_q4_k_q8_1_mma: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -7691,6 +8081,9 @@ impl LlmKernels {
             // T246.8 A5 — split-K Q6_K SGEMV for lm_head ceiling.
             sgemv_q6k_split_k_partial: std::sync::OnceLock::new(),
             reduce_split_k_bf16: std::sync::OnceLock::new(),
+            // T246.10 MMQ-WHOLESALE.
+            quantize_mmq_q8_1_ds4: std::sync::OnceLock::new(),
+            mul_mat_q4_k_q8_1_mma: std::sync::OnceLock::new(),
         }
     }
 
@@ -11930,6 +12323,130 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemv_nvfp4_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T246.10 MMQ-WHOLESALE — Q4_K × Q8_1 staged kernel + Q8_1 prepass.
+    //
+    // The pair :
+    //   - quantize_mmq_q8_1_bf16_ds4  : BF16 → packed block_q8_1_mmq (144 B)
+    //   - mul_mat_q4_k_q8_1_mma       : Q4_K × Q8_1_mmq → BF16 matmul
+    //
+    // Together they replace the BF16 mma path (TrackG-lite) for prefill MoE
+    // FFN matmuls when RUSTORCH_MMQ_WHOLESALE=1 is set. The Q8_1 input cuts
+    // memory bandwidth in half vs BF16 (1.125 B/elem vs 2 B/elem). The
+    // staged tile_x/tile_y layout matches llama.cpp's MMQ_MMA_TILE_X_K_Q8_1
+    // exactly so we can flip the inner dp4a loop to mma.sync s8 later.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Quantize a BF16 activation tensor to the packed Q8_1 MMQ layout
+    /// (block_q8_1_mmq, 144 B per 128-element row segment).
+    ///
+    /// Layout of `y_q8_1` :  M rows × (K/128) packed blocks × 144 B each.
+    /// Each block holds 4 half2 (d, sum) scales + 128 int8 quants.
+    ///
+    /// Constraint : K % 128 == 0 (= 4 × QK8_1=32 sub-blocks per packed block).
+    ///
+    /// # Safety
+    /// Caller ensures `x` points to `M * K` BF16 elements and `y_q8_1`
+    /// points to `M * (K/128) * 144` bytes ; stream is the kernel's CUDA
+    /// context.
+    pub unsafe fn quantize_mmq_q8_1_bf16_ds4(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: u64,
+        y_q8_1: u64,
+        m: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 128 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("quantize_mmq_q8_1_bf16_ds4: K={k} must be multiple of 128"),
+            });
+        }
+        if m <= 0 || k <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("quantize_mmq_q8_1_bf16_ds4: M={m} K={k} must be positive"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.quantize_mmq_q8_1_ds4,
+            QUANTIZE_MMQ_Q8_1_BF16_DS4_SRC,
+            "quantize_mmq_q8_1_bf16_ds4",
+        )?;
+        let block_num_y = ((k as u32) + 4 * 128 - 1) / (4 * 128);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (m as u32, block_num_y, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&x).arg(&y_q8_1).arg(&m).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "quantize_mmq_q8_1_bf16_ds4::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q4_K × Q8_1_mmq matmul via INT8-staged tile GEMM (port of llama.cpp
+    /// `mul_mat_q<Q4_K>` body, mmq_x=64, mmq_y=64, nwarps=4 instantiation).
+    ///
+    /// Inputs :
+    ///   - `w_q4k` : [N, K/256 * 144] Q4_K row-major (W weights)
+    ///   - `x_q8_1`: [M, K/128 * 144] packed block_q8_1_mmq (activation, pre-quantized)
+    ///   - `y`     : [M, N] BF16 row-major (output)
+    ///
+    /// Constraint : K % 256 == 0 (= Q4_K super-block size).
+    ///
+    /// # Safety
+    /// Caller ensures pointers are valid device pointers with the indicated
+    /// shapes ; stream is the kernel's CUDA context ; M, N, K are positive.
+    pub unsafe fn mul_mat_q4_k_q8_1_mma(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q4k: u64,
+        x_q8_1: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mat_q4_k_q8_1_mma: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mat_q4_k_q8_1_mma: M={m} N={n} K={k} must be positive"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mat_q4_k_q8_1_mma,
+            MUL_MAT_Q4_K_Q8_1_MMA_SRC,
+            "mul_mat_q4_k_q8_1_mma_kernel",
+        )?;
+        let grid_x = ((n as u32) + 63) / 64;
+        let grid_y = ((m as u32) + 63) / 64;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (32, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&w_q4k)
+            .arg(&x_q8_1)
+            .arg(&y)
+            .arg(&m)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mat_q4_k_q8_1_mma::launch",
         })?;
         Ok(())
     }
