@@ -1533,20 +1533,27 @@ impl Qwen35ModelCudaQ4K {
         let split_on = std::env::var("RUSTORCH_LM_HEAD_SPLIT")
             .map(|v| v == "1")
             .unwrap_or(false);
+        // Allow K_CHUNKS to be tuned via env (`RUSTORCH_LM_HEAD_SPLIT_K`,
+        // default 8 — full split of the 8 super-blocks for lm_head K=2048).
+        // Clamped to [1, LM_HEAD_K_CHUNKS_MAX].
+        let k_chunks_env: usize = std::env::var("RUSTORCH_LM_HEAD_SPLIT_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(LM_HEAD_K_CHUNKS_MAX)
+            .clamp(1, LM_HEAD_K_CHUNKS_MAX);
         // Decide split-K eligibility + extract weight pointer before any
         // &mut self borrow on scratch.
-        let split_args: Option<(u64, i32, i32)> = if split_on {
+        let split_args: Option<(u64, i32, i32, i32)> = if split_on {
             match &self.lm_head {
                 QuantTensor::Q6K { bytes, n, k } => {
                     let blocks_per_row = *k / 256;
-                    if *n >= 100_000 && blocks_per_row % LM_HEAD_K_CHUNKS_MAX == 0 && *k % 256 == 0
-                    {
+                    if *n >= 100_000 && blocks_per_row % k_chunks_env == 0 && *k % 256 == 0 {
                         use cudarc::driver::DevicePtr;
                         // SAFETY : device_ptr returns a u64 valid for the
                         // lifetime of the guard ; guard dropped at end of
                         // this expression. Kernel reads only.
                         let (w, _g) = bytes.device_ptr(&self.stream);
-                        Some((w, *n as i32, *k as i32))
+                        Some((w, *n as i32, *k as i32, k_chunks_env as i32))
                     } else {
                         None
                     }
@@ -1556,7 +1563,7 @@ impl Qwen35ModelCudaQ4K {
         } else {
             None
         };
-        if let Some((w, n, k)) = split_args {
+        if let Some((w, n, k, k_chunks)) = split_args {
             use cudarc::driver::DevicePtrMut;
             unsafe {
                 let (partial_p, _g1) = self
@@ -1572,7 +1579,7 @@ impl Qwen35ModelCudaQ4K {
                         logits_p,
                         n,
                         k,
-                        LM_HEAD_K_CHUNKS_MAX as i32,
+                        k_chunks,
                     )
                     .map_err(|e| LlmError::Backend(format!("lm_head split_k: {e:?}")))?;
             }
