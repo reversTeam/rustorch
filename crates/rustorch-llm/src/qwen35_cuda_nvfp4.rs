@@ -81,16 +81,32 @@ impl Nvfp4Tensor {
         self.n * self.k / 2 + self.n * self.k / 16
     }
 
-    /// `alpha` used at GEMM call : `1 / (weight_global * input_global)`.
+    /// `alpha` used at GEMM call : `1 / weight_global_scale_checkpoint`.
     ///
-    /// Per vLLM `apply_weights` : `cutlass_scaled_fp4_mm(... 1.0/alpha ...)`
-    /// where their `alpha = input_global * weight_global`. We pre-invert.
+    /// **Why not `1 / (w_g * in_g)` like vLLM ?** vLLM quantizes the
+    /// activation X to FP4 before the matmul, dividing by `in_g_ckpt` along
+    /// the way. Their kernel then multiplies by `(in_g_ckpt * w_g_ckpt)` to
+    /// recover. Our kernel reads **BF16 X directly** (no activation quantize),
+    /// so the `in_g_ckpt` factor must NOT appear in `alpha`.
+    ///
+    /// Math (verbatim from kernel) :
+    ///   `acc = sum(W_fp4 * scale_e4m3 * X_bf16)`
+    ///   `y   = acc * alpha`
+    ///
+    /// The dequant convention is `W_real = W_fp4 * scale_e4m3 / w_g_ckpt`
+    /// (`w_g_ckpt` is stored as the divisor — `max_E4M3*max_E2M1/max(|W|)`).
+    /// Therefore `y = sum(W_real * X_bf16) * w_g_ckpt * alpha`. To recover
+    /// `sum(W_real * X_bf16)` we need `alpha = 1 / w_g_ckpt`.
+    ///
+    /// T246.9 NVFP4-BISECT.2 — the previous version multiplied by an
+    /// additional `1/in_g_ckpt ≈ 0.001-0.01` factor, shrinking every NVFP4
+    /// matmul output by 100-1000×. The residual stream absorbed enough signal
+    /// to keep ~18 tokens coherent but the lm_head logits collapsed past that.
     pub fn matmul_alpha(&self) -> f32 {
-        let g = self.weight_global_scale * self.input_global_scale;
-        if g == 0.0 {
+        if self.weight_global_scale == 0.0 {
             1.0
         } else {
-            1.0 / g
+            1.0 / self.weight_global_scale
         }
     }
 
@@ -829,6 +845,14 @@ impl Qwen35ModelCudaNVFP4 {
                     BlockNvfp4::Attn(attn)
                 },
                 LayerKind::Ssm => {
+                    // T246.9 NVFP4-BISECT.2 : per vLLM `gdn_linear_attn.py`
+                    // canonical math `A = -exp(A_log)`, applied here at load
+                    // time so the GGUF-trained `ssm_pre_step_bf16` kernel
+                    // (which expects `ssm_a = A` directly, with the `-exp`
+                    // already folded in) computes the right state transition.
+                    let mut ssm_a = weights.take_bf16(&format!("{prefix}linear_attn.A_log"))?;
+                    transform_a_log_to_ssm_a(&stream, &mut ssm_a)?;
+
                     let ssm = SsmBlockNvfp4 {
                         attn_norm: weights.take_bf16(&format!("{prefix}input_layernorm.weight"))?,
                         post_norm: weights
@@ -843,7 +867,7 @@ impl Qwen35ModelCudaNVFP4 {
                         w_beta: weights
                             .take_bf16(&format!("{prefix}linear_attn.in_proj_b.weight"))?,
                         dt_bias: weights.take_bf16(&format!("{prefix}linear_attn.dt_bias"))?,
-                        ssm_a: weights.take_bf16(&format!("{prefix}linear_attn.A_log"))?,
+                        ssm_a,
                         ssm_norm: weights.take_bf16(&format!("{prefix}linear_attn.norm.weight"))?,
                         ssm_out: weights
                             .take_bf16(&format!("{prefix}linear_attn.out_proj.weight"))?,
@@ -1867,11 +1891,6 @@ fn moe_ffn_forward_step_nvfp4(
 /// Roundtrip : DtoH → CPU `-exp(...)` → HtoD. ~32 elements per layer × 30
 /// SSM layers = 960 floats total — negligible at load time.
 ///
-/// Currently unused — empirical bench showed enabling this transform makes
-/// the model collapse to a 1-token loop within 4 steps (worse than no
-/// transform). Kept here as a debugging tool for future SSM correctness
-/// follow-ups.
-#[allow(dead_code)]
 fn transform_a_log_to_ssm_a(stream: &Arc<CudaStream>, t: &mut Bf16Tensor) -> Result<(), LlmError> {
     let host: Vec<half::bf16> = stream
         .memcpy_dtov(&t.data)
@@ -1894,11 +1913,14 @@ fn transform_a_log_to_ssm_a(stream: &Arc<CudaStream>, t: &mut Bf16Tensor) -> Res
 /// Returns a fresh `Bf16Tensor` owning the transposed device buffer.
 /// 32K elements per layer × 30 SSM layers = 1M floats — trivial at load time.
 ///
-/// Currently unused — empirical bench showed enabling this transform makes
-/// the model collapse faster (5 distinct tokens vs 18 with the raw layout).
-/// The actual safetensors layout that produces the longest coherent run
-/// matches the GGUF kernel ABI directly. Kept as a debugging tool for
-/// future SSM correctness follow-ups.
+/// Currently unused — see note inline. The HF `[8192, 1, 4]` byte layout
+/// IS byte-identical to the GGUF `[4, 8192]` (because GGUF's `ne[0]` is
+/// innermost, so GGUF's `[4, 8192]` is row-major `[8192, 4]`). The
+/// `conv1d_depthwise_bf16` kernel doc string says it expects
+/// `[kernel, conv_dim]` but the Q4_K path uses the GGUF bytes unchanged and
+/// works coherently — so either the kernel's index math is robust to this
+/// layout OR the doc string is misleading. Don't enable this without a real
+/// parity test against Q4_K_M conv1d outputs.
 #[allow(dead_code)]
 fn transpose_conv1d_to_kernel_major(
     stream: &Arc<CudaStream>,
