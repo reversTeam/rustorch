@@ -4950,6 +4950,555 @@ extern "C" __global__ void mul_mm_id_bf16_bf16(
 }
 "#;
 
+// =====================================================================
+// T246.10 TrackE.2 — batched MoE Group-GEMM kernels.
+//
+// Extension of the A4 `mul_mm_id_*` family (M=1, indexed) to variable M.
+// Each block processes exactly one (row, slot, token) triple — identical
+// per-block body to the M=1 variant — but the grid is 3D
+// `(rows/ROWS_PER_BLOCK, k_used, M)` so a single launch covers ALL
+// `(token, slot)` pairs across the prefill tree.
+//
+// Layout :
+//   - expert_ptrs  : [n_experts]  u64 device pointers (one per stacked expert)
+//   - topk_indices : [M, k_used]  i32 row-major (per-token routing)
+//   - x            : [M, K]       BF16 row-major (per-token activations)
+//   - y            : [M, k_used, N] BF16, token-major slot-major (output)
+//
+// Inside the kernel : block (bx, by, bz) reads
+//   token  = bz
+//   slot   = by
+//   row0   = bx * ROWS_PER_BLOCK
+//   e_idx  = topk_indices[token * k_used + slot]
+//   x_ptr  = x + token * K
+//   y_ptr  = y + (token * k_used + slot) * N + row
+//
+// This is byte-for-byte identical to running the M=1 kernel M times with
+// (token, slot) input. Bit-exact parity is guaranteed.
+//
+// Launch-count reduction (Qwen3.6-A3B prefill, N=512, k=8, 64 MoE layers) :
+//   before : 512 × (1 gate + 1 up + 8 down) per layer = 5120 launches/layer
+//          × 64 MoE layers = 327k launches/prefill (gate/up via mega + down
+//          per-slot via dispatch_indexed_matmul_m1 inner loop)
+//   after  : 1 gate + 1 up + 8 down = 10 launches/layer × 64 = 640/prefill
+//   net    : ~500× launch reduction on the MoE FFN hot path.
+//
+// W-amortization across M : when multiple tokens route to the same expert
+// for some slot (~M*k_used / n_experts ≈ 32 collisions/expert at M=512,
+// k=8, n_e=128), the same expert weight rows are read by multiple blocks
+// in the same launch. L2 cache absorbs the redundancy. A canonical
+// sort-permutation kernel would group all colliding (token, slot) into
+// adjacent blocks for guaranteed L1 reuse, but per the A6.b finding the
+// warp-shuffle path is memory-bound at the bandwidth limit, so the simpler
+// non-sorted version is expected to capture most of the win.
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_GEMM_Q4_K_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void mul_mm_id_gemm_q4_k_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,  // [n_experts]
+    const int*                __restrict__ topk_indices, // [M, k_used]
+    const __nv_bfloat16*      __restrict__ x,            // [M, K]
+    __nv_bfloat16*            __restrict__ y,            // [M, k_used, N]
+    int N,
+    int K,
+    int k_used
+) {
+    int token = blockIdx.z;
+    int slot  = blockIdx.y;
+    int e_idx = topk_indices[token * k_used + slot];
+    const unsigned char* __restrict__ w_q4k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 144;
+
+    int group     = lane >> 3;
+    int pos_base  = (lane & 7) << 2;
+    int byte_base = (group << 5) + pos_base;
+
+    // Per-token x base pointer (each token has its own [K] activation row).
+    const __nv_bfloat16* x_tok = x + (long long)token * K;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 144;
+        const unsigned char* blk = w_q4k + blk_off;
+
+        unsigned short d_bits    = blk[0] | (blk[1] << 8);
+        unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_bits));
+        float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+        const unsigned char* scales = blk + 4;
+        int sub_a = group * 2;
+        int sub_b = sub_a + 1;
+        unsigned char sc_a, m_a, sc_b, m_b;
+        if (sub_a < 4) {
+            sc_a = scales[sub_a]     & 0x3F;
+            m_a  = scales[sub_a + 4] & 0x3F;
+        } else {
+            int ga = sub_a - 4;
+            sc_a = (scales[ga + 8] & 0x0F) | ((scales[ga]     >> 6) << 4);
+            m_a  = (scales[ga + 8] >> 4)   | ((scales[ga + 4] >> 6) << 4);
+        }
+        if (sub_b < 4) {
+            sc_b = scales[sub_b]     & 0x3F;
+            m_b  = scales[sub_b + 4] & 0x3F;
+        } else {
+            int gb = sub_b - 4;
+            sc_b = (scales[gb + 8] & 0x0F) | ((scales[gb]     >> 6) << 4);
+            m_b  = (scales[gb + 8] >> 4)   | ((scales[gb + 4] >> 6) << 4);
+        }
+        float scale_a = d    * (float)sc_a;
+        float min_a   = dmin * (float)m_a;
+        float scale_b = d    * (float)sc_b;
+        float min_b   = dmin * (float)m_b;
+
+        const unsigned char* qs = blk + 16;
+        unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
+
+        const __nv_bfloat16* xa_ptr = x_tok + b * 256 + sub_a * 32 + pos_base;
+        const __nv_bfloat16* xb_ptr = x_tok + b * 256 + sub_b * 32 + pos_base;
+        uint2 xa = *(const uint2*)xa_ptr;
+        uint2 xb = *(const uint2*)xb_ptr;
+        float xa0 = (float)__ushort_as_bfloat16((unsigned short)(xa.x & 0xFFFFu));
+        float xa1 = (float)__ushort_as_bfloat16((unsigned short)(xa.x >> 16));
+        float xa2 = (float)__ushort_as_bfloat16((unsigned short)(xa.y & 0xFFFFu));
+        float xa3 = (float)__ushort_as_bfloat16((unsigned short)(xa.y >> 16));
+        float xb0 = (float)__ushort_as_bfloat16((unsigned short)(xb.x & 0xFFFFu));
+        float xb1 = (float)__ushort_as_bfloat16((unsigned short)(xb.x >> 16));
+        float xb2 = (float)__ushort_as_bfloat16((unsigned short)(xb.y & 0xFFFFu));
+        float xb3 = (float)__ushort_as_bfloat16((unsigned short)(xb.y >> 16));
+
+        unsigned char by0 = (qbytes      ) & 0xFFu;
+        unsigned char by1 = (qbytes >>  8) & 0xFFu;
+        unsigned char by2 = (qbytes >> 16) & 0xFFu;
+        unsigned char by3 = (qbytes >> 24) & 0xFFu;
+        int na0 = by0 & 0x0F, na1 = by1 & 0x0F, na2 = by2 & 0x0F, na3 = by3 & 0x0F;
+        int nb0 = by0 >>   4, nb1 = by1 >>   4, nb2 = by2 >>   4, nb3 = by3 >>   4;
+
+        acc += (scale_a * (float)na0 - min_a) * xa0;
+        acc += (scale_a * (float)na1 - min_a) * xa1;
+        acc += (scale_a * (float)na2 - min_a) * xa2;
+        acc += (scale_a * (float)na3 - min_a) * xa3;
+        acc += (scale_b * (float)nb0 - min_b) * xb0;
+        acc += (scale_b * (float)nb1 - min_b) * xb1;
+        acc += (scale_b * (float)nb2 - min_b) * xb2;
+        acc += (scale_b * (float)nb3 - min_b) * xb3;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        // Output layout : y[token, slot, row] in [M, k_used, N] row-major.
+        y[((long long)token * k_used + slot) * N + row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_GEMM_Q4_K_Q8_1_DP4A_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices, // [M, k_used]
+    const unsigned char*      __restrict__ x_q8_1,       // [M, K/32 * 36]
+    __nv_bfloat16*            __restrict__ y,            // [M, k_used, N]
+    int N,
+    int K,
+    int k_used
+) {
+    int token = blockIdx.z;
+    int slot  = blockIdx.y;
+    int e_idx = topk_indices[token * k_used + slot];
+    const unsigned char* __restrict__ w_q4k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
+
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+
+    int blocks_per_row = K / 256;
+    // Per-token q8_1 buffer base (each token's K activation is K/32 super-blocks
+    // of 36 bytes each).
+    int q8_per_tok = (K / 32) * 36;
+    const unsigned char* x_q8_tok = x_q8_1 + (long long)token * q8_per_tok;
+
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += 32) {
+        const unsigned char* blk = w_q4k + (row * blocks_per_row + b) * 144;
+
+        float d    = __half2float(*(const __half*)(blk + 0));
+        float dmin = __half2float(*(const __half*)(blk + 2));
+
+        const unsigned char* sr = blk + 4;
+        unsigned char sc[8], m[8];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sc[i]     = sr[i]     & 0x3F;
+            m[i]      = sr[i + 4] & 0x3F;
+            sc[i + 4] = (sr[i + 8] & 0x0F) | ((sr[i]     >> 6) << 4);
+            m[i  + 4] = (sr[i + 8] >>   4) | ((sr[i + 4] >> 6) << 4);
+        }
+
+        const unsigned char* qs = blk + 16;
+
+        #pragma unroll
+        for (int bp = 0; bp < 4; ++bp) {
+            int bq8_offset = 2 * bp;
+            #pragma unroll
+            for (int qc = 0; qc < 4; ++qc) {
+                int v0 = *(const int*)(qs + 32 * bp +  4 * qc);
+                int v1 = *(const int*)(qs + 32 * bp + 16 + 4 * qc);
+
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    unsigned int v0i = (v0 >> (4 * i)) & 0x0F0F0F0Fu;
+                    unsigned int v1i = (v1 >> (4 * i)) & 0x0F0F0F0Fu;
+
+                    int sb_idx = b * 8 + bq8_offset + i;
+                    const unsigned char* x_blk = x_q8_tok + sb_idx * 36;
+                    float xd = __half2float(*(const __half*)x_blk);
+
+                    int u0 = *(const int*)(x_blk + 4      + 4 * qc);
+                    int u1 = *(const int*)(x_blk + 4 + 16 + 4 * qc);
+
+                    int dot1 = __dp4a((int)v1i, u1, __dp4a((int)v0i, u0, 0));
+                    int dot2 = __dp4a((int)0x01010101u, u1,
+                               __dp4a((int)0x01010101u, u0, 0));
+
+                    acc += d    * xd * (float)(dot1 * (int)sc[bq8_offset + i])
+                         - dmin * xd * (float)(dot2 * (int)m [bq8_offset + i]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, o);
+    }
+
+    if (tid == 0) {
+        y[((long long)token * k_used + slot) * N + row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_GEMM_Q5_K_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(128, 8)
+__global__ void mul_mm_id_gemm_q5_k_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices, // [M, k_used]
+    const __nv_bfloat16*      __restrict__ x,            // [M, K]
+    __nv_bfloat16*            __restrict__ y,            // [M, k_used, N]
+    int N,
+    int K,
+    int k_used
+) {
+    int token = blockIdx.z;
+    int slot  = blockIdx.y;
+    int e_idx = topk_indices[token * k_used + slot];
+    const unsigned char* __restrict__ w_q5k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 176;
+
+    int group     = lane >> 3;
+    int pos_base  = (lane & 7) << 2;
+    int byte_base = (group << 5) + pos_base;
+    unsigned int qh_mask_a = 1u << (2 * group);
+    unsigned int qh_mask_b = 1u << (2 * group + 1);
+
+    const __nv_bfloat16* x_tok = x + (long long)token * K;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 176;
+        const unsigned char* blk = w_q5k + blk_off;
+
+        unsigned short d_bits    = blk[0] | (blk[1] << 8);
+        unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_bits));
+        float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+        const unsigned char* scales = blk + 4;
+        int sub_a = group * 2;
+        int sub_b = sub_a + 1;
+        unsigned char sc_a, m_a, sc_b, m_b;
+        if (sub_a < 4) {
+            sc_a = scales[sub_a]     & 0x3F;
+            m_a  = scales[sub_a + 4] & 0x3F;
+        } else {
+            int ga = sub_a - 4;
+            sc_a = (scales[ga + 8] & 0x0F) | ((scales[ga]     >> 6) << 4);
+            m_a  = (scales[ga + 8] >> 4)   | ((scales[ga + 4] >> 6) << 4);
+        }
+        if (sub_b < 4) {
+            sc_b = scales[sub_b]     & 0x3F;
+            m_b  = scales[sub_b + 4] & 0x3F;
+        } else {
+            int gb = sub_b - 4;
+            sc_b = (scales[gb + 8] & 0x0F) | ((scales[gb]     >> 6) << 4);
+            m_b  = (scales[gb + 8] >> 4)   | ((scales[gb + 4] >> 6) << 4);
+        }
+        float scale_a = d    * (float)sc_a;
+        float min_a   = dmin * (float)m_a;
+        float scale_b = d    * (float)sc_b;
+        float min_b   = dmin * (float)m_b;
+
+        const unsigned char* qh = blk + 16;
+        const unsigned char* ql = blk + 16 + 32;
+
+        unsigned int qlbytes = *(const unsigned int*)(ql + byte_base);
+        unsigned int qhbytes = *(const unsigned int*)(qh + pos_base);
+
+        const __nv_bfloat16* xa_ptr = x_tok + b * 256 + sub_a * 32 + pos_base;
+        const __nv_bfloat16* xb_ptr = x_tok + b * 256 + sub_b * 32 + pos_base;
+        uint2 xa = *(const uint2*)xa_ptr;
+        uint2 xb = *(const uint2*)xb_ptr;
+        float xa0 = (float)__ushort_as_bfloat16((unsigned short)(xa.x & 0xFFFFu));
+        float xa1 = (float)__ushort_as_bfloat16((unsigned short)(xa.x >> 16));
+        float xa2 = (float)__ushort_as_bfloat16((unsigned short)(xa.y & 0xFFFFu));
+        float xa3 = (float)__ushort_as_bfloat16((unsigned short)(xa.y >> 16));
+        float xb0 = (float)__ushort_as_bfloat16((unsigned short)(xb.x & 0xFFFFu));
+        float xb1 = (float)__ushort_as_bfloat16((unsigned short)(xb.x >> 16));
+        float xb2 = (float)__ushort_as_bfloat16((unsigned short)(xb.y & 0xFFFFu));
+        float xb3 = (float)__ushort_as_bfloat16((unsigned short)(xb.y >> 16));
+
+        unsigned char qb0 = (qlbytes      ) & 0xFFu;
+        unsigned char qb1 = (qlbytes >>  8) & 0xFFu;
+        unsigned char qb2 = (qlbytes >> 16) & 0xFFu;
+        unsigned char qb3 = (qlbytes >> 24) & 0xFFu;
+        unsigned char hb0 = (qhbytes      ) & 0xFFu;
+        unsigned char hb1 = (qhbytes >>  8) & 0xFFu;
+        unsigned char hb2 = (qhbytes >> 16) & 0xFFu;
+        unsigned char hb3 = (qhbytes >> 24) & 0xFFu;
+
+        int qa0 = (qb0 & 0x0F) + ((hb0 & qh_mask_a) ? 16 : 0);
+        int qa1 = (qb1 & 0x0F) + ((hb1 & qh_mask_a) ? 16 : 0);
+        int qa2 = (qb2 & 0x0F) + ((hb2 & qh_mask_a) ? 16 : 0);
+        int qa3 = (qb3 & 0x0F) + ((hb3 & qh_mask_a) ? 16 : 0);
+        int qbq0 = (qb0 >>   4) + ((hb0 & qh_mask_b) ? 16 : 0);
+        int qbq1 = (qb1 >>   4) + ((hb1 & qh_mask_b) ? 16 : 0);
+        int qbq2 = (qb2 >>   4) + ((hb2 & qh_mask_b) ? 16 : 0);
+        int qbq3 = (qb3 >>   4) + ((hb3 & qh_mask_b) ? 16 : 0);
+
+        acc += (scale_a * (float)qa0  - min_a) * xa0;
+        acc += (scale_a * (float)qa1  - min_a) * xa1;
+        acc += (scale_a * (float)qa2  - min_a) * xa2;
+        acc += (scale_a * (float)qa3  - min_a) * xa3;
+        acc += (scale_b * (float)qbq0 - min_b) * xb0;
+        acc += (scale_b * (float)qbq1 - min_b) * xb1;
+        acc += (scale_b * (float)qbq2 - min_b) * xb2;
+        acc += (scale_b * (float)qbq3 - min_b) * xb3;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        y[((long long)token * k_used + slot) * N + row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_GEMM_Q6_K_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(128, 8)
+__global__ void mul_mm_id_gemm_q6_k_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices, // [M, k_used]
+    const __nv_bfloat16*      __restrict__ x,            // [M, K]
+    __nv_bfloat16*            __restrict__ y,            // [M, k_used, N]
+    int N,
+    int K,
+    int k_used
+) {
+    int token = blockIdx.z;
+    int slot  = blockIdx.y;
+    int e_idx = topk_indices[token * k_used + slot];
+    const unsigned char* __restrict__ w_q6k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 210;
+    int l16            = lane >> 4;
+
+    const __nv_bfloat16* x_tok = x + (long long)token * K;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 210;
+        const unsigned char* blk = w_q6k + blk_off;
+
+        unsigned short d_bits = blk[208] | (blk[209] << 8);
+        float d = __half2float(__ushort_as_half(d_bits));
+
+        const signed char* scales = (const signed char*)(blk + 192);
+        float sc0_a = d * (float)scales[0 + l16];
+        float sc2_a = d * (float)scales[2 + l16];
+        float sc4_a = d * (float)scales[4 + l16];
+        float sc6_a = d * (float)scales[6 + l16];
+        float sc0_b = d * (float)scales[8 + l16];
+        float sc2_b = d * (float)scales[10 + l16];
+        float sc4_b = d * (float)scales[12 + l16];
+        float sc6_b = d * (float)scales[14 + l16];
+
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+
+        unsigned char ql_a0 = ql[0 + lane];
+        unsigned char ql_b0 = ql[0 + lane + 32];
+        unsigned char qh_0  = qh[0 + lane];
+        int q0a = (ql_a0 & 0x0F) | (((qh_0)      & 0x03) << 4);
+        int q1a = (ql_b0 & 0x0F) | (((qh_0 >> 2) & 0x03) << 4);
+        int q2a = (ql_a0 >> 4)   | (((qh_0 >> 4) & 0x03) << 4);
+        int q3a = (ql_b0 >> 4)   | (((qh_0 >> 6) & 0x03) << 4);
+
+        const __nv_bfloat16* x_ptr_a = x_tok + b * 256 + 0;
+        float x0a = (float)x_ptr_a[lane];
+        float x1a = (float)x_ptr_a[lane + 32];
+        float x2a = (float)x_ptr_a[lane + 64];
+        float x3a = (float)x_ptr_a[lane + 96];
+
+        acc += sc0_a * (float)(q0a - 32) * x0a;
+        acc += sc2_a * (float)(q1a - 32) * x1a;
+        acc += sc4_a * (float)(q2a - 32) * x2a;
+        acc += sc6_a * (float)(q3a - 32) * x3a;
+
+        unsigned char ql_a1 = ql[64 + lane];
+        unsigned char ql_b1 = ql[64 + lane + 32];
+        unsigned char qh_1  = qh[32 + lane];
+        int q0b = (ql_a1 & 0x0F) | (((qh_1)      & 0x03) << 4);
+        int q1b = (ql_b1 & 0x0F) | (((qh_1 >> 2) & 0x03) << 4);
+        int q2b = (ql_a1 >> 4)   | (((qh_1 >> 4) & 0x03) << 4);
+        int q3b = (ql_b1 >> 4)   | (((qh_1 >> 6) & 0x03) << 4);
+
+        const __nv_bfloat16* x_ptr_b = x_tok + b * 256 + 128;
+        float x0b = (float)x_ptr_b[lane];
+        float x1b = (float)x_ptr_b[lane + 32];
+        float x2b = (float)x_ptr_b[lane + 64];
+        float x3b = (float)x_ptr_b[lane + 96];
+
+        acc += sc0_b * (float)(q0b - 32) * x0b;
+        acc += sc2_b * (float)(q1b - 32) * x1b;
+        acc += sc4_b * (float)(q2b - 32) * x2b;
+        acc += sc6_b * (float)(q3b - 32) * x3b;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        y[((long long)token * k_used + slot) * N + row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_GEMM_BF16_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void mul_mm_id_gemm_bf16_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices, // [M, k_used]
+    const __nv_bfloat16*      __restrict__ x,            // [M, K]
+    __nv_bfloat16*            __restrict__ y,            // [M, k_used, N]
+    int N,
+    int K,
+    int k_used
+) {
+    int token = blockIdx.z;
+    int slot  = blockIdx.y;
+    int e_idx = topk_indices[token * k_used + slot];
+    const __nv_bfloat16* __restrict__ w =
+        (const __nv_bfloat16* __restrict__)expert_ptrs[e_idx];
+
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+
+    extern __shared__ float shmem[];
+
+    const __nv_bfloat16* x_tok = x + (long long)token * K;
+
+    float acc = 0.0f;
+    int blocks_per_row = K / 256;
+    int pos_base = tid * 4;
+    int row_offset = row * K;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int k_off = b * 256 + pos_base;
+        const __nv_bfloat16* w_ptr = w + row_offset + k_off;
+        const __nv_bfloat16* x_ptr = x_tok + k_off;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float wv = (float)w_ptr[i];
+            float xv = (float)x_ptr[i];
+            acc += wv * xv;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    if (lane_id == 0) {
+        shmem[warp_id] = acc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float total = shmem[0] + shmem[1];
+        y[((long long)token * k_used + slot) * N + row] = (__nv_bfloat16)total;
+    }
+}
+"#;
+
 // T246.8 A4 — fused routed reduce :
 //
 //   y[i] += sum_{slot=0..K-1} alpha_dev[slot] * x[slot, i]
@@ -6227,6 +6776,12 @@ pub struct LlmKernels {
     mul_mm_id_q5_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     mul_mm_id_q6_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     mul_mm_id_bf16_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.10 TrackE.2 — Group-GEMM (M-variable) extensions.
+    mul_mm_id_gemm_q4_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mm_id_gemm_q5_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mm_id_gemm_q6_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mm_id_gemm_bf16_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     scaled_add_routed_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.9 NVFP4.2 — indexed NVFP4 SGEMV for MoE FFN forward (single-token decode)
     sgemv_nvfp4_bf16_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -6327,6 +6882,11 @@ impl LlmKernels {
             mul_mm_id_q5_k_bf16: std::sync::OnceLock::new(),
             mul_mm_id_q6_k_bf16: std::sync::OnceLock::new(),
             mul_mm_id_bf16_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_gemm_q4_k_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_gemm_q5_k_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_gemm_q6_k_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_gemm_bf16_bf16: std::sync::OnceLock::new(),
             scaled_add_routed_bf16: std::sync::OnceLock::new(),
             // T246.9 NVFP4.2 — indexed/non-indexed NVFP4 SGEMV
             sgemv_nvfp4_bf16_indexed: std::sync::OnceLock::new(),
@@ -9681,6 +10241,286 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "mul_mm_id_bf16_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // T246.10 TrackE.2 — Group-GEMM (M-variable) launch wrappers.
+    //
+    // Each wrapper extends the corresponding M=1 `mul_mm_id_*` to a
+    // 3D-grid launch covering ALL `(token, slot)` pairs in one call.
+    // Per-token rows of `x` and `topk_indices` are addressed by `blockIdx.z`.
+    // Output `y` is `[M, k_used, N]` BF16, contiguous in the last dim.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Q4_K group-GEMM : `y[m, slot, :] = expert[topk[m, slot]] @ x[m, :]`.
+    ///
+    /// # Safety  See `mul_mm_id_q4_k_bf16` — `expert_ptrs[i]` must point
+    /// to a `[N, K]` row-major Q4_K block array. `topk_indices` is `[M, k_used]`
+    /// i32 row-major. `x` is `[M, K]` BF16 row-major.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_gemm_q4_k_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_q4_k_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 || k_used <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_q4_k_bf16: M={m} N={n} k_used={k_used} must be > 0"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_gemm_q4_k_bf16,
+            MUL_MM_ID_GEMM_Q4_K_BF16_SRC,
+            "mul_mm_id_gemm_q4_k_bf16",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, k_used as u32, m as u32),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k)
+            .arg(&k_used);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_gemm_q4_k_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q4_K dp4a group-GEMM (input pre-quantized to Q8_1).
+    ///
+    /// # Safety  `x_q8_1` is `[M, K/32 * 36]` u8 row-major (per-token Q8_1
+    /// super-blocks). Other contract identical to `mul_mm_id_gemm_q4_k_bf16`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x_q8_1: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 || k_used <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!(
+                    "mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16: M={m} N={n} k_used={k_used} must be > 0"
+                ),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16,
+            MUL_MM_ID_GEMM_Q4_K_Q8_1_DP4A_BF16_SRC,
+            "mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, k_used as u32, m as u32),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x_q8_1)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k)
+            .arg(&k_used);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q5_K group-GEMM.
+    ///
+    /// # Safety  See `mul_mm_id_q5_k_bf16` — expert weights `[N, K]` Q5_K.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_gemm_q5_k_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_q5_k_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 || k_used <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_q5_k_bf16: M={m} N={n} k_used={k_used} must be > 0"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_gemm_q5_k_bf16,
+            MUL_MM_ID_GEMM_Q5_K_BF16_SRC,
+            "mul_mm_id_gemm_q5_k_bf16",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, k_used as u32, m as u32),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k)
+            .arg(&k_used);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_gemm_q5_k_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q6_K group-GEMM.
+    ///
+    /// # Safety  See `mul_mm_id_q6_k_bf16` — expert weights `[N, K]` Q6_K.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_gemm_q6_k_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_q6_k_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 || k_used <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_q6_k_bf16: M={m} N={n} k_used={k_used} must be > 0"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_gemm_q6_k_bf16,
+            MUL_MM_ID_GEMM_Q6_K_BF16_SRC,
+            "mul_mm_id_gemm_q6_k_bf16",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, k_used as u32, m as u32),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k)
+            .arg(&k_used);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_gemm_q6_k_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// BF16 group-GEMM.
+    ///
+    /// # Safety  See `mul_mm_id_bf16_bf16` — expert weights `[N, K]` BF16.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_gemm_bf16_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_bf16_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 || k_used <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_gemm_bf16_bf16: M={m} N={n} k_used={k_used} must be > 0"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_gemm_bf16_bf16,
+            MUL_MM_ID_GEMM_BF16_BF16_SRC,
+            "mul_mm_id_gemm_bf16_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, k_used as u32, m as u32),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 64 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k)
+            .arg(&k_used);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_gemm_bf16_bf16::launch",
         })?;
         Ok(())
     }
