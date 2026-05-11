@@ -43,10 +43,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let dir = Path::new(&args[0]);
     let n_tokens: usize = args.get(1).map(|s| s.parse().unwrap_or(32)).unwrap_or(32);
-    let seed: u32 = args.get(2).map(|s| s.parse().unwrap_or(1)).unwrap_or(1);
+    let seed_arg: u32 = args.get(2).map(|s| s.parse().unwrap_or(1)).unwrap_or(1);
+
+    // Optional multi-token prefill via `RUSTORCH_NVFP4_PROMPT_IDS=1,2,3,...`.
+    // Useful for visual-coherence smoke tests where a single seed token does
+    // not have enough context to predict English text (both Q4_K_M and
+    // NVFP4 output multilingual subwords from a 1-token seed).
+    let prompt_ids: Vec<u32> = match std::env::var("RUSTORCH_NVFP4_PROMPT_IDS") {
+        Ok(s) if !s.is_empty() => s
+            .split(',')
+            .filter_map(|t| t.trim().parse::<u32>().ok())
+            .collect(),
+        _ => vec![seed_arg],
+    };
+    assert!(!prompt_ids.is_empty(), "prompt empty");
 
     println!("[qwen36_nvfp4_smoke] dir={}", dir.display());
-    println!("[qwen36_nvfp4_smoke] N={n_tokens} seed={seed}");
+    println!(
+        "[qwen36_nvfp4_smoke] N={n_tokens} prompt_len={} prompt={:?}",
+        prompt_ids.len(),
+        prompt_ids
+    );
 
     // --- Optional load-only fast path (legacy substrate validation) -----
     if std::env::var("RUSTORCH_NVFP4_LOAD_ONLY").ok().as_deref() == Some("1") {
@@ -76,14 +93,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[qwen36_nvfp4_smoke] model loaded in {load_secs:.2}s");
 
     // --- Decode N tokens ------------------------------------------------
-    let mut tokens: Vec<u32> = Vec::with_capacity(n_tokens + 1);
-    tokens.push(seed);
-    let mut current = seed;
+    let mut tokens: Vec<u32> = Vec::with_capacity(n_tokens + prompt_ids.len());
 
-    println!("[qwen36_nvfp4_smoke] decoding {n_tokens} tokens from seed={seed}...");
+    // Prefill : push every prompt token through decode_step to grow the KV
+    // cache + SSM state. Only the predicted next-token after the LAST
+    // prompt token is kept as the first auto-regressive output.
+    println!(
+        "[qwen36_nvfp4_smoke] prefilling {} prompt token(s)...",
+        prompt_ids.len()
+    );
+    let mut last_pred: u32 = 0;
+    for (i, &pid) in prompt_ids.iter().enumerate() {
+        tokens.push(pid);
+        last_pred = model
+            .decode_step(pid)
+            .map_err(|e| format!("decode_step prefill #{i}: {e:?}"))?;
+    }
+    // First auto-regressive token = prediction after the last prompt token.
+    tokens.push(last_pred);
+    let mut current = last_pred;
+
+    println!("[qwen36_nvfp4_smoke] decoding {n_tokens} tokens auto-regressively from {current}...");
     let mut warmup_secs = 0.0_f64;
     let t_decode = Instant::now();
-    for i in 0..n_tokens {
+    // We already produced 1 auto-regressive token in prefill ; decode N-1 more.
+    let n_to_decode = n_tokens.saturating_sub(1);
+    for i in 0..n_to_decode {
         let t_step = Instant::now();
         let next = model
             .decode_step(current)
@@ -101,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let total_secs = t_decode.elapsed().as_secs_f64();
     let post_warmup_secs = (total_secs - warmup_secs).max(1e-9);
-    let post_warmup_tok = (n_tokens - 1).max(1) as f64;
+    let post_warmup_tok = (n_to_decode.saturating_sub(1)).max(1) as f64;
     let tok_per_sec = post_warmup_tok / post_warmup_secs;
 
     println!();
