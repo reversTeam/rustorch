@@ -6652,20 +6652,68 @@ fn moe_ffn_forward_step_group_gemm(
     // output is [M, k_used, d] (= flat [M*k_used, d]). Flatten (m, slot) as
     // m' and let kernel read topk_indices[m' * 1 + 0] = topk_idx_m_p[m']
     // which is topk[m, slot] — exactly the right expert pick.
-    dispatch_indexed_group_gemm(
-        kernels,
-        stream,
-        moe.down_exp_kind,
-        d_ptrs_p,
-        topk_idx_m_p,
-        expert_gate_m_p,
-        expert_out_m_p,
-        m_tokens * k, // M' = M * k_used
-        d,
-        ef,
-        1, // k_used' = 1
-        x_q8_m_p,
-    )?;
+    //
+    // T246.10 TrackE.4 — when `use_sorted=true` AND the down expert kind is
+    // a sorted-supported quant (Q4_K or Q5_K), also build a compact-by-expert
+    // permutation for the flat `[M*k_used, 1]` topk view and dispatch the
+    // matching sorted kernel. The down projection is the Q5_K bottleneck on
+    // Qwen3.6-A3B Q4_K_M (37 of 40 layers ship `down_exps` as Q5_K), so this
+    // is where the bulk of TrackE.4's wall-clock win actually lands.
+    let down_sort_active = use_sorted
+        && ids_src1_m_p != 0
+        && ids_dst_m_p != 0
+        && expert_bounds_p != 0
+        && is_sorted_kind(moe.down_exp_kind);
+    if down_sort_active {
+        // The down's effective topk view is [M*k_used, k_used'=1], so rebuild
+        // the permutation with `n_tokens = M*k`, `k_used = 1`.
+        let m_flat = m_tokens * k;
+        unsafe {
+            kernels
+                .mm_ids_helper_bf16(
+                    stream,
+                    topk_idx_m_p,
+                    ids_src1_m_p,
+                    ids_dst_m_p,
+                    expert_bounds_p,
+                    m_flat,
+                    1,
+                    n_e,
+                )
+                .map_err(|e| LlmError::Backend(format!("mm_ids_helper down: {e:?}")))?;
+        }
+        dispatch_sorted_group_gemm(
+            kernels,
+            stream,
+            moe.down_exp_kind,
+            d_ptrs_p,
+            topk_idx_m_p,
+            ids_src1_m_p,
+            ids_dst_m_p,
+            expert_gate_m_p,
+            expert_out_m_p,
+            m_flat, // M' = M * k_used
+            d,
+            ef,
+            1, // k_used' = 1
+            "down",
+        )?;
+    } else {
+        dispatch_indexed_group_gemm(
+            kernels,
+            stream,
+            moe.down_exp_kind,
+            d_ptrs_p,
+            topk_idx_m_p,
+            expert_gate_m_p,
+            expert_out_m_p,
+            m_tokens * k, // M' = M * k_used
+            d,
+            ef,
+            1, // k_used' = 1
+            x_q8_m_p,
+        )?;
+    }
 
     // ---- 8. Routed scaled-add epilogue (per-token, per-slot loop) ----
     //
