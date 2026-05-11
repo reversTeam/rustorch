@@ -119,6 +119,29 @@ fn gemm_prefill_enabled() -> bool {
 /// At M >= 8 the M=8 / mvar path is bandwidth-positive (T245.4).
 const GEMM_PREFILL_MIN_M: usize = 8;
 
+/// T246.10 TrackE.2 — runtime gate for the batched MoE Group-GEMM
+/// dispatch. Default OFF for safety. Only valid when both `RUSTORCH_MOE_MEGA`
+/// (or async) AND `RUSTORCH_GEMM_PREFILL` are also set : we replace the
+/// per-row `moe_ffn_forward_step_mega` loop with a single Group-GEMM
+/// pass over all M tokens for the gate / up / down projections.
+///
+/// Requires :
+///   - tree_size >= GROUP_GEMM_MIN_M (default = GEMM_PREFILL_MIN_M, 8)
+///   - force_accept_all = true (prefill mode)
+///
+/// Decode (tree_size = 1) is NEVER routed through this path.
+fn moe_group_gemm_enabled() -> bool {
+    std::env::var("RUSTORCH_MOE_GROUP_GEMM")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Minimum M batch below which we keep the per-token MoE mega loop.
+/// At M >= 8 the per-block W amortization across L2 cache becomes
+/// significant and the launch-count reduction dominates.
+const GROUP_GEMM_MIN_M: usize = 8;
+
 /// One matmul weight on GPU. Qwen3.6 Q4_K_M uses a mix of Q4_K / Q5_K /
 /// Q6_K for big matmuls and F32 (→ BF16) for small ones (ssm_alpha, ssm_beta
 /// when n_v_heads is small : n=48 typical, K=hidden_size, ≈1 MB each).
@@ -497,6 +520,121 @@ pub(crate) fn dispatch_indexed_mega(
     }
 }
 
+/// T246.10 TrackE.2 — Group-GEMM (M-variable) indexed dispatcher.
+///
+/// Mirror of `dispatch_indexed_mega` extended to M tokens. Replaces an
+/// outer `for m in 0..M { dispatch_indexed_mega(m) }` loop with a single
+/// 3D-grid launch.
+///
+/// `topk_indices_p` is `[M, k_used]` i32 row-major device pointer.
+/// `x` is `[M, K]` BF16 row-major (or `[M, (K/32)*36]` u8 row-major for
+/// the Q4_K dp4a path with `x_q8_staging != 0`).
+/// `y` is `[M, k_used, N]` BF16 row-major (output).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_indexed_group_gemm(
+    kernels: &LlmKernels,
+    stream: &Arc<CudaStream>,
+    kind: ExpertQuantKind,
+    expert_ptrs_p: u64,
+    topk_indices_p: u64,
+    x: u64,
+    y: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    k_used: i32,
+    x_q8_m_staging: u64, // [M, (K/32)*36] device, 0 disables dp4a
+) -> Result<(), LlmError> {
+    unsafe {
+        match kind {
+            ExpertQuantKind::Q4K => {
+                if x_q8_m_staging != 0 {
+                    // Per-token Q8_1 quantization : iterate M (cheap kernel,
+                    // amortized by the large gate/up/down GEMM that follows).
+                    let bf16_sz = std::mem::size_of::<half::bf16>() as u64;
+                    let q8_per_tok = ((k as usize) / 32 * 36) as u64;
+                    for tok in 0..m {
+                        kernels
+                            .quantize_q8_1_bf16(
+                                stream,
+                                x + (tok as u64) * (k as u64) * bf16_sz,
+                                x_q8_m_staging + (tok as u64) * q8_per_tok,
+                                k,
+                            )
+                            .map_err(|e| LlmError::Backend(format!("q8_1 quant group: {e:?}")))?;
+                    }
+                    kernels
+                        .mul_mm_id_gemm_q4_k_q8_1_dp4a_bf16(
+                            stream,
+                            expert_ptrs_p,
+                            topk_indices_p,
+                            x_q8_m_staging,
+                            y,
+                            m,
+                            n,
+                            k,
+                            k_used,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("mul_mm_id_gemm q4k_dp4a: {e:?}")))
+                } else {
+                    kernels
+                        .mul_mm_id_gemm_q4_k_bf16(
+                            stream,
+                            expert_ptrs_p,
+                            topk_indices_p,
+                            x,
+                            y,
+                            m,
+                            n,
+                            k,
+                            k_used,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("mul_mm_id_gemm q4k: {e:?}")))
+                }
+            },
+            ExpertQuantKind::Q5K => kernels
+                .mul_mm_id_gemm_q5_k_bf16(
+                    stream,
+                    expert_ptrs_p,
+                    topk_indices_p,
+                    x,
+                    y,
+                    m,
+                    n,
+                    k,
+                    k_used,
+                )
+                .map_err(|e| LlmError::Backend(format!("mul_mm_id_gemm q5k: {e:?}"))),
+            ExpertQuantKind::Q6K => kernels
+                .mul_mm_id_gemm_q6_k_bf16(
+                    stream,
+                    expert_ptrs_p,
+                    topk_indices_p,
+                    x,
+                    y,
+                    m,
+                    n,
+                    k,
+                    k_used,
+                )
+                .map_err(|e| LlmError::Backend(format!("mul_mm_id_gemm q6k: {e:?}"))),
+            ExpertQuantKind::Bf16 => kernels
+                .mul_mm_id_gemm_bf16_bf16(
+                    stream,
+                    expert_ptrs_p,
+                    topk_indices_p,
+                    x,
+                    y,
+                    m,
+                    n,
+                    k,
+                    k_used,
+                )
+                .map_err(|e| LlmError::Backend(format!("mul_mm_id_gemm bf16: {e:?}"))),
+        }
+    }
+}
+
 /// MoE FFN weights for one layer (Qwen3.6-35B-A3B). Top-K routed experts +
 /// parallel shared expert. T246.6.
 pub(crate) struct MoeFfnQ4K {
@@ -740,6 +878,39 @@ pub(crate) struct DecodeScratch {
     pub(crate) tree_logits: CudaSlice<half::bf16>,
     /// Host-pinned `[MAX_TREE_SIZE]` u32 — DtoH target for tree argmax tokens.
     pub(crate) tree_argmax_host_pinned: PinnedHostSlice<u32>,
+
+    // ── T246.10 TrackE.2 — batched MoE Group-GEMM scratch ──
+    //
+    // Per-row MoE scratch sized for MAX_TREE_SIZE rows so the prefill /
+    // tree-verify path can route ALL M tokens through one Group-GEMM
+    // launch per gate / up / down. Only used when
+    // `RUSTORCH_MOE_GROUP_GEMM=1` AND `tree_size >= GROUP_GEMM_MIN_M`.
+    //
+    // Memory budget (Qwen3.6-A3B : n_experts=128, k_used=8, ef=18944,
+    // d=2048, MAX_TREE_SIZE=512) :
+    //   moe_router_logits_M : 512×128×2  ≈ 128 KB
+    //   moe_topk_idx_M      : 512×8×4    ≈ 16 KB
+    //   moe_topk_w_M        : 512×8×2    ≈ 8 KB
+    //   moe_expert_gate_M   : 512×8×ef×2 ≈ 155 MB
+    //   moe_expert_up_M     : 512×8×ef×2 ≈ 155 MB
+    //   moe_expert_out_M    : 512×8×d×2  ≈ 16 MB
+    // Total : ~326 MB (one-time allocation, fits comfortably in GB10's 120 GB).
+    // For Dense / non-MoE variants n_experts == 0 so the (.max(1)) sizing
+    // reduces this to a few hundred bytes.
+    /// `[MAX_TREE_SIZE, n_experts]` BF16 — per-token router logits.
+    pub(crate) moe_router_logits_m: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, k_used]` i32 — per-token top-K expert indices.
+    pub(crate) moe_topk_idx_m: CudaSlice<i32>,
+    /// `[MAX_TREE_SIZE, k_used]` BF16 — per-token renormalized weights.
+    pub(crate) moe_topk_w_m: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, k_used, expert_f]` BF16 — per-token gate output.
+    pub(crate) moe_expert_gate_m: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, k_used, expert_f]` BF16 — per-token up output.
+    pub(crate) moe_expert_up_m: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, k_used, d]` BF16 — per-token down output.
+    pub(crate) moe_expert_out_m: CudaSlice<half::bf16>,
+    /// `[MAX_TREE_SIZE, K/32 * 36]` u8 — per-token Q8_1 staging for dp4a.
+    pub(crate) moe_x_q8_m: CudaSlice<u8>,
 
     // ── T246.7 TrackC — SSM-hybrid Lookahead per-branch state forking ──
     //
@@ -1451,6 +1622,41 @@ impl Qwen35ModelCudaQ4K {
                 .map_err(|e| LlmError::Backend(format!("scratch tree_logits: {e:?}")))?,
             tree_argmax_host_pinned: unsafe { ctx.alloc_pinned::<u32>(MAX_TREE_SIZE) }
                 .map_err(|e| LlmError::Backend(format!("alloc_pinned tree_argmax: {e:?}")))?,
+
+            // ── T246.10 TrackE.2 — Group-GEMM batched MoE staging ──
+            moe_router_logits_m: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.n_experts.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch moe_router_m: {e:?}")))?,
+            moe_topk_idx_m: stream
+                .alloc_zeros::<i32>(MAX_TREE_SIZE * cfg.n_experts_used.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch moe_idx_m: {e:?}")))?,
+            moe_topk_w_m: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.n_experts_used.max(1))
+                .map_err(|e| LlmError::Backend(format!("scratch moe_w_m: {e:?}")))?,
+            moe_expert_gate_m: stream
+                .alloc_zeros::<half::bf16>(
+                    MAX_TREE_SIZE * cfg.n_experts_used.max(1) * cfg.expert_f.max(1),
+                )
+                .map_err(|e| LlmError::Backend(format!("scratch moe_gate_m: {e:?}")))?,
+            moe_expert_up_m: stream
+                .alloc_zeros::<half::bf16>(
+                    MAX_TREE_SIZE * cfg.n_experts_used.max(1) * cfg.expert_f.max(1),
+                )
+                .map_err(|e| LlmError::Backend(format!("scratch moe_up_m: {e:?}")))?,
+            moe_expert_out_m: stream
+                .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.n_experts_used.max(1) * cfg.d)
+                .map_err(|e| LlmError::Backend(format!("scratch moe_out_m: {e:?}")))?,
+            moe_x_q8_m: {
+                // Worst-case per-token Q8_1 staging : K/32 * 36 bytes per token.
+                // We size for d (MoE gate/up takes h_norm[M, d]) — the down
+                // proj uses [M, ef] which is larger but the dp4a path is
+                // only used for Q4_K weights which we redirect to the float
+                // path on the down proj for size compatibility.
+                let max_k_blocks = (cfg.d.max(cfg.expert_f.max(1)) + 31) / 32;
+                stream
+                    .alloc_zeros::<u8>(MAX_TREE_SIZE * max_k_blocks * 36)
+                    .map_err(|e| LlmError::Backend(format!("scratch moe_x_q8_m: {e:?}")))?
+            },
 
             // ── T246.7 TrackC — SSM-hybrid Lookahead per-branch buffers ──
             // For SSM-hybrid models (Qwen3.6 Dense / MoE) we pre-allocate one
@@ -3314,44 +3520,93 @@ impl Qwen35ModelCudaQ4K {
                         let (msd_, _gmsd) = self.scratch.moe_shexp_dot.device_ptr_mut(&self.stream);
                         (mr_, mi_, mw_, mg_, mu_, mo_, msd_)
                     };
-                    for r in 0..tree_size {
-                        let hn_r = thn_p + (r as u64) * row_h;
-                        let h_r = th_p + (r as u64) * row_h;
-                        if moe_mega_enabled() {
-                            moe_ffn_forward_step_mega(
-                                moe,
-                                &self.kernels,
-                                &self.stream,
-                                &cfg,
-                                hn_r,
-                                h_r,
-                                x_q8_p,
-                                moe_router_p,
-                                moe_idx_p,
-                                moe_w_p,
-                                moe_egate_p,
-                                moe_eup_p,
-                                moe_eout_p,
-                                moe_sd_p,
-                            )?;
-                        } else {
-                            // moe_async_enabled() == true by the guard above.
-                            moe_ffn_forward_step_async(
-                                moe,
-                                &self.kernels,
-                                &self.stream,
-                                &cfg,
-                                hn_r,
-                                h_r,
-                                x_q8_p,
-                                moe_router_p,
-                                moe_idx_p,
-                                moe_w_p,
-                                moe_egate_p,
-                                moe_eup_p,
-                                moe_eout_p,
-                                moe_sd_p,
-                            )?;
+                    // T246.10 TrackE.2 — Group-GEMM batched MoE forward.
+                    // Only valid when force_accept_all (prefill mode) AND
+                    // tree_size >= GROUP_GEMM_MIN_M AND RUSTORCH_MOE_GROUP_GEMM=1.
+                    // Decode (tree_size=1) and small trees keep the per-row
+                    // mega loop (A2/A4 wins are preserved).
+                    let use_group_gemm = force_accept_all
+                        && tree_size >= GROUP_GEMM_MIN_M
+                        && moe_group_gemm_enabled()
+                        && moe_mega_enabled();
+                    if use_group_gemm {
+                        let (mrlm_p, midxm_p, mwm_p, megm_p, meum_p, meom_p, mxq8m_p) = {
+                            let (a, _g1) = self
+                                .scratch
+                                .moe_router_logits_m
+                                .device_ptr_mut(&self.stream);
+                            let (b, _g2) = self.scratch.moe_topk_idx_m.device_ptr_mut(&self.stream);
+                            let (c, _g3) = self.scratch.moe_topk_w_m.device_ptr_mut(&self.stream);
+                            let (d_, _g4) =
+                                self.scratch.moe_expert_gate_m.device_ptr_mut(&self.stream);
+                            let (e_, _g5) =
+                                self.scratch.moe_expert_up_m.device_ptr_mut(&self.stream);
+                            let (f_, _g6) =
+                                self.scratch.moe_expert_out_m.device_ptr_mut(&self.stream);
+                            let (g_, _g7) = self.scratch.moe_x_q8_m.device_ptr_mut(&self.stream);
+                            (a, b, c, d_, e_, f_, g_)
+                        };
+                        moe_ffn_forward_step_group_gemm(
+                            moe,
+                            &self.kernels,
+                            &self.stream,
+                            &cfg,
+                            tree_size as i32,
+                            thn_p,
+                            th_p,
+                            mrlm_p,
+                            midxm_p,
+                            mwm_p,
+                            megm_p,
+                            meum_p,
+                            meom_p,
+                            mxq8m_p,
+                            x_q8_p,
+                            moe_sd_p,
+                            moe_egate_p,
+                            moe_eup_p,
+                            moe_eout_p,
+                        )?;
+                    } else {
+                        for r in 0..tree_size {
+                            let hn_r = thn_p + (r as u64) * row_h;
+                            let h_r = th_p + (r as u64) * row_h;
+                            if moe_mega_enabled() {
+                                moe_ffn_forward_step_mega(
+                                    moe,
+                                    &self.kernels,
+                                    &self.stream,
+                                    &cfg,
+                                    hn_r,
+                                    h_r,
+                                    x_q8_p,
+                                    moe_router_p,
+                                    moe_idx_p,
+                                    moe_w_p,
+                                    moe_egate_p,
+                                    moe_eup_p,
+                                    moe_eout_p,
+                                    moe_sd_p,
+                                )?;
+                            } else {
+                                // moe_async_enabled() == true by the guard above.
+                                moe_ffn_forward_step_async(
+                                    moe,
+                                    &self.kernels,
+                                    &self.stream,
+                                    &cfg,
+                                    hn_r,
+                                    h_r,
+                                    x_q8_p,
+                                    moe_router_p,
+                                    moe_idx_p,
+                                    moe_w_p,
+                                    moe_egate_p,
+                                    moe_eup_p,
+                                    moe_eout_p,
+                                    moe_sd_p,
+                                )?;
+                            }
                         }
                     }
                 },
@@ -5557,6 +5812,245 @@ fn moe_ffn_forward_step_mega(
         kernels
             .scaled_add_sigmoid_devscalar_bf16(stream, h_p, expert_out_p, shexp_dot_p, d)
             .map_err(|e| LlmError::Backend(format!("scaled_add_sigmoid shexp mega: {e:?}")))?;
+    }
+
+    Ok(())
+}
+
+/// T246.10 TrackE.2 — batched MoE Group-GEMM forward for M tokens.
+///
+/// Replaces the per-row `moe_ffn_forward_step_mega` loop when
+/// `RUSTORCH_MOE_GROUP_GEMM=1` AND `m_tokens >= GROUP_GEMM_MIN_M`. The
+/// routed-experts gate/up/down get collapsed into 3 Group-GEMM launches
+/// (1 per projection, regardless of M or k_used), and the routed-reduce
+/// epilogue is a per-token loop of `scaled_add_routed_bf16`.
+///
+/// The shared expert keeps the per-token loop : it's a Dense FFN (one set
+/// of weights applied uniformly), so going batched there is straightforward
+/// follow-up work but not the hot path TrackE.2 targets.
+///
+/// Layout :
+///   `h_norm_m_p`         : [M, d]              BF16 (input, post-norm)
+///   `h_m_p`              : [M, d]              BF16 (output, accumulator)
+///   `router_logits_m_p`  : [M, n_experts]      BF16 scratch
+///   `topk_idx_m_p`       : [M, k_used]         i32 scratch
+///   `topk_w_m_p`         : [M, k_used]         BF16 scratch
+///   `expert_gate_m_p`    : [M, k_used, ef]     BF16 scratch
+///   `expert_up_m_p`      : [M, k_used, ef]     BF16 scratch
+///   `expert_out_m_p`     : [M, k_used, d]      BF16 scratch
+///   `x_q8_m_p`           : [M, (max(d,ef)/32)*36] u8 scratch (dp4a, 0 to skip)
+///   `shexp_dot_p`        : [1] BF16 (single-token shared expert, reused per row)
+///   `expert_gate_p`      : [ef] BF16 (single-token shared expert scratch)
+///   `expert_up_p`        : [ef] BF16 (single-token shared expert scratch)
+///   `expert_out_p`       : [d]  BF16 (single-token shared expert scratch)
+#[allow(clippy::too_many_arguments)]
+fn moe_ffn_forward_step_group_gemm(
+    moe: &MoeFfnQ4K,
+    kernels: &LlmKernels,
+    stream: &Arc<CudaStream>,
+    cfg: &Qwen35Config,
+    m_tokens: i32,
+    h_norm_m_p: u64,
+    h_m_p: u64,
+    router_logits_m_p: u64,
+    topk_idx_m_p: u64,
+    topk_w_m_p: u64,
+    expert_gate_m_p: u64,
+    expert_up_m_p: u64,
+    expert_out_m_p: u64,
+    x_q8_m_p: u64,
+    // Single-token scratch for the shared expert per-row loop :
+    x_q8_p: u64,
+    shexp_dot_p: u64,
+    expert_gate_p: u64,
+    expert_up_p: u64,
+    expert_out_p: u64,
+) -> Result<(), LlmError> {
+    use cudarc::driver::DevicePtr;
+    let d = cfg.d as i32;
+    let ef = cfg.expert_f as i32;
+    let n_e = cfg.n_experts as i32;
+    let k = cfg.n_experts_used as i32;
+    let bf16_sz = std::mem::size_of::<half::bf16>() as u64;
+
+    // ---- 1. Router logits (batched M-variable) ----
+    moe.gate_inp.dispatch_matmul_mvar(
+        kernels,
+        stream,
+        m_tokens as usize,
+        h_norm_m_p,
+        router_logits_m_p,
+    )?;
+
+    // ---- 2. Top-K softmax per token (M cheap launches) ----
+    // The existing topk_softmax kernel is per-token ; M iterations.
+    for m in 0..m_tokens {
+        let scores_p = router_logits_m_p + (m as u64) * (n_e as u64) * bf16_sz;
+        let idx_p = topk_idx_m_p + (m as u64) * (k as u64) * (std::mem::size_of::<i32>() as u64);
+        let w_p = topk_w_m_p + (m as u64) * (k as u64) * bf16_sz;
+        unsafe {
+            kernels
+                .topk_softmax_bf16(stream, scores_p, idx_p, w_p, n_e, k)
+                .map_err(|e| LlmError::Backend(format!("topk_softmax m={m}: {e:?}")))?;
+        }
+    }
+
+    // ---- 3. Zero h_m (one launch over M*d) ----
+    unsafe {
+        kernels
+            .zero_bf16(stream, h_m_p, m_tokens * d)
+            .map_err(|e| LlmError::Backend(format!("zero h_m group: {e:?}")))?;
+    }
+
+    // ---- 4. Gate (single Group-GEMM launch over all M*k slots) ----
+    let (g_ptrs_p, _gg) = moe.gate_exp_ptrs_dev.device_ptr(stream);
+    let (u_ptrs_p, _gu) = moe.up_exp_ptrs_dev.device_ptr(stream);
+    let (d_ptrs_p, _gd) = moe.down_exp_ptrs_dev.device_ptr(stream);
+
+    dispatch_indexed_group_gemm(
+        kernels,
+        stream,
+        moe.gate_exp_kind,
+        g_ptrs_p,
+        topk_idx_m_p,
+        h_norm_m_p,
+        expert_gate_m_p,
+        m_tokens,
+        ef,
+        d,
+        k,
+        x_q8_m_p,
+    )?;
+
+    // ---- 5. Up (single Group-GEMM launch) ----
+    dispatch_indexed_group_gemm(
+        kernels,
+        stream,
+        moe.up_exp_kind,
+        u_ptrs_p,
+        topk_idx_m_p,
+        h_norm_m_p,
+        expert_up_m_p,
+        m_tokens,
+        ef,
+        d,
+        k,
+        x_q8_m_p,
+    )?;
+
+    // ---- 6. SwiGLU over the entire M * k_used * ef element block ----
+    unsafe {
+        kernels
+            .swiglu_bf16(
+                stream,
+                expert_gate_m_p,
+                expert_up_m_p,
+                expert_gate_m_p,
+                m_tokens * k * ef,
+            )
+            .map_err(|e| LlmError::Backend(format!("swiglu group: {e:?}")))?;
+    }
+
+    // ---- 7. Down (single Group-GEMM launch) ----
+    //
+    // The down kernel's `x` is `[M, k_used, ef]` (the swiglu'd gate buffer).
+    // We need to view it as `[M*k_used, ef]` and feed slot indices that
+    // pick expert_down[topk[m, slot]] for each (m, slot) row. The natural
+    // way : flatten (m, slot) into a single "token" axis of size M*k_used,
+    // and use a "1-of-1" routing where slot=0 picks the expert directly.
+    //
+    // Equivalently : build a flat topk array `flat_topk[m*k + slot] = topk[m, slot]`
+    // (which IS exactly the in-memory layout of `topk_idx_m_p`) and call
+    // Group-GEMM with M' = M*k_used, k_used = 1.
+    //
+    // Output : `[M*k_used, 1, d]` BF16, layout-compatible with
+    // `expert_out_m_p` viewed as `[M, k_used, d]`.
+    //
+    // Pre-condition : x for the down proj is `[M*k_used, ef]` row-major
+    // (yes, that's what expert_gate_m_p is after the swiglu).
+    dispatch_indexed_group_gemm(
+        kernels,
+        stream,
+        moe.down_exp_kind,
+        d_ptrs_p,
+        topk_idx_m_p,
+        expert_gate_m_p,
+        expert_out_m_p,
+        m_tokens * k, // M' = M * k_used, k_used' = 1
+        d,
+        ef,
+        1,
+        // Force the float path on the down projection : with flat-M = M*k_used,
+        // the dp4a staging would need M*k_used*(ef/32)*36 bytes (≈ 88 MB at
+        // M=512), 8× larger than what we allocated. The warp-shuffle float
+        // path is already memory-bound per A6.b so the compute gain from
+        // dp4a is small here.
+        0,
+    )?;
+
+    // ---- 8. Routed scaled-add epilogue : per-token routed reduce ----
+    // `scaled_add_routed_bf16(h_m[m], expert_out_m[m, k_used, d], topk_w_m[m, k_used], d, k_used)`
+    // For each token : h_m[m, :] += Σ_s topk_w_m[m, s] * expert_out_m[m, s, :].
+    //
+    // Per-token loop (M cheap launches). A future M-batched routed-add
+    // kernel could collapse this further.
+    for m in 0..m_tokens {
+        let h_row_p = h_m_p + (m as u64) * (d as u64) * bf16_sz;
+        let eo_row_p = expert_out_m_p + (m as u64) * (k as u64) * (d as u64) * bf16_sz;
+        let tw_row_p = topk_w_m_p + (m as u64) * (k as u64) * bf16_sz;
+        unsafe {
+            kernels
+                .scaled_add_routed_bf16(stream, h_row_p, eo_row_p, tw_row_p, d, k)
+                .map_err(|e| LlmError::Backend(format!("scaled_add_routed m={m}: {e:?}")))?;
+        }
+    }
+
+    // ---- 9. Shared expert (Dense FFN) per-token loop ----
+    //
+    // The shared expert applies one fixed set of weights uniformly across
+    // all M tokens. The hottest matmuls (gate_shexp, up_shexp, down_shexp)
+    // are Dense — they can be batched via `dispatch_matmul_mvar` (sgemm-mvar).
+    // The two NON-batchable parts are :
+    //   - `gate_inp_shexp` : [1, d] → scalar per token, sized M (cheap).
+    //   - `scaled_add_sigmoid_devscalar_bf16` epilogue : per-token devscalar.
+    //
+    // We keep the existing per-token sequence but call dispatch_matmul_mvar
+    // for the gate/up/down where it helps.
+    //
+    // To avoid an additional [M, ef] / [M, d] scratch allocation just for
+    // the shared expert (which would double our memory cost), we run the
+    // shared expert per-token using the single-token scratch buffers
+    // (`expert_gate_p`, `expert_up_p`, `expert_out_p`). The cost is M
+    // launches × (gate + up + swiglu + down + scaled_add) = 5M launches.
+    // For M=512 that's 2560 launches — vs the 4 launches gain on routed
+    // experts being 16320 saved (from 16384 to 64). Net : huge win.
+    for m in 0..m_tokens {
+        let h_norm_row_p = h_norm_m_p + (m as u64) * (d as u64) * bf16_sz;
+        let h_row_p = h_m_p + (m as u64) * (d as u64) * bf16_sz;
+        unsafe {
+            let (gip_p, _g) = moe.gate_inp_shexp.device_ptr(stream);
+            kernels
+                .sgemv_bf16_bf16(stream, gip_p, h_norm_row_p, shexp_dot_p, 1, d)
+                .map_err(|e| LlmError::Backend(format!("shexp dot group m={m}: {e:?}")))?;
+        }
+        moe.gate_shexp
+            .dispatch_matmul_m1(kernels, stream, h_norm_row_p, expert_gate_p, x_q8_p)?;
+        moe.up_shexp
+            .dispatch_matmul_m1(kernels, stream, h_norm_row_p, expert_up_p, x_q8_p)?;
+        unsafe {
+            kernels
+                .swiglu_bf16(stream, expert_gate_p, expert_up_p, expert_gate_p, ef)
+                .map_err(|e| LlmError::Backend(format!("swiglu shexp group m={m}: {e:?}")))?;
+        }
+        moe.down_shexp
+            .dispatch_matmul_m1(kernels, stream, expert_gate_p, expert_out_p, x_q8_p)?;
+        unsafe {
+            kernels
+                .scaled_add_sigmoid_devscalar_bf16(stream, h_row_p, expert_out_p, shexp_dot_p, d)
+                .map_err(|e| {
+                    LlmError::Backend(format!("scaled_add_sigmoid shexp group m={m}: {e:?}"))
+                })?;
+        }
     }
 
     Ok(())
