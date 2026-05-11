@@ -215,6 +215,16 @@ fn delta_net_opt_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// NEW-SSM — env gate for the bandwidth-saturated v2 `delta_net_step_tree_bf16`
+/// kernel (per-warp row ownership + coalesced state RMW, no block-wide sync).
+/// Default OFF. Takes precedence over `RUSTORCH_DELTA_NET_OPT` when both set.
+fn delta_net_new_enabled() -> bool {
+    std::env::var("RUSTORCH_DELTA_NET_NEW")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Minimum M below which the BF16 mma path is NOT used. mma.sync m16n8k16
 /// needs M >= 16 to fill its 16-row tile ; smaller M wastes 87.5%+ of
 /// tensor-core compute on broadcast (A3 negative result confirmed).
@@ -5202,14 +5212,31 @@ impl Qwen35ModelCudaQ4K {
             // T246.10 TrackF — env-gated dispatch to the column-parallel
             // delta_net_step_tree_bf16_opt variant. Default OFF preserves
             // bit-exact parity with the baseline kernel.
-            let use_dn_opt = delta_net_opt_enabled();
+            let use_dn_new = delta_net_new_enabled();
+            let use_dn_opt = !use_dn_new && delta_net_opt_enabled();
             if in_prefill_capture {
                 // Linear-chain : one row per depth, depth = row index.
                 let (lin_p, _gl) = self.tree_ssm_wave_indices_linear.device_ptr(&self.stream);
                 let i32_sz = std::mem::size_of::<i32>() as u64;
                 for d_idx in 0..tree_size {
                     let wave_p = lin_p + (d_idx as u64) * i32_sz;
-                    let launch_res = if use_dn_opt {
+                    let launch_res = if use_dn_new {
+                        self.kernels.delta_net_step_tree_bf16_v2(
+                            &self.stream,
+                            tssm_qv_p,
+                            tssm_kv_p,
+                            tssm_out_p,   // V
+                            tssm_alpha_p, // gate
+                            tssm_beta_p,  // beta
+                            parents_dev_p,
+                            wave_p,
+                            tree_states_p,
+                            tssm_out_p,
+                            1, // wave_size
+                            n_v as i32,
+                            head_kv as i32,
+                        )
+                    } else if use_dn_opt {
                         self.kernels.delta_net_step_tree_bf16_opt(
                             &self.stream,
                             tssm_qv_p,
@@ -5260,7 +5287,23 @@ impl Qwen35ModelCudaQ4K {
                     // delta_net_step_tree_bf16(q, k, v, gate, beta, parents,
                     //   wave_indices, tree_states, out, wave_size, n_heads,
                     //   head_dim).
-                    let launch_res = if use_dn_opt {
+                    let launch_res = if use_dn_new {
+                        self.kernels.delta_net_step_tree_bf16_v2(
+                            &self.stream,
+                            tssm_qv_p,
+                            tssm_kv_p,
+                            tssm_out_p,
+                            tssm_alpha_p,
+                            tssm_beta_p,
+                            parents_dev_p,
+                            tssm_wave_p,
+                            tree_states_p,
+                            tssm_out_p,
+                            wave.len() as i32,
+                            n_v as i32,
+                            head_kv as i32,
+                        )
+                    } else if use_dn_opt {
                         self.kernels.delta_net_step_tree_bf16_opt(
                             &self.stream,
                             tssm_qv_p,
