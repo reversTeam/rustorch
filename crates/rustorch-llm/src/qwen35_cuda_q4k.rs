@@ -58,6 +58,7 @@ use rustorch_cuda::cublas_lt::LtSession;
 use rustorch_cuda::llm_kernels::LlmKernels;
 use rustorch_gguf::reader::GgufFile;
 use rustorch_gguf::tensor::GgmlType;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -150,6 +151,33 @@ const GROUP_GEMM_MIN_M: usize = 8;
 /// blocks share L1/L2 weight tiles.
 fn moe_group_gemm_sorted_enabled() -> bool {
     std::env::var("RUSTORCH_MOE_GROUP_GEMM_SORTED")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// T246.10 TrackI — runtime gate for CUDA Graph capture on the prefill
+/// path (`prefill_tokens` linear-chain forward). Default OFF for safety.
+///
+/// When set to `1` (or `true`), the second call to `prefill_tokens` with
+/// a given N captures the full forward body into a `cudaGraph_t` keyed by
+/// N. Every subsequent call with the same N replays the captured graph
+/// with a single `cuGraphLaunch`, eliminating ~99 % of `cuLaunchKernel`
+/// host overhead (PRE-FLIGHT measured ~1.23 M launches / pp512 →
+/// ~10 s of host time, vs llama.cpp's ~2 627 launches via the same
+/// graph-capture optimization).
+///
+/// Requires the same env preconditions as prefill GEMM batching :
+/// `RUSTORCH_MOE_ASYNC=1`, `RUSTORCH_MOE_GRAPH=1`, `RUSTORCH_MOE_MEGA=1`,
+/// `RUSTORCH_GEMM_PREFILL=1` (and recommended
+/// `RUSTORCH_MOE_GROUP_GEMM=1` `RUSTORCH_MOE_GROUP_GEMM_SORTED=1`). The
+/// body must contain ZERO host-syncs / `memcpy_dtov` / pageable HtoD
+/// during replay — the wrapper handles tree-descriptor uploads and the
+/// final argmax DtoH explicitly outside the capture region, and the SSM
+/// per-wave HtoD chain is replaced by offsets into a pre-baked linear
+/// wave-indices buffer (linear chains have wave[d] = [d]).
+fn prefill_graph_enabled() -> bool {
+    std::env::var("RUSTORCH_PREFILL_GRAPH")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -1056,6 +1084,32 @@ pub struct Qwen35ModelCudaQ4K {
     /// `as_slice()` call which waits on a dedicated event instead of the
     /// full stream.
     pub(crate) next_token_host_pinned: PinnedHostSlice<u32>,
+    /// T246.10 TrackI — Bag-of-graphs cache for `prefill_tokens` captured
+    /// bodies, keyed by `N` (= linear-chain `tree_size`). Populated lazily
+    /// on the second call with a given N (after a warmup pass that triggers
+    /// nvrtc compilation for every kernel). Each subsequent call with the
+    /// same N replays the captured graph in a single launch.
+    ///
+    /// Reset (cleared) by `reset_state()` so per-conversation state changes
+    /// always force a re-capture.
+    pub(crate) prefill_graphs: HashMap<usize, CudaGraph>,
+    /// T246.10 TrackI — pinned-host descriptor buffers for the tree
+    /// `drafts` / `parents` / `depths` HtoD uploads. We pre-bake the
+    /// `parents = [-1, 0, 1, ..., N-2]` and `depths = [0, 1, ..., N-1]`
+    /// values for the maximum N once (linear-chain semantics never
+    /// change), and only `drafts` is rewritten per call. Pinned memory
+    /// is required so the HtoD upload (which happens OUTSIDE the capture
+    /// region but before each replay) does NOT implicitly synchronize the
+    /// stream (`cuMemcpyHtoDAsync` on pageable host memory degenerates
+    /// into a synchronous copy that aborts in-progress captures).
+    pub(crate) prefill_drafts_host_pinned: PinnedHostSlice<u32>,
+    /// T246.10 TrackI — linear-chain wave-indices buffer
+    /// `[0, 1, 2, ..., MAX_TREE_SIZE - 1]`. Populated once at construction
+    /// (constant for the lifetime of the model). The hybrid SSM path
+    /// reads `tree_ssm_wave_indices_linear + d*4` with `wave_size=1` for
+    /// depth `d` so each SSM wave kernel call needs zero HtoD setup
+    /// before launch — capturable.
+    pub(crate) tree_ssm_wave_indices_linear: CudaSlice<i32>,
 }
 
 impl Qwen35ModelCudaQ4K {
@@ -1784,6 +1838,19 @@ impl Qwen35ModelCudaQ4K {
         let next_token_host_pinned = unsafe { ctx.alloc_pinned::<u32>(1) }
             .map_err(|e| LlmError::Backend(format!("alloc_pinned next_token: {e:?}")))?;
 
+        // T246.10 TrackI — pinned-host drafts buffer (rewritten each
+        // prefill call), sized MAX_TREE_SIZE.
+        let prefill_drafts_host_pinned = unsafe { ctx.alloc_pinned::<u32>(MAX_TREE_SIZE) }
+            .map_err(|e| LlmError::Backend(format!("alloc_pinned prefill drafts: {e:?}")))?;
+
+        // T246.10 TrackI — pre-baked linear wave-indices [0..MAX_TREE_SIZE]
+        // so the SSM per-depth dispatch can use offsets without a per-wave
+        // HtoD upload (which would invalidate capture).
+        let wave_indices_host: Vec<i32> = (0..MAX_TREE_SIZE as i32).collect();
+        let tree_ssm_wave_indices_linear = stream
+            .memcpy_stod(&wave_indices_host)
+            .map_err(|e| LlmError::Backend(format!("upload wave_indices_linear: {e:?}")))?;
+
         Ok(Self {
             config: cfg,
             ctx,
@@ -1813,6 +1880,9 @@ impl Qwen35ModelCudaQ4K {
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(true),
             next_token_host_pinned,
+            prefill_graphs: HashMap::new(),
+            prefill_drafts_host_pinned,
+            tree_ssm_wave_indices_linear,
         })
     }
 
@@ -1845,6 +1915,13 @@ impl Qwen35ModelCudaQ4K {
         // T246.5.3 — captured graph is no longer valid for the new state.
         // It will be re-captured on the 2nd decode_step after this reset.
         self.decode_graph = None;
+        // T246.10 TrackI — clear the prefill bag-of-graphs cache : the
+        // captured graphs reference device-side pointers and tree-state
+        // buffers whose contents change on state reset. Each prefill
+        // graph will be re-captured on the next pair of calls with the
+        // same N (the warmup + capture pattern matches the decode_graph
+        // mechanism on `decode_step`).
+        self.prefill_graphs.clear();
         Ok(())
     }
 
