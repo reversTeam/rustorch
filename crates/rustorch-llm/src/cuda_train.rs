@@ -210,6 +210,203 @@ pub fn rms_norm_cuda(x: &Variable, gamma: &Variable, eps: f32) -> Result<Variabl
 }
 
 // ---------------------------------------------------------------------------
+// T246.11 TRAINING-BENCH — BF16 GEMM forward + backward (CustomFunction).
+// ---------------------------------------------------------------------------
+
+/// Helper : run cuBLASLt `matmul_bf16` on three CPU f32 slices `[M,K] @ [K,N] -> [M,N]`.
+/// Uploads inputs as BF16, runs the LtSession kernel, downloads result. Used
+/// for *both* forward (Y = X · W) and the two backward matmuls (dX = dY · W^T,
+/// dW = X^T · dY). LtSession is built per call — production wiring will share
+/// one per process — but this isolates the bench from any cross-op state.
+fn matmul_bf16_host(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    use rustorch_cuda::cublas_lt::LtSession;
+    let ctx = CudaContext::new(0).expect("CudaContext::new");
+    let stream = ctx.default_stream();
+    let a_bf: Vec<half::bf16> = a.iter().copied().map(half::bf16::from_f32).collect();
+    let b_bf: Vec<half::bf16> = b.iter().copied().map(half::bf16::from_f32).collect();
+    let a_dev = stream.memcpy_stod(&a_bf).expect("upload a");
+    let b_dev = stream.memcpy_stod(&b_bf).expect("upload b");
+    let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+    let mut lt = LtSession::new(stream.clone()).expect("LtSession::new");
+    {
+        let (a_ptr, _g0) = a_dev.device_ptr(&stream);
+        let (b_ptr, _g1) = b_dev.device_ptr(&stream);
+        let (c_ptr, _g2) = c_dev.device_ptr_mut(&stream);
+        unsafe {
+            lt.matmul_bf16(a_ptr, b_ptr, c_ptr, m, k, n, 1.0, 0.0)
+                .expect("matmul_bf16");
+        }
+    }
+    let c_bf = stream.memcpy_dtov(&c_dev).expect("download c");
+    c_bf.into_iter().map(|b: half::bf16| b.to_f32()).collect()
+}
+
+/// CustomFunction : `Y = X · W` with backward via two more BF16 GEMMs.
+///   inputs[0] = x  f32  [M, K]
+///   inputs[1] = w  f32  [K, N]
+///   output    = y  f32  [M, N]
+///
+/// Backward :
+///   dX = dY · W^T   shape [M, N] · [N, K] = [M, K]
+///   dW = X^T · dY   shape [K, M] · [M, N] = [K, N]
+struct MatmulBf16Fn;
+
+impl CustomFunction for MatmulBf16Fn {
+    fn forward(ctx: &mut FwdCtx, inputs: &[Tensor]) -> Vec<Tensor> {
+        assert_eq!(inputs.len(), 2, "matmul_bf16_fn expects (x, w)");
+        let x = &inputs[0];
+        let w = &inputs[1];
+        let xshape = x.shape();
+        let wshape = w.shape();
+        assert_eq!(xshape.len(), 2, "x must be 2-D [M, K]");
+        assert_eq!(wshape.len(), 2, "w must be 2-D [K, N]");
+        let m = xshape[0];
+        let k = xshape[1];
+        assert_eq!(wshape[0], k, "K dim mismatch");
+        let n = wshape[1];
+
+        let x_slice = x.as_slice::<f32>().expect("x f32");
+        let w_slice = w.as_slice::<f32>().expect("w f32");
+        let y_buf = matmul_bf16_host(x_slice, w_slice, m, k, n);
+
+        ctx.save_for_backward(x.clone());
+        ctx.save_for_backward(w.clone());
+
+        vec![Tensor::from_vec([m, n], y_buf).expect("y tensor")]
+    }
+
+    fn backward(ctx: &BwdCtx, grad_outputs: &[Tensor]) -> Vec<Tensor> {
+        let saved = ctx.saved_tensors();
+        let x = &saved[0];
+        let w = &saved[1];
+        let dy = &grad_outputs[0];
+        let xshape = x.shape();
+        let wshape = w.shape();
+        let m = xshape[0];
+        let k = xshape[1];
+        let n = wshape[1];
+
+        let x_slice = x.as_slice::<f32>().expect("x f32");
+        let w_slice = w.as_slice::<f32>().expect("w f32");
+        let dy_slice = dy.as_slice::<f32>().expect("dy f32");
+
+        // W^T : [N, K] — transpose on CPU before upload.
+        let mut wt = vec![0.0_f32; n * k];
+        for r in 0..k {
+            for c in 0..n {
+                wt[c * k + r] = w_slice[r * n + c];
+            }
+        }
+        let dx_buf = matmul_bf16_host(dy_slice, &wt, m, n, k);
+
+        // X^T : [K, M]
+        let mut xt = vec![0.0_f32; k * m];
+        for r in 0..m {
+            for c in 0..k {
+                xt[c * m + r] = x_slice[r * k + c];
+            }
+        }
+        let dw_buf = matmul_bf16_host(&xt, dy_slice, k, m, n);
+
+        let dx = Tensor::from_vec([m, k], dx_buf).expect("dx tensor");
+        let dw = Tensor::from_vec([k, n], dw_buf).expect("dw tensor");
+        vec![dx, dw]
+    }
+}
+
+/// T246.11 — Variable-aware BF16 GEMM `Y = X · W` running on CUDA (cuBLASLt)
+/// for forward, and two more BF16 GEMMs for backward.
+pub fn matmul_bf16_cuda(x: &Variable, w: &Variable) -> Result<Variable, BackwardError> {
+    let mut outs = apply_custom::<MatmulBf16Fn>(&[x.clone(), w.clone()])?;
+    Ok(outs.pop().unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// T246.11 TRAINING-BENCH — SwiGLU forward + backward (CustomFunction).
+// ---------------------------------------------------------------------------
+
+/// CustomFunction : SwiGLU `y = silu(gate) * up`, elementwise.
+///   inputs[0] = gate  f32  [N]
+///   inputs[1] = up    f32  [N]
+///   output    = y     f32  [N]
+struct SwigluCudaFn;
+
+impl CustomFunction for SwigluCudaFn {
+    fn forward(ctx: &mut FwdCtx, inputs: &[Tensor]) -> Vec<Tensor> {
+        assert_eq!(inputs.len(), 2, "swiglu_cuda_fn expects (gate, up)");
+        let gate = &inputs[0];
+        let up = &inputs[1];
+        assert_eq!(gate.shape(), up.shape(), "gate/up shape mismatch");
+        let n = gate.numel();
+
+        let g_slice = gate.as_slice::<f32>().expect("gate f32");
+        let u_slice = up.as_slice::<f32>().expect("up f32");
+
+        let (_ctx, stream, kernels) = cuda_setup();
+        let g_dev = upload_bf16(&stream, g_slice);
+        let u_dev = upload_bf16(&stream, u_slice);
+        let mut y_dev = stream.alloc_zeros::<half::bf16>(n).expect("alloc y");
+
+        unsafe {
+            let (gp, _g0) = g_dev.device_ptr(&stream);
+            let (up_p, _g1) = u_dev.device_ptr(&stream);
+            let (yp, _g2) = y_dev.device_ptr_mut(&stream);
+            kernels
+                .swiglu_bf16(&stream, gp, up_p, yp, n as i32)
+                .expect("swiglu_bf16");
+        }
+        let y_cpu = download_bf16(&stream, &y_dev);
+
+        ctx.save_for_backward(gate.clone());
+        ctx.save_for_backward(up.clone());
+
+        vec![Tensor::from_vec(gate.shape().to_vec(), y_cpu).expect("y tensor")]
+    }
+
+    fn backward(ctx: &BwdCtx, grad_outputs: &[Tensor]) -> Vec<Tensor> {
+        let saved = ctx.saved_tensors();
+        let gate = &saved[0];
+        let up = &saved[1];
+        let dy = &grad_outputs[0];
+        let n = gate.numel();
+
+        let g_slice = gate.as_slice::<f32>().expect("gate f32");
+        let u_slice = up.as_slice::<f32>().expect("up f32");
+        let dy_slice = dy.as_slice::<f32>().expect("dy f32");
+
+        let (_ctx, stream, kernels) = cuda_setup();
+        let g_dev = upload_bf16(&stream, g_slice);
+        let u_dev = upload_bf16(&stream, u_slice);
+        let dy_dev = upload_bf16(&stream, dy_slice);
+        let mut dg_dev = stream.alloc_zeros::<half::bf16>(n).expect("alloc dg");
+        let mut du_dev = stream.alloc_zeros::<half::bf16>(n).expect("alloc du");
+
+        unsafe {
+            let (gp, _g0) = g_dev.device_ptr(&stream);
+            let (up_p, _g1) = u_dev.device_ptr(&stream);
+            let (dyp, _g2) = dy_dev.device_ptr(&stream);
+            let (dgp, _g3) = dg_dev.device_ptr_mut(&stream);
+            let (dup, _g4) = du_dev.device_ptr_mut(&stream);
+            kernels
+                .swiglu_grad_bf16(&stream, gp, up_p, dyp, dgp, dup, n as i32)
+                .expect("swiglu_grad_bf16");
+        }
+        let dg_cpu = download_bf16(&stream, &dg_dev);
+        let du_cpu = download_bf16(&stream, &du_dev);
+
+        let dgate = Tensor::from_vec(gate.shape().to_vec(), dg_cpu).expect("dgate tensor");
+        let dup = Tensor::from_vec(up.shape().to_vec(), du_cpu).expect("dup tensor");
+        vec![dgate, dup]
+    }
+}
+
+/// T246.11 — Variable-aware SwiGLU `y = silu(gate) * up` running on CUDA.
+pub fn swiglu_cuda(gate: &Variable, up: &Variable) -> Result<Variable, BackwardError> {
+    let mut outs = apply_custom::<SwigluCudaFn>(&[gate.clone(), up.clone()])?;
+    Ok(outs.pop().unwrap())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

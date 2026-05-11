@@ -43,6 +43,10 @@ rustorch-cpu   = { workspace = true } # T171 — AMX (Accelerate) path for F32 s
 metal          = "0.29"
 half           = { workspace = true } # T180 — F32 → Q8_0 routing requantization
 
+# T246.11 TRAINING-BENCH.1 — optimizer for the CUDA training bench example.
+[dev-dependencies]
+rustorch-optim = { workspace = true }
+
 [[example]]
 name = "qwen_inference"
 path = "examples/qwen_inference.rs"
@@ -159,4 +163,19 @@ required-features = ["cuda"]
 [[example]]
 name = "qwen36_cuda_prefill_parity"
 path = "examples/qwen36_cuda_prefill_parity.rs"
+required-features = ["cuda"]
+
+# T246.11 TRAINING-BENCH.1 — rustorch CUDA training throughput bench.
+# Measures fwd+bwd+opt step tokens/sec on a synthetic transformer block
+# (RMSNorm → BF16 GEMM → SwiGLU → BF16 GEMM → residual) for direct
+# comparison against PyTorch CUDA on the same DGX GB10 hardware.
+[[example]]
+name = "training_bench_cuda"
+path = "examples/training_bench_cuda.rs"
+required-features = ["cuda"]
+
+# T246.11 TRAINING-BENCH.3 — per-op breakdown to identify the rustorch slow path.
+[[example]]
+name = "training_bench_cuda_breakdown"
+path = "examples/training_bench_cuda_breakdown.rs"
 required-features = ["cuda"]
