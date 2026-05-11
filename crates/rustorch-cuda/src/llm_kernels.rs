@@ -2333,6 +2333,221 @@ extern "C" __global__ void sgemm_bf16_bf16_mvar(
 }
 "#;
 
+// T246.10 TrackG-lite — gemm_bf16_bf16_mma_m16n8k16 : BF16×BF16 GEMM via
+// mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 tensor cores.
+//
+// Replaces sgemm_bf16_bf16_mvar (warp-shuffle scalar) on the M >= 16 batch
+// regime. At M = 1..15 the warp-shuffle baseline still wins (per A3 negative
+// result — broadcast wastes mma compute on SGEMV).
+//
+// Layout (matches sgemm_bf16_bf16_mvar) :
+//   W : [N, K] BF16 row-major  (one row per output column n)
+//   X : [M, K] BF16 row-major
+//   Y : [M, N] BF16 row-major
+//
+// Block topology (canonical Ampere mma m16n8k16) :
+//   - Each warp computes ONE 16(M) × 8(N) output tile in FP32 accumulator.
+//   - 4 warps per block, each warp owns a different N-tile :
+//       warp w (w in 0..3) → owns columns [n_base + 8*w .. n_base + 8*w + 7]
+//   - block_dim = (32, 4, 1) = 128 threads
+//   - grid_dim  = (ceil(N/32), ceil(M/16), 1)
+//
+// Smem tile :
+//   A_smem[16][16] BF16 (X tile)           = 512 B
+//   B_smem[32][16] BF16 (W tile, 4 warps)  = 1024 B
+//   Total                                  = 1536 B per block (cheap)
+//
+// K loop : iterates over K in chunks of 16 BF16 (= 1 mma k-step).
+//
+// References :
+//   - PTX ISA 9.2 §9.7.14.5 mma.sync.aligned.m16n8k16
+//   - llama.cpp ggml/src/ggml-cuda/mma.cuh:1064-1077 (BF16 mma overload)
+//   - C-fragment (16x8 FP32) layout : thread t holds D[(l/2)*8 + t/4]
+//                                                    [(t%4)*2 + l%2] for l=0..3
+//
+// Constraints :
+//   - K must be multiple of 16 (we enforce 256 in wrapper to keep parity with
+//     the existing sgemm_bf16_bf16_mvar constraint).
+//   - M and N can be arbitrary positive integers (boundary checks at write).
+#[cfg(feature = "cuda")]
+const GEMM_BF16_BF16_MMA_M16N8K16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+#define WARP_SIZE 32
+#define WARPS_PER_BLOCK 4
+#define BM 16
+#define BN 32
+#define BK 16
+
+extern "C" __global__ void gemm_bf16_bf16_mma_m16n8k16(
+    const __nv_bfloat16* __restrict__ w,    // [N, K] row-major
+    const __nv_bfloat16* __restrict__ x,    // [M, K] row-major
+    __nv_bfloat16* __restrict__ y,          // [M, N] row-major
+    int M,
+    int N,
+    int K
+) {
+    const int m_base = blockIdx.y * BM;     // 16
+    const int n_base = blockIdx.x * BN;     // 32
+    const int warp_id = threadIdx.y;        // 0..3
+    const int lane    = threadIdx.x;        // 0..31
+    const int tid     = warp_id * WARP_SIZE + lane;
+    // Each warp owns 8 N-cols starting at n_base + 8*warp_id.
+    const int n_warp_base = n_base + warp_id * 8;
+
+    // Shared memory : two tiles staged per K-chunk.
+    //   A_smem layout : A_smem[m][k] (row-major) — 16 rows × 16 BF16
+    //   B_smem layout : B_smem[n][k] (row-major) — 32 rows × 16 BF16
+    __shared__ __nv_bfloat16 A_smem[BM][BK];
+    __shared__ __nv_bfloat16 B_smem[BN][BK];
+
+    // FP32 accumulator : per warp, 4 floats covering its 16x8 output tile.
+    float Dx[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // ------------------------------------------------------------------
+    // Cooperative tile load helpers.
+    //
+    // A_smem load : 16 * 16 = 256 BF16 to load. 128 threads → 2 BF16/thread.
+    //   We pack as one .u32 per pair of BF16, so 128 ints (16 rows × 8
+    //   bf162 cols) loaded by 128 threads = 1 int / thread.
+    //
+    // B_smem load : 32 * 16 = 512 BF16 = 256 bf162. 128 threads → 2 bf162/thr.
+    //   We do 2 ints per thread.
+    // ------------------------------------------------------------------
+
+    const int n_kchunks = K / BK;
+
+    for (int kc = 0; kc < n_kchunks; ++kc) {
+        const int k_base = kc * BK;
+
+        // --- Load A tile : X[m_base .. m_base+15][k_base .. k_base+15] ---
+        // 16 rows × 8 bf162 cols ; thread tid (0..127) loads element
+        //   row = tid / 8        (0..15)
+        //   col = (tid % 8) * 2  (0..14)
+        {
+            const int row = tid >> 3;
+            const int col = (tid & 7) << 1;
+            const int gm = m_base + row;
+            __nv_bfloat16 a0 = __float2bfloat16(0.0f);
+            __nv_bfloat16 a1 = __float2bfloat16(0.0f);
+            if (gm < M) {
+                const __nv_bfloat16* xp = x + (long long)gm * K + k_base + col;
+                a0 = xp[0];
+                a1 = xp[1];
+            }
+            A_smem[row][col]     = a0;
+            A_smem[row][col + 1] = a1;
+        }
+
+        // --- Load B tile : W[n_base .. n_base+31][k_base .. k_base+15] ---
+        // 32 rows × 8 bf162 cols = 256 bf162. 128 threads → 2 ints/thread.
+        // Strategy : each thread loads 2 BF16 pairs.
+        //   element index e = tid + p * 128 for p in {0,1}
+        //   row = e / 8 ; col = (e % 8) * 2
+        #pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int e   = tid + p * 128;
+            const int row = e >> 3;          // 0..31
+            const int col = (e & 7) << 1;    // 0..14 even
+            const int gn  = n_base + row;
+            __nv_bfloat16 b0 = __float2bfloat16(0.0f);
+            __nv_bfloat16 b1 = __float2bfloat16(0.0f);
+            if (gn < N) {
+                const __nv_bfloat16* wp = w + (long long)gn * K + k_base + col;
+                b0 = wp[0];
+                b1 = wp[1];
+            }
+            B_smem[row][col]     = b0;
+            B_smem[row][col + 1] = b1;
+        }
+
+        __syncthreads();
+
+        // --- Build A register fragment (tile<16,8,bf162>, ne=4 ints/thread).
+        //
+        // Canonical Ampere A-fragment thread layout for m16n8k16 (from
+        // llama.cpp mma.cuh tile<16,8,bf162>::get_i / get_j) :
+        //   Per thread holds 4 .b32 = 4 bf162 = 8 BF16. Element l (0..3) :
+        //     get_i(l) = ((l & 1) << 3) + (lane >> 2)   row in A     (0..15)
+        //     get_j(l) = ((l >> 1) << 2) + (lane & 3)   bf162 col    (0..7)
+        //   Equivalently, BF16 K-col = 2 * get_j(l).
+        //
+        //   l = 0 : row = lane/4 ,     k_bf16_col = (lane%4)*2
+        //   l = 1 : row = lane/4 + 8 , k_bf16_col = (lane%4)*2
+        //   l = 2 : row = lane/4 ,     k_bf16_col = (lane%4)*2 + 8
+        //   l = 3 : row = lane/4 + 8 , k_bf16_col = (lane%4)*2 + 8
+        //
+        // Each .b32 holds (BF16[col], BF16[col+1]) — natural bf162 layout
+        // from row-major smem A_smem[row][col].
+        unsigned int A0, A1, A2, A3;
+        {
+            const int lane_div_4 = lane >> 2;        // 0..7
+            const int lane_mod_4 = lane & 3;         // 0..3
+            const int row_lo = lane_div_4;           // for l = 0, 2
+            const int row_hi = lane_div_4 + 8;       // for l = 1, 3
+            const int k_col_lo = (lane_mod_4 << 1);          // 0..6 even, l = 0, 1
+            const int k_col_hi = (lane_mod_4 << 1) + 8;      // 8..14 even, l = 2, 3
+            A0 = *reinterpret_cast<const unsigned int*>(&A_smem[row_lo][k_col_lo]);
+            A1 = *reinterpret_cast<const unsigned int*>(&A_smem[row_hi][k_col_lo]);
+            A2 = *reinterpret_cast<const unsigned int*>(&A_smem[row_lo][k_col_hi]);
+            A3 = *reinterpret_cast<const unsigned int*>(&A_smem[row_hi][k_col_hi]);
+        }
+
+        // --- Build B register fragment (tile<8,8,bf162>, ne=2 ints/thread).
+        //
+        // Canonical Ampere B-fragment thread layout for m16n8k16 (from
+        // llama.cpp mma.cuh tile<8,8,bf162>::get_i / get_j) :
+        //   get_i(l) = lane / 4               row in B  (=K bf162 row, 0..7)
+        //   get_j(l) = (l << 2) + (lane & 3)  col in B  (=N col, 0..7)
+        //
+        //   l = 0 : K bf162 row = lane/4 , N col = lane%4
+        //   l = 1 : K bf162 row = lane/4 , N col = lane%4 + 4
+        //
+        // B_smem is stored [N row][K BF16 col] row-major over N. Each .b32
+        // holds 2 BF16 packed at consecutive K (so BF16 col base = 2 *
+        // K_bf162_row). Each warp owns N ∈ [warp_id*8 .. warp_id*8+7]
+        // (= n_warp_base .. n_warp_base+7 in global N).
+        unsigned int B0, B1;
+        {
+            const int lane_div_4 = lane >> 2;            // 0..7  K bf162 row
+            const int lane_mod_4 = lane & 3;             // 0..3
+            const int k_bf16_col = lane_div_4 << 1;      // 0..14 even
+            const int b_row_l0 = warp_id * 8 + lane_mod_4;       // N col for l=0
+            const int b_row_l1 = warp_id * 8 + lane_mod_4 + 4;   // N col for l=1
+            B0 = *reinterpret_cast<const unsigned int*>(&B_smem[b_row_l0][k_bf16_col]);
+            B1 = *reinterpret_cast<const unsigned int*>(&B_smem[b_row_l1][k_bf16_col]);
+        }
+
+        // --- mma.sync m16n8k16 BF16×BF16 → FP32 accumulate in-place ---
+        unsigned int *Dxi = reinterpret_cast<unsigned int*>(Dx);
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+            : "r"(A0), "r"(A1), "r"(A2), "r"(A3),
+              "r"(B0), "r"(B1)
+        );
+
+        __syncthreads();
+    }
+
+    // --- Write Y from D fragment ---
+    // C-fragment (16x8 FP32) layout : ne=4, per llama.cpp `get_i`/`get_j` :
+    //   get_i(l) = (l/2)*8 + lane/4    (0..15) → m offset in 16-row tile
+    //   get_j(l) = (lane%4)*2 + l%2    (0..7)  → n offset in 8-col tile (this warp)
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int mi = ((l >> 1) << 3) + (lane >> 2);     // 0..15
+        const int nj = ((lane & 3) << 1) + (l & 1);       // 0..7
+        const int gm = m_base + mi;
+        const int gn = n_warp_base + nj;
+        if (gm < M && gn < N) {
+            y[(long long)gm * N + gn] = __float2bfloat16(Dx[l]);
+        }
+    }
+}
+"#;
+
 // T244.2 — sgemv_bf16_bf16 : pure-BF16 weight matmul for thin GEMV (decode).
 //
 // PROBLEM : cuBLASLt matmul_bf16 with M=1 is catastrophic on GB10. Measured
@@ -7112,6 +7327,8 @@ pub struct LlmKernels {
     sgemm_q6k_mvar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     /// T246.10 A6b.1 — pure-BF16 matmul with arbitrary batch M.
     sgemm_bf16_mvar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    /// T246.10 TrackG-lite — BF16×BF16 GEMM via mma.sync.aligned.m16n8k16.
+    gemm_bf16_mma: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     /// T246.8 A3 — sgemv_bf16_bf16_v2 mma.sync m16n8k16 tensor-core SGEMV.
     sgemv_bf16_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -7237,6 +7454,7 @@ impl LlmKernels {
             sgemm_q6k_m8: std::sync::OnceLock::new(),
             sgemm_q6k_mvar: std::sync::OnceLock::new(),
             sgemm_bf16_mvar: std::sync::OnceLock::new(),
+            gemm_bf16_mma: std::sync::OnceLock::new(),
             sgemv_bf16: std::sync::OnceLock::new(),
             sgemv_bf16_v2: std::sync::OnceLock::new(),
             softplus_inplace: std::sync::OnceLock::new(),
@@ -8464,6 +8682,69 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemm_bf16_bf16_mvar::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.10 TrackG-lite — BF16×BF16 GEMM via mma.sync m16n8k16 tensor
+    /// cores (Ampere+ / Blackwell sm_121).
+    ///
+    /// API mirrors `sgemm_bf16_bf16_mvar` exactly :
+    ///   w : [N, K] BF16 row-major
+    ///   x : [M, K] BF16 row-major
+    ///   y : [M, N] BF16 row-major
+    ///
+    /// Constraints :
+    ///   - K must be multiple of 16 (we enforce 256 to keep parity with the
+    ///     baseline kernel's constraint).
+    ///   - M, N > 0. For M < 16 the warp-shuffle baseline is preferred —
+    ///     A3 proved mma.sync at M=1 loses to warp-shuffle.
+    ///
+    /// # Safety
+    /// Caller ensures device pointers valid, layouts as documented, and the
+    /// stream is the one bound to this kernel's CUDA context.
+    pub unsafe fn gemm_bf16_bf16_mma(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 16 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("gemm_bf16_bf16_mma: K={k} must be multiple of 16"),
+            });
+        }
+        if m <= 0 || n <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("gemm_bf16_bf16_mma: M={m} N={n} must be positive"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.gemm_bf16_mma,
+            GEMM_BF16_BF16_MMA_M16N8K16_SRC,
+            "gemm_bf16_bf16_mma_m16n8k16",
+        )?;
+        // Block : (warp_size=32, warps=4, 1) = 128 threads ; one warp per
+        // 8-col N-tile (4 warps × 8 cols = 32 cols/block) × one shared 16-row
+        // M-tile.
+        let grid_x = ((n as u32) + 31) / 32;
+        let grid_y = ((m as u32) + 15) / 16;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (32, 4, 1),
+            // smem usage is static (A_smem + B_smem declared __shared__ in
+            // the kernel) ; no dynamic smem needed.
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w).arg(&x).arg(&y).arg(&m).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gemm_bf16_bf16_mma::launch",
         })?;
         Ok(())
     }
