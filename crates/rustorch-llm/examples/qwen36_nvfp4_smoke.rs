@@ -17,6 +17,9 @@
 //!   - `RUSTORCH_MOE_GRAPH=0` : disable CUDA Graph capture (debug A/B)
 //!   - `RUSTORCH_SSM_FUSE=0`  : disable fused SSM pre/post-step kernels
 //!   - `RUSTORCH_NVFP4_LOAD_ONLY=1` : load + inventory + pipeline test only
+//!   - `RUSTORCH_NVFP4_PREFILL_BENCH=1` : after the decode smoke, run a
+//!     3-run wall-clock prefill bench at N ∈ {32, 128, 512} via the new
+//!     `prefill_tokens` API (TrackK.2). Reports tok/s table.
 //!
 //! Per RFC b5fc8ead — coherence success = generated tokens look like
 //! plausible text (no NaN, no all-zeros, no obvious repetition).
@@ -168,6 +171,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if max_run > n_tokens / 2 {
         eprintln!("WARN : single-token run > N/2 — likely incoherent");
+    }
+
+    // --- T246.10 TrackK.2 — optional prefill bench --------------------
+    //
+    // Activated by `RUSTORCH_NVFP4_PREFILL_BENCH=1`. Mirrors the structure
+    // of `qwen36_cuda_prefill_bench` (TrackI bench harness for Q4_K) :
+    // a deterministic token-id prompt of length N is fed through the new
+    // `prefill_tokens` API and wall-clock tok/s is averaged over 3 runs
+    // (post 2 warmup runs to amortise the captured-graph compile / first
+    // launch). The "first decode token" returned by each run is compared
+    // across runs as a non-determinism gate.
+    if std::env::var("RUSTORCH_NVFP4_PREFILL_BENCH")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        println!();
+        println!("=== T246.10 TrackK.2 — NVFP4 prefill bench ===");
+        let ns: Vec<usize> = vec![32, 128, 512];
+        println!(
+            "{:>6} | {:>15} | {:>14} | {:>14}",
+            "N", "prefill tok/s", "mean ms", "first_tok"
+        );
+        println!("{}", "-".repeat(60));
+        for &n in &ns {
+            // Deterministic prompt : BOS=1, then a chain matching the
+            // Q4_K bench harness (`qwen36_cuda_prefill_bench.rs`) so the
+            // numbers are roughly comparable. Wraps to vocab=248320.
+            let mut prompt: Vec<u32> = Vec::with_capacity(n);
+            prompt.push(1u32);
+            for i in 1..n {
+                prompt.push(((i * 31 + 7) % 10_000) as u32 + 100);
+            }
+
+            let total_runs = 5;
+            let warmup_runs = 2;
+            let mut runs_ms: Vec<f64> = Vec::with_capacity(total_runs - warmup_runs);
+            let mut first_tok: Option<u32> = None;
+            for run in 0..total_runs {
+                model
+                    .reset_state()
+                    .map_err(|e| format!("reset N={n} run={run}: {e:?}"))?;
+                let t0 = Instant::now();
+                let tok = model
+                    .prefill_tokens(&prompt, 0)
+                    .map_err(|e| format!("prefill N={n} run={run}: {e:?}"))?;
+                let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if run >= warmup_runs {
+                    runs_ms.push(dt_ms);
+                }
+                if first_tok.is_none() {
+                    first_tok = Some(tok);
+                } else if first_tok != Some(tok) {
+                    eprintln!(
+                        "[WARN] N={n}: prefill output drift across runs ({:?} vs {tok})",
+                        first_tok
+                    );
+                }
+            }
+            let mean_ms = runs_ms.iter().sum::<f64>() / (runs_ms.len() as f64);
+            let prefill_tok_s = (n as f64) / (mean_ms / 1000.0);
+            println!(
+                "{:>6} | {:>15.2} | {:>14.1} | {:>14}",
+                n,
+                prefill_tok_s,
+                mean_ms,
+                first_tok.unwrap_or(0)
+            );
+        }
+        println!("{}", "-".repeat(60));
+        println!("(NVFP4 prefill = sequential decode_step loop — TrackK.1 baseline ;");
+        println!(" tree-batched GEMM-prefill port is TrackK.b future work.)");
     }
 
     println!();
