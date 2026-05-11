@@ -1849,6 +1849,97 @@ fn moe_ffn_forward_step_nvfp4(
 }
 
 // ---------------------------------------------------------------------------
+// SSM weight transforms — bridge HF safetensors layout to llm_kernels ABI
+// ---------------------------------------------------------------------------
+
+/// Transform raw `A_log` BF16 buffer into `ssm_a = -exp(A_log)` in place,
+/// to match the GGUF `ssm_a` semantics consumed by `ssm_pre_step_bf16`.
+///
+/// Per qwen35.rs:27 architecture note : `A = -exp(ssm_a_in_gguf)` ; the GGUF
+/// loader stores the raw value (no transform), and the SSM pre-step kernel
+/// multiplies the softplus output directly by it. So in the GGUF flow the
+/// effective math is `alpha = softplus(...) * (-exp(A_log_raw))`.
+///
+/// HF safetensors checkpoints store `A_log` raw (literally named `A_log`),
+/// while GGUF stores `ssm_a = -exp(A_log)` already pre-computed. We mirror
+/// the GGUF convention so the existing kernels work unchanged.
+///
+/// Roundtrip : DtoH → CPU `-exp(...)` → HtoD. ~32 elements per layer × 30
+/// SSM layers = 960 floats total — negligible at load time.
+///
+/// Currently unused — empirical bench showed enabling this transform makes
+/// the model collapse to a 1-token loop within 4 steps (worse than no
+/// transform). Kept here as a debugging tool for future SSM correctness
+/// follow-ups.
+#[allow(dead_code)]
+fn transform_a_log_to_ssm_a(stream: &Arc<CudaStream>, t: &mut Bf16Tensor) -> Result<(), LlmError> {
+    let host: Vec<half::bf16> = stream
+        .memcpy_dtov(&t.data)
+        .map_err(|e| LlmError::Backend(format!("dtov A_log: {e:?}")))?;
+    let transformed: Vec<half::bf16> = host
+        .iter()
+        .map(|v| half::bf16::from_f32(-(v.to_f32()).exp()))
+        .collect();
+    let dev = stream
+        .memcpy_stod(&transformed)
+        .map_err(|e| LlmError::Backend(format!("stod ssm_a: {e:?}")))?;
+    t.data = dev;
+    Ok(())
+}
+
+/// Transpose conv1d weight from HF Conv1d layout `[out_ch=conv_dim, 1, kernel]`
+/// to the kernel-major layout `[kernel, conv_dim]` expected by
+/// `conv1d_depthwise_bf16` (which reads `weight[t * conv_dim + c]`).
+///
+/// Returns a fresh `Bf16Tensor` owning the transposed device buffer.
+/// 32K elements per layer × 30 SSM layers = 1M floats — trivial at load time.
+///
+/// Currently unused — empirical bench showed enabling this transform makes
+/// the model collapse faster (5 distinct tokens vs 18 with the raw layout).
+/// The actual safetensors layout that produces the longest coherent run
+/// matches the GGUF kernel ABI directly. Kept as a debugging tool for
+/// future SSM correctness follow-ups.
+#[allow(dead_code)]
+fn transpose_conv1d_to_kernel_major(
+    stream: &Arc<CudaStream>,
+    src: Bf16Tensor,
+) -> Result<Bf16Tensor, LlmError> {
+    // Expected source shape : [conv_dim, 1, kernel] OR [conv_dim, kernel].
+    let (conv_dim, kernel) = match src.shape.as_slice() {
+        [c, 1, k] => (*c, *k),
+        [c, k] => (*c, *k),
+        other => {
+            return Err(LlmError::Safetensors(format!(
+                "conv1d.weight: expected [conv_dim, 1, kernel] or [conv_dim, kernel], got {other:?}"
+            )));
+        },
+    };
+    let host: Vec<half::bf16> = stream
+        .memcpy_dtov(&src.data)
+        .map_err(|e| LlmError::Backend(format!("dtov conv1d: {e:?}")))?;
+    if host.len() != conv_dim * kernel {
+        return Err(LlmError::Safetensors(format!(
+            "conv1d.weight: expected {conv_dim}*{kernel}={} elements, got {}",
+            conv_dim * kernel,
+            host.len()
+        )));
+    }
+    let mut transposed: Vec<half::bf16> = vec![half::bf16::from_f32(0.0); conv_dim * kernel];
+    for c in 0..conv_dim {
+        for t in 0..kernel {
+            transposed[t * conv_dim + c] = host[c * kernel + t];
+        }
+    }
+    let dev = stream
+        .memcpy_stod(&transposed)
+        .map_err(|e| LlmError::Backend(format!("stod conv1d: {e:?}")))?;
+    Ok(Bf16Tensor {
+        data: dev,
+        shape: vec![kernel, conv_dim],
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Per-layer MoE loader helper
 // ---------------------------------------------------------------------------
 
