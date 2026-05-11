@@ -1910,46 +1910,46 @@ extern "C" __global__ void sgemv_bf16_bf16(
 }
 "#;
 
-// T246.8 A3 — sgemv_bf16_bf16_v2 : tensor-core (mma.sync m16n8k16) thin GEMV.
+// T246.8 A3 — sgemv_bf16_bf16_v2 : multi-row block SGEMV (BIT-EXACT with V1).
 //
-// Replaces V1 warp-shuffle SGEMV for N >= 128. Uses BF16 tensor cores
-// (m16n8k16 with FP32 accumulator) to amortize 16 output rows per warp
-// per mma instruction.
+// Mirrors V1's per-thread arithmetic exactly to guarantee bit-exact match
+// for unaltered argmax decode parity, while reducing block-launch count 4×
+// by handling 4 output rows per block (one warp per row).
 //
-// Layout :
-//   - 1 block = 1 warp = 32 threads
-//   - 1 block computes 16 contiguous output rows (y[row_base..row_base+16])
-//   - K loop : 16 BF16 elements per iteration (mma.sync m16n8k16 K-tile)
+// Design (revised after mma.sync m16n8k16 attempt showed 30% slowdown in
+// end-to-end model — see note 0418e02c) :
 //
-// mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 :
-//   D[16,8] += A[16,16] @ B[16,8]    (BF16 inputs, FP32 accumulators)
+// 1 block = 4 warps × 64 threads = 256 threads. EACH WARP-PAIR (64 threads,
+// = 1 "row warp") handles ONE output row, 4 rows per block. Within each
+// row-warp the per-thread MAC pattern is BIT-IDENTICAL to V1 :
 //
-// We broadcast x (16 BF16 values per K-tile) across all 8 N-cols of B,
-// so each output column 0..7 of D is the same value (= row · x). We only
-// keep col 0 (held by lanes where lane%4 == 0). Wasted compute on cols 1..7
-// is acceptable since the kernel is bandwidth-bound on W, not compute-bound.
+//   per-row warp (64 threads, tid in 0..63) :
+//     pos_base = tid * 4
+//     for s in 0..K/256 :
+//       k_off = s * 256 + pos_base
+//       acc += W[row, k_off+0..3] * x[k_off+0..3]
+//     warp-shuffle reduce, lane 0 stores y[row]
 //
-// Constraint : K must be multiple of 16 (mma K-stride). N rounded up to 16.
+// This is V1's exact arithmetic — same per-thread MAC sequence, same
+// warp reduction — just packaged 4-rows-per-block instead of 1-per-block.
+// The benefit comes from :
+//   - 4× fewer block launches (less SM scheduling overhead)
+//   - L1 cache reuse for x : 4 rows per block all read the same x[k_off..]
+//     pattern → L1 hits on x for warps 1..3 of each block (warp 0 misses).
 //
-// Per-thread fragment layout (PTX ISA §9.7.13.4 m16n8k16) :
-//   lane = 4*groupID + threadID_in_group, groupID in 0..7, tig in 0..3.
-//   A (16x16 BF16, .row) per thread :
-//     a[0] = W[row_base+groupID,    K_base + 2*tig + 0..1]
-//     a[1] = W[row_base+groupID+8,  K_base + 2*tig + 0..1]
-//     a[2] = W[row_base+groupID,    K_base + 2*tig + 8..9]
-//     a[3] = W[row_base+groupID+8,  K_base + 2*tig + 8..9]
-//   B (16(K)x8(N) BF16, .col, broadcast x across N) per thread :
-//     b[0] = x[K_base + 2*tig + 0..1]   (replicated across all 8 N-cols)
-//     b[1] = x[K_base + 2*tig + 8..9]
-//   D (16x8 FP32) per thread :
-//     d[0] = D[groupID,    2*tig + 0]
-//     d[1] = D[groupID,    2*tig + 1]
-//     d[2] = D[groupID+8,  2*tig + 0]
-//     d[3] = D[groupID+8,  2*tig + 1]
-//   We only keep col 0 → only tig == 0 lanes write outputs (8 lanes write
-//   16 outputs total : lane 0 writes y[row_base], y[row_base+8] ; lane 4
-//   writes y[row_base+1], y[row_base+9] ; ... ; lane 28 writes y[row_base+7],
-//   y[row_base+15]).
+// Constraint : K must be multiple of 256 (V1's constraint, kept identical
+// for bit-exact MAC sequence).
+//
+// Per-block layout : block_dim = (64, 4, 1) — 64 lanes × 4 row-warps.
+//   threadIdx.x = lane (0..63 within row's warp-pair)
+//   threadIdx.y = row_in_block (0..3)
+//   row = blockIdx.x * 4 + threadIdx.y
+//
+// Note : (64, 4, 1) launches 256 threads = 8 hardware warps per block. Each
+// "row warp-pair" is actually 2 hardware warps (lanes 0..31 and 32..63). The
+// reduction must work across this 64-thread group, not just 32. We use the
+// V1 pattern : warp-shuffle within 32 lanes, then shared-mem combine of the
+// 2 halves.
 #[cfg(feature = "cuda")]
 const SGEMV_BF16_BF16_V2_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -1961,71 +1961,48 @@ extern "C" __global__ void sgemv_bf16_bf16_v2(
     int N,
     int K
 ) {
-    const int row_base = blockIdx.x * 16;
-    if (row_base >= N) return;
+    const int row_in_block = threadIdx.y;          // 0..3
+    const int row = blockIdx.x * 4 + row_in_block;
+    if (row >= N) return;
+    const int tid = threadIdx.x;                   // 0..63 (V1 pattern)
 
-    const int lane = threadIdx.x;       // 0..31
-    const int group_id = lane >> 2;     // 0..7
-    const int tig      = lane & 3;      // 0..3
+    // Shared memory : 2-halfwarp reduction buffer per row.
+    // [4 rows][2 half-warps] floats = 32 bytes total
+    extern __shared__ float sdata[];               // size : 4*2 = 8 floats
+    float* row_sdata = sdata + row_in_block * 2;
 
-    // Accumulators (FP32, 4 per thread for D[16,8]).
-    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    float acc = 0.0f;
+    const int blocks_per_row = K / 256;
+    const int pos_base = tid * 4;
+    const int row_offset = row * K;
 
-    // Mask : are the two A-rows we own (group_id, group_id+8) valid ?
-    const int row_a = row_base + group_id;
-    const int row_b = row_base + group_id + 8;
-    const bool row_a_valid = (row_a < N);
-    const bool row_b_valid = (row_b < N);
-
-    const int K_steps = K / 16;
-    for (int k_step = 0; k_step < K_steps; ++k_step) {
-        const int k_base = k_step * 16;
-
-        // ---- Load B fragments (broadcast x across 8 N-cols) ----
-        // b[0] = pack(x[k_base + 2*tig], x[k_base + 2*tig + 1])
-        // b[1] = pack(x[k_base + 2*tig + 8], x[k_base + 2*tig + 9])
-        // BF16 pair packed as a single 32-bit unsigned (lo = first, hi = second).
-        const unsigned int* xp = reinterpret_cast<const unsigned int*>(x + k_base);
-        const unsigned int b0 = xp[tig];       // x[k_base + 2*tig + 0..1]
-        const unsigned int b1 = xp[tig + 4];   // x[k_base + 2*tig + 8..9]
-
-        // ---- Load A fragments ----
-        // a[0,1] need cols [2*tig + 0..1] of rows (group_id, group_id+8).
-        // a[2,3] need cols [2*tig + 8..9] of rows (group_id, group_id+8).
-        unsigned int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-        if (row_a_valid) {
-            const unsigned int* wp_a = reinterpret_cast<const unsigned int*>(
-                w + row_a * K + k_base);
-            a0 = wp_a[tig];          // cols 2*tig + 0..1
-            a2 = wp_a[tig + 4];      // cols 2*tig + 8..9
+    // V1's exact MAC loop — preserved bit-exact.
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const int k_off = b * 256 + pos_base;
+        const __nv_bfloat16* w_ptr = w + row_offset + k_off;
+        const __nv_bfloat16* x_ptr = x + k_off;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float wv = (float)w_ptr[i];
+            float xv = (float)x_ptr[i];
+            acc += wv * xv;
         }
-        if (row_b_valid) {
-            const unsigned int* wp_b = reinterpret_cast<const unsigned int*>(
-                w + row_b * K + k_base);
-            a1 = wp_b[tig];          // cols 2*tig + 0..1
-            a3 = wp_b[tig + 4];      // cols 2*tig + 8..9
-        }
-
-        // ---- mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 ----
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-            : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-              "r"(b0), "r"(b1),
-              "f"(d0), "f"(d1), "f"(d2), "f"(d3));
     }
 
-    // Output : only tig == 0 lanes hold col 0 of D.
-    //   d0 = D[group_id,   0]  → y[row_base + group_id]
-    //   d2 = D[group_id+8, 0]  → y[row_base + group_id + 8]
-    if (tig == 0) {
-        if (row_a_valid) {
-            y[row_a] = (__nv_bfloat16)d0;
-        }
-        if (row_b_valid) {
-            y[row_b] = (__nv_bfloat16)d2;
-        }
+    // Warp-shuffle reduction (same as V1 : __shfl_down_sync to stay bit-exact).
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+    const int warp_id = tid >> 5;     // 0 or 1 (within this row's 64-thread group)
+    const int lane_id = tid & 31;
+    if (lane_id == 0) {
+        row_sdata[warp_id] = acc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const float total = row_sdata[0] + row_sdata[1];
+        y[row] = (__nv_bfloat16)total;
     }
 }
 "#;
@@ -6128,21 +6105,30 @@ impl LlmKernels {
         Ok(())
     }
 
-    /// T246.8 A3 — Tensor-core BF16 thin GEMV (mma.sync m16n8k16).
+    /// T246.8 A3 — Multi-row block BF16 thin GEMV (V2, bit-exact with V1).
     ///
-    /// Replaces V1 warp-shuffle SGEMV for N >= 128. Uses BF16 tensor cores
-    /// with FP32 accumulator. 1 warp per block, 16 output rows per block.
-    /// Targets 1.7-2.2× speedup over V1 on Qwen3.6-35B-A3B Q4_K_M decode
-    /// (BF16 sgemv is 46% of GPU time post-A2).
+    /// V1 = 1 row per block, 64 threads. V2 = 4 rows per block, 64 threads
+    /// per row × 4 rows = 256 threads/block, with V1's exact per-thread
+    /// arithmetic preserved → guaranteed bit-exact with V1 for unaltered
+    /// argmax decode parity. Wins from :
+    ///   - 4× fewer block launches (less SM scheduling overhead)
+    ///   - L1 reuse on x : 4 row-warps in a block share x access pattern,
+    ///     warps 1..3 hit L1 for x reads
     ///
-    /// Falls back to V1 via `sgemv_bf16_bf16_dispatch` for K not multiple
-    /// of 16 (mma constraint) or N < 128 (mma overhead exceeds win).
+    /// First-attempt mma.sync m16n8k16 variant was abandoned : it wasted
+    /// 87.5% of compute on broadcast-x cols 1..7 of D and ran 30% slower
+    /// than V1 end-to-end (note 0418e02c). Second attempt (32-thread/row
+    /// warp-shuffle V2) was bit-exact in synthetic tests but produced
+    /// different argmax tokens in the model — different MAC count per
+    /// thread (K/32 vs V1's K/64) → different FP non-associativity.
+    /// This 3rd version keeps V1's exact 64-thread/row pattern.
     ///
     /// # Safety
     ///
     /// Caller ensures pointers `w`, `x`, `y` are valid for the lifetime of
     /// the kernel and reference at least `N*K`, `K`, and `N` BF16 elements
-    /// respectively. K must be a multiple of 16 (mma m16n8k16 constraint).
+    /// respectively. K must be a multiple of 256 (V1's constraint, kept
+    /// identical for bit-exact MAC sequence).
     pub unsafe fn sgemv_bf16_bf16_v2(
         &self,
         stream: &Arc<CudaStream>,
@@ -6152,9 +6138,9 @@ impl LlmKernels {
         n: i32,
         k: i32,
     ) -> Result<(), CudaError> {
-        if k % 16 != 0 {
+        if k % 256 != 0 {
             return Err(CudaError::Unsupported {
-                msg: format!("sgemv_bf16_bf16_v2: K={k} must be multiple of 16 (mma m16n8k16)"),
+                msg: format!("sgemv_bf16_bf16_v2: K={k} must be multiple of 256"),
             });
         }
         let (_module, func) = self.compile_or_get(
@@ -6162,11 +6148,15 @@ impl LlmKernels {
             SGEMV_BF16_BF16_V2_SRC,
             "sgemv_bf16_bf16_v2",
         )?;
-        let n_blocks = (n as u32).div_ceil(16);
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = (n as u32).div_ceil(ROWS_PER_BLOCK as u32);
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (n_blocks, 1, 1),
-            block_dim: (32, 1, 1),
-            shared_mem_bytes: 0,
+            // 64 threads/row × 4 rows = 256 threads/block. (64,4) layout
+            // keeps lane-id = threadIdx.x (0..63) bit-identical to V1's tid.
+            block_dim: (64, ROWS_PER_BLOCK as u32, 1),
+            // 4 rows × 2 half-warps = 8 floats reduction buffer.
+            shared_mem_bytes: (ROWS_PER_BLOCK as u32) * 2 * 4,
         };
         let mut launcher = stream.launch_builder(&func);
         launcher.arg(&w).arg(&x).arg(&y).arg(&n).arg(&k);
@@ -6197,10 +6187,27 @@ impl LlmKernels {
         n: i32,
         k: i32,
     ) -> Result<(), CudaError> {
-        // V2 wins for large N (mma amortization). For small N (e.g. shexp
-        // dot M=1, single-row reductions) keep V1 to avoid mma launch cost
-        // and the wasted N=8 broadcast.
-        if n >= 128 && k % 16 == 0 {
+        // V2 (4-row-per-block, bit-exact with V1) shows neutral perf in
+        // Qwen3.6-35B-A3B end-to-end bench (32.55 V1 vs 32.36 V2 tok/s on
+        // GB10 sm_121, T246.8 A3 — see note 0418e02c & superseder). The
+        // BF16 SGEMV is bandwidth-bound and topology changes alone don't
+        // recover a meaningful win ; the real bottleneck is the per-tensor
+        // launch sequence which only A4 (mul_mm_id mega-kernel) can fix.
+        //
+        // V2 is therefore DEFAULT OFF (env-opt-in via RUSTORCH_ENABLE_BF16_V2=1)
+        // to keep the simpler V1 path the default. Code is retained because :
+        //   1. Parity tests pass bit-exact
+        //   2. V2 may win on different hardware (Hopper / Ada) where launch
+        //      overhead dominates more than bandwidth
+        //   3. Future work can restructure V2 (e.g. larger blocks, persistent
+        //      kernel) without rewriting the dispatch surface
+        static ENABLE_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enable_v2 = *ENABLE_V2.get_or_init(|| {
+            std::env::var("RUSTORCH_ENABLE_BF16_V2")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        });
+        if enable_v2 && n >= 128 && k % 256 == 0 {
             self.sgemv_bf16_bf16_v2(stream, w, x, y, n, k)
         } else {
             self.sgemv_bf16_bf16(stream, w, x, y, n, k)

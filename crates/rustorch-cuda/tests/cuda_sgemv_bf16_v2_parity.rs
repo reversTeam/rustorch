@@ -170,9 +170,83 @@ fn sgemv_bf16_v2_n_not_multiple_of_16_handles_tail() {
     run_parity_case("sgemv_v2_130x2048_tail_mask", 130, 2048);
 }
 
+/// T246.8 A3 — Stress test : verify V2 == V1 bit-exact across a wide range
+/// of N (up to lm_head 152064) and input scales (0.4 to 4.0). Catches edge
+/// cases where the parity-test default scale 0.4 may not exercise overflow
+/// or precision-sensitive paths.
+#[test]
+fn sgemv_bf16_v2_stress_scales_and_shapes() {
+    let cases = [
+        (256usize, 2048usize, 1.0f32),    // attention proj-class
+        (384usize, 2048usize, 1.0f32),    // attention KV proj
+        (2048usize, 2048usize, 1.0f32),   // attention Q / O proj
+        (256usize, 2048usize, 4.0f32),    // higher scale
+        (4096usize, 2048usize, 1.0f32),   // FFN intermediate
+        (152064usize, 2048usize, 1.0f32), // lm_head full
+    ];
+    let ctx = CudaContext::new(0).expect("ctx");
+    let stream = ctx.default_stream();
+    let kernels = LlmKernels::new(ctx);
+    for &(n, k, scale) in &cases {
+        let label = format!("stress_n{n}_k{k}_scale{scale}");
+        let w: Vec<half::bf16> = (0..n * k)
+            .map(|i| half::bf16::from_f32(((i as f32 + 1.0) * 0.0017 + 0.03).sin() * scale))
+            .collect();
+        let x: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32(((i as f32 + 1.0) * 0.0021 + 0.07).sin() * scale))
+            .collect();
+        let w_dev = stream.memcpy_stod(&w).expect("w");
+        let x_dev = stream.memcpy_stod(&x).expect("x");
+        let mut y_v1 = stream
+            .memcpy_stod(&vec![half::bf16::from_f32(0.0); n])
+            .expect("y_v1");
+        let mut y_v2 = stream
+            .memcpy_stod(&vec![half::bf16::from_f32(0.0); n])
+            .expect("y_v2");
+        unsafe {
+            let (wp, _g0) = w_dev.device_ptr(&stream);
+            let (xp, _g1) = x_dev.device_ptr(&stream);
+            let (yp1, _g2) = y_v1.device_ptr_mut(&stream);
+            let (yp2, _g3) = y_v2.device_ptr_mut(&stream);
+            kernels
+                .sgemv_bf16_bf16(&stream, wp, xp, yp1, n as i32, k as i32)
+                .expect("v1");
+            kernels
+                .sgemv_bf16_bf16_v2(&stream, wp, xp, yp2, n as i32, k as i32)
+                .expect("v2");
+        }
+        let o1 = stream.memcpy_dtov(&y_v1).expect("dtov v1");
+        let o2 = stream.memcpy_dtov(&y_v2).expect("dtov v2");
+        let mismatches: Vec<_> = o1
+            .iter()
+            .zip(o2.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+            .map(|(i, (a, b))| (i, a.to_f32(), b.to_f32(), a.to_bits(), b.to_bits()))
+            .collect();
+        eprintln!(
+            "{label}: N={} mismatches={} (scale={scale})",
+            n,
+            mismatches.len()
+        );
+        if !mismatches.is_empty() {
+            let (i, av, bv, ab, bb) = mismatches[0];
+            eprintln!("  first mismatch idx={i}: v1={av} (0x{ab:04x}) v2={bv} (0x{bb:04x})");
+        }
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "{label}: expected bit-exact match between V1 and V2"
+        );
+    }
+}
+
 #[test]
 fn sgemv_bf16_v2_dispatch_routes_correctly() {
-    // Dispatch heuristic : N >= 128 && K%16==0 → V2, else V1.
+    // Dispatch defaults to V1 (V2 opt-in via RUSTORCH_ENABLE_BF16_V2=1).
+    // Since V1 and V2 are bit-exact (same per-thread arithmetic), the
+    // dispatch result is bit-exact with both V1 and V2 regardless of which
+    // is selected. We assert against V2 here.
     let n = 256usize;
     let k = 2048usize;
     let w = bf16_vec(n * k, 0.0011, 0.05);
@@ -202,11 +276,11 @@ fn sgemv_bf16_v2_dispatch_routes_correctly() {
     }
     let od = stream.memcpy_dtov(&y_disp).expect("dtov");
     let o2 = stream.memcpy_dtov(&y_v2).expect("dtov v2");
-    // For N=256 and K=2048 (K%16==0), dispatch should pick V2 → bit-exact match.
+    // V1 and V2 are bit-exact ; dispatch always matches V2 either way.
     assert_eq!(
         od.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
         o2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "dispatch (N=256) should pick V2 → bit-exact match"
+        "dispatch (N=256) should be bit-exact with V2 (and V1, since V1==V2)"
     );
 
     // Now test dispatch fall-through to V1 for tiny N=64.
