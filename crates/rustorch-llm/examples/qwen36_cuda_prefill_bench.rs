@@ -92,10 +92,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &n in &ns {
         let prompt = make_prompt(n);
 
-        // ── A. prefill_tokens, 3-run avg, drop the slowest run ──────────
-        let mut runs_ms: Vec<f64> = Vec::with_capacity(3);
+        // ── A. prefill_tokens, 5-run timing with 2 warmup + 3 measured.
+        //
+        // T246.10 TrackI : the first 2 runs prime the JIT kernel cache
+        // and capture the CUDA Graph (`RUSTORCH_PREFILL_GRAPH=1`). The
+        // remaining 3 runs replay the captured graph (~1 ms CPU dispatch
+        // per call) and are averaged. Without graph capture all 5 runs
+        // have identical performance so the warmup-discard is a no-op
+        // (a small loss to the JIT-only path : ~100 ms × 2 thrown
+        // away). For 5 runs total wall time is dominated by warmup
+        // anyway — fine.
+        let total_runs = 5;
+        let warmup_runs = 2;
+        let mut runs_ms: Vec<f64> = Vec::with_capacity(total_runs - warmup_runs);
         let mut first_tok: Option<u32> = None;
-        for run in 0..3 {
+        for run in 0..total_runs {
             // Reset model state so each run starts fresh from position 0.
             model
                 .reset_state()
@@ -105,7 +116,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .prefill_tokens(&prompt, 0)
                 .map_err(|e| format!("prefill N={n} run={run}: {e:?}"))?;
             let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            runs_ms.push(dt_ms);
+            if run >= warmup_runs {
+                runs_ms.push(dt_ms);
+            }
             if first_tok.is_none() {
                 first_tok = Some(tok);
             } else if first_tok != Some(tok) {
@@ -118,6 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mean_ms_prefill = runs_ms.iter().sum::<f64>() / runs_ms.len() as f64;
         let prefill_tok_s = (n as f64) / (mean_ms_prefill / 1000.0);
+        let _ = first_tok; // kept for the intra-run drift WARN above
 
         // ── B. Naive baseline : decode_step loop, single run ────────────
         model

@@ -1093,6 +1093,14 @@ pub struct Qwen35ModelCudaQ4K {
     /// Reset (cleared) by `reset_state()` so per-conversation state changes
     /// always force a re-capture.
     pub(crate) prefill_graphs: HashMap<usize, CudaGraph>,
+    /// T246.10 TrackI — set of N values for which the prefill body has
+    /// been run once (uncaptured warmup) and is ready to be captured on
+    /// the next call. Mirrors llama.cpp's two-call warmup pattern in
+    /// `ggml_backend_cuda_graph_compute` : the first call triggers JIT
+    /// compilation of every kernel (nvrtc/cuModuleLoadData) which is not
+    /// itself capturable ; only the second call enters `begin_capture`
+    /// / `end_capture`.
+    pub(crate) prefill_warmed: std::collections::HashSet<usize>,
     /// T246.10 TrackI — pinned-host descriptor buffers for the tree
     /// `drafts` / `parents` / `depths` HtoD uploads. We pre-bake the
     /// `parents = [-1, 0, 1, ..., N-2]` and `depths = [0, 1, ..., N-1]`
@@ -1881,6 +1889,7 @@ impl Qwen35ModelCudaQ4K {
                 .unwrap_or(true),
             next_token_host_pinned,
             prefill_graphs: HashMap::new(),
+            prefill_warmed: std::collections::HashSet::new(),
             prefill_drafts_host_pinned,
             tree_ssm_wave_indices_linear,
         })
@@ -1915,13 +1924,17 @@ impl Qwen35ModelCudaQ4K {
         // T246.5.3 — captured graph is no longer valid for the new state.
         // It will be re-captured on the 2nd decode_step after this reset.
         self.decode_graph = None;
-        // T246.10 TrackI — clear the prefill bag-of-graphs cache : the
-        // captured graphs reference device-side pointers and tree-state
-        // buffers whose contents change on state reset. Each prefill
-        // graph will be re-captured on the next pair of calls with the
-        // same N (the warmup + capture pattern matches the decode_graph
-        // mechanism on `decode_step`).
-        self.prefill_graphs.clear();
+        // T246.10 TrackI — the prefill bag-of-graphs cache is preserved
+        // across `reset_state()`. Captured graphs reference device-side
+        // pointers (KV cache base, SSM state base, position_dev, etc.)
+        // which are NOT freed/moved by `reset_state()` — only their
+        // contents are zeroed via `memset_zeros`. The captured nodes
+        // then read whatever values are in the buffers at replay time
+        // (e.g. `position_dev = 0`, `kv_len_dev = 1`), which is exactly
+        // the state we re-initialize here. So each replay starts from
+        // a clean state without re-capturing. The warmup tracker
+        // (`prefill_warmed`) is also preserved : it represents
+        // module-load / JIT state which persists across resets.
         Ok(())
     }
 
@@ -3021,9 +3034,47 @@ impl Qwen35ModelCudaQ4K {
         let parents: Vec<i32> = std::iter::once(-1i32).chain((0..(n - 1) as i32)).collect();
         let depths: Vec<u16> = (0..n as u16).collect();
 
-        // ── Dispatch by variant ─────────────────────────────────────────
-        let cfg_variant = self.config.variant;
-        let accepted = match cfg_variant {
+        // ── T246.10 TrackI — CUDA Graph capture / replay path ──────────
+        //
+        // When `RUSTORCH_PREFILL_GRAPH=1` and `n` is a previously-captured
+        // (or will-be-captured) bucket size, we route through the bag-of-
+        // graphs cache (`self.prefill_graphs`). The first call with a
+        // given `n` runs the body uncaptured (warmup — JIT all kernels)
+        // ; the second runs it again under `begin_capture` /
+        // `end_capture`, instantiates a `cudaGraph_t`, caches it, and
+        // launches it. Every subsequent call with the same `n` replays
+        // the captured graph in a single `cuGraphLaunch` (≈ 5-10 µs CPU
+        // dispatch vs ~10 s on the per-launch path per PRE-FLIGHT note
+        // 1ac7de4a).
+        //
+        // Pre-conditions (mirrors the decode-side graph capture in
+        // `decode_step` and the llama.cpp `TAG_MUL_MAT_ID_CUDA_GRAPHS`
+        // compatibility check) :
+        //
+        // 1. The MoE body must be sync-free → `RUSTORCH_MOE_ASYNC=1`
+        //    AND (`RUSTORCH_MOE_MEGA=1` OR `RUSTORCH_MOE_GROUP_GEMM=1`).
+        // 2. The GEMM-prefill path is required so the matmul calls go
+        //    through `dispatch_matmul_mvar` (no host-side shape
+        //    branching inside the body) →  `RUSTORCH_GEMM_PREFILL=1`.
+        // 3. n must be ≥ `GEMM_PREFILL_MIN_M` (otherwise the body
+        //    branches into per-row dispatch, which is correct but not
+        //    the design target of TrackI).
+        //
+        // When any condition fails (or the env gate is off) we fall
+        // through to the legacy path below, preserving the
+        // `RUSTORCH_PREFILL_GRAPH=0` baseline bit-exactly.
+        let variant = self.config.variant;
+        let moe_ok = !matches!(variant, Qwen35Variant::Moe)
+            || (moe_async_enabled() && (moe_mega_enabled() || moe_group_gemm_enabled()));
+        let graph_eligible =
+            prefill_graph_enabled() && moe_ok && gemm_prefill_enabled() && n >= GEMM_PREFILL_MIN_M;
+
+        if graph_eligible {
+            return self.prefill_tokens_capture(token_ids, &parents, &depths);
+        }
+
+        // ── Dispatch by variant (legacy / RUSTORCH_PREFILL_GRAPH=0 path) ─
+        let accepted = match variant {
             Qwen35Variant::Qwen2PureTransformer | Qwen35Variant::Qwen3PureTransformer => {
                 self.decode_step_tree_pure_transformer_inner(token_ids, &parents, &depths, true)?
             },
@@ -3044,6 +3095,172 @@ impl Qwen35ModelCudaQ4K {
         // seeing all N input tokens — that's the "first decode token" we
         // return to the caller.
         Ok(accepted[n - 1])
+    }
+
+    /// T246.10 TrackI — Graph-capture entry for `prefill_tokens`. Caller
+    /// must validate `n >= GEMM_PREFILL_MIN_M`, MoE async/mega/group-gemm
+    /// invariants, etc. See `prefill_tokens` for the env-gate logic.
+    ///
+    /// Strategy : bag-of-graphs keyed by `n`. First call with a given
+    /// `n` runs the body uncaptured (warmup — primes nvrtc compile +
+    /// CUmodule load for every kernel). Second call runs under
+    /// `begin_capture` / `end_capture`, instantiates the graph, caches
+    /// it under `n`. Every subsequent call replays the cached graph in
+    /// a single launch.
+    fn prefill_tokens_capture(
+        &mut self,
+        token_ids: &[u32],
+        parents: &[i32],
+        depths: &[u16],
+    ) -> Result<u32, LlmError> {
+        use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+        let n = token_ids.len();
+
+        // ── 1. Upload tree descriptors (capture-safe, pinned source) ─────
+        //
+        // The captured graph reads `tree_drafts` / `tree_parents` /
+        // `tree_depths` by pointer. We upload the per-call values into
+        // those device buffers OUTSIDE the capture region — pageable
+        // HtoD inside the region would degenerate into a synchronous
+        // copy and abort the capture
+        // (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`). The source must
+        // come from pinned host memory so the upload is truly async
+        // and does not implicitly drain the stream.
+        //
+        // For `parents` / `depths` on a linear-chain prefill the values
+        // are constant in `n` (parents = [-1, 0, .., n-2], depths =
+        // [0, 1, .., n-1]) ; the caller passes them in. We accept the
+        // small cost of one un-pinned upload per call for these two —
+        // it happens BEFORE begin_capture and the explicit pre-capture
+        // `synchronize()` below absorbs any implicit driver sync. Only
+        // `drafts` is re-uploaded every call (the token content varies),
+        // so pinning matters most for it.
+        {
+            let mut drafts_pinned = self
+                .prefill_drafts_host_pinned
+                .as_mut_slice()
+                .map_err(|e| LlmError::Backend(format!("drafts_pinned as_mut_slice: {e:?}")))?;
+            drafts_pinned[..n].copy_from_slice(token_ids);
+        }
+        {
+            let drafts_pinned = self
+                .prefill_drafts_host_pinned
+                .as_slice()
+                .map_err(|e| LlmError::Backend(format!("drafts_pinned as_slice: {e:?}")))?;
+            self.stream
+                .memcpy_htod(&drafts_pinned[..n], &mut self.scratch.tree_drafts)
+                .map_err(|e| LlmError::Backend(format!("upload tree_drafts (capture): {e:?}")))?;
+        }
+        self.stream
+            .memcpy_htod(parents, &mut self.scratch.tree_parents)
+            .map_err(|e| LlmError::Backend(format!("upload tree_parents (capture): {e:?}")))?;
+        self.stream
+            .memcpy_htod(depths, &mut self.scratch.tree_depths)
+            .map_err(|e| LlmError::Backend(format!("upload tree_depths (capture): {e:?}")))?;
+
+        // ── 2. Replay path — graph cached for this n ────────────────────
+        let variant = self.config.variant;
+        if let Some(graph) = self.prefill_graphs.get(&n) {
+            graph
+                .launch()
+                .map_err(|e| LlmError::Backend(format!("prefill graph launch: {e:?}")))?;
+            // After replay, the device-side `argmax` buffer has N entries
+            // ; DtoH them to the pinned host buffer.
+            return self.prefill_finish_after_capture(n);
+        }
+
+        // ── 3. Warmup path — first call for this n, no capture ──────────
+        // Run the body uncaptured to ensure all kernels JIT-compile and
+        // load before we attempt to capture. The body MUST run on the
+        // same stream as the eventual capture (it does — `self.stream`).
+        // Mirrors llama.cpp's `warmup_complete` two-call pattern.
+        if !self.prefill_warmed.contains(&n) {
+            // Standard (non-capture) prefill body. We've already
+            // uploaded the descriptors above ; the inner re-uploads
+            // them (cheap, ~12 µs) which is fine for the warmup pass.
+            let accepted = match variant {
+                Qwen35Variant::Qwen2PureTransformer | Qwen35Variant::Qwen3PureTransformer => {
+                    self.decode_step_tree_pure_transformer_inner(token_ids, parents, depths, true)?
+                },
+                Qwen35Variant::Dense | Qwen35Variant::Moe => {
+                    self.decode_step_tree_hybrid_inner(token_ids, parents, depths, true)?
+                },
+            };
+            if accepted.len() != n {
+                return Err(LlmError::Backend(format!(
+                    "prefill_tokens (warmup): tree forward returned {} accepted tokens, \
+                     expected {} (force_accept_all bug ?)",
+                    accepted.len(),
+                    n
+                )));
+            }
+            // Mark warmup complete — the next call with this n will
+            // go down the capture path.
+            self.prefill_warmed.insert(n);
+            return Ok(accepted[n - 1]);
+        }
+
+        // ── 4. Capture path — second call, instantiate graph ────────────
+        // Drain any pending stream work : ensures the tree-descriptor HtoD
+        // uploads above are fully retired before we transition the stream
+        // into capture mode.
+        self.stream
+            .synchronize()
+            .map_err(|e| LlmError::Backend(format!("pre-capture sync: {e:?}")))?;
+        self.stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .map_err(|e| LlmError::Backend(format!("prefill begin_capture: {e:?}")))?;
+
+        // Run the *capturable* body. The inner function knows to skip
+        // the HtoD descriptors (already done), use linear wave-indices
+        // offsets, skip the final DtoH + accept walk, and skip the
+        // host-side `self.position +=` (we do it post-launch).
+        let _accepted = match variant {
+            Qwen35Variant::Qwen2PureTransformer | Qwen35Variant::Qwen3PureTransformer => self
+                .decode_step_tree_pure_transformer_inner_capture(
+                    token_ids, parents, depths, true, true,
+                )?,
+            Qwen35Variant::Dense | Qwen35Variant::Moe => {
+                self.decode_step_tree_hybrid_inner_capture(token_ids, parents, depths, true, true)?
+            },
+        };
+
+        let graph = self
+            .stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .map_err(|e| LlmError::Backend(format!("prefill end_capture: {e:?}")))?
+            .ok_or_else(|| LlmError::Backend("prefill end_capture returned no graph".into()))?;
+
+        // Launch the captured graph once to materialize the recorded
+        // work for this call (which is what the user actually asked
+        // for — we promised to do the prefill, not just record it).
+        graph
+            .launch()
+            .map_err(|e| LlmError::Backend(format!("first prefill graph launch: {e:?}")))?;
+
+        self.prefill_graphs.insert(n, graph);
+        self.prefill_finish_after_capture(n)
+    }
+
+    /// T246.10 TrackI — post-replay finalizer. Reads the argmax tokens
+    /// into pinned host memory, advances the host-side `self.position`,
+    /// and returns the last accepted token (the "first decode token").
+    fn prefill_finish_after_capture(&mut self, n: usize) -> Result<u32, LlmError> {
+        self.stream
+            .memcpy_dtoh(
+                &self.scratch.tree_argmax,
+                &mut self.scratch.tree_argmax_host_pinned,
+            )
+            .map_err(|e| LlmError::Backend(format!("prefill post-capture dtoh argmax: {e:?}")))?;
+        let argmax_host = self
+            .scratch
+            .tree_argmax_host_pinned
+            .as_slice()
+            .map_err(|e| LlmError::Backend(format!("prefill pinned argmax read: {e:?}")))?;
+        // Capture mode never updates `self.position` from inside the
+        // inner — apply it here for the N accepted tokens.
+        self.position += n;
+        Ok(argmax_host[n - 1])
     }
 
     /// T246.7 P1.3d — tree-aware decode step for Lookahead Decoding (RFC
