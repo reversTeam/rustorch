@@ -1725,6 +1725,104 @@ impl Qwen35ModelCudaNVFP4 {
         self.position += 1;
         Ok(token_id)
     }
+
+    /// Current host-side position (number of decode steps committed so far).
+    /// Mirrors `Qwen35ModelCudaQ4K::position()` for caller compatibility.
+    #[inline]
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Zero out the KV cache, conv state, and SSM state ; reset the host-side
+    /// `position` counter and the device-side `position_dev` / `kv_len_dev`
+    /// counters back to a fresh-context state. The captured decode graph is
+    /// dropped — it will be re-captured on the 2nd subsequent `decode_step`
+    /// (mirrors the Q4_K path's `reset_state` contract).
+    ///
+    /// Required by `prefill_tokens` (when called with `start_pos == 0` after
+    /// previous decodes) and by the bench harness between runs.
+    pub fn reset_state(&mut self) -> Result<(), LlmError> {
+        for kv in self.kv_caches.iter_mut() {
+            self.stream
+                .memset_zeros(&mut kv.k)
+                .map_err(|e| LlmError::Backend(format!("zero K cache: {e:?}")))?;
+            self.stream
+                .memset_zeros(&mut kv.v)
+                .map_err(|e| LlmError::Backend(format!("zero V cache: {e:?}")))?;
+        }
+        for ssm in self.ssm_states.iter_mut() {
+            self.stream
+                .memset_zeros(&mut ssm.state)
+                .map_err(|e| LlmError::Backend(format!("zero SSM state: {e:?}")))?;
+            self.stream
+                .memset_zeros(&mut ssm.conv_state)
+                .map_err(|e| LlmError::Backend(format!("zero conv state: {e:?}")))?;
+        }
+        self.position = 0;
+        self.stream
+            .memcpy_htod(&[0i32], &mut self.position_dev)
+            .map_err(|e| LlmError::Backend(format!("reset position_dev: {e:?}")))?;
+        self.stream
+            .memcpy_htod(&[1i32], &mut self.kv_len_dev)
+            .map_err(|e| LlmError::Backend(format!("reset kv_len_dev: {e:?}")))?;
+        // Captured decode graph reads stale state ; drop so the next pair of
+        // decode_step calls re-captures against the fresh KV/SSM state.
+        self.decode_graph = None;
+        Ok(())
+    }
+
+    /// T246.10 TrackK.1 — Prefill `token_ids` and return the prediction after
+    /// the last input token.
+    ///
+    /// **Semantics** : feeds each of the N input tokens through the model
+    /// sequentially via `decode_step`, growing the KV cache and SSM state.
+    /// Returns the argmax of the logits produced after the LAST input token
+    /// — that's the "first decode token" the caller would emit next.
+    ///
+    /// **Implementation note** : this is a sequential `decode_step` loop, NOT
+    /// a tree-batched GEMM-prefill pass. The NVFP4 path's per-tree-row scratch
+    /// buffers and tree-aware kernel dispatchers (counterpart of Q4_K's
+    /// `decode_step_tree_hybrid_inner_capture` + `hybrid_attn_layer` +
+    /// `hybrid_ssm_layer` + GEMM-prefill matmul variants) are NOT yet ported.
+    /// Porting them is TrackK.b (separate task) — the structural cost is
+    /// ~2000 LOC of new dispatch + new tree-scaled scratch fields and would
+    /// also need NVFP4-side `sgemm_mvar`-shape matmul wrappers that don't
+    /// exist today. For TrackK.1 we ship the working baseline (functionally
+    /// correct, reuses the captured decode graph) and bench it informationally.
+    ///
+    /// **Parity with Q4_K** : the Q4_K `prefill_tokens` short-circuits to
+    /// `decode_step` for N=1 ; this NVFP4 implementation generalises that
+    /// fast path to all N. When the Q4_K bench harness runs the "naive"
+    /// baseline it does this exact sequence (see `qwen36_cuda_prefill_bench`
+    /// lines 142-152). The NVFP4 prefill is thus equivalent to the Q4_K
+    /// naive baseline path — a real apples-to-apples comparison point.
+    ///
+    /// **CUDA Graph reuse** : `decode_step` captures its graph on the 2nd
+    /// call (`self.position == 1`), so the first 2 of the N tokens are
+    /// JIT-compile + capture, and the remaining N-2 are graph replays.
+    /// This is the same captured-graph win the decode-only path enjoys.
+    pub fn prefill_tokens(&mut self, token_ids: &[u32], start_pos: usize) -> Result<u32, LlmError> {
+        let n = token_ids.len();
+        if n == 0 {
+            return Err(LlmError::Backend(
+                "prefill_tokens: token_ids must be non-empty".into(),
+            ));
+        }
+        if start_pos != self.position {
+            return Err(LlmError::Backend(format!(
+                "prefill_tokens: start_pos={start_pos} != self.position={}. \
+                 Call model.reset_state() first or pass start_pos=self.position().",
+                self.position
+            )));
+        }
+        let mut last_pred: u32 = 0;
+        for (i, &tok) in token_ids.iter().enumerate() {
+            last_pred = self.decode_step(tok).map_err(|e| {
+                LlmError::Backend(format!("prefill_tokens: decode_step #{i} failed: {e:?}"))
+            })?;
+        }
+        Ok(last_pred)
+    }
 }
 
 // ---------------------------------------------------------------------------
