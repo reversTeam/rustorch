@@ -1843,6 +1843,496 @@ extern "C" __global__ void sgemm_q4k_bf16_m8(
 }
 "#;
 
+// T246.10 A6b.1 — sgemm_q4k_bf16_mvar : Q4_K matmul with arbitrary batch M (1..MAX).
+// Extension of sgemm_q4k_bf16_m8 to variable M. Reads each W super-block ONCE
+// per block and accumulates against all M m-rows (tiled in chunks of 8).
+//
+// Bandwidth analysis (Qwen3.6 35B-A3B Q4_K_M, N=4096, K=2048, blocks_per_row=8) :
+//   M=1   : per-token W reads  = 144*8 * 4096 = 4.7 MB    (M=1 baseline)
+//   M=8   : per-token W reads  = 4.7 / 8     ≈ 590 KB     (M=8 win)
+//   M=512 : per-token W reads  = 4.7 / 512   ≈ 9 KB       (M=512 dream)
+//
+// Mirror of M=8 kernel : 64 threads/TG, per-thread accumulators [8] floats.
+// For M > 8 we tile : outer loop processes ceil(M/8) m-tiles, each tile
+// re-reads x and accumulates the same 4 weights into 8 accumulators.
+//
+// The kernel re-reads the W super-block 1 time per M-tile (the dequant scales
+// are cached in shmem and re-used across m-tiles, the W bytes themselves are
+// in L1 cache for the second-and-later tile reads).
+//
+// Layout matches sgemm_q4k_bf16_m8 EXACTLY for M=1..8 (tile_idx=0 only).
+// For M > 8 each block processes ALL m-tiles in sequence.
+//
+// Inputs :
+//   w_q4k : [N, K] Q4_K row-major (same layout as sgemv_q4k_v2 / sgemm_m8)
+//   x     : [M, K] BF16 row-major
+//   y     : [M, N] BF16 row-major (output)
+//
+// Constraint : K must be multiple of 256.
+#[cfg(feature = "cuda")]
+const SGEMM_Q4K_BF16_MVAR_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemm_q4k_bf16_mvar(
+    const unsigned char* __restrict__ w_q4k,
+    const __nv_bfloat16* __restrict__ x,    // [M, K] row-major
+    __nv_bfloat16* __restrict__ y,          // [M, N] row-major
+    int M,
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = K / 256;
+    int row_offset = row * blocks_per_row * 144;
+    int n_mtiles = (M + 7) >> 3;
+    int mtile_idx = blockIdx.y;
+    if (mtile_idx >= n_mtiles) return;
+    int m_base = mtile_idx << 3;
+    int m_cnt = M - m_base;
+    if (m_cnt > 8) m_cnt = 8;
+
+    extern __shared__ float shmem[];
+    float* sc_pre = shmem;             // [8]
+    float* m_pre  = shmem + 8;         // [8]
+    float* sdata  = shmem + 16;        // [16] : 8 m × 2 warps reduction
+
+    float acc[8];
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) acc[m] = 0.0f;
+
+    int group       = tid >> 3;
+    int pos_base    = (tid & 7) << 2;
+    int pair_idx    = group >> 1;
+    int sub_in_pair = group & 1;
+    int byte_base   = (pair_idx << 5) + pos_base;
+    int low_nibble  = (sub_in_pair == 0) ? 1 : 0;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 144;
+        const unsigned char* blk = w_q4k + blk_off;
+
+        if (tid == 0) {
+            unsigned short d_bits    = blk[0] | (blk[1] << 8);
+            unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+            float d    = __half2float(__ushort_as_half(d_bits));
+            float dmin = __half2float(__ushort_as_half(dmin_bits));
+            const unsigned char* scales = blk + 4;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                unsigned char sc_i  = scales[i] & 0x3F;
+                unsigned char m_i   = scales[i + 4] & 0x3F;
+                unsigned char sc_i4 = (scales[i + 8] & 0x0F) | ((scales[i] >> 6) << 4);
+                unsigned char m_i4  = (scales[i + 8] >> 4)   | ((scales[i + 4] >> 6) << 4);
+                sc_pre[i]     = d * (float)sc_i;
+                m_pre[i]      = dmin * (float)m_i;
+                sc_pre[i + 4] = d * (float)sc_i4;
+                m_pre[i + 4]  = dmin * (float)m_i4;
+            }
+        }
+        __syncthreads();
+
+        float scale = sc_pre[group];
+        float min_v = m_pre[group];
+        const unsigned char* qs = blk + 16;
+        unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
+
+        int x_super_pos = (group << 5) + pos_base;
+        // x base for THIS m-tile : x + (m_base + m) * K + b*256 + x_super_pos
+        const __nv_bfloat16* x_block = x + (long long)m_base * K + b * 256 + x_super_pos;
+
+        // Vectorize : load 4 BF16 per m row.
+        uint2 xv[8];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            // Out-of-range m-rows get a zero stub : safe because we only
+            // write acc to y for m < m_cnt. Zero load avoids OOB read.
+            if (m < m_cnt) {
+                xv[m] = *(const uint2*)(x_block + m * K);
+            } else {
+                xv[m].x = 0; xv[m].y = 0;
+            }
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned char byte_i = (qbytes >> (i << 3)) & 0xFFu;
+            int nibble = low_nibble ? (byte_i & 0x0F) : (byte_i >> 4);
+            float w_val = scale * (float)nibble - min_v;
+
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                unsigned short xb_i = (i < 2)
+                    ? (unsigned short)((xv[m].x >> (i << 4)) & 0xFFFFu)
+                    : (unsigned short)((xv[m].y >> ((i - 2) << 4)) & 0xFFFFu);
+                __nv_bfloat16 xbf = __ushort_as_bfloat16(xb_i);
+                acc[m] += w_val * (float)xbf;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Reduction : 8 accumulators per thread × 64 threads (2 warps).
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        float a = acc[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xffffffff, a, offset);
+        }
+        int warp_id = tid >> 5;
+        int lane_id = tid & 31;
+        if (lane_id == 0) {
+            sdata[m * 2 + warp_id] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < 8) {
+        int m = tid;
+        if (m < m_cnt) {
+            float total = sdata[m * 2] + sdata[m * 2 + 1];
+            // Output : y[m_base + m, row]
+            y[(long long)(m_base + m) * N + row] = (__nv_bfloat16)total;
+        }
+    }
+}
+"#;
+
+// T246.10 A6b.1 — sgemm_q5k_bf16_mvar : Q5_K matmul with arbitrary batch M.
+// Mirror of sgemm_q5k_bf16_m8 extended to M-variable. See SGEMM_Q4K_BF16_MVAR_SRC
+// for the design rationale (W-amortization).
+#[cfg(feature = "cuda")]
+const SGEMM_Q5K_BF16_MVAR_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemm_q5k_bf16_mvar(
+    const unsigned char* __restrict__ w_q5k,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int M,
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = K / 256;
+    int row_offset = row * blocks_per_row * 176;
+    int n_mtiles = (M + 7) >> 3;
+    int mtile_idx = blockIdx.y;
+    if (mtile_idx >= n_mtiles) return;
+    int m_base = mtile_idx << 3;
+    int m_cnt = M - m_base;
+    if (m_cnt > 8) m_cnt = 8;
+
+    extern __shared__ float shmem[];
+    float* sc_pre = shmem;
+    float* m_pre  = shmem + 8;
+    float* sdata  = shmem + 16;
+
+    float acc[8];
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) acc[m] = 0.0f;
+
+    int group       = tid >> 3;
+    int pos_base    = (tid & 7) << 2;
+    int pair_idx    = group >> 1;
+    int sub_in_pair = group & 1;
+    int byte_base   = (pair_idx << 5) + pos_base;
+    int low_nibble  = (sub_in_pair == 0) ? 1 : 0;
+    int qh_bit_idx  = (sub_in_pair == 0) ? (2 * pair_idx) : (2 * pair_idx + 1);
+    unsigned int qh_mask = 1u << qh_bit_idx;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 176;
+        const unsigned char* blk = w_q5k + blk_off;
+
+        if (tid == 0) {
+            unsigned short d_bits    = blk[0] | (blk[1] << 8);
+            unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+            float d    = __half2float(__ushort_as_half(d_bits));
+            float dmin = __half2float(__ushort_as_half(dmin_bits));
+            const unsigned char* scales = blk + 4;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                unsigned char sc_i  = scales[i] & 0x3F;
+                unsigned char m_i   = scales[i + 4] & 0x3F;
+                unsigned char sc_i4 = (scales[i + 8] & 0x0F) | ((scales[i] >> 6) << 4);
+                unsigned char m_i4  = (scales[i + 8] >> 4)   | ((scales[i + 4] >> 6) << 4);
+                sc_pre[i]     = d * (float)sc_i;
+                m_pre[i]      = dmin * (float)m_i;
+                sc_pre[i + 4] = d * (float)sc_i4;
+                m_pre[i + 4]  = dmin * (float)m_i4;
+            }
+        }
+        __syncthreads();
+
+        float scale = sc_pre[group];
+        float min_v = m_pre[group];
+        const unsigned char* qh = blk + 16;
+        const unsigned char* ql = blk + 16 + 32;
+
+        unsigned int qlbytes = *(const unsigned int*)(ql + byte_base);
+        unsigned int qhbytes = *(const unsigned int*)(qh + pos_base);
+
+        int x_super_pos = (group << 5) + pos_base;
+        const __nv_bfloat16* x_block = x + (long long)m_base * K + b * 256 + x_super_pos;
+
+        uint2 xv[8];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if (m < m_cnt) {
+                xv[m] = *(const uint2*)(x_block + m * K);
+            } else {
+                xv[m].x = 0; xv[m].y = 0;
+            }
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned char ql_byte = (qlbytes >> (i << 3)) & 0xFFu;
+            unsigned char qh_byte = (qhbytes >> (i << 3)) & 0xFFu;
+            int low_bits = low_nibble ? (ql_byte & 0x0F) : (ql_byte >> 4);
+            int high_bit = (qh_byte & qh_mask) ? 16 : 0;
+            int q = low_bits + high_bit;
+            float w_val = scale * (float)q - min_v;
+
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                unsigned short xb_i = (i < 2)
+                    ? (unsigned short)((xv[m].x >> (i << 4)) & 0xFFFFu)
+                    : (unsigned short)((xv[m].y >> ((i - 2) << 4)) & 0xFFFFu);
+                __nv_bfloat16 xbf = __ushort_as_bfloat16(xb_i);
+                acc[m] += w_val * (float)xbf;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        float a = acc[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xffffffff, a, offset);
+        }
+        int warp_id = tid >> 5;
+        int lane_id = tid & 31;
+        if (lane_id == 0) {
+            sdata[m * 2 + warp_id] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < 8) {
+        int m = tid;
+        if (m < m_cnt) {
+            float total = sdata[m * 2] + sdata[m * 2 + 1];
+            y[(long long)(m_base + m) * N + row] = (__nv_bfloat16)total;
+        }
+    }
+}
+"#;
+
+// T246.10 A6b.1 — sgemm_q6k_bf16_mvar : Q6_K matmul with arbitrary batch M.
+// Mirror of sgemm_q6k_bf16_m8 extended to M-variable.
+#[cfg(feature = "cuda")]
+const SGEMM_Q6K_BF16_MVAR_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void sgemm_q6k_bf16_mvar(
+    const unsigned char* __restrict__ w_q6k,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int M,
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = K / 256;
+    int row_offset = row * blocks_per_row * 210;
+    int n_mtiles = (M + 7) >> 3;
+    int mtile_idx = blockIdx.y;
+    if (mtile_idx >= n_mtiles) return;
+    int m_base = mtile_idx << 3;
+    int m_cnt = M - m_base;
+    if (m_cnt > 8) m_cnt = 8;
+
+    extern __shared__ float shmem[];
+    float* sc_pre = shmem;       // [16]
+    float* sdata  = shmem + 16;  // [16]
+
+    float acc[8];
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) acc[m] = 0.0f;
+
+    int half          = tid >> 5;
+    int l             = tid & 31;
+    int half_offset_x = half << 7;
+    int ql_base       = half << 6;
+    int qh_base       = half << 5;
+    int sb            = half << 3;
+    int l16           = l >> 4;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 210;
+        const unsigned char* blk = w_q6k + blk_off;
+
+        if (tid == 0) {
+            unsigned short d_bits = blk[208] | (blk[209] << 8);
+            float d = __half2float(__ushort_as_half(d_bits));
+            const signed char* scales = (const signed char*)(blk + 192);
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                sc_pre[i] = d * (float)scales[i];
+            }
+        }
+        __syncthreads();
+
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+
+        unsigned char ql_a = ql[ql_base + l];
+        unsigned char ql_b = ql[ql_base + l + 32];
+        unsigned char qh_b = qh[qh_base + l];
+
+        int q0 = (ql_a & 0x0F) | (((qh_b)      & 0x03) << 4);
+        int q1 = (ql_b & 0x0F) | (((qh_b >> 2) & 0x03) << 4);
+        int q2 = (ql_a >> 4)   | (((qh_b >> 4) & 0x03) << 4);
+        int q3 = (ql_b >> 4)   | (((qh_b >> 6) & 0x03) << 4);
+
+        float w0 = sc_pre[sb + 0 + l16] * (float)(q0 - 32);
+        float w1 = sc_pre[sb + 2 + l16] * (float)(q1 - 32);
+        float w2 = sc_pre[sb + 4 + l16] * (float)(q2 - 32);
+        float w3 = sc_pre[sb + 6 + l16] * (float)(q3 - 32);
+
+        const __nv_bfloat16* x_base = x + (long long)m_base * K + b * 256 + half_offset_x;
+
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if (m < m_cnt) {
+                float x0 = (float)x_base[m * K + l];
+                float x1 = (float)x_base[m * K + l + 32];
+                float x2 = (float)x_base[m * K + l + 64];
+                float x3 = (float)x_base[m * K + l + 96];
+                acc[m] += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        float a = acc[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xffffffff, a, offset);
+        }
+        int warp_id = tid >> 5;
+        int lane_id = tid & 31;
+        if (lane_id == 0) {
+            sdata[m * 2 + warp_id] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < 8) {
+        int m = tid;
+        if (m < m_cnt) {
+            float total = sdata[m * 2] + sdata[m * 2 + 1];
+            y[(long long)(m_base + m) * N + row] = (__nv_bfloat16)total;
+        }
+    }
+}
+"#;
+
+// T246.10 A6b.1 — sgemm_bf16_bf16_mvar : pure-BF16 weight matmul with arbitrary M.
+// Mirrors sgemv_bf16_bf16 but produces M output rows per launch.
+// Used for : SSM in_proj / out_proj / attention QKV/O if not quantized.
+#[cfg(feature = "cuda")]
+const SGEMM_BF16_BF16_MVAR_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void sgemm_bf16_bf16_mvar(
+    const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ x,    // [M, K] row-major
+    __nv_bfloat16* __restrict__ y,          // [M, N] row-major
+    int M,
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int n_mtiles = (M + 7) >> 3;
+    int mtile_idx = blockIdx.y;
+    if (mtile_idx >= n_mtiles) return;
+    int m_base = mtile_idx << 3;
+    int m_cnt = M - m_base;
+    if (m_cnt > 8) m_cnt = 8;
+
+    extern __shared__ float shmem[];     // [8 m × 2 warps] = 16 floats
+
+    float acc[8];
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) acc[m] = 0.0f;
+
+    int blocks_per_row = K / 256;
+    int pos_base = tid * 4;
+    int row_offset = row * K;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int k_off = b * 256 + pos_base;
+        const __nv_bfloat16* w_ptr = w + row_offset + k_off;
+        const __nv_bfloat16* x_base = x + (long long)m_base * K + k_off;
+
+        // Load 4 BF16 of W (shared across all m).
+        float wv0 = (float)w_ptr[0];
+        float wv1 = (float)w_ptr[1];
+        float wv2 = (float)w_ptr[2];
+        float wv3 = (float)w_ptr[3];
+
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if (m < m_cnt) {
+                const __nv_bfloat16* x_ptr = x_base + m * K;
+                acc[m] += wv0 * (float)x_ptr[0]
+                        + wv1 * (float)x_ptr[1]
+                        + wv2 * (float)x_ptr[2]
+                        + wv3 * (float)x_ptr[3];
+            }
+        }
+    }
+
+    // Warp-shuffle reduction (each m independently).
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        float a = acc[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xffffffff, a, offset);
+        }
+        int warp_id = tid >> 5;
+        int lane_id = tid & 31;
+        if (lane_id == 0) {
+            shmem[m * 2 + warp_id] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < 8) {
+        int m = tid;
+        if (m < m_cnt) {
+            float total = shmem[m * 2] + shmem[m * 2 + 1];
+            y[(long long)(m_base + m) * N + row] = (__nv_bfloat16)total;
+        }
+    }
+}
+"#;
+
 // T244.2 — sgemv_bf16_bf16 : pure-BF16 weight matmul for thin GEMV (decode).
 //
 // PROBLEM : cuBLASLt matmul_bf16 with M=1 is catastrophic on GB10. Measured
@@ -5653,14 +6143,22 @@ pub struct LlmKernels {
     sgemv_q4k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q4k_v3: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemm_q4k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    /// T246.10 A6b.1 — Q4_K matmul with arbitrary batch M (1..MAX_TREE_SIZE).
+    sgemm_q4k_mvar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q5k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q5k_v3: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemm_q5k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    /// T246.10 A6b.1 — Q5_K matmul with arbitrary batch M.
+    sgemm_q5k_mvar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k_v3: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_q6k_v4: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemm_q6k_m8: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    /// T246.10 A6b.1 — Q6_K matmul with arbitrary batch M.
+    sgemm_q6k_mvar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    /// T246.10 A6b.1 — pure-BF16 matmul with arbitrary batch M.
+    sgemm_bf16_mvar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     sgemv_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     /// T246.8 A3 — sgemv_bf16_bf16_v2 mma.sync m16n8k16 tensor-core SGEMV.
     sgemv_bf16_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -5763,14 +6261,18 @@ impl LlmKernels {
             sgemv_q4k_v2: std::sync::OnceLock::new(),
             sgemv_q4k_v3: std::sync::OnceLock::new(),
             sgemm_q4k_m8: std::sync::OnceLock::new(),
+            sgemm_q4k_mvar: std::sync::OnceLock::new(),
             sgemv_q5k: std::sync::OnceLock::new(),
             sgemv_q5k_v3: std::sync::OnceLock::new(),
             sgemm_q5k_m8: std::sync::OnceLock::new(),
+            sgemm_q5k_mvar: std::sync::OnceLock::new(),
             sgemv_q6k: std::sync::OnceLock::new(),
             sgemv_q6k_v2: std::sync::OnceLock::new(),
             sgemv_q6k_v3: std::sync::OnceLock::new(),
             sgemv_q6k_v4: std::sync::OnceLock::new(),
             sgemm_q6k_m8: std::sync::OnceLock::new(),
+            sgemm_q6k_mvar: std::sync::OnceLock::new(),
+            sgemm_bf16_mvar: std::sync::OnceLock::new(),
             sgemv_bf16: std::sync::OnceLock::new(),
             sgemv_bf16_v2: std::sync::OnceLock::new(),
             softplus_inplace: std::sync::OnceLock::new(),
@@ -6799,6 +7301,191 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "sgemm_q6k_bf16_m8::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.10 A6b.1 — Q4_K matmul with arbitrary batch M (1..MAX_TREE_SIZE).
+    /// Generalises `sgemm_q4k_bf16_m8` to M-variable. The kernel reads each
+    /// W super-block once per block and accumulates against `ceil(M/8)`
+    /// m-tiles of up to 8 m-rows.
+    ///
+    /// Inputs :
+    ///   w_q4k : [N, K] Q4_K row-major
+    ///   x     : [M, K] BF16 row-major
+    ///   y     : [M, N] BF16 row-major (output)
+    ///
+    /// # Safety  Caller ensures pointers valid and K multiple of 256.
+    pub unsafe fn sgemm_q4k_bf16_mvar(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q4k: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_q4k_bf16_mvar: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_q4k_bf16_mvar: M={m} N={n} must be positive"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemm_q4k_mvar,
+            SGEMM_Q4K_BF16_MVAR_SRC,
+            "sgemm_q4k_bf16_mvar",
+        )?;
+        let n_mtiles = ((m as u32) + 7) >> 3;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, n_mtiles, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 32 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q4k).arg(&x).arg(&y).arg(&m).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemm_q4k_bf16_mvar::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.10 A6b.1 — Q5_K matmul with arbitrary batch M.
+    ///
+    /// # Safety  Same contract as `sgemm_q4k_bf16_mvar`.
+    pub unsafe fn sgemm_q5k_bf16_mvar(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q5k: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_q5k_bf16_mvar: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_q5k_bf16_mvar: M={m} N={n} must be positive"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemm_q5k_mvar,
+            SGEMM_Q5K_BF16_MVAR_SRC,
+            "sgemm_q5k_bf16_mvar",
+        )?;
+        let n_mtiles = ((m as u32) + 7) >> 3;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, n_mtiles, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 32 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q5k).arg(&x).arg(&y).arg(&m).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemm_q5k_bf16_mvar::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.10 A6b.1 — Q6_K matmul with arbitrary batch M.
+    ///
+    /// # Safety  Same contract as `sgemm_q4k_bf16_mvar`.
+    pub unsafe fn sgemm_q6k_bf16_mvar(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q6k: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_q6k_bf16_mvar: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_q6k_bf16_mvar: M={m} N={n} must be positive"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemm_q6k_mvar,
+            SGEMM_Q6K_BF16_MVAR_SRC,
+            "sgemm_q6k_bf16_mvar",
+        )?;
+        let n_mtiles = ((m as u32) + 7) >> 3;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, n_mtiles, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 32 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q6k).arg(&x).arg(&y).arg(&m).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemm_q6k_bf16_mvar::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.10 A6b.1 — pure-BF16 matmul with arbitrary batch M.
+    ///
+    /// Inputs :
+    ///   w : [N, K] BF16 row-major
+    ///   x : [M, K] BF16 row-major
+    ///   y : [M, N] BF16 row-major (output)
+    ///
+    /// # Safety  Caller ensures pointers valid and K multiple of 256.
+    pub unsafe fn sgemm_bf16_bf16_mvar(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: u64,
+        x: u64,
+        y: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_bf16_bf16_mvar: K={k} must be multiple of 256"),
+            });
+        }
+        if m <= 0 || n <= 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemm_bf16_bf16_mvar: M={m} N={n} must be positive"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemm_bf16_mvar,
+            SGEMM_BF16_BF16_MVAR_SRC,
+            "sgemm_bf16_bf16_mvar",
+        )?;
+        let n_mtiles = ((m as u32) + 7) >> 3;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, n_mtiles, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 16 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w).arg(&x).arg(&y).arg(&m).arg(&n).arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemm_bf16_bf16_mvar::launch",
         })?;
         Ok(())
     }
@@ -9964,6 +10651,199 @@ mod parity_tests {
                     diff <= tol,
                     "m={m} n={j}: got={got} want={want} diff={diff} tol={tol}"
                 );
+            }
+        }
+    }
+
+    /// T246.10 A6b.1 — sgemm_q4k_bf16_mvar parity test : variable-M SGEMM
+    /// must match M sequential M=1 SGEMVs within BF16 tolerance, for several
+    /// M values including 1, 8, 15 (partial last tile), 16, 17, 32, 64.
+    /// Also verifies the M=8 path is bit-equivalent to sgemm_q4k_bf16_m8.
+    #[test]
+    fn sgemm_q4k_bf16_mvar_matches_seq_sgemv() {
+        use rustorch_gguf::dequant::{Q4_K_BYTES, QK_K};
+
+        let n = 64usize;
+        let k = 512usize;
+        let blocks_per_row = k / QK_K;
+        let row_bytes = blocks_per_row * Q4_K_BYTES;
+
+        let mut state: u64 = 0xa6b15eed;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut w_q4k_bytes = vec![0u8; n * row_bytes];
+        for b in &mut w_q4k_bytes {
+            *b = (next() & 0xFF) as u8;
+        }
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q4_K_BYTES;
+                let d = half::f16::from_f32(0.05).to_le_bytes();
+                let dmin = half::f16::from_f32(0.025).to_le_bytes();
+                w_q4k_bytes[off] = d[0];
+                w_q4k_bytes[off + 1] = d[1];
+                w_q4k_bytes[off + 2] = dmin[0];
+                w_q4k_bytes[off + 3] = dmin[1];
+                for i in 0..12 {
+                    w_q4k_bytes[off + 4 + i] &= 0x3F;
+                }
+            }
+        }
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let w_dev = stream.memcpy_stod(&w_q4k_bytes).expect("w");
+
+        for &m_batch in &[1usize, 8, 15, 16, 17, 32, 64] {
+            let mut x_all = vec![0.0f32; m_batch * k];
+            for m in 0..m_batch {
+                for j in 0..k {
+                    x_all[m * k + j] = ((m as f32 + 1.0) * (j as f32 * 0.013).sin()) * 0.3;
+                }
+            }
+            let x_bf: Vec<half::bf16> = x_all.iter().copied().map(half::bf16::from_f32).collect();
+            let x_dev = stream.memcpy_stod(&x_bf).expect("x");
+
+            // Reference : m_batch sequential M=1 SGEMVs.
+            let mut y_seq = vec![half::bf16::ZERO; m_batch * n];
+            for m in 0..m_batch {
+                let xm: Vec<half::bf16> = x_bf[m * k..(m + 1) * k].to_vec();
+                let xm_dev = stream.memcpy_stod(&xm).expect("xm");
+                let mut ym_dev = stream.alloc_zeros::<half::bf16>(n).expect("ym");
+                unsafe {
+                    let (w_p, _g1) = w_dev.device_ptr(&stream);
+                    let (x_p, _g2) = xm_dev.device_ptr(&stream);
+                    let (y_p, _g3) = ym_dev.device_ptr_mut(&stream);
+                    kernels
+                        .sgemv_q4k_bf16_v2(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                        .expect("v2");
+                }
+                let ym: Vec<half::bf16> = stream.memcpy_dtov(&ym_dev).expect("dl");
+                for j in 0..n {
+                    y_seq[m * n + j] = ym[j];
+                }
+            }
+
+            // M-variable test.
+            let mut y_dev = stream
+                .alloc_zeros::<half::bf16>(m_batch * n)
+                .expect("y_dev");
+            unsafe {
+                let (w_p, _g1) = w_dev.device_ptr(&stream);
+                let (x_p, _g2) = x_dev.device_ptr(&stream);
+                let (y_p, _g3) = y_dev.device_ptr_mut(&stream);
+                kernels
+                    .sgemm_q4k_bf16_mvar(&stream, w_p, x_p, y_p, m_batch as i32, n as i32, k as i32)
+                    .expect("mvar");
+            }
+            let y_mvar: Vec<half::bf16> = stream.memcpy_dtov(&y_dev).expect("dl mvar");
+
+            for m in 0..m_batch {
+                for j in 0..n {
+                    let got = y_mvar[m * n + j].to_f32();
+                    let want = y_seq[m * n + j].to_f32();
+                    let diff = (got - want).abs();
+                    let tol = want.abs() * 5e-2 + 1e-2;
+                    assert!(
+                        diff <= tol,
+                        "M={m_batch} m={m} n={j}: got={got} want={want} diff={diff} tol={tol}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// T246.10 A6b.1 — sgemm_bf16_bf16_mvar parity test.
+    #[test]
+    fn sgemm_bf16_bf16_mvar_matches_seq_sgemv() {
+        let n = 64usize;
+        let k = 512usize;
+
+        let mut state: u64 = 0xbf16a6b;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+        let mut w_f32 = vec![0.0f32; n * k];
+        for v in &mut w_f32 {
+            *v = ((next() % 1024) as f32 - 512.0) * 0.001;
+        }
+        let w_bf: Vec<half::bf16> = w_f32.iter().copied().map(half::bf16::from_f32).collect();
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let kernels = LlmKernels::new(ctx);
+        let w_dev = stream.memcpy_stod(&w_bf).expect("w");
+
+        for &m_batch in &[1usize, 8, 16, 17, 32] {
+            let mut x_all = vec![0.0f32; m_batch * k];
+            for m in 0..m_batch {
+                for j in 0..k {
+                    x_all[m * k + j] = ((m as f32 + 1.0) * (j as f32 * 0.013).sin()) * 0.3;
+                }
+            }
+            let x_bf: Vec<half::bf16> = x_all.iter().copied().map(half::bf16::from_f32).collect();
+            let x_dev = stream.memcpy_stod(&x_bf).expect("x");
+
+            // Reference : m_batch sequential M=1 SGEMVs (via sgemv_bf16_bf16).
+            let mut y_seq = vec![half::bf16::ZERO; m_batch * n];
+            for m in 0..m_batch {
+                let xm: Vec<half::bf16> = x_bf[m * k..(m + 1) * k].to_vec();
+                let xm_dev = stream.memcpy_stod(&xm).expect("xm");
+                let mut ym_dev = stream.alloc_zeros::<half::bf16>(n).expect("ym");
+                unsafe {
+                    let (w_p, _g1) = w_dev.device_ptr(&stream);
+                    let (x_p, _g2) = xm_dev.device_ptr(&stream);
+                    let (y_p, _g3) = ym_dev.device_ptr_mut(&stream);
+                    kernels
+                        .sgemv_bf16_bf16(&stream, w_p, x_p, y_p, n as i32, k as i32)
+                        .expect("v1");
+                }
+                let ym: Vec<half::bf16> = stream.memcpy_dtov(&ym_dev).expect("dl");
+                for j in 0..n {
+                    y_seq[m * n + j] = ym[j];
+                }
+            }
+
+            let mut y_dev = stream
+                .alloc_zeros::<half::bf16>(m_batch * n)
+                .expect("y_dev");
+            unsafe {
+                let (w_p, _g1) = w_dev.device_ptr(&stream);
+                let (x_p, _g2) = x_dev.device_ptr(&stream);
+                let (y_p, _g3) = y_dev.device_ptr_mut(&stream);
+                kernels
+                    .sgemm_bf16_bf16_mvar(
+                        &stream,
+                        w_p,
+                        x_p,
+                        y_p,
+                        m_batch as i32,
+                        n as i32,
+                        k as i32,
+                    )
+                    .expect("mvar");
+            }
+            let y_mvar: Vec<half::bf16> = stream.memcpy_dtov(&y_dev).expect("dl mvar");
+
+            for m in 0..m_batch {
+                for j in 0..n {
+                    let got = y_mvar[m * n + j].to_f32();
+                    let want = y_seq[m * n + j].to_f32();
+                    let diff = (got - want).abs();
+                    let tol = want.abs() * 5e-2 + 1e-2;
+                    assert!(
+                        diff <= tol,
+                        "M={m_batch} m={m} n={j}: got={got} want={want} diff={diff} tol={tol}"
+                    );
+                }
             }
         }
     }
