@@ -7315,7 +7315,8 @@ impl LlmKernels {
     ///   x     : [M, K] BF16 row-major
     ///   y     : [M, N] BF16 row-major (output)
     ///
-    /// # Safety  Caller ensures pointers valid and K multiple of 256.
+    /// # Safety
+    /// Caller ensures pointers valid and K multiple of 256.
     pub unsafe fn sgemm_q4k_bf16_mvar(
         &self,
         stream: &Arc<CudaStream>,
@@ -7358,7 +7359,8 @@ impl LlmKernels {
 
     /// T246.10 A6b.1 — Q5_K matmul with arbitrary batch M.
     ///
-    /// # Safety  Same contract as `sgemm_q4k_bf16_mvar`.
+    /// # Safety
+    /// Same contract as `sgemm_q4k_bf16_mvar`.
     pub unsafe fn sgemm_q5k_bf16_mvar(
         &self,
         stream: &Arc<CudaStream>,
@@ -7401,7 +7403,8 @@ impl LlmKernels {
 
     /// T246.10 A6b.1 — Q6_K matmul with arbitrary batch M.
     ///
-    /// # Safety  Same contract as `sgemm_q4k_bf16_mvar`.
+    /// # Safety
+    /// Same contract as `sgemm_q4k_bf16_mvar`.
     pub unsafe fn sgemm_q6k_bf16_mvar(
         &self,
         stream: &Arc<CudaStream>,
@@ -7449,7 +7452,8 @@ impl LlmKernels {
     ///   x : [M, K] BF16 row-major
     ///   y : [M, N] BF16 row-major (output)
     ///
-    /// # Safety  Caller ensures pointers valid and K multiple of 256.
+    /// # Safety
+    /// Caller ensures pointers valid and K multiple of 256.
     pub unsafe fn sgemm_bf16_bf16_mvar(
         &self,
         stream: &Arc<CudaStream>,
