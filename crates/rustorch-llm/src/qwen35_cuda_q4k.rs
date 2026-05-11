@@ -4830,12 +4830,38 @@ fn moe_ffn_forward_step_mega(
             x_q8_p,
         )?;
     }
-    // h_p += Σ_{s} topk_w[s] * down[s, :]  (single fused launch — replaces
-    // the K-iteration scaled_add_inplace_bf16_devscalar loop).
-    unsafe {
-        kernels
-            .scaled_add_routed_bf16(stream, h_p, expert_out_p, topk_w_p, d, k)
-            .map_err(|e| LlmError::Backend(format!("scaled_add_routed: {e:?}")))?;
+    // h_p += Σ_{s} topk_w[s] * down[s, :]
+    //
+    // We have two epilogue options :
+    //   a) `scaled_add_routed_bf16` (1 launch, sums all K in fp32 then
+    //      down-casts once) — drifts ~1 ULP per element vs the per-step
+    //      down-cast path, which compounds across 64 layers and produces
+    //      different greedy tokens from token 1 onwards on Qwen3.6-A3B
+    //      (real-world : ~12% perf win, but parity gate fails).
+    //   b) K iterations of `scaled_add_inplace_bf16_devscalar` (legacy
+    //      A2 path) — bit-exact with MEGA=0 epilogue but adds K=8 launches.
+    //
+    // We default to (b) for parity ; flip RUSTORCH_MOE_MEGA_ROUTED=1 to
+    // opt into (a) for the extra ~3-4% win at the cost of token drift.
+    let mega_routed = std::env::var("RUSTORCH_MOE_MEGA_ROUTED")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if mega_routed {
+        unsafe {
+            kernels
+                .scaled_add_routed_bf16(stream, h_p, expert_out_p, topk_w_p, d, k)
+                .map_err(|e| LlmError::Backend(format!("scaled_add_routed: {e:?}")))?;
+        }
+    } else {
+        for slot in 0..k {
+            let y_slot_p = expert_out_p + (slot as u64) * (d as u64) * elem_size;
+            unsafe {
+                kernels
+                    .scaled_add_inplace_bf16_devscalar(stream, h_p, y_slot_p, topk_w_p, slot, d)
+                    .map_err(|e| LlmError::Backend(format!("scaled_add slot={slot}: {e:?}")))?;
+            }
+        }
     }
 
     // ---- 5. Shared expert (parallel path, identical to async variant) ----
