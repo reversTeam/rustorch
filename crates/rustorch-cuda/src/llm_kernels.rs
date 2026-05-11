@@ -6215,6 +6215,167 @@ extern "C" __global__ void dequant_q4_k_to_bf16(
 }
 "#;
 
+// Q4K-MOE-CUBLAS.1b — dequant N expert Q4_K weight tiles into a CONTIGUOUS
+// BF16 buffer. Each expert has its own VRAM base pointer (the loader
+// allocates one CudaSlice per expert — see load_stacked_quant_experts), so
+// we read source data via `expert_ptrs[e]` and write to
+// `out[(e * blocks_per_expert + b) * 256 ... ]` contiguously.
+//
+// Launch geometry : grid = (n_experts, blocks_per_expert, 1), each block
+// handles one super-block.
+#[cfg(feature = "cuda")]
+const DEQUANT_Q4_K_INDEXED_TO_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void dequant_q4_k_indexed_to_bf16(
+    const unsigned long long* __restrict__ expert_ptrs, // [n_experts]
+    __nv_bfloat16*            __restrict__ out,         // [n_experts*blocks_per_expert*256]
+    int blocks_per_expert
+) {
+    int e   = blockIdx.x;
+    int blk = blockIdx.y;
+    int tid = threadIdx.x;
+
+    const unsigned char* __restrict__ w_q4k =
+        (const unsigned char* __restrict__)expert_ptrs[e];
+    const unsigned char* blk_ptr = w_q4k + (long long)blk * 144;
+
+    unsigned short d_bits    = blk_ptr[0] | (blk_ptr[1] << 8);
+    unsigned short dmin_bits = blk_ptr[2] | (blk_ptr[3] << 8);
+    float d    = __half2float(__ushort_as_half(d_bits));
+    float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+    __shared__ float scale[8];
+    __shared__ float min_v[8];
+    if (tid < 8) {
+        const unsigned char* scales = blk_ptr + 4;
+        unsigned char sc, m;
+        if (tid < 4) {
+            sc = scales[tid]     & 0x3F;
+            m  = scales[tid + 4] & 0x3F;
+        } else {
+            int g = tid - 4;
+            sc = (scales[g + 8] & 0x0F) | ((scales[g]     >> 6) << 4);
+            m  = (scales[g + 8] >> 4)   | ((scales[g + 4] >> 6) << 4);
+        }
+        scale[tid] = d    * (float)sc;
+        min_v[tid] = dmin * (float)m;
+    }
+    __syncthreads();
+
+    const unsigned char* qs = blk_ptr + 16;
+    int group     = tid >> 3;
+    int pos_base  = (tid & 7) << 2;
+    int byte_base = (group << 5) + pos_base;
+    int sub_a = group * 2;
+    int sub_b = sub_a + 1;
+    float sa = scale[sub_a], ma = min_v[sub_a];
+    float sb = scale[sub_b], mb = min_v[sub_b];
+
+    unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
+    unsigned char by0 = (qbytes      ) & 0xFFu;
+    unsigned char by1 = (qbytes >>  8) & 0xFFu;
+    unsigned char by2 = (qbytes >> 16) & 0xFFu;
+    unsigned char by3 = (qbytes >> 24) & 0xFFu;
+    int na0 = by0 & 0x0F, na1 = by1 & 0x0F, na2 = by2 & 0x0F, na3 = by3 & 0x0F;
+    int nb0 = by0 >>   4, nb1 = by1 >>   4, nb2 = by2 >>   4, nb3 = by3 >>   4;
+
+    long long out_blk_base = ((long long)e * blocks_per_expert + blk) * 256;
+    long long off_a = out_blk_base + (long long)sub_a * 32 + pos_base;
+    long long off_b = out_blk_base + (long long)sub_b * 32 + pos_base;
+    out[off_a + 0] = (__nv_bfloat16)(sa * (float)na0 - ma);
+    out[off_a + 1] = (__nv_bfloat16)(sa * (float)na1 - ma);
+    out[off_a + 2] = (__nv_bfloat16)(sa * (float)na2 - ma);
+    out[off_a + 3] = (__nv_bfloat16)(sa * (float)na3 - ma);
+    out[off_b + 0] = (__nv_bfloat16)(sb * (float)nb0 - mb);
+    out[off_b + 1] = (__nv_bfloat16)(sb * (float)nb1 - mb);
+    out[off_b + 2] = (__nv_bfloat16)(sb * (float)nb2 - mb);
+    out[off_b + 3] = (__nv_bfloat16)(sb * (float)nb3 - mb);
+}
+"#;
+
+// Q4K-MOE-CUBLAS.2 — row gather / scatter helpers for the per-expert
+// cuBLASLt path. The MoE Group-GEMM input x[M, K] gets gathered into a
+// CONTIGUOUS [n_slots, K] buffer via `ids_src1`, then cuBLASLt produces a
+// CONTIGUOUS [n_slots, N] output buffer, which gets scattered to the final
+// y[M, k_used, N] layout via `ids_dst`.
+//
+// Both kernels are bandwidth-bound copies — one warp per row, each thread
+// copies 8 contiguous BF16 = 16 B per iteration. For Qwen3.6-A3B shapes
+// (n_slots=4096, K=2048 or N=768) the gather costs ~16 MB write @ 200 GB/s
+// = 0.08 ms — negligible vs the dequant + cuBLASLt (~5 ms).
+#[cfg(feature = "cuda")]
+const GATHER_ROWS_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// Each block handles ONE compact slot. Block size = 128 threads,
+// each thread copies K/128 BF16 elements (K is multiple of 256, so /128 ok).
+extern "C" __global__ void gather_rows_bf16(
+    const __nv_bfloat16* __restrict__ src,       // [M, K]
+    __nv_bfloat16*       __restrict__ dst,       // [n_slots, K]
+    const int*           __restrict__ ids_src1,  // [n_slots] -> source row
+    int n_slots,
+    int K
+) {
+    int compact_idx = blockIdx.x;
+    if (compact_idx >= n_slots) return;
+    int src_row = ids_src1[compact_idx];
+
+    const __nv_bfloat16* sptr = src + (long long)src_row * K;
+    __nv_bfloat16*       dptr = dst + (long long)compact_idx * K;
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    // 8-wide vec copy when aligned (K is multiple of 8 here since K%256==0).
+    int K8 = K / 8;
+    const ulonglong2* sptr8 = (const ulonglong2*)sptr;
+    ulonglong2*       dptr8 = (ulonglong2*)dptr;
+    for (int i = tid; i < K8; i += stride) {
+        dptr8[i] = sptr8[i];
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const SCATTER_ROWS_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+// Each block handles ONE compact slot. Same launch geometry as
+// gather_rows_bf16, but destination row is ids_dst[compact_idx].
+extern "C" __global__ void scatter_rows_bf16(
+    const __nv_bfloat16* __restrict__ src,       // [n_slots, N]
+    __nv_bfloat16*       __restrict__ dst,       // [M * k_used, N] flat
+    const int*           __restrict__ ids_dst,   // [n_slots] -> destination row
+    int n_slots,
+    int N
+) {
+    int compact_idx = blockIdx.x;
+    if (compact_idx >= n_slots) return;
+    int dst_row = ids_dst[compact_idx];
+
+    const __nv_bfloat16* sptr = src + (long long)compact_idx * N;
+    __nv_bfloat16*       dptr = dst + (long long)dst_row * N;
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    // N may not be multiple of 8 (Qwen3.6-A3B has expert_f=768 = 8x96 -> ok).
+    int N8 = N / 8;
+    const ulonglong2* sptr8 = (const ulonglong2*)sptr;
+    ulonglong2*       dptr8 = (ulonglong2*)dptr;
+    for (int i = tid; i < N8; i += stride) {
+        dptr8[i] = sptr8[i];
+    }
+    // Tail (N % 8) - only thread 0 handles it.
+    if (tid == 0) {
+        int tail0 = N8 * 8;
+        for (int i = tail0; i < N; ++i) {
+            dptr[i] = sptr[i];
+        }
+    }
+}
+"#;
+
 // T246.10 TrackE.4 — Q5_K sort-permutation Group-GEMM (cache reuse).
 //
 // Same per-(slot, row) inner body as `mul_mm_id_gemm_q5_k_bf16`, but iterates
@@ -8354,6 +8515,11 @@ pub struct LlmKernels {
     mul_mat_q4_k_q8_1_mma: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.10 Q4K-MOE-CUBLAS — Q4_K -> BF16 device-side dequant.
     dequant_q4_k_to_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.10 Q4K-MOE-CUBLAS.1b — indexed dequant (per-expert base pointer).
+    dequant_q4_k_indexed_to_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.10 Q4K-MOE-CUBLAS.2 — row gather / scatter for cuBLASLt staging.
+    gather_rows_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    scatter_rows_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -8471,6 +8637,9 @@ impl LlmKernels {
             mul_mat_q4_k_q8_1_mma: std::sync::OnceLock::new(),
             // T246.10 Q4K-MOE-CUBLAS.
             dequant_q4_k_to_bf16: std::sync::OnceLock::new(),
+            dequant_q4_k_indexed_to_bf16: std::sync::OnceLock::new(),
+            gather_rows_bf16: std::sync::OnceLock::new(),
+            scatter_rows_bf16: std::sync::OnceLock::new(),
         }
     }
 
@@ -12946,6 +13115,137 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "dequant_q4_k_to_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q4K-MOE-CUBLAS.1b — indexed Q4_K → BF16 dequant.
+    ///
+    /// Each expert has its own VRAM base pointer (loader-side per-expert
+    /// CudaSlice). Source data is read via `expert_ptrs[e]` and written to
+    /// `out[(e * blocks_per_expert + b) * 256 ..]` contiguously across
+    /// experts. Output `[n_experts * blocks_per_expert * 256]` BF16.
+    ///
+    /// # Safety
+    /// `expert_ptrs_dev` is `[n_experts]` u64 with valid Q4_K base pointers
+    /// of length `blocks_per_expert * 144` bytes. `out_bf16_dev` is at least
+    /// `n_experts * blocks_per_expert * 256` BF16 elements.
+    pub unsafe fn dequant_q4_k_indexed_to_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs_dev: u64,
+        out_bf16_dev: u64,
+        n_experts: i32,
+        blocks_per_expert: i32,
+    ) -> Result<(), CudaError> {
+        if n_experts <= 0 || blocks_per_expert <= 0 {
+            return Ok(());
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.dequant_q4_k_indexed_to_bf16,
+            DEQUANT_Q4_K_INDEXED_TO_BF16_SRC,
+            "dequant_q4_k_indexed_to_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_experts as u32, blocks_per_expert as u32, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs_dev)
+            .arg(&out_bf16_dev)
+            .arg(&blocks_per_expert);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "dequant_q4_k_indexed_to_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q4K-MOE-CUBLAS.2 — gather rows from `src[M, K]` into a CONTIGUOUS
+    /// `dst[n_slots, K]` buffer per `ids_src1[compact_idx] → source_row`.
+    /// Used to stage the MoE Group-GEMM input for cuBLASLt.
+    ///
+    /// # Safety
+    /// `src_dev` is `[M, K]` BF16, `dst_dev` is `[n_slots, K]` BF16,
+    /// `ids_src1_dev` is `[n_slots]` i32 with valid row indices in `[0, M)`.
+    pub unsafe fn gather_rows_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        src_dev: u64,
+        dst_dev: u64,
+        ids_src1_dev: u64,
+        n_slots: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if n_slots <= 0 || k <= 0 {
+            return Ok(());
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.gather_rows_bf16,
+            GATHER_ROWS_BF16_SRC,
+            "gather_rows_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_slots as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&src_dev)
+            .arg(&dst_dev)
+            .arg(&ids_src1_dev)
+            .arg(&n_slots)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "gather_rows_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q4K-MOE-CUBLAS.2 — scatter rows from `src[n_slots, N]` into
+    /// `dst[M*k_used, N]` per `ids_dst[compact_idx] → destination_row`.
+    /// Used to map the cuBLASLt output back to the `[M, k_used, N]` layout
+    /// that downstream consumers (swiglu, scaled_add) read from.
+    ///
+    /// # Safety
+    /// `src_dev` is `[n_slots, N]` BF16, `dst_dev` is `[M*k_used, N]` BF16,
+    /// `ids_dst_dev` is `[n_slots]` i32 with valid row indices in `[0, M*k_used)`.
+    pub unsafe fn scatter_rows_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        src_dev: u64,
+        dst_dev: u64,
+        ids_dst_dev: u64,
+        n_slots: i32,
+        n: i32,
+    ) -> Result<(), CudaError> {
+        if n_slots <= 0 || n <= 0 {
+            return Ok(());
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.scatter_rows_bf16,
+            SCATTER_ROWS_BF16_SRC,
+            "scatter_rows_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_slots as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&src_dev)
+            .arg(&dst_dev)
+            .arg(&ids_dst_dev)
+            .arg(&n_slots)
+            .arg(&n);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "scatter_rows_bf16::launch",
         })?;
         Ok(())
     }

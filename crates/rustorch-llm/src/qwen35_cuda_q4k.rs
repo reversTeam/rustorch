@@ -256,6 +256,29 @@ fn prefill_cublas_enabled() -> bool {
 /// tensor-core compute on the floor.
 pub(crate) const PREFILL_CUBLAS_MIN_M: usize = 16;
 
+/// **Q4K-MOE-CUBLAS** — runtime gate for the Path A MoE Group-GEMM dispatch
+/// (dequant Q4_K → BF16 + per-expert cuBLASLt SGEMM). Default OFF.
+/// When `RUSTORCH_Q4K_MOE_CUBLAS=1` AND the gate/up/down expert kind is Q4_K
+/// AND `M >= Q4K_MOE_CUBLAS_MIN_M`, the routed MoE matmuls in
+/// `moe_ffn_forward_step_group_gemm` are dispatched through this path
+/// instead of the sorted Group-GEMM kernel.
+///
+/// Phase 1 standalone bench (note Q4K-MOE-CUBLAS.1) measured this path
+/// at 4.97 ms vs the sorted kernel's 8.82 ms on the representative
+/// Qwen3.6-A3B shape (M=512, K=2048, N=768, n_experts=128, k_used=8) — a
+/// 1.78× speedup. Amdahl projects ~+10 tok/s on the wall-clock pp512.
+fn q4k_moe_cublas_enabled() -> bool {
+    std::env::var("RUSTORCH_Q4K_MOE_CUBLAS")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Minimum M for the Q4K-MOE-CUBLAS path. At low M the per-expert cuBLASLt
+/// launch overhead (128 calls × ~17 μs = 2 ms minimum) dominates over the
+/// sorted kernel's single-launch cost.
+pub(crate) const Q4K_MOE_CUBLAS_MIN_M: i32 = 64;
+
 /// T246.10 MMQ-WHOLESALE — env gate for the Q8_1-packed INT8-staged Q4_K
 /// matmul path (kernels landed in 4206d2d). Default OFF preserves bit-exact
 /// parity with TrackG-lite. Set `RUSTORCH_MMQ_WHOLESALE=1` to route the
@@ -881,6 +904,116 @@ pub(crate) fn dispatch_sorted_group_gemm(
     }
 }
 
+/// Q4K-MOE-CUBLAS — context bundle passed to the Group-GEMM helper.
+///
+/// Holds the cuBLASLt session (mutably borrowed via `RefCell`) plus the
+/// dequant / gather / scatter scratches. The MoE loop calls this once per
+/// matmul (gate / up / down) with the same scratches re-used.
+pub(crate) struct Q4kCublasCtx<'a> {
+    pub session: &'a std::cell::RefCell<LtSession>,
+    pub w_bf16_p: u64,
+    pub x_gather_p: u64,
+    pub y_dense_p: u64,
+}
+
+/// Q4K-MOE-CUBLAS.2 — Path A dispatch for one MoE matmul.
+///
+/// 1. Dequant N expert Q4_K weights into a CONTIGUOUS `w_bf16`
+///    `[n_experts × N × K]` buffer via the indexed dequant kernel
+///    (one launch, source pointers from `expert_ptrs_dev`).
+/// 2. Gather the per-compact-slot input rows from `x[M, K]` into
+///    `x_gather[n_slots × K]` via `ids_src1` (one launch).
+/// 3. For each active expert (count_e > 0), call cuBLASLt
+///    `matmul_bf16_rowmajor` over `[count_e, K] × [N, K]^T → [count_e, N]`.
+/// 4. Scatter `y_dense[n_slots × N]` into `y[M*k_used, N]` via `ids_dst`
+///    (one launch).
+///
+/// Output layout matches the sorted kernel's `[M, k_used, N]` so downstream
+/// consumers (swiglu, scaled_add, down-proj) are unchanged.
+///
+/// Precondition : `kind == ExpertQuantKind::Q4K`, `K % 256 == 0`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_q4k_moe_cublas(
+    kernels: &LlmKernels,
+    stream: &Arc<CudaStream>,
+    session: &mut LtSession,
+    expert_ptrs_dev_p: u64,
+    expert_bounds_host: &[i32],
+    ids_src1_p: u64,
+    ids_dst_p: u64,
+    x_p: u64,
+    y_p: u64,
+    w_bf16_scratch_p: u64,
+    x_gather_scratch_p: u64,
+    y_dense_scratch_p: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    k_used: i32,
+    _label: &'static str,
+) -> Result<(), LlmError> {
+    let n_experts = expert_bounds_host.len().saturating_sub(1);
+    if n_experts == 0 {
+        return Ok(());
+    }
+    let n_slots = m * k_used;
+    if n_slots == 0 {
+        return Ok(());
+    }
+    let blocks_per_expert = n * k / 256;
+
+    // ---- (1) Dequant all experts in ONE indexed launch -------------
+    unsafe {
+        kernels
+            .dequant_q4_k_indexed_to_bf16(
+                stream,
+                expert_ptrs_dev_p,
+                w_bf16_scratch_p,
+                n_experts as i32,
+                blocks_per_expert,
+            )
+            .map_err(|e| LlmError::Backend(format!("dequant Q4K-CUBLAS: {e:?}")))?;
+    }
+
+    // ---- (2) Gather x rows into contiguous [n_slots, K] buffer -----
+    unsafe {
+        kernels
+            .gather_rows_bf16(stream, x_p, x_gather_scratch_p, ids_src1_p, n_slots, k)
+            .map_err(|e| LlmError::Backend(format!("gather Q4K-CUBLAS: {e:?}")))?;
+    }
+
+    // ---- (3) Per-expert cuBLASLt SGEMM -----------------------------
+    let bf16_sz = std::mem::size_of::<half::bf16>() as u64;
+    for e in 0..n_experts {
+        let start = expert_bounds_host[e] as i64;
+        let end = expert_bounds_host[e + 1] as i64;
+        let count = (end - start) as usize;
+        if count == 0 {
+            continue;
+        }
+        let w_e_p = w_bf16_scratch_p + (e as u64) * (n as u64) * (k as u64) * bf16_sz;
+        let x_e_p = x_gather_scratch_p + (start as u64) * (k as u64) * bf16_sz;
+        let y_e_p = y_dense_scratch_p + (start as u64) * (n as u64) * bf16_sz;
+        unsafe {
+            session
+                .matmul_bf16_rowmajor(w_e_p, x_e_p, y_e_p, count, n as usize, k as usize, 1.0, 0.0)
+                .map_err(|e_| {
+                    LlmError::Backend(format!(
+                        "matmul_bf16_rowmajor Q4K-CUBLAS expert {e} count={count}: {e_:?}"
+                    ))
+                })?;
+        }
+    }
+
+    // ---- (4) Scatter dense output to y[ids_dst, :] -----------------
+    unsafe {
+        kernels
+            .scatter_rows_bf16(stream, y_dense_scratch_p, y_p, ids_dst_p, n_slots, n)
+            .map_err(|e| LlmError::Backend(format!("scatter Q4K-CUBLAS: {e:?}")))?;
+    }
+    Ok(())
+}
+
 /// MoE FFN weights for one layer (Qwen3.6-35B-A3B). Top-K routed experts +
 /// parallel shared expert. T246.6.
 pub(crate) struct MoeFfnQ4K {
@@ -1181,6 +1314,27 @@ pub(crate) struct DecodeScratch {
     pub(crate) moe_ids_dst_m: CudaSlice<i32>,
     /// `[n_experts + 1]` i32 — prefix sums per expert.
     pub(crate) moe_expert_bounds: CudaSlice<i32>,
+
+    // ── Q4K-MOE-CUBLAS — Path A scratch (dequant + per-expert cuBLASLt) ──
+    //
+    // Sized to the WORST-CASE per-matmul (= max(d × ef, n_experts × N × K))
+    // and re-used across gate / up / down. For Qwen3.6-35B-A3B at
+    // n_experts=128, d=2048, ef=768 :
+    //   - moe_q4k_cublas_w_bf16 : 128 × 2048 × 768 × 2 ≈ 403 MB
+    //   - moe_q4k_cublas_x_gather : MAX_TREE_SIZE × k_used × max(d, ef) × 2
+    //                              ≈ 512 × 8 × 2048 × 2 = 16 MB
+    //   - moe_q4k_cublas_y_dense : MAX_TREE_SIZE × k_used × max(d, ef) × 2
+    //                              ≈ 16 MB
+    // For Dense (non-MoE) variants these are sized 1 (placeholder, never
+    // used) to avoid allocation overhead on models that don't need them.
+    /// BF16 dequantized expert weights buffer, sized for the largest
+    /// `[n_experts × N × K]` tile — re-used per gate/up/down.
+    pub(crate) moe_q4k_cublas_w_bf16: CudaSlice<half::bf16>,
+    /// Per-compact-slot gathered input `[n_slots × max(d, ef)]` BF16.
+    pub(crate) moe_q4k_cublas_x_gather: CudaSlice<half::bf16>,
+    /// Per-compact-slot dense output `[n_slots × max(d, ef)]` BF16, to be
+    /// scatter-copied to the final `[M, k_used, *]` layout.
+    pub(crate) moe_q4k_cublas_y_dense: CudaSlice<half::bf16>,
 
     // ── T246.7 TrackC — SSM-hybrid Lookahead per-branch state forking ──
     //
@@ -1996,6 +2150,42 @@ impl Qwen35ModelCudaQ4K {
             moe_expert_bounds: stream
                 .alloc_zeros::<i32>(cfg.n_experts.max(1) + 1)
                 .map_err(|e| LlmError::Backend(format!("scratch moe_expert_bounds: {e:?}")))?,
+
+            // ── Q4K-MOE-CUBLAS — Path A scratch buffers ──
+            //
+            // For MoE variants (cfg.n_experts > 0) we allocate dequant scratch
+            // sized to the worst-case per-matmul tile. For non-MoE variants
+            // (Dense / Qwen3.6-27B / pure transformer) we keep these at size 1
+            // so the field is always valid but never read.
+            moe_q4k_cublas_w_bf16: {
+                let is_moe = cfg.n_experts > 0 && cfg.expert_f > 0;
+                let len = if is_moe {
+                    cfg.n_experts * cfg.d * cfg.expert_f.max(1)
+                } else {
+                    1
+                };
+                stream.alloc_zeros::<half::bf16>(len).map_err(|e| {
+                    LlmError::Backend(format!("scratch moe_q4k_cublas_w_bf16: {e:?}"))
+                })?
+            },
+            moe_q4k_cublas_x_gather: {
+                let is_moe = cfg.n_experts > 0 && cfg.expert_f > 0;
+                let kmax = cfg.d.max(cfg.expert_f.max(1));
+                let n_slots_max = MAX_TREE_SIZE * cfg.n_experts_used.max(1);
+                let len = if is_moe { n_slots_max * kmax } else { 1 };
+                stream.alloc_zeros::<half::bf16>(len).map_err(|e| {
+                    LlmError::Backend(format!("scratch moe_q4k_cublas_x_gather: {e:?}"))
+                })?
+            },
+            moe_q4k_cublas_y_dense: {
+                let is_moe = cfg.n_experts > 0 && cfg.expert_f > 0;
+                let nmax = cfg.d.max(cfg.expert_f.max(1));
+                let n_slots_max = MAX_TREE_SIZE * cfg.n_experts_used.max(1);
+                let len = if is_moe { n_slots_max * nmax } else { 1 };
+                stream.alloc_zeros::<half::bf16>(len).map_err(|e| {
+                    LlmError::Backend(format!("scratch moe_q4k_cublas_y_dense: {e:?}"))
+                })?
+            },
 
             // ── T246.7 TrackC — SSM-hybrid Lookahead per-branch buffers ──
             // For SSM-hybrid models (Qwen3.6 Dense / MoE) we pre-allocate one
@@ -4188,6 +4378,29 @@ impl Qwen35ModelCudaQ4K {
                         // + minimum M + Q4_K weight kind.
                         let (mxq8mmq_p, _g11) =
                             self.scratch.moe_x_q8_mmq_m.device_ptr_mut(&self.stream);
+                        // Q4K-MOE-CUBLAS — gather Path A scratch pointers
+                        // and pass an Option<Q4kCublasCtx>. When the env
+                        // flag is OFF we pass None — `moe_ffn_forward_step_group_gemm`
+                        // then takes the legacy sorted / indexed paths.
+                        let q4k_cublas_on = q4k_moe_cublas_enabled();
+                        let (q4k_w_p, _gqw) = self
+                            .scratch
+                            .moe_q4k_cublas_w_bf16
+                            .device_ptr_mut(&self.stream);
+                        let (q4k_xg_p, _gqxg) = self
+                            .scratch
+                            .moe_q4k_cublas_x_gather
+                            .device_ptr_mut(&self.stream);
+                        let (q4k_yd_p, _gqyd) = self
+                            .scratch
+                            .moe_q4k_cublas_y_dense
+                            .device_ptr_mut(&self.stream);
+                        let q4k_cublas_ctx = Q4kCublasCtx {
+                            session: &self.session,
+                            w_bf16_p: q4k_w_p,
+                            x_gather_p: q4k_xg_p,
+                            y_dense_p: q4k_yd_p,
+                        };
                         moe_ffn_forward_step_group_gemm(
                             moe,
                             &self.kernels,
@@ -4211,8 +4424,14 @@ impl Qwen35ModelCudaQ4K {
                             ids_src1_m_p,
                             ids_dst_m_p,
                             expert_bounds_p,
+                            Some(&self.scratch.moe_expert_bounds),
                             use_sorted,
                             mxq8mmq_p,
+                            if q4k_cublas_on {
+                                Some(&q4k_cublas_ctx)
+                            } else {
+                                None
+                            },
                         )?;
                     } else {
                         for r in 0..tree_size {
@@ -6770,10 +6989,13 @@ fn moe_ffn_forward_step_group_gemm(
     ids_src1_m_p: u64,
     ids_dst_m_p: u64,
     expert_bounds_p: u64,
+    expert_bounds_dev: Option<&CudaSlice<i32>>,
     use_sorted: bool,
     // MMQ-WHOLESALE.6a — packed Q8_1 staging for the shared-expert MMQ path
     // (0 to skip, falls back to per-token loop).
     x_q8_mmq_m_p: u64,
+    // Q4K-MOE-CUBLAS — Path A dispatch.
+    q4k_cublas: Option<&Q4kCublasCtx<'_>>,
 ) -> Result<(), LlmError> {
     use cudarc::driver::DevicePtr;
     let d = cfg.d as i32;
@@ -6859,7 +7081,60 @@ fn moe_ffn_forward_step_group_gemm(
     let (u_ptrs_p, _gu) = moe.up_exp_ptrs_dev.device_ptr(stream);
     let (d_ptrs_p, _gd) = moe.down_exp_ptrs_dev.device_ptr(stream);
 
-    if sort_active {
+    // Q4K-MOE-CUBLAS — Path A is active when : (a) the caller provided a
+    // ctx + device-side expert_bounds, (b) M >= Q4K_MOE_CUBLAS_MIN_M,
+    // (c) the relevant expert kind is Q4_K (only kind we have a CUDA
+    // dequant for), AND (d) sort_active was also enabled (we re-use the
+    // ids_src1/ids_dst from mm_ids_helper_bf16).
+    let cublas_gate_active = q4k_cublas.is_some()
+        && expert_bounds_dev.is_some()
+        && sort_active
+        && m_tokens >= Q4K_MOE_CUBLAS_MIN_M
+        && moe.gate_exp_kind == ExpertQuantKind::Q4K;
+    let cublas_up_active = q4k_cublas.is_some()
+        && expert_bounds_dev.is_some()
+        && sort_active
+        && m_tokens >= Q4K_MOE_CUBLAS_MIN_M
+        && moe.up_exp_kind == ExpertQuantKind::Q4K;
+
+    // Download expert_bounds[n_experts+1] once if we'll need it (gate or up
+    // through cuBLASLt). The sync is unavoidable — cuBLASLt host-side
+    // launches need per-call M = expert_count_e known on the host.
+    let expert_bounds_host: Option<Vec<i32>> = if cublas_gate_active || cublas_up_active {
+        let dev = expert_bounds_dev.expect("checked above");
+        Some(
+            stream
+                .memcpy_dtov(dev)
+                .map_err(|e| LlmError::Backend(format!("dtov expert_bounds: {e:?}")))?,
+        )
+    } else {
+        None
+    };
+
+    if cublas_gate_active {
+        let ctx = q4k_cublas.expect("checked above");
+        let bounds = expert_bounds_host.as_ref().expect("set above");
+        let mut session = ctx.session.borrow_mut();
+        dispatch_q4k_moe_cublas(
+            kernels,
+            stream,
+            &mut session,
+            g_ptrs_p,
+            bounds,
+            ids_src1_m_p,
+            ids_dst_m_p,
+            h_norm_m_p,
+            expert_gate_m_p,
+            ctx.w_bf16_p,
+            ctx.x_gather_p,
+            ctx.y_dense_p,
+            m_tokens,
+            ef,
+            d,
+            k,
+            "gate",
+        )?;
+    } else if sort_active {
         dispatch_sorted_group_gemm(
             kernels,
             stream,
@@ -6894,7 +7169,30 @@ fn moe_ffn_forward_step_group_gemm(
     }
 
     // ---- 5. Up (batched Group-GEMM call) ----
-    if sort_active {
+    if cublas_up_active {
+        let ctx = q4k_cublas.expect("checked above");
+        let bounds = expert_bounds_host.as_ref().expect("set above");
+        let mut session = ctx.session.borrow_mut();
+        dispatch_q4k_moe_cublas(
+            kernels,
+            stream,
+            &mut session,
+            u_ptrs_p,
+            bounds,
+            ids_src1_m_p,
+            ids_dst_m_p,
+            h_norm_m_p,
+            expert_up_m_p,
+            ctx.w_bf16_p,
+            ctx.x_gather_p,
+            ctx.y_dense_p,
+            m_tokens,
+            ef,
+            d,
+            k,
+            "up",
+        )?;
+    } else if sort_active {
         dispatch_sorted_group_gemm(
             kernels,
             stream,
@@ -6959,10 +7257,15 @@ fn moe_ffn_forward_step_group_gemm(
         && ids_dst_m_p != 0
         && expert_bounds_p != 0
         && is_sorted_kind(moe.down_exp_kind);
-    if down_sort_active {
+    let cublas_down_active = q4k_cublas.is_some()
+        && expert_bounds_dev.is_some()
+        && down_sort_active
+        && m_tokens >= Q4K_MOE_CUBLAS_MIN_M
+        && moe.down_exp_kind == ExpertQuantKind::Q4K;
+    let m_flat = m_tokens * k;
+    if down_sort_active || cublas_down_active {
         // The down's effective topk view is [M*k_used, k_used'=1], so rebuild
         // the permutation with `n_tokens = M*k`, `k_used = 1`.
-        let m_flat = m_tokens * k;
         unsafe {
             kernels
                 .mm_ids_helper_bf16(
@@ -6977,6 +7280,34 @@ fn moe_ffn_forward_step_group_gemm(
                 )
                 .map_err(|e| LlmError::Backend(format!("mm_ids_helper down: {e:?}")))?;
         }
+    }
+    if cublas_down_active {
+        let ctx = q4k_cublas.expect("checked above");
+        let dev = expert_bounds_dev.expect("checked above");
+        let bounds: Vec<i32> = stream
+            .memcpy_dtov(dev)
+            .map_err(|e| LlmError::Backend(format!("dtov expert_bounds down: {e:?}")))?;
+        let mut session = ctx.session.borrow_mut();
+        dispatch_q4k_moe_cublas(
+            kernels,
+            stream,
+            &mut session,
+            d_ptrs_p,
+            &bounds,
+            ids_src1_m_p,
+            ids_dst_m_p,
+            expert_gate_m_p,
+            expert_out_m_p,
+            ctx.w_bf16_p,
+            ctx.x_gather_p,
+            ctx.y_dense_p,
+            m_flat,
+            d,
+            ef,
+            1,
+            "down",
+        )?;
+    } else if down_sort_active {
         dispatch_sorted_group_gemm(
             kernels,
             stream,
