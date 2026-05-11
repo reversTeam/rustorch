@@ -148,3 +148,15 @@ required-features = ["cuda"]
 name = "qwen36_nvfp4_smoke"
 path = "examples/qwen36_nvfp4_smoke.rs"
 required-features = ["cuda"]
+
+# T246.10 A6 — batched prefill bench (pp32/128/256/512) on Qwen3.6 Q4_K_M.
+[[example]]
+name = "qwen36_cuda_prefill_bench"
+path = "examples/qwen36_cuda_prefill_bench.rs"
+required-features = ["cuda"]
+
+# T246.10 A6 — prefill_tokens parity test vs N-step decode_step loop.
+[[example]]
+name = "qwen36_cuda_prefill_parity"
+path = "examples/qwen36_cuda_prefill_parity.rs"
+required-features = ["cuda"]
