@@ -185,6 +185,30 @@ fn prefill_graph_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// T246.10 TrackG-lite — runtime gate for the BF16xBF16 mma.sync m16n8k16
+/// tensor-core GEMM path. Default OFF for safety.
+///
+/// When set, the `QuantTensor::Bf16` arm of `dispatch_matmul_mvar` routes
+/// M >= GEMM_BF16_MMA_MIN_M (16) to `gemm_bf16_bf16_mma` (mma.sync) instead
+/// of the warp-shuffle `sgemm_bf16_bf16_mvar`. Below the threshold the
+/// warp-shuffle path is kept (A3 negative result : mma at M=1 loses to
+/// warp-shuffle — see note 8e23a850).
+///
+/// Targets the attention QKV/O matmuls and SSM in_proj/out_proj which
+/// currently dominate per-pp512 GPU compute (sgemm_bf16_bf16_mvar = 27%
+/// per TrackE.4 nsys).
+fn gemm_bf16_mma_enabled() -> bool {
+    std::env::var("RUSTORCH_GEMM_BF16_MMA")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Minimum M below which the BF16 mma path is NOT used. mma.sync m16n8k16
+/// needs M >= 16 to fill its 16-row tile ; smaller M wastes 87.5%+ of
+/// tensor-core compute on broadcast (A3 negative result confirmed).
+pub(crate) const GEMM_BF16_MMA_MIN_M: usize = 16;
+
 /// One matmul weight on GPU. Qwen3.6 Q4_K_M uses a mix of Q4_K / Q5_K /
 /// Q6_K for big matmuls and F32 (→ BF16) for small ones (ssm_alpha, ssm_beta
 /// when n_v_heads is small : n=48 typical, K=hidden_size, ≈1 MB each).
@@ -355,9 +379,18 @@ impl QuantTensor {
             match self {
                 QuantTensor::Bf16 { weights, n, k } => {
                     let (w, _g) = weights.device_ptr(stream);
-                    kernels
-                        .sgemm_bf16_bf16_mvar(stream, w, x, y, m as i32, *n as i32, *k as i32)
-                        .map_err(|e| LlmError::Backend(format!("sgemm_bf16_mvar: {e:?}")))
+                    // TrackG-lite : route M >= 16 to mma.sync m16n8k16 BF16
+                    // tensor-core path. M < 16 stays on warp-shuffle (A3
+                    // proved mma loses at small M — note 8e23a850).
+                    if gemm_bf16_mma_enabled() && m >= GEMM_BF16_MMA_MIN_M {
+                        kernels
+                            .gemm_bf16_bf16_mma(stream, w, x, y, m as i32, *n as i32, *k as i32)
+                            .map_err(|e| LlmError::Backend(format!("gemm_bf16_mma: {e:?}")))
+                    } else {
+                        kernels
+                            .sgemm_bf16_bf16_mvar(stream, w, x, y, m as i32, *n as i32, *k as i32)
+                            .map_err(|e| LlmError::Backend(format!("sgemm_bf16_mvar: {e:?}")))
+                    }
                 },
                 QuantTensor::Q4K { bytes, n, k } => {
                     let (w, _g) = bytes.device_ptr(stream);
