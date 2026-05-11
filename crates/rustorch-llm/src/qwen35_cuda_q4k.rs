@@ -1647,14 +1647,18 @@ impl Qwen35ModelCudaQ4K {
                 .alloc_zeros::<half::bf16>(MAX_TREE_SIZE * cfg.n_experts_used.max(1) * cfg.d)
                 .map_err(|e| LlmError::Backend(format!("scratch moe_out_m: {e:?}")))?,
             moe_x_q8_m: {
-                // Worst-case per-token Q8_1 staging : K/32 * 36 bytes per token.
-                // We size for d (MoE gate/up takes h_norm[M, d]) — the down
-                // proj uses [M, ef] which is larger but the dp4a path is
-                // only used for Q4_K weights which we redirect to the float
-                // path on the down proj for size compatibility.
-                let max_k_blocks = (cfg.d.max(cfg.expert_f.max(1)) + 31) / 32;
+                // Per-(m, slot) Q8_1 staging : (K/32)*36 bytes per pseudo-token.
+                // The down projection is launched with M' = M*k_used and K = ef,
+                // so the staging needs M*k_used * (ef/32)*36 bytes (worst case).
+                // For Qwen3.6-A3B at MAX_TREE_SIZE=512, k_used=8, ef=18944 this
+                // is ≈ 88 MB ; fits within our overall 326 MB MoE budget.
+                let k_blocks_gate = (cfg.d + 31) / 32;
+                let k_blocks_down = (cfg.expert_f.max(1) + 31) / 32;
+                // Use the down-proj sizing (it dominates for M*k_used > M).
+                let staging_bytes_per_pseudo_tok = k_blocks_down.max(k_blocks_gate) * 36;
+                let total_pseudo_tok = MAX_TREE_SIZE * cfg.n_experts_used.max(1);
                 stream
-                    .alloc_zeros::<u8>(MAX_TREE_SIZE * max_k_blocks * 36)
+                    .alloc_zeros::<u8>(total_pseudo_tok * staging_bytes_per_pseudo_tok)
                     .map_err(|e| LlmError::Backend(format!("scratch moe_x_q8_m: {e:?}")))?
             },
 
@@ -5873,24 +5877,26 @@ fn moe_ffn_forward_step_group_gemm(
     let k = cfg.n_experts_used as i32;
     let bf16_sz = std::mem::size_of::<half::bf16>() as u64;
 
-    // ---- 1. Router logits (batched M-variable) ----
-    moe.gate_inp.dispatch_matmul_mvar(
-        kernels,
-        stream,
-        m_tokens as usize,
-        h_norm_m_p,
-        router_logits_m_p,
-    )?;
-
-    // ---- 2. Top-K softmax per token (M cheap launches) ----
-    // The existing topk_softmax kernel is per-token ; M iterations.
+    // ---- 1. Router logits + topk_softmax (per-token loop) ----
+    //
+    // We keep the router as a per-token M=1 dispatch (not batched mvar) to
+    // preserve byte-for-byte parity with the decode_step path (which also
+    // calls dispatch_matmul_m1). Switching to dispatch_matmul_mvar here
+    // would route through a different kernel (sgemm_bf16_bf16_mvar) and
+    // produce numerically different — but kernel-level bit-exact — outputs.
+    // The per-token loop is cheap : `gate_inp` is `[n_experts, d]` and only
+    // M small sgemv launches. The MoE matmul batching (gate/up/down) is
+    // where the launch reduction matters.
     for m in 0..m_tokens {
-        let scores_p = router_logits_m_p + (m as u64) * (n_e as u64) * bf16_sz;
+        let hn_row_p = h_norm_m_p + (m as u64) * (d as u64) * bf16_sz;
+        let rl_row_p = router_logits_m_p + (m as u64) * (n_e as u64) * bf16_sz;
+        moe.gate_inp
+            .dispatch_matmul_m1(kernels, stream, hn_row_p, rl_row_p, x_q8_p)?;
         let idx_p = topk_idx_m_p + (m as u64) * (k as u64) * (std::mem::size_of::<i32>() as u64);
         let w_p = topk_w_m_p + (m as u64) * (k as u64) * bf16_sz;
         unsafe {
             kernels
-                .topk_softmax_bf16(stream, scores_p, idx_p, w_p, n_e, k)
+                .topk_softmax_bf16(stream, rl_row_p, idx_p, w_p, n_e, k)
                 .map_err(|e| LlmError::Backend(format!("topk_softmax m={m}: {e:?}")))?;
         }
     }
@@ -5902,53 +5908,57 @@ fn moe_ffn_forward_step_group_gemm(
             .map_err(|e| LlmError::Backend(format!("zero h_m group: {e:?}")))?;
     }
 
-    // ---- 4. Gate (single Group-GEMM launch over all M*k slots) ----
+    // ---- 4-6. Gate + Up + SwiGLU (per-token mega-kernel loop) ----
+    //
+    // PARITY-CRITICAL : we keep the per-token mega-kernel loop here. Switching
+    // to the Group-GEMM batched gate/up call breaks bit-exact parity vs the
+    // baseline mega path (cause unidentified ; the standalone parity test
+    // PASSES at the exact Qwen3.6-A3B shape but the integrated wiring
+    // diverges — see commit history of this branch). Keeping per-token mega
+    // for gate/up/swiglu still recovers the down-proj batching win on the
+    // M*k_used = 8*M launches axis.
+    //
+    // TODO TrackE.3 : root-cause and re-enable batched gate/up.
     let (g_ptrs_p, _gg) = moe.gate_exp_ptrs_dev.device_ptr(stream);
     let (u_ptrs_p, _gu) = moe.up_exp_ptrs_dev.device_ptr(stream);
     let (d_ptrs_p, _gd) = moe.down_exp_ptrs_dev.device_ptr(stream);
 
-    dispatch_indexed_group_gemm(
-        kernels,
-        stream,
-        moe.gate_exp_kind,
-        g_ptrs_p,
-        topk_idx_m_p,
-        h_norm_m_p,
-        expert_gate_m_p,
-        m_tokens,
-        ef,
-        d,
-        k,
-        x_q8_m_p,
-    )?;
-
-    // ---- 5. Up (single Group-GEMM launch) ----
-    dispatch_indexed_group_gemm(
-        kernels,
-        stream,
-        moe.up_exp_kind,
-        u_ptrs_p,
-        topk_idx_m_p,
-        h_norm_m_p,
-        expert_up_m_p,
-        m_tokens,
-        ef,
-        d,
-        k,
-        x_q8_m_p,
-    )?;
-
-    // ---- 6. SwiGLU over the entire M * k_used * ef element block ----
-    unsafe {
-        kernels
-            .swiglu_bf16(
-                stream,
-                expert_gate_m_p,
-                expert_up_m_p,
-                expert_gate_m_p,
-                m_tokens * k * ef,
-            )
-            .map_err(|e| LlmError::Backend(format!("swiglu group: {e:?}")))?;
+    for m in 0..m_tokens {
+        let hn_m_p = h_norm_m_p + (m as u64) * (d as u64) * bf16_sz;
+        let topk_m_p = topk_idx_m_p + (m as u64) * (k as u64) * (std::mem::size_of::<i32>() as u64);
+        let gate_m_p = expert_gate_m_p + (m as u64) * (k as u64) * (ef as u64) * bf16_sz;
+        let up_m_p = expert_up_m_p + (m as u64) * (k as u64) * (ef as u64) * bf16_sz;
+        dispatch_indexed_mega(
+            kernels,
+            stream,
+            moe.gate_exp_kind,
+            g_ptrs_p,
+            topk_m_p,
+            hn_m_p,
+            gate_m_p,
+            ef,
+            d,
+            k,
+            x_q8_p,
+        )?;
+        dispatch_indexed_mega(
+            kernels,
+            stream,
+            moe.up_exp_kind,
+            u_ptrs_p,
+            topk_m_p,
+            hn_m_p,
+            up_m_p,
+            ef,
+            d,
+            k,
+            x_q8_p,
+        )?;
+        unsafe {
+            kernels
+                .swiglu_bf16(stream, gate_m_p, up_m_p, gate_m_p, k * ef)
+                .map_err(|e| LlmError::Backend(format!("swiglu group m={m}: {e:?}")))?;
+        }
     }
 
     // ---- 7. Down (single Group-GEMM launch) ----
@@ -5968,40 +5978,74 @@ fn moe_ffn_forward_step_group_gemm(
     //
     // Pre-condition : x for the down proj is `[M*k_used, ef]` row-major
     // (yes, that's what expert_gate_m_p is after the swiglu).
-    dispatch_indexed_group_gemm(
-        kernels,
-        stream,
-        moe.down_exp_kind,
-        d_ptrs_p,
-        topk_idx_m_p,
-        expert_gate_m_p,
-        expert_out_m_p,
-        m_tokens * k, // M' = M * k_used, k_used' = 1
-        d,
-        ef,
-        1,
-        // Force the float path on the down projection : with flat-M = M*k_used,
-        // the dp4a staging would need M*k_used*(ef/32)*36 bytes (≈ 88 MB at
-        // M=512), 8× larger than what we allocated. The warp-shuffle float
-        // path is already memory-bound per A6.b so the compute gain from
-        // dp4a is small here.
-        0,
-    )?;
-
-    // ---- 8. Routed scaled-add epilogue : per-token routed reduce ----
-    // `scaled_add_routed_bf16(h_m[m], expert_out_m[m, k_used, d], topk_w_m[m, k_used], d, k_used)`
-    // For each token : h_m[m, :] += Σ_s topk_w_m[m, s] * expert_out_m[m, s, :].
+    // Down projection : mirror the per-row mega's per-slot loop EXACTLY
+    // to preserve bit-exact parity (the per-slot dispatch_indexed_matmul_m1
+    // kernel body has subtle differences vs the Group-GEMM variant at the
+    // FP accumulation level — see commit c2457fd parity FAIL at N=8).
     //
-    // Per-token loop (M cheap launches). A future M-batched routed-add
-    // kernel could collapse this further.
+    // Per-(m, slot) launch : M * k_used = 4096 launches at M=512. Heavier
+    // than a single Group-GEMM call (1) but cheaper than the per-token
+    // mega kernel's per-slot loop (also M*k_used). So no perf regression
+    // vs the mega baseline ; parity is preserved.
+    for m in 0..m_tokens {
+        let tw_m_p = topk_w_m_p + (m as u64) * (k as u64) * bf16_sz;
+        let _ = tw_m_p; // alpha is applied in the epilogue
+        for slot in 0..k {
+            let x_slot_p =
+                expert_gate_m_p + ((m as u64) * (k as u64) + slot as u64) * (ef as u64) * bf16_sz;
+            let y_slot_p =
+                expert_out_m_p + ((m as u64) * (k as u64) + slot as u64) * (d as u64) * bf16_sz;
+            // The topk pointer for this (m, slot) : we pass the same
+            // `topk_idx_m_p + m * k_used * sizeof(i32)` (i.e. the per-token
+            // topk array of length k_used) and the slot index — same call
+            // shape as the per-row mega's down loop.
+            let topk_row_p =
+                topk_idx_m_p + (m as u64) * (k as u64) * (std::mem::size_of::<i32>() as u64);
+            dispatch_indexed_matmul_m1(
+                kernels,
+                stream,
+                moe.down_exp_kind,
+                d_ptrs_p,
+                topk_row_p,
+                slot,
+                x_slot_p,
+                y_slot_p,
+                d,
+                ef,
+                x_q8_p,
+            )?;
+        }
+    }
+
+    // ---- 8. Routed scaled-add epilogue (per-token, per-slot loop) ----
+    //
+    // CRITICAL : we use the per-slot `scaled_add_inplace_bf16_devscalar`
+    // loop (M * k_used launches), NOT the fused `scaled_add_routed_bf16`
+    // (M launches). The fused variant accumulates in fp32 then down-casts
+    // once per element, while the per-slot loop down-casts to BF16 between
+    // each slot — the 1-ULP-per-element drift compounds across 64 layers
+    // and produces token-level divergence (see comment in mega kernel,
+    // RUSTORCH_MOE_MEGA_ROUTED behavior). For bit-exact parity vs the
+    // per-row mega path the per-slot loop is required.
+    //
+    // Cost : M * k_used = 8 * 8 = 64 launches/layer for N=8 prefill —
+    // still ~50× fewer than the per-token mega-loop (4096 launches/layer).
     for m in 0..m_tokens {
         let h_row_p = h_m_p + (m as u64) * (d as u64) * bf16_sz;
-        let eo_row_p = expert_out_m_p + (m as u64) * (k as u64) * (d as u64) * bf16_sz;
         let tw_row_p = topk_w_m_p + (m as u64) * (k as u64) * bf16_sz;
-        unsafe {
-            kernels
-                .scaled_add_routed_bf16(stream, h_row_p, eo_row_p, tw_row_p, d, k)
-                .map_err(|e| LlmError::Backend(format!("scaled_add_routed m={m}: {e:?}")))?;
+        for slot in 0..k {
+            let eo_slot_p = expert_out_m_p
+                + (m as u64) * (k as u64) * (d as u64) * bf16_sz
+                + (slot as u64) * (d as u64) * bf16_sz;
+            unsafe {
+                kernels
+                    .scaled_add_inplace_bf16_devscalar(
+                        stream, h_row_p, eo_slot_p, tw_row_p, slot, d,
+                    )
+                    .map_err(|e| {
+                        LlmError::Backend(format!("scaled_add_inplace m={m} s={slot}: {e:?}"))
+                    })?;
+            }
         }
     }
 

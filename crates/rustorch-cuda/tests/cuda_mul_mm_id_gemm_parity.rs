@@ -597,6 +597,14 @@ fn mul_mm_id_gemm_q4_k_dp4a_parity_large() {
     run_q4k_dp4a_case("q4k_dp4a M=128 N=4096 K=2048", 128, 4096, 2048, 8);
 }
 
+/// Exact Qwen3.6-35B-A3B MoE gate/up shape : M = 8 (prefill min), N = ef = 18944,
+/// K = d = 2048, k_used = 8.
+#[test]
+#[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+fn mul_mm_id_gemm_q4_k_dp4a_parity_qwen36_a3b() {
+    run_q4k_dp4a_case("q4k_dp4a Qwen3.6-A3B M=8", 8, 18944, 2048, 8);
+}
+
 // ── Q5_K / Q6_K / BF16 parity ────────────────────────────────────────
 
 #[test]
@@ -618,4 +626,22 @@ fn mul_mm_id_gemm_q6_k_parity() {
 fn mul_mm_id_gemm_bf16_parity() {
     run_bf16_case("bf16 M=32 N=1024 K=256", 32, 1024, 256, 8);
     run_bf16_case("bf16 M=128 N=1024 K=2048", 128, 1024, 2048, 8);
+}
+
+// ── k_used=1 parity (the down-projection flatten config) ─────────────
+//
+// In TrackE2.2 the MoE down projection is launched with `M' = M*k_used`
+// (flat token axis) and `k_used' = 1` so each block processes one
+// (m', 0) pair. This test exercises that exact configuration.
+
+#[test]
+#[ignore = "requires CUDA GPU — run with --ignored on DGX"]
+fn mul_mm_id_gemm_q4_k_parity_k_used_1() {
+    // Mirror the prefill-mode down-proj : M = N_tokens * k_used = 64 (8*8),
+    // K = ef = 2048, N = d = 2048.
+    run_q4k_case("q4k k_used=1 M=64 N=2048 K=2048", 64, 2048, 2048, 1);
+    run_q4k_case("q4k k_used=1 M=128 N=2048 K=2048", 128, 2048, 2048, 1);
+    // Stress : matches what the down proj sees at prefill N=512 :
+    // M' = 512*8 = 4096, N = d = 2048, K = ef = 2048.
+    run_q4k_case("q4k k_used=1 M=4096 N=2048 K=2048", 4096, 2048, 2048, 1);
 }
