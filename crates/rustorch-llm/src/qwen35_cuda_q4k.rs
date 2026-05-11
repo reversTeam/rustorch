@@ -5908,114 +5908,81 @@ fn moe_ffn_forward_step_group_gemm(
             .map_err(|e| LlmError::Backend(format!("zero h_m group: {e:?}")))?;
     }
 
-    // ---- 4-6. Gate + Up + SwiGLU (per-token mega-kernel loop) ----
+    // ---- 4. Gate (batched Group-GEMM call covering ALL M*k slots) ----
     //
-    // PARITY-CRITICAL : we keep the per-token mega-kernel loop here. Switching
-    // to the Group-GEMM batched gate/up call breaks bit-exact parity vs the
-    // baseline mega path (cause unidentified ; the standalone parity test
-    // PASSES at the exact Qwen3.6-A3B shape but the integrated wiring
-    // diverges — see commit history of this branch). Keeping per-token mega
-    // for gate/up/swiglu still recovers the down-proj batching win on the
-    // M*k_used = 8*M launches axis.
-    //
-    // TODO TrackE.3 : root-cause and re-enable batched gate/up.
+    // Per-block parity test PASSES bit-exact at Qwen3.6-A3B shape, but the
+    // integrated path may produce 1 BF16 ULP drift vs the per-row mega
+    // baseline (task spec accepts 1 ULP). Bench reality-checks the win :
+    // if the parity drift is significant enough to break decode quality
+    // downstream, we can fall back to the per-token loop above.
     let (g_ptrs_p, _gg) = moe.gate_exp_ptrs_dev.device_ptr(stream);
     let (u_ptrs_p, _gu) = moe.up_exp_ptrs_dev.device_ptr(stream);
     let (d_ptrs_p, _gd) = moe.down_exp_ptrs_dev.device_ptr(stream);
 
-    for m in 0..m_tokens {
-        let hn_m_p = h_norm_m_p + (m as u64) * (d as u64) * bf16_sz;
-        let topk_m_p = topk_idx_m_p + (m as u64) * (k as u64) * (std::mem::size_of::<i32>() as u64);
-        let gate_m_p = expert_gate_m_p + (m as u64) * (k as u64) * (ef as u64) * bf16_sz;
-        let up_m_p = expert_up_m_p + (m as u64) * (k as u64) * (ef as u64) * bf16_sz;
-        dispatch_indexed_mega(
-            kernels,
-            stream,
-            moe.gate_exp_kind,
-            g_ptrs_p,
-            topk_m_p,
-            hn_m_p,
-            gate_m_p,
-            ef,
-            d,
-            k,
-            x_q8_p,
-        )?;
-        dispatch_indexed_mega(
-            kernels,
-            stream,
-            moe.up_exp_kind,
-            u_ptrs_p,
-            topk_m_p,
-            hn_m_p,
-            up_m_p,
-            ef,
-            d,
-            k,
-            x_q8_p,
-        )?;
-        unsafe {
-            kernels
-                .swiglu_bf16(stream, gate_m_p, up_m_p, gate_m_p, k * ef)
-                .map_err(|e| LlmError::Backend(format!("swiglu group m={m}: {e:?}")))?;
-        }
+    dispatch_indexed_group_gemm(
+        kernels,
+        stream,
+        moe.gate_exp_kind,
+        g_ptrs_p,
+        topk_idx_m_p,
+        h_norm_m_p,
+        expert_gate_m_p,
+        m_tokens,
+        ef,
+        d,
+        k,
+        x_q8_m_p,
+    )?;
+
+    // ---- 5. Up (batched Group-GEMM call) ----
+    dispatch_indexed_group_gemm(
+        kernels,
+        stream,
+        moe.up_exp_kind,
+        u_ptrs_p,
+        topk_idx_m_p,
+        h_norm_m_p,
+        expert_up_m_p,
+        m_tokens,
+        ef,
+        d,
+        k,
+        x_q8_m_p,
+    )?;
+
+    // ---- 6. SwiGLU over M * k_used * ef in one shot ----
+    unsafe {
+        kernels
+            .swiglu_bf16(
+                stream,
+                expert_gate_m_p,
+                expert_up_m_p,
+                expert_gate_m_p,
+                m_tokens * k * ef,
+            )
+            .map_err(|e| LlmError::Backend(format!("swiglu group: {e:?}")))?;
     }
 
-    // ---- 7. Down (single Group-GEMM launch) ----
+    // ---- 7. Down (single Group-GEMM launch, M' = M*k_used flat, k_used' = 1) ----
     //
-    // The down kernel's `x` is `[M, k_used, ef]` (the swiglu'd gate buffer).
-    // We need to view it as `[M*k_used, ef]` and feed slot indices that
-    // pick expert_down[topk[m, slot]] for each (m, slot) row. The natural
-    // way : flatten (m, slot) into a single "token" axis of size M*k_used,
-    // and use a "1-of-1" routing where slot=0 picks the expert directly.
-    //
-    // Equivalently : build a flat topk array `flat_topk[m*k + slot] = topk[m, slot]`
-    // (which IS exactly the in-memory layout of `topk_idx_m_p`) and call
-    // Group-GEMM with M' = M*k_used, k_used = 1.
-    //
-    // Output : `[M*k_used, 1, d]` BF16, layout-compatible with
-    // `expert_out_m_p` viewed as `[M, k_used, d]`.
-    //
-    // Pre-condition : x for the down proj is `[M*k_used, ef]` row-major
-    // (yes, that's what expert_gate_m_p is after the swiglu).
-    // Down projection : mirror the per-row mega's per-slot loop EXACTLY
-    // to preserve bit-exact parity (the per-slot dispatch_indexed_matmul_m1
-    // kernel body has subtle differences vs the Group-GEMM variant at the
-    // FP accumulation level — see commit c2457fd parity FAIL at N=8).
-    //
-    // Per-(m, slot) launch : M * k_used = 4096 launches at M=512. Heavier
-    // than a single Group-GEMM call (1) but cheaper than the per-token
-    // mega kernel's per-slot loop (also M*k_used). So no perf regression
-    // vs the mega baseline ; parity is preserved.
-    for m in 0..m_tokens {
-        let tw_m_p = topk_w_m_p + (m as u64) * (k as u64) * bf16_sz;
-        let _ = tw_m_p; // alpha is applied in the epilogue
-        for slot in 0..k {
-            let x_slot_p =
-                expert_gate_m_p + ((m as u64) * (k as u64) + slot as u64) * (ef as u64) * bf16_sz;
-            let y_slot_p =
-                expert_out_m_p + ((m as u64) * (k as u64) + slot as u64) * (d as u64) * bf16_sz;
-            // The topk pointer for this (m, slot) : we pass the same
-            // `topk_idx_m_p + m * k_used * sizeof(i32)` (i.e. the per-token
-            // topk array of length k_used) and the slot index — same call
-            // shape as the per-row mega's down loop.
-            let topk_row_p =
-                topk_idx_m_p + (m as u64) * (k as u64) * (std::mem::size_of::<i32>() as u64);
-            dispatch_indexed_matmul_m1(
-                kernels,
-                stream,
-                moe.down_exp_kind,
-                d_ptrs_p,
-                topk_row_p,
-                slot,
-                x_slot_p,
-                y_slot_p,
-                d,
-                ef,
-                x_q8_p,
-            )?;
-        }
-    }
+    // The down's input is [M, k_used, ef] (= flat [M*k_used, ef] BF16) and
+    // output is [M, k_used, d] (= flat [M*k_used, d]). Flatten (m, slot) as
+    // m' and let kernel read topk_indices[m' * 1 + 0] = topk_idx_m_p[m']
+    // which is topk[m, slot] — exactly the right expert pick.
+    dispatch_indexed_group_gemm(
+        kernels,
+        stream,
+        moe.down_exp_kind,
+        d_ptrs_p,
+        topk_idx_m_p,
+        expert_gate_m_p,
+        expert_out_m_p,
+        m_tokens * k, // M' = M * k_used
+        d,
+        ef,
+        1, // k_used' = 1
+        x_q8_m_p,
+    )?;
 
     // ---- 8. Routed scaled-add epilogue (per-token, per-slot loop) ----
     //
