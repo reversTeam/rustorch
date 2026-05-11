@@ -5337,7 +5337,7 @@ extern "C" __global__ void gqa_decode_split_combine_bf16(
 //
 // Tree encoding :
 //   parents : [tree_size] i32  — parent index in BFS order, root = -1.
-//   depths  : [tree_size] u8   — depth of each node (root depth = 0).
+//   depths  : [tree_size] u16  — depth of each node (root depth = 0). T246.10 A6 widened u8→u16 to support depth ≥ 256 for batched prefill.
 //
 // Grid : (n_q_heads, n_split, tree_size).  Block : (head_dim, 1, 1).
 // Outputs (per-block) :
@@ -5353,7 +5353,7 @@ extern "C" __global__ void gqa_decode_tree_partial_bf16(
     const __nv_bfloat16* __restrict__ k_cache,     // [max_seq, kv_dim] = [max_seq, n_kv, head_dim] (P1.5 — Layout A, matches kv_append_*_devcnt)
     const __nv_bfloat16* __restrict__ v_cache,
     const int*           __restrict__ parents,     // [tree_size]
-    const unsigned char* __restrict__ depths,      // [tree_size]
+    const unsigned short* __restrict__ depths,     // [tree_size] (T246.10 A6 widened u8→u16 to support depth ≥ 256 for batched prefill)
     float*               __restrict__ partial_m,   // [tree_size, n_heads, n_split]
     float*               __restrict__ partial_l,   // [tree_size, n_heads, n_split]
     __nv_bfloat16*       __restrict__ partial_o,   // [tree_size, n_heads, n_split, head_dim]
@@ -8323,7 +8323,7 @@ impl LlmKernels {
     /// per-token tree-attention mask). Two-phase like `gqa_decode_split_bf16`.
     ///
     /// # Safety  Same as `gqa_decode_split_bf16`, plus `parents_dev`
-    /// (i32 [tree_size]) and `depths_dev` (u8 [tree_size]) device pointers.
+    /// (i32 [tree_size]) and `depths_dev` (u16 [tree_size]) device pointers.
     /// Partial buffer sizes : m/l = tree_size * n_q * n_split floats ;
     /// o = tree_size * n_q * n_split * head_dim BF16.
     #[allow(clippy::too_many_arguments)]

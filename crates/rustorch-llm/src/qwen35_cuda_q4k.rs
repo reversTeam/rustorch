@@ -29,7 +29,22 @@ const GQA_N_SPLIT: usize = 4;
 /// Sized to give headroom over the (W=5, L=5) Jacobi window which yields
 /// at most 21 tree nodes (1 + W*(L-1)). 32 leaves room for (W=5, L=7) and
 /// future tweaks without re-allocating the tree scratch buffers.
-pub const MAX_TREE_SIZE: usize = 32;
+/// T246.10 A6 — bumped from 32 to 512 to enable batched prefill via the
+/// existing tree-attention infrastructure with a linear-chain topology.
+///
+/// Memory impact at 512 (decision 25db464b):
+/// - Pure-transformer per-tree scratch: ~250 MB (mostly `tree_logits` =
+///   `MAX × vocab × 2B` ≈ 152 MB at vocab=151936).
+/// - Hybrid (Qwen3.6 Dense/MoE) adds SSM tree-state buffers ~ MAX × 32 × 64
+///   × 64 × 2B per layer ≈ 8.4 MB × 48 layers = ~400 MB at MAX=32 → ~6.4 GB
+///   at MAX=512.
+///
+/// Acceptable on the GB10 256 GB unified pool. Linear-chain prefill
+/// degenerates the SSM tree forking to one BFS depth wave per row (sequential
+/// SSM is correct, slow per launch but at N=512 the dominant cost shifts to
+/// the attention/FFN matmul fan-out, which is where the prefill speedup
+/// lives).
+pub const MAX_TREE_SIZE: usize = 512;
 
 /// T246.8 A5 — number of K-direction chunks used by the split-K lm_head
 /// kernel when enabled (`RUSTORCH_LM_HEAD_SPLIT=1`). For Qwen3.6-35B-A3B
@@ -614,8 +629,11 @@ pub(crate) struct DecodeScratch {
     pub(crate) tree_drafts: CudaSlice<u32>,
     /// `[MAX_TREE_SIZE]` i32 — parent pointer per tree node, root = -1.
     pub(crate) tree_parents: CudaSlice<i32>,
-    /// `[MAX_TREE_SIZE]` u8 — depth per tree node, root = 0.
-    pub(crate) tree_depths: CudaSlice<u8>,
+    /// `[MAX_TREE_SIZE]` u16 — depth per tree node, root = 0. T246.10 A6
+    /// widened u8 → u16 so linear-chain prefill with N up to 65k still fits
+    /// the depth field (a chain of 512 tokens has max depth 511 which
+    /// overflows u8).
+    pub(crate) tree_depths: CudaSlice<u16>,
     /// `[MAX_TREE_SIZE]` u32 — argmax token per tree node row of logits.
     pub(crate) tree_argmax: CudaSlice<u32>,
     /// `[MAX_TREE_SIZE, n_q, n_split]` f32 — partial m for tree GQA.
@@ -1319,7 +1337,7 @@ impl Qwen35ModelCudaQ4K {
                 .alloc_zeros::<i32>(MAX_TREE_SIZE)
                 .map_err(|e| LlmError::Backend(format!("scratch tree_parents: {e:?}")))?,
             tree_depths: stream
-                .alloc_zeros::<u8>(MAX_TREE_SIZE)
+                .alloc_zeros::<u16>(MAX_TREE_SIZE)
                 .map_err(|e| LlmError::Backend(format!("scratch tree_depths: {e:?}")))?,
             tree_argmax: stream
                 .alloc_zeros::<u32>(MAX_TREE_SIZE)
@@ -2552,15 +2570,90 @@ impl Qwen35ModelCudaQ4K {
         Ok(token_id)
     }
 
-    /// Process a prompt at once. **STATUS T246.1** : returns Err. T246.5.
-    pub fn prefill_tokens(
-        &mut self,
-        _token_ids: &[u32],
-        _start_pos: usize,
-    ) -> Result<u32, LlmError> {
-        Err(LlmError::Backend(
-            "Qwen35ModelCudaQ4K::prefill_tokens not yet implemented (T246.5)".into(),
-        ))
+    /// T246.10 A6 — Process a prompt of `N` tokens at once and return the
+    /// first decode token (i.e. the model's argmax after seeing all N
+    /// inputs). Uses the existing tree-attention infrastructure with a
+    /// linear-chain topology (`parents = [-1, 0, 1, .., N-2]`,
+    /// `depths = [0, 1, .., N-1]`).
+    ///
+    /// **Constraints**
+    /// - `1 ≤ token_ids.len() ≤ MAX_TREE_SIZE` (512 since T246.10 A6 bump).
+    /// - `start_pos` must equal `self.position` AND device counter state
+    ///   (`*position_dev`, `*kv_len_dev`). At the moment we only support
+    ///   `start_pos == self.position` (incremental prefill from current
+    ///   state). The model must NOT have any in-flight CUDA Graph capture
+    ///   (decode-only graphs are invalidated and rebuilt on the next
+    ///   `decode_step`).
+    /// - Variant : works for `Qwen2PureTransformer`, `Qwen3PureTransformer`,
+    ///   `Dense`, `Moe` — all four variants.
+    ///
+    /// **Semantics** : after this call the KV cache contains the N appended
+    /// tokens, the SSM state advances by N (per-layer recurrence on the
+    /// chain), `self.position += N`, and the returned u32 is the predicted
+    /// next token (`argmax(logits[token_ids[N-1]])`) which is bit-equivalent
+    /// (or 1 ULP BF16) to running `decode_step` N times in a loop.
+    ///
+    /// **CUDA Graph interaction** : tree forwards bypass graph capture by
+    /// design (decision RFC D4 in note f0e68045). The decode-only graph
+    /// captured by earlier `decode_step` calls is preserved : it reads
+    /// device counters via pointer indirection so its validity is unchanged
+    /// by the counter advance we perform here.
+    pub fn prefill_tokens(&mut self, token_ids: &[u32], start_pos: usize) -> Result<u32, LlmError> {
+        let n = token_ids.len();
+        if n == 0 {
+            return Err(LlmError::Backend(
+                "prefill_tokens: token_ids must be non-empty".into(),
+            ));
+        }
+        if n > MAX_TREE_SIZE {
+            return Err(LlmError::Backend(format!(
+                "prefill_tokens: N={n} exceeds MAX_TREE_SIZE={MAX_TREE_SIZE}. \
+                 Call prefill_tokens in chunks of {MAX_TREE_SIZE} for longer prompts."
+            )));
+        }
+        if start_pos != self.position {
+            return Err(LlmError::Backend(format!(
+                "prefill_tokens: start_pos={start_pos} != self.position={}. \
+                 Call model.reset_state() first or pass start_pos=self.position().",
+                self.position
+            )));
+        }
+
+        // ── Single-token fast path ──────────────────────────────────────
+        // For N=1, prefill is equivalent to a single decode_step. Use
+        // decode_step directly (preserves the captured graph win).
+        if n == 1 {
+            return self.decode_step(token_ids[0]);
+        }
+
+        // ── Linear-chain tree descriptors ───────────────────────────────
+        // parents = [-1, 0, 1, ..., n-2], depths = [0, 1, ..., n-1].
+        let parents: Vec<i32> = std::iter::once(-1i32).chain((0..(n - 1) as i32)).collect();
+        let depths: Vec<u16> = (0..n as u16).collect();
+
+        // ── Dispatch by variant ─────────────────────────────────────────
+        let cfg_variant = self.config.variant;
+        let accepted = match cfg_variant {
+            Qwen35Variant::Qwen2PureTransformer | Qwen35Variant::Qwen3PureTransformer => {
+                self.decode_step_tree_pure_transformer_inner(token_ids, &parents, &depths, true)?
+            },
+            Qwen35Variant::Dense | Qwen35Variant::Moe => {
+                self.decode_step_tree_hybrid_inner(token_ids, &parents, &depths, true)?
+            },
+        };
+
+        if accepted.len() != n {
+            return Err(LlmError::Backend(format!(
+                "prefill_tokens: tree forward returned {} accepted tokens, \
+                 expected {} (force_accept_all bug ?)",
+                accepted.len(),
+                n
+            )));
+        }
+        // The token at position N-1 of accepted[] is `argmax(logits)` after
+        // seeing all N input tokens — that's the "first decode token" we
+        // return to the caller.
+        Ok(accepted[n - 1])
     }
 
     /// T246.7 P1.3d — tree-aware decode step for Lookahead Decoding (RFC
@@ -2595,7 +2688,7 @@ impl Qwen35ModelCudaQ4K {
         &mut self,
         drafts: &[u32],
         parents: &[i32],
-        depths: &[u8],
+        depths: &[u16],
     ) -> Result<Vec<u32>, LlmError> {
         // ── Validation ───────────────────────────────────────────────────
         if drafts.is_empty() {
@@ -2707,7 +2800,22 @@ impl Qwen35ModelCudaQ4K {
         &mut self,
         drafts: &[u32],
         parents: &[i32],
-        depths: &[u8],
+        depths: &[u16],
+    ) -> Result<Vec<u32>, LlmError> {
+        self.decode_step_tree_hybrid_inner(drafts, parents, depths, false)
+    }
+
+    /// T246.10 A6 — shared implementation behind `decode_step_tree_hybrid`
+    /// and `prefill_tokens` (hybrid path). When `force_accept_all` is true,
+    /// skip the acceptance walk and force-accept every BFS-ordered tree node.
+    /// This is the prefill mode (linear-chain trees committed verbatim).
+    #[allow(clippy::too_many_lines)]
+    fn decode_step_tree_hybrid_inner(
+        &mut self,
+        drafts: &[u32],
+        parents: &[i32],
+        depths: &[u16],
+        force_accept_all: bool,
     ) -> Result<Vec<u32>, LlmError> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
 
@@ -3030,12 +3138,90 @@ impl Qwen35ModelCudaQ4K {
                         down.dispatch_matmul_m1(&self.kernels, &self.stream, gate_r, h_r, x_q8_p)?;
                     }
                 },
-                FfnQ4K::Moe(_) => {
-                    return Err(LlmError::Backend(format!(
-                        "decode_step_tree_hybrid: layer {li} has MoE FFN — \
-                         MoE+SSM hybrid Lookahead not supported (see \
-                         dispatch error path in decode_step_tree)"
-                    )));
+                FfnQ4K::Moe(moe) => {
+                    // T246.10 A6 — MoE FFN per-row dispatch in the
+                    // tree-forward path. The MoE scratch buffers
+                    // (router/topk/expert) are single-token sized, so we
+                    // call `moe_ffn_forward_step_*` once per BFS row,
+                    // reading `h_norm[r]` and writing `h[r]`.
+                    //
+                    // Picks the same async/mega/sync variant as
+                    // `decode_step` based on env gates. Per-row dispatch
+                    // means router/topk run N× per layer ; for N≤512 on a
+                    // 64-MoE-layer model that's ~32K extra small launches
+                    // — acceptable for prefill since the matmul fan-out
+                    // amortizes to dominate.
+                    use cudarc::driver::DevicePtrMut;
+                    let (moe_router_p, _gmr) =
+                        self.scratch.moe_router_logits.device_ptr_mut(&self.stream);
+                    let (moe_idx_p, _gmi) = self.scratch.moe_topk_idx.device_ptr_mut(&self.stream);
+                    let (moe_w_p, _gmw) = self.scratch.moe_topk_w.device_ptr_mut(&self.stream);
+                    let (moe_egate_p, _gmeg) =
+                        self.scratch.moe_expert_gate.device_ptr_mut(&self.stream);
+                    let (moe_eup_p, _gmeu) =
+                        self.scratch.moe_expert_up.device_ptr_mut(&self.stream);
+                    let (moe_eout_p, _gmeo) =
+                        self.scratch.moe_expert_out.device_ptr_mut(&self.stream);
+                    let (moe_sd_p, _gmsd) = self.scratch.moe_shexp_dot.device_ptr_mut(&self.stream);
+                    for r in 0..tree_size {
+                        let hn_r = thn_p + (r as u64) * row_h;
+                        let h_r = th_p + (r as u64) * row_h;
+                        if moe_mega_enabled() {
+                            moe_ffn_forward_step_mega(
+                                moe,
+                                &self.kernels,
+                                &self.stream,
+                                &cfg,
+                                hn_r,
+                                h_r,
+                                x_q8_p,
+                                moe_router_p,
+                                moe_idx_p,
+                                moe_w_p,
+                                moe_egate_p,
+                                moe_eup_p,
+                                moe_eout_p,
+                                moe_sd_p,
+                            )?;
+                        } else if moe_async_enabled() {
+                            moe_ffn_forward_step_async(
+                                moe,
+                                &self.kernels,
+                                &self.stream,
+                                &cfg,
+                                hn_r,
+                                h_r,
+                                x_q8_p,
+                                moe_router_p,
+                                moe_idx_p,
+                                moe_w_p,
+                                moe_egate_p,
+                                moe_eup_p,
+                                moe_eout_p,
+                                moe_sd_p,
+                            )?;
+                        } else {
+                            moe_ffn_forward_step(
+                                moe,
+                                &self.kernels,
+                                &self.stream,
+                                &cfg,
+                                hn_r,
+                                h_r,
+                                x_q8_p,
+                                moe_router_p,
+                                moe_idx_p,
+                                &self.scratch.moe_topk_idx,
+                                moe_w_p,
+                                &self.scratch.moe_topk_w,
+                                moe_egate_p,
+                                moe_eup_p,
+                                moe_eout_p,
+                                moe_sd_p,
+                                &self.scratch.moe_shexp_dot,
+                            )?;
+                        }
+                    }
                 },
             }
 
@@ -3086,31 +3272,43 @@ impl Qwen35ModelCudaQ4K {
             .map_err(|e| LlmError::Backend(format!("hyb pinned argmax: {e:?}")))?;
 
         // ── 7. CPU acceptance walk (same as pure-transformer path) ────────
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
-        for (r, &p) in parents.iter().enumerate().skip(1) {
-            children[p as usize].push(r);
-        }
-        let mut accepted_indices: Vec<usize> = vec![0];
-        let mut accepted_tokens: Vec<u32> = vec![argmax_host[0]];
-        let mut cur = 0usize;
-        loop {
-            let next_tok = argmax_host[cur];
-            let mut found: Option<usize> = None;
-            for &c in &children[cur] {
-                if drafts[c] == next_tok {
-                    found = Some(c);
-                    break;
+        // T246.10 A6 — prefill mode (`force_accept_all = true`) bypasses
+        // the acceptance walk and force-accepts every BFS-ordered node.
+        // For a linear-chain prefill the BFS order is the chain itself, so
+        // `accepted_indices[i] = i`, the compaction loop (step 8) is a no-op
+        // (each `src == i`), and the counter advance writes all N positions.
+        let (accepted_indices, accepted_tokens): (Vec<usize>, Vec<u32>) = if force_accept_all {
+            let idx: Vec<usize> = (0..tree_size).collect();
+            let tok: Vec<u32> = (0..tree_size).map(|r| argmax_host[r]).collect();
+            (idx, tok)
+        } else {
+            let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
+            for (r, &p) in parents.iter().enumerate().skip(1) {
+                children[p as usize].push(r);
+            }
+            let mut a_indices: Vec<usize> = vec![0];
+            let mut a_tokens: Vec<u32> = vec![argmax_host[0]];
+            let mut cur = 0usize;
+            loop {
+                let next_tok = argmax_host[cur];
+                let mut found: Option<usize> = None;
+                for &c in &children[cur] {
+                    if drafts[c] == next_tok {
+                        found = Some(c);
+                        break;
+                    }
+                }
+                match found {
+                    Some(c) => {
+                        a_indices.push(c);
+                        a_tokens.push(argmax_host[c]);
+                        cur = c;
+                    },
+                    None => break,
                 }
             }
-            match found {
-                Some(c) => {
-                    accepted_indices.push(c);
-                    accepted_tokens.push(argmax_host[c]);
-                    cur = c;
-                },
-                None => break,
-            }
-        }
+            (a_indices, a_tokens)
+        };
         let accept_len = accepted_tokens.len();
         debug_assert!(accept_len >= 1);
 
@@ -3248,7 +3446,7 @@ impl Qwen35ModelCudaQ4K {
         row_h: u64,
         row_q: u64,
         row_kv: u64,
-        depths: &[u8],
+        depths: &[u16],
         _f: usize,
         eps: f32,
         n_q: usize,
@@ -3921,7 +4119,22 @@ impl Qwen35ModelCudaQ4K {
         &mut self,
         drafts: &[u32],
         parents: &[i32],
-        depths: &[u8],
+        depths: &[u16],
+    ) -> Result<Vec<u32>, LlmError> {
+        self.decode_step_tree_pure_transformer_inner(drafts, parents, depths, false)
+    }
+
+    /// T246.10 A6 — shared implementation behind
+    /// `decode_step_tree_pure_transformer` and `prefill_tokens`. When
+    /// `force_accept_all = true`, the acceptance walk is skipped and every
+    /// BFS-ordered tree node is force-accepted (prefill linear-chain mode).
+    #[allow(clippy::too_many_lines)]
+    fn decode_step_tree_pure_transformer_inner(
+        &mut self,
+        drafts: &[u32],
+        parents: &[i32],
+        depths: &[u16],
+        force_accept_all: bool,
     ) -> Result<Vec<u32>, LlmError> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
 
@@ -4394,37 +4607,49 @@ impl Qwen35ModelCudaQ4K {
         // argmax_host[0] (since it's whatever the model would have
         // sampled with the standard decode_step on `drafts[0]`).
         //
-        // Build a child-list once : children[parent] = Vec<child_idx>.
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
-        for (r, &p) in parents.iter().enumerate().skip(1) {
-            children[p as usize].push(r);
-        }
+        // T246.10 A6 — prefill mode (`force_accept_all = true`) bypasses
+        // the walk and force-accepts every BFS-ordered node. For a
+        // linear-chain prefill the BFS order is the chain itself, so
+        // `accepted_indices[i] = i`, the compaction loop (step 8) is a no-op
+        // (each `src == i`), and step 9 advances counters by N.
+        let (accepted_indices, accepted_tokens): (Vec<usize>, Vec<u32>) = if force_accept_all {
+            let idx: Vec<usize> = (0..tree_size).collect();
+            let tok: Vec<u32> = (0..tree_size).map(|r| argmax_host[r]).collect();
+            (idx, tok)
+        } else {
+            // Build a child-list once : children[parent] = Vec<child_idx>.
+            let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
+            for (r, &p) in parents.iter().enumerate().skip(1) {
+                children[p as usize].push(r);
+            }
 
-        let mut accepted_indices: Vec<usize> = vec![0]; // root
-        let mut accepted_tokens: Vec<u32> = vec![argmax_host[0]];
-        let mut cur = 0usize;
-        loop {
-            let next_tok = argmax_host[cur];
-            // Look for a child of cur whose draft token equals next_tok.
-            let mut found: Option<usize> = None;
-            for &c in &children[cur] {
-                if drafts[c] == next_tok {
-                    found = Some(c);
-                    break;
+            let mut a_indices: Vec<usize> = vec![0]; // root
+            let mut a_tokens: Vec<u32> = vec![argmax_host[0]];
+            let mut cur = 0usize;
+            loop {
+                let next_tok = argmax_host[cur];
+                // Look for a child of cur whose draft token equals next_tok.
+                let mut found: Option<usize> = None;
+                for &c in &children[cur] {
+                    if drafts[c] == next_tok {
+                        found = Some(c);
+                        break;
+                    }
+                }
+                match found {
+                    Some(c) => {
+                        // The child's *own* prediction (argmax_host[c]) is the
+                        // token AFTER c. So push c's index and the prediction
+                        // for one step beyond c.
+                        a_indices.push(c);
+                        a_tokens.push(argmax_host[c]);
+                        cur = c;
+                    },
+                    None => break,
                 }
             }
-            match found {
-                Some(c) => {
-                    // The child's *own* prediction (argmax_host[c]) is the
-                    // token AFTER c. So push c's index and the prediction
-                    // for one step beyond c.
-                    accepted_indices.push(c);
-                    accepted_tokens.push(argmax_host[c]);
-                    cur = c;
-                },
-                None => break,
-            }
-        }
+            (a_indices, a_tokens)
+        };
         let accept_len = accepted_tokens.len();
         debug_assert!(accept_len >= 1);
         debug_assert_eq!(accepted_indices.len(), accept_len);

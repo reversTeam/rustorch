@@ -40,8 +40,10 @@ pub struct DraftTree {
     /// `parents[i]` is the index of node `i`'s parent, or `-1` for
     /// the root. Always `< i` for non-root nodes (BFS invariant).
     pub parents: Vec<i32>,
-    /// Depth of each node from the root (root depth = 0).
-    pub depths: Vec<u8>,
+    /// Depth of each node from the root (root depth = 0). T246.10 A6
+    /// widened to u16 so prefill linear-chain trees of length > 256
+    /// remain representable.
+    pub depths: Vec<u16>,
 }
 
 impl DraftTree {
@@ -57,7 +59,7 @@ impl DraftTree {
     }
 
     /// Maximum depth observed (root depth = 0).
-    pub fn max_depth(&self) -> u8 {
+    pub fn max_depth(&self) -> u16 {
         self.depths.iter().copied().max().unwrap_or(0)
     }
 
@@ -300,7 +302,7 @@ impl JacobiWindow {
                     let new_idx = tree.tokens.len();
                     tree.tokens.push(t);
                     tree.parents.push(parent_idx as i32);
-                    tree.depths.push(d as u8);
+                    tree.depths.push(d as u16);
                     cur_level_indices.push(new_idx);
                 }
             }

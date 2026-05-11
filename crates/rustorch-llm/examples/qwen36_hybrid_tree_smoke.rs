@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // to match argmax_host[0] — vanishingly unlikely with draft=0.
         let drafts = [cur, 0u32];
         let parents = [-1i32, 0];
-        let depths = [0u8, 1];
+        let depths = [0u16, 1];
         let accepted = model_b
             .decode_step_tree(&drafts, &parents, &depths)
             .map_err(|e| format!("decode_step_tree B step {step}: {e:?}"))?;

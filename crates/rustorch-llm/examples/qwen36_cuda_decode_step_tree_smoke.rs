@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..n_steps {
         let drafts = [cur];
         let parents = [-1i32];
-        let depths = [0u8];
+        let depths = [0u16];
         let accepted = model_b
             .decode_step_tree(&drafts, &parents, &depths)
             .map_err(|e| format!("decode_step_tree B: {e:?}"))?;

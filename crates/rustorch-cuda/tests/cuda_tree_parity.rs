@@ -243,7 +243,7 @@ fn gqa_decode_tree_bf16_tree_size_1_matches_split() {
 
     // Tree variant : tree_size=1, parent=-1, depth=0.
     let parents = stream.memcpy_stod(&[-1i32]).expect("par");
-    let depths = stream.memcpy_stod(&[0u8]).expect("dep");
+    let depths = stream.memcpy_stod(&[0u16]).expect("dep");
 
     let mut out_tree = stream
         .alloc_zeros::<half::bf16>(n_q * head_dim)
