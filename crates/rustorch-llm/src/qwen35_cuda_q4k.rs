@@ -220,6 +220,32 @@ fn delta_net_opt_enabled() -> bool {
 /// tensor-core compute on broadcast (A3 negative result confirmed).
 pub(crate) const GEMM_BF16_MMA_MIN_M: usize = 16;
 
+/// **DESIGN-PIVOT** — runtime gate for the cuBLASLt-backed BF16 prefill GEMM.
+/// Default OFF for safety. When set (`RUSTORCH_PREFILL_CUBLAS=1`), the
+/// `QuantTensor::Bf16` arm of `dispatch_matmul_mvar` routes
+/// `M >= PREFILL_CUBLAS_MIN_M` matmuls through `LtSession::matmul_bf16_rowmajor`
+/// (vendor-tuned tensor-core GEMM, expected 70-80 % of peak vs the
+/// hand-written mma kernel at 30-40 %).
+///
+/// Decode (M=1) keeps the warp-shuffle SGEMV path unconditionally — cuBLASLt
+/// is slower at M=1 (see disaster note 28f5bc08). The threshold mirrors
+/// `GEMM_BF16_MMA_MIN_M`.
+///
+/// Precedence : `RUSTORCH_PREFILL_CUBLAS=1` overrides `RUSTORCH_GEMM_BF16_MMA`
+/// for the BF16 prefill path (both can be set ; cuBLASLt wins on the
+/// `M >= 16` arm, mma path becomes the CUBLAS=0 fallback).
+fn prefill_cublas_enabled() -> bool {
+    std::env::var("RUSTORCH_PREFILL_CUBLAS")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Minimum M for the cuBLASLt prefill path. Mirrors `GEMM_BF16_MMA_MIN_M` —
+/// at M < 16, cuBLASLt's batched-GEMM heuristic kernels also leave most
+/// tensor-core compute on the floor.
+pub(crate) const PREFILL_CUBLAS_MIN_M: usize = 16;
+
 /// T246.10 MMQ-WHOLESALE — env gate for the Q8_1-packed INT8-staged Q4_K
 /// matmul path (kernels landed in 4206d2d). Default OFF preserves bit-exact
 /// parity with TrackG-lite. Set `RUSTORCH_MMQ_WHOLESALE=1` to route the
@@ -394,10 +420,41 @@ impl QuantTensor {
     ///
     /// Kernel grid is (N, ceil(M/8)) ; one super-block W read amortized
     /// across all M m-rows (W is read 1× per (row, mtile_idx) block).
+    ///
+    /// **DESIGN-PIVOT** : when `session` is `Some` and `RUSTORCH_PREFILL_CUBLAS=1`,
+    /// the BF16 arm at `M >= PREFILL_CUBLAS_MIN_M` is routed through
+    /// `LtSession::matmul_bf16_rowmajor` (cuBLASLt vendor tensor-core path).
+    #[allow(dead_code)]
     pub(crate) fn dispatch_matmul_mvar(
         &self,
         kernels: &LlmKernels,
         stream: &Arc<CudaStream>,
+        m: usize,
+        x: u64,
+        y: u64,
+    ) -> Result<(), LlmError> {
+        self.dispatch_matmul_mvar_inner(kernels, stream, None, m, x, y)
+    }
+
+    /// `dispatch_matmul_mvar` variant that can route the BF16 arm through
+    /// cuBLASLt when `session` is `Some`.
+    pub(crate) fn dispatch_matmul_mvar_with_session(
+        &self,
+        kernels: &LlmKernels,
+        stream: &Arc<CudaStream>,
+        session: &std::cell::RefCell<rustorch_cuda::cublas_lt::LtSession>,
+        m: usize,
+        x: u64,
+        y: u64,
+    ) -> Result<(), LlmError> {
+        self.dispatch_matmul_mvar_inner(kernels, stream, Some(session), m, x, y)
+    }
+
+    fn dispatch_matmul_mvar_inner(
+        &self,
+        kernels: &LlmKernels,
+        stream: &Arc<CudaStream>,
+        session: Option<&std::cell::RefCell<rustorch_cuda::cublas_lt::LtSession>>,
         m: usize,
         x: u64,
         y: u64,
@@ -407,6 +464,19 @@ impl QuantTensor {
             match self {
                 QuantTensor::Bf16 { weights, n, k } => {
                     let (w, _g) = weights.device_ptr(stream);
+                    // DESIGN-PIVOT : prefer cuBLASLt when session passed and
+                    // env gate set. Falls back to mma.sync or warp-shuffle on
+                    // M < threshold / disabled.
+                    if let Some(sess) = session {
+                        if prefill_cublas_enabled() && m >= PREFILL_CUBLAS_MIN_M {
+                            return sess
+                                .borrow_mut()
+                                .matmul_bf16_rowmajor(w, x, y, m, *n, *k, 1.0, 0.0)
+                                .map_err(|e| {
+                                    LlmError::Backend(format!("cublas_matmul_bf16: {e:?}"))
+                                });
+                        }
+                    }
                     // TrackG-lite : route M >= 16 to mma.sync m16n8k16 BF16
                     // tensor-core path. M < 16 stays on warp-shuffle (A3
                     // proved mma loses at small M — note 8e23a850).
@@ -1158,8 +1228,13 @@ pub struct Qwen35ModelCudaQ4K {
     pub config: Qwen35Config,
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
-    #[allow(dead_code)]
-    pub(crate) session: LtSession,
+    /// cuBLASLt session for BF16 prefill matmuls (DESIGN-PIVOT). Wrapped in
+    /// `RefCell` because `LtSession::matmul_*` mutate the algo cache, but the
+    /// hot prefill path borrows `self` immutably during per-layer loops. The
+    /// borrow is local to each matmul call and never overlaps with another
+    /// session borrow on the same model instance (single-threaded forward
+    /// pass per process).
+    pub(crate) session: std::cell::RefCell<LtSession>,
     pub(crate) kernels: LlmKernels,
     /// Token embedding `[V, D]` BF16 (dequantized at load — single read at start).
     pub(crate) token_emb: CudaSlice<half::bf16>,
@@ -1284,8 +1359,10 @@ impl Qwen35ModelCudaQ4K {
         let stream = ctx
             .new_stream()
             .map_err(|e| LlmError::Backend(format!("new_stream: {e:?}")))?;
-        let session = LtSession::new(stream.clone())
-            .map_err(|e| LlmError::Backend(format!("LtSession: {e:?}")))?;
+        let session = std::cell::RefCell::new(
+            LtSession::new(stream.clone())
+                .map_err(|e| LlmError::Backend(format!("LtSession: {e:?}")))?,
+        );
         let kernels = LlmKernels::new(ctx.clone());
 
         let cfg = crate::qwen35::parse_config(path)
@@ -3938,16 +4015,18 @@ impl Qwen35ModelCudaQ4K {
                     let gate_stride_ok = gate.shape().0 * bf16_sz as usize == row_ffn_gate as usize;
                     let up_stride_ok = up.shape().0 * bf16_sz as usize == row_ffn_up as usize;
                     if use_gemm && gate_stride_ok && up_stride_ok {
-                        gate.dispatch_matmul_mvar(
+                        gate.dispatch_matmul_mvar_with_session(
                             &self.kernels,
                             &self.stream,
+                            &self.session,
                             tree_size,
                             thn_p,
                             tgate_p,
                         )?;
-                        up.dispatch_matmul_mvar(
+                        up.dispatch_matmul_mvar_with_session(
                             &self.kernels,
                             &self.stream,
+                            &self.session,
                             tree_size,
                             thn_p,
                             tup_p,
@@ -3963,9 +4042,10 @@ impl Qwen35ModelCudaQ4K {
                                     })?;
                             }
                         }
-                        down.dispatch_matmul_mvar(
+                        down.dispatch_matmul_mvar_with_session(
                             &self.kernels,
                             &self.stream,
+                            &self.session,
                             tree_size,
                             tgate_p,
                             th_p,
@@ -4195,9 +4275,10 @@ impl Qwen35ModelCudaQ4K {
         // legacy paths).
         let lm_k_ok = self.lm_head.shape().1 % 256 == 0;
         if use_gemm && lm_k_ok {
-            self.lm_head.dispatch_matmul_mvar(
+            self.lm_head.dispatch_matmul_mvar_with_session(
                 &self.kernels,
                 &self.stream,
+                &self.session,
                 tree_size,
                 th_p,
                 tlogits_p,
@@ -4481,9 +4562,10 @@ impl Qwen35ModelCudaQ4K {
             if use_gemm {
                 // T246.10 A6b.3 — one mvar call writes M=tree_size rows of
                 // [q | gate] into tup_p (stride row_up = 2*q_dim = w_q.N).
-                attn.w_q.dispatch_matmul_mvar(
+                attn.w_q.dispatch_matmul_mvar_with_session(
                     &self.kernels,
                     &self.stream,
+                    &self.session,
                     tree_size,
                     thn_p,
                     tup_p,
@@ -4518,8 +4600,14 @@ impl Qwen35ModelCudaQ4K {
                 }
             }
         } else if use_gemm {
-            attn.w_q
-                .dispatch_matmul_mvar(&self.kernels, &self.stream, tree_size, thn_p, tq_p)?;
+            attn.w_q.dispatch_matmul_mvar_with_session(
+                &self.kernels,
+                &self.stream,
+                &self.session,
+                tree_size,
+                thn_p,
+                tq_p,
+            )?;
         } else {
             for r in 0..tree_size {
                 let hn_r = thn_p + (r as u64) * row_h;
@@ -4531,10 +4619,22 @@ impl Qwen35ModelCudaQ4K {
 
         // K, V projections.
         if use_gemm {
-            attn.w_k
-                .dispatch_matmul_mvar(&self.kernels, &self.stream, tree_size, thn_p, tk_p)?;
-            attn.w_v
-                .dispatch_matmul_mvar(&self.kernels, &self.stream, tree_size, thn_p, tv_p)?;
+            attn.w_k.dispatch_matmul_mvar_with_session(
+                &self.kernels,
+                &self.stream,
+                &self.session,
+                tree_size,
+                thn_p,
+                tk_p,
+            )?;
+            attn.w_v.dispatch_matmul_mvar_with_session(
+                &self.kernels,
+                &self.stream,
+                &self.session,
+                tree_size,
+                thn_p,
+                tv_p,
+            )?;
         } else {
             for r in 0..tree_size {
                 let hn_r = thn_p + (r as u64) * row_h;
@@ -4718,8 +4818,14 @@ impl Qwen35ModelCudaQ4K {
 
         // w_o → tree_h ; residual add.
         if use_gemm {
-            attn.w_o
-                .dispatch_matmul_mvar(&self.kernels, &self.stream, tree_size, tao_p, th_p)?;
+            attn.w_o.dispatch_matmul_mvar_with_session(
+                &self.kernels,
+                &self.stream,
+                &self.session,
+                tree_size,
+                tao_p,
+                th_p,
+            )?;
         } else {
             for r in 0..tree_size {
                 let ao_r = tao_p + (r as u64) * row_q;
@@ -4806,24 +4912,27 @@ impl Qwen35ModelCudaQ4K {
         let alpha_k_ok = ssm.w_alpha.shape().1 % 256 == 0;
         let beta_k_ok = ssm.w_beta.shape().1 % 256 == 0;
         if use_gemm {
-            ssm.w_qkv.dispatch_matmul_mvar(
+            ssm.w_qkv.dispatch_matmul_mvar_with_session(
                 &self.kernels,
                 &self.stream,
+                &self.session,
                 tree_size,
                 thn_p,
                 tssm_qkv_p,
             )?;
-            ssm.w_gate.dispatch_matmul_mvar(
+            ssm.w_gate.dispatch_matmul_mvar_with_session(
                 &self.kernels,
                 &self.stream,
+                &self.session,
                 tree_size,
                 thn_p,
                 tssm_z_p,
             )?;
             if alpha_k_ok {
-                ssm.w_alpha.dispatch_matmul_mvar(
+                ssm.w_alpha.dispatch_matmul_mvar_with_session(
                     &self.kernels,
                     &self.stream,
+                    &self.session,
                     tree_size,
                     thn_p,
                     tssm_alpha_p,
@@ -4842,9 +4951,10 @@ impl Qwen35ModelCudaQ4K {
                 }
             }
             if beta_k_ok {
-                ssm.w_beta.dispatch_matmul_mvar(
+                ssm.w_beta.dispatch_matmul_mvar_with_session(
                     &self.kernels,
                     &self.stream,
+                    &self.session,
                     tree_size,
                     thn_p,
                     tssm_beta_p,
@@ -5234,9 +5344,10 @@ impl Qwen35ModelCudaQ4K {
         //     do NOT add residual here).
         let out_k_ok = ssm.ssm_out.shape().1 % 256 == 0;
         if use_gemm && out_k_ok {
-            ssm.ssm_out.dispatch_matmul_mvar(
+            ssm.ssm_out.dispatch_matmul_mvar_with_session(
                 &self.kernels,
                 &self.stream,
+                &self.session,
                 tree_size,
                 tssm_out_p,
                 th_p,
@@ -5526,23 +5637,26 @@ impl Qwen35ModelCudaQ4K {
                 // M=1 SGEMVs. Input thn_p[tree_size, d] row-major, outputs
                 // tq_p[tree_size, q_dim], tk_p[tree_size, kv_dim],
                 // tv_p[tree_size, kv_dim] all row-major.
-                attn.w_q.dispatch_matmul_mvar(
+                attn.w_q.dispatch_matmul_mvar_with_session(
                     &self.kernels,
                     &self.stream,
+                    &self.session,
                     tree_size,
                     thn_p,
                     tq_p,
                 )?;
-                attn.w_k.dispatch_matmul_mvar(
+                attn.w_k.dispatch_matmul_mvar_with_session(
                     &self.kernels,
                     &self.stream,
+                    &self.session,
                     tree_size,
                     thn_p,
                     tk_p,
                 )?;
-                attn.w_v.dispatch_matmul_mvar(
+                attn.w_v.dispatch_matmul_mvar_with_session(
                     &self.kernels,
                     &self.stream,
+                    &self.session,
                     tree_size,
                     thn_p,
                     tv_p,
@@ -5724,9 +5838,10 @@ impl Qwen35ModelCudaQ4K {
 
             // w_o per row : h_r = w_o @ attn_out_r.
             if use_gemm {
-                attn.w_o.dispatch_matmul_mvar(
+                attn.w_o.dispatch_matmul_mvar_with_session(
                     &self.kernels,
                     &self.stream,
+                    &self.session,
                     tree_size,
                     tao_p,
                     th_p,
@@ -5781,16 +5896,18 @@ impl Qwen35ModelCudaQ4K {
                     let gate_stride_ok = gate.shape().0 * bf16_sz as usize == row_ffn_gate as usize;
                     let up_stride_ok = up.shape().0 * bf16_sz as usize == row_ffn_up as usize;
                     if use_gemm && gate_stride_ok && up_stride_ok {
-                        gate.dispatch_matmul_mvar(
+                        gate.dispatch_matmul_mvar_with_session(
                             &self.kernels,
                             &self.stream,
+                            &self.session,
                             tree_size,
                             thn_p,
                             tgate_p,
                         )?;
-                        up.dispatch_matmul_mvar(
+                        up.dispatch_matmul_mvar_with_session(
                             &self.kernels,
                             &self.stream,
+                            &self.session,
                             tree_size,
                             thn_p,
                             tup_p,
@@ -5808,9 +5925,10 @@ impl Qwen35ModelCudaQ4K {
                                     })?;
                             }
                         }
-                        down.dispatch_matmul_mvar(
+                        down.dispatch_matmul_mvar_with_session(
                             &self.kernels,
                             &self.stream,
+                            &self.session,
                             tree_size,
                             tgate_p,
                             th_p,
@@ -5877,9 +5995,10 @@ impl Qwen35ModelCudaQ4K {
         // legacy paths).
         let lm_k_ok = self.lm_head.shape().1 % 256 == 0;
         if use_gemm && lm_k_ok {
-            self.lm_head.dispatch_matmul_mvar(
+            self.lm_head.dispatch_matmul_mvar_with_session(
                 &self.kernels,
                 &self.stream,
+                &self.session,
                 tree_size,
                 th_p,
                 tlogits_p,

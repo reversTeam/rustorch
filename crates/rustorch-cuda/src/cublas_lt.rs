@@ -624,6 +624,106 @@ impl LtSession {
         Ok(())
     }
 
+    /// **DESIGN-PIVOT — row-major BF16 GEMM**.
+    ///
+    /// Drop-in replacement for the hand-written `gemm_bf16_bf16_mma_m16n8k16`
+    /// kernel signature : computes `Y[M, N] = X[M, K] · W^T[K, N]` where all
+    /// three buffers are stored **row-major** (BF16) :
+    ///
+    ///   w : `[N, K]` BF16 row-major
+    ///   x : `[M, K]` BF16 row-major
+    ///   y : `[M, N]` BF16 row-major  (output)
+    ///
+    /// The math is identical to `y = x · w.t()` and matches
+    /// `LlmKernels::sgemm_bf16_bf16_mvar` / `gemm_bf16_bf16_mma` element-by-
+    /// element (modulo BF16 rounding-order drift).
+    ///
+    /// Internally this calls cuBLASLt with `(A = W, B = X)`, cublas-M = N,
+    /// cublas-N = M, cublas-K = K, transa = T, transb = N. The output is
+    /// written in col-major `[N, M]` ld=N, which **is** row-major `[M, N]`
+    /// stride=N — the layout we want. No post-transpose needed.
+    ///
+    /// Lane-equivalence proof :
+    ///   col-major output Y_cm[i, j] (0..N, 0..M)
+    ///     = sum_k op(A)[i, k] · op(B)[k, j]
+    ///     = sum_k A^T[i, k] · B[k, j]
+    ///     = sum_k A[k, i] · B[k, j]                  (A col-major [K, N]·)
+    ///     = sum_k W_rm[i, k] · X_rm[j, k]            (row=col-of-transpose)
+    /// row-major Y_rm[m, n] = Y_cm[n, m]
+    ///                       = sum_k W_rm[n, k] · X_rm[m, k]
+    ///                       = sum_k X_rm[m, k] · W_rm[n, k]
+    ///                       = (X · W^T)[m, n] ✓
+    ///
+    /// Cache key (m=N_rust, n=M_rust, transa=T, transb=N) differs from the
+    /// existing `matmul_bf16` cache key (TT) so both can coexist on the same
+    /// `LtSession`.
+    ///
+    /// # Safety
+    /// `*_dev` pointers must be valid for the call duration and reference
+    /// allocations of `n*k`, `m*k`, `m*n` BF16 elements respectively.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matmul_bf16_rowmajor(
+        &mut self,
+        w_dev: u64,
+        x_dev: u64,
+        y_dev: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), CudaError> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        // Cache key uses (m=n_rust, n=m_rust, transa=T, transb=N) to keep
+        // this config distinct from the col-major matmul_bf16 path.
+        let key = ConfigKey {
+            m: n as u32,
+            n: m as u32,
+            k: k as u32,
+            a_dt: sys::cudaDataType_t::CUDA_R_16BF as i32,
+            b_dt: sys::cudaDataType_t::CUDA_R_16BF as i32,
+            c_dt: sys::cudaDataType_t::CUDA_R_16BF as i32,
+            transa: true,
+            transb: false,
+            scale_mode: 0,
+        };
+        if !self.cache.contains_key(&key) {
+            let cached = build_cached_bf16_rowmajor(self.handle, m, n, k, self.workspace_bytes)?;
+            self.cache.insert(key, cached);
+        }
+        let cached = self.cache.get(&key).unwrap() as *const CachedMatmul;
+        let cached = &*cached;
+        let workspace_ptr = {
+            use cudarc::driver::DevicePtr;
+            self.workspace.device_ptr(&self.stream).0
+        };
+        result::matmul(
+            self.handle,
+            cached.matmul_desc,
+            (&alpha) as *const f32 as *const _,
+            (&beta) as *const f32 as *const _,
+            w_dev as *const _, // A = W
+            cached.a_layout,
+            x_dev as *const _, // B = X
+            cached.b_layout,
+            y_dev as *const _,
+            cached.c_layout,
+            y_dev as *mut _,
+            cached.c_layout,
+            (&cached.algo) as *const _,
+            workspace_ptr as *mut _,
+            self.workspace_bytes,
+            self.stream.cu_stream() as *mut _,
+        )
+        .map_err(|e| CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "LtSession::matmul_bf16_rowmajor::dispatch",
+        })?;
+        Ok(())
+    }
+
     /// Cached MXFP4/NVFP4 matmul.
     ///
     /// # Safety
@@ -1376,6 +1476,126 @@ unsafe fn build_cached(
     .map_err(|e| CudaError::CublasStatus {
         code: lt_err_code(e),
         location: "build_cached::heuristic",
+    })?;
+
+    Ok(CachedMatmul {
+        a_layout,
+        b_layout,
+        c_layout,
+        matmul_desc,
+        pref,
+        algo: heuristic.algo,
+    })
+}
+
+/// **DESIGN-PIVOT** — BF16 TN-with-row-major-output cached config.
+///
+/// Builds layouts and matmul descriptor for the row-major BF16 path used by
+/// `LtSession::matmul_bf16_rowmajor`. Convention :
+///
+///   w (row-major `[N, K]`, BF16) → seen by cuBLASLt as col-major
+///                                   `(K, N)` ld=K. transa=T turns it back
+///                                   into "logical N × K".
+///   x (row-major `[M, K]`, BF16) → seen by cuBLASLt as col-major
+///                                   `(K, M)` ld=K. transb=N keeps it.
+///   y (col-major `[N, M]` ld=N output, == row-major `[M, N]` stride=N).
+///
+/// cuBLASLt is asked for `cublas-M=N, cublas-N=M, cublas-K=K, transa=T,
+/// transb=N`. The math reduction is `Y = X · W^T` (the standard "linear"
+/// op), which is exactly what the hand-written GEMM kernels compute.
+#[cfg(feature = "cuda")]
+unsafe fn build_cached_bf16_rowmajor(
+    handle: sys::cublasLtHandle_t,
+    m: usize,
+    n: usize,
+    k: usize,
+    workspace_bytes: usize,
+) -> Result<CachedMatmul, CudaError> {
+    let dt = sys::cudaDataType_t::CUDA_R_16BF;
+
+    // A = W. cublas-side cols = N (cublas-M), rows = K (cublas-K), ld = K.
+    let a_layout = result::create_matrix_layout(dt, k as u64, n as u64, k as i64).map_err(|e| {
+        CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached_bf16_rowmajor::a_layout",
+        }
+    })?;
+    // B = X. cublas-side cols = M (cublas-N), rows = K (cublas-K), ld = K.
+    let b_layout = result::create_matrix_layout(dt, k as u64, m as u64, k as i64).map_err(|e| {
+        CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached_bf16_rowmajor::b_layout",
+        }
+    })?;
+    // C : col-major (cublas-M=N, cublas-N=M), ld = N. Physical bytes match
+    // row-major Y[M, N] stride=N, so the same buffer reads identically as
+    // row-major from the caller's perspective.
+    let c_layout = result::create_matrix_layout(dt, n as u64, m as u64, n as i64).map_err(|e| {
+        CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached_bf16_rowmajor::c_layout",
+        }
+    })?;
+
+    let matmul_desc = result::create_matmul_desc(
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        sys::cudaDataType_t::CUDA_R_32F,
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::matmul_desc",
+    })?;
+
+    let transa = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
+    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        (&transa) as *const _ as *const _,
+        std::mem::size_of::<cudarc::cublas::sys::cublasOperation_t>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::set_transa",
+    })?;
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+        (&transb) as *const _ as *const _,
+        std::mem::size_of::<cudarc::cublas::sys::cublasOperation_t>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::set_transb",
+    })?;
+
+    let pref = result::create_matmul_pref().map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::pref",
+    })?;
+    result::set_matmul_pref_attribute(
+        pref,
+        sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        (&workspace_bytes) as *const _ as *const _,
+        std::mem::size_of::<usize>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::pref_workspace",
+    })?;
+
+    let heuristic = result::get_matmul_algo_heuristic(
+        handle,
+        matmul_desc,
+        a_layout,
+        b_layout,
+        c_layout,
+        c_layout,
+        pref,
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::heuristic",
     })?;
 
     Ok(CachedMatmul {
