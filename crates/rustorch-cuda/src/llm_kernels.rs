@@ -3560,6 +3560,792 @@ extern "C" __global__ void zero_bf16(
 }
 "#;
 
+// ────────────────────────────────────────────────────────────────────────
+// T246.9 NVFP4.2 — NVFP4 SGEMV (vLLM `nvfp4-pack-quantized` layout)
+//
+// Per-row dot product against a NVFP4-quantized weight matrix.
+//
+// Weight tensor 4-tuple per Linear (vLLM convention) :
+//   weight_packed       [N, K/2]  U8       — 2 FP4 (E2M1) per byte, low nibble = even index
+//   weight_scale        [N, K/16] F8_E4M3  — UE4M3 per-16-element micro-block scale
+//   weight_global_scale [1]       F32      — per-tensor calibration scale
+//   input_global_scale  [1]       F32      — per-tensor activation scale
+//
+// At call time the kernel takes `alpha = 1 / (weight_global * input_global)`
+// and applies it once at the end of the K reduction (folded into the
+// final BF16 down-cast).
+//
+// FP4 E2M1 decode table (4 bits) :
+//   0=+0,    1=+0.5,  2=+1,   3=+1.5,  4=+2,   5=+3,   6=+4,   7=+6
+//   8=-0,    9=-0.5,  a=-1,   b=-1.5,  c=-2,   d=-3,   e=-4,   f=-6
+// Magnitudes : {0, 0.5, 1, 1.5, 2, 3, 4, 6} — max = 6.0.
+//
+// UE4M3 scale decode (8-bit unsigned, exp 4 bits bias 7, mantissa 3 bits) :
+//   value = 2^(E - 7) * (1 + M/8)   for E >= 1
+//   value = 0                        for E == 0   (subnormal — RFC R3 says
+//                                                  the calibrated checkpoint
+//                                                  shouldn't have these)
+// Layout : bit 7 reserved, bits 6-3 = E, bits 2-0 = M.
+//
+// Block layout : `(N, 1, 1)` × 32 threads (1 warp / row). Each lane handles
+// `K/16 / 32 = K/512` micro-blocks. Final acc is reduced via warp-shuffle.
+// For Qwen3.6-A3B (K=2048 → 128 micro-blocks) each lane processes 4 blocks
+// (i.e. 64 FP4 weights = 32 packed bytes per lane per row). Sufficient ILP
+// for the M=1 decode case ; for prompt-processing batches we'd switch to
+// the cuBLASLt `matmul_mxfp4` path.
+// Reserved : a shared device-header that future NVFP4 kernels (mul_mm_id
+// FP4 variants, prompt-batch GEMMs) can include. Kept inlined into the
+// per-kernel SRC strings for now to avoid plumbing nvrtc include paths.
+#[allow(dead_code)]
+#[cfg(feature = "cuda")]
+const NVFP4_DECODE_DEVICE_HEADER: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+// E2M1 → fp32 LUT, 16 entries indexed by the raw 4-bit code.
+__device__ __forceinline__ float fp4_to_fp32(unsigned int code) {
+    // Table sized to 16 because the full 4-bit code (incl. sign) is the index.
+    // mag[c & 7] = magnitude; sign = (c & 8) ? -1 : +1.
+    static const float MAG[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float m = MAG[code & 0x7];
+    return (code & 0x8) ? -m : m;
+}
+
+// UE4M3 byte → fp32 (NVFP4 per-block scale convention).
+__device__ __forceinline__ float ue4m3_to_fp32(unsigned char b) {
+    unsigned int e = (b >> 3) & 0xF;
+    unsigned int m = b & 0x7;
+    if (e == 0) {
+        // Subnormal — calibrated checkpoint shouldn't have these.
+        // Fold mantissa as 2^(-7) * M/8 to match OCP-MX UE4M3 strict spec.
+        return (float)m * 0.0009765625f;  // 2^-7 / 8 = 1/1024 ≈ 0.000977
+    }
+    // value = 2^(E-7) * (1 + M/8)
+    int exp_unbiased = (int)e - 7;
+    float scale = ldexpf(1.0f + (float)m * 0.125f, exp_unbiased);
+    return scale;
+}
+
+// Decode 1 micro-block of 16 FP4 values into 16 fp32 elements.
+// `packed` is 8 bytes (16 nibbles), `scale_byte` is 1 UE4M3.
+// `out[16]` is the dequantized values (already × scale).
+__device__ __forceinline__ void nvfp4_decode_block16(
+    const unsigned char* __restrict__ packed_8b,
+    unsigned char scale_byte,
+    float* __restrict__ out16
+) {
+    float s = ue4m3_to_fp32(scale_byte);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        unsigned char b = packed_8b[i];
+        unsigned int lo = b & 0xF;
+        unsigned int hi = (b >> 4) & 0xF;
+        out16[2*i + 0] = fp4_to_fp32(lo) * s;
+        out16[2*i + 1] = fp4_to_fp32(hi) * s;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const SGEMV_NVFP4_BF16_INDEXED_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float fp4_to_fp32_idx(unsigned int code) {
+    static const float MAG[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float m = MAG[code & 0x7];
+    return (code & 0x8) ? -m : m;
+}
+
+__device__ __forceinline__ float ue4m3_to_fp32_idx(unsigned char b) {
+    unsigned int e = (b >> 3) & 0xF;
+    unsigned int m = b & 0x7;
+    if (e == 0) {
+        return (float)m * 0.0009765625f;
+    }
+    int exp_unbiased = (int)e - 7;
+    return ldexpf(1.0f + (float)m * 0.125f, exp_unbiased);
+}
+
+extern "C" __global__ void sgemv_nvfp4_bf16_indexed(
+    const unsigned long long* __restrict__ expert_packed_ptrs,  // [n_experts] u64
+    const unsigned long long* __restrict__ expert_scale_ptrs,   // [n_experts] u64
+    const float*              __restrict__ expert_alphas,       // [n_experts] f32 = 1/(w_g*in_g)
+    const int*                __restrict__ topk_indices,        // [k_used] device i32
+    int slot,                                                   // host-side const
+    const __nv_bfloat16*      __restrict__ x,                   // [K] activation
+    __nv_bfloat16*            __restrict__ y,                   // [N] output
+    int N,
+    int K
+) {
+    int e_idx = topk_indices[slot];
+    const unsigned char* __restrict__ packed = (const unsigned char*)expert_packed_ptrs[e_idx];
+    const unsigned char* __restrict__ scale  = (const unsigned char*)expert_scale_ptrs[e_idx];
+    float alpha = expert_alphas[e_idx];
+
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;  // [0, 32)
+
+    int n_blocks = K / 16;
+    int packed_row_off = row * (K / 2);  // bytes, packed
+    int scale_row_off  = row * n_blocks; // bytes, scale
+
+    float acc = 0.0f;
+
+    // Stride-32 over micro-blocks. Each iteration processes 1 micro-block
+    // (16 FP4 weights, 8 packed bytes, 1 UE4M3 scale, 16 BF16 inputs).
+    for (int b = tid; b < n_blocks; b += 32) {
+        const unsigned char* p8 = packed + packed_row_off + b * 8;
+        unsigned char sb = scale[scale_row_off + b];
+        float s = ue4m3_to_fp32_idx(sb);
+
+        const __nv_bfloat16* xptr = x + b * 16;
+        // Load 8 packed bytes + 16 BF16 + accumulate.
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            unsigned char by = p8[i];
+            unsigned int lo = by & 0xF;
+            unsigned int hi = (by >> 4) & 0xF;
+            float w0 = fp4_to_fp32_idx(lo) * s;
+            float w1 = fp4_to_fp32_idx(hi) * s;
+            float x0 = (float)xptr[2*i + 0];
+            float x1 = (float)xptr[2*i + 1];
+            acc += w0 * x0 + w1 * x1;
+        }
+    }
+
+    // Warp-shuffle reduction.
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    }
+
+    if (tid == 0) {
+        y[row] = (__nv_bfloat16)(acc * alpha);
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const SGEMV_NVFP4_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float fp4_to_fp32_solo(unsigned int code) {
+    static const float MAG[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float m = MAG[code & 0x7];
+    return (code & 0x8) ? -m : m;
+}
+
+__device__ __forceinline__ float ue4m3_to_fp32_solo(unsigned char b) {
+    unsigned int e = (b >> 3) & 0xF;
+    unsigned int m = b & 0x7;
+    if (e == 0) {
+        return (float)m * 0.0009765625f;
+    }
+    int exp_unbiased = (int)e - 7;
+    return ldexpf(1.0f + (float)m * 0.125f, exp_unbiased);
+}
+
+extern "C" __global__ void sgemv_nvfp4_bf16(
+    const unsigned char*  __restrict__ packed,      // [N, K/2] U8
+    const unsigned char*  __restrict__ scale,       // [N, K/16] U8 (UE4M3)
+    float                              alpha,       // 1 / (w_g * in_g)
+    const __nv_bfloat16*  __restrict__ x,
+    __nv_bfloat16*        __restrict__ y,
+    int N,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+
+    int n_blocks = K / 16;
+    int packed_row_off = row * (K / 2);
+    int scale_row_off  = row * n_blocks;
+
+    float acc = 0.0f;
+
+    for (int b = tid; b < n_blocks; b += 32) {
+        const unsigned char* p8 = packed + packed_row_off + b * 8;
+        unsigned char sb = scale[scale_row_off + b];
+        float s = ue4m3_to_fp32_solo(sb);
+
+        const __nv_bfloat16* xptr = x + b * 16;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            unsigned char by = p8[i];
+            unsigned int lo = by & 0xF;
+            unsigned int hi = (by >> 4) & 0xF;
+            float w0 = fp4_to_fp32_solo(lo) * s;
+            float w1 = fp4_to_fp32_solo(hi) * s;
+            float x0 = (float)xptr[2*i + 0];
+            float x1 = (float)xptr[2*i + 1];
+            acc += w0 * x0 + w1 * x1;
+        }
+    }
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    }
+
+    if (tid == 0) {
+        y[row] = (__nv_bfloat16)(acc * alpha);
+    }
+}
+"#;
+
+// ────────────────────────────────────────────────────────────────────────
+// T246.8 A4 — mul_mm_id mega-kernels (one launch per gate/up/down matmul)
+//
+// Replaces the K-iteration `sgemv_q?k_bf16_v?_indexed` dispatch loop in
+// `moe_ffn_forward_step_async` with a single launch per matmul. The
+// canonical llama.cpp pattern (mmvq.cu:597-654, mul_mat_vec_q_moe) maps
+// `(blockIdx.y, blockIdx.x)` → `(slot, row_tile)` so each block reads
+// `e_idx = topk_indices[blockIdx.y]` instead of the host-bound `slot`.
+//
+// Output layout : `[k_used, N]` row-major. Per-slot-row scalar lands at
+// `y[slot * N + row]`. The caller either dispatches the existing
+// per-slot `scaled_add_inplace_bf16_devscalar` epilogue (initial wiring,
+// trivially bit-exact) or a fused routed-reduce primitive
+// (`scaled_add_routed_bf16`, see below) that sums all K slots in one
+// launch.
+//
+// The PER-SLOT BODY is byte-for-byte identical to the v3 indexed kernel
+// it replaces — A3 demonstrated that any reduction-order change (e.g.
+// 32→64 lane warp split) produces token-level drift even when synthetic
+// parity holds. Reuse > rewrite for FP non-associativity safety.
+//
+// Block topology mirrors the v3 indexed kernels :
+//   block_dim = (128, 1, 1)        — 4 rows × 32 lanes (warp-shuffle SGEMV)
+//   grid_dim  = (ceil(N/4), k_used, 1)
+//
+// Q4_K dp4a path uses the dp4a body : block_dim = (32, 1, 1), one warp
+// per row → grid = (N, k_used, 1).
+// BF16 path uses the bf16 body : block_dim = (64, 1, 1), 2 warps per
+// row → grid = (N, k_used, 1).
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_Q4_K_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(128, 8)
+__global__ void mul_mm_id_q4_k_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,  // [n_experts] u64
+    const int*                __restrict__ topk_indices, // [k_used] device i32
+    const __nv_bfloat16*      __restrict__ x,            // [K]
+    __nv_bfloat16*            __restrict__ y,            // [k_used, N]
+    int N,
+    int K
+) {
+    int slot = blockIdx.y;
+    int e_idx = topk_indices[slot];
+    const unsigned char* __restrict__ w_q4k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 144;
+
+    int group     = lane >> 3;
+    int pos_base  = (lane & 7) << 2;
+    int byte_base = (group << 5) + pos_base;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 144;
+        const unsigned char* blk = w_q4k + blk_off;
+
+        unsigned short d_bits    = blk[0] | (blk[1] << 8);
+        unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_bits));
+        float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+        const unsigned char* scales = blk + 4;
+        int sub_a = group * 2;
+        int sub_b = sub_a + 1;
+        unsigned char sc_a, m_a, sc_b, m_b;
+        if (sub_a < 4) {
+            sc_a = scales[sub_a]     & 0x3F;
+            m_a  = scales[sub_a + 4] & 0x3F;
+        } else {
+            int ga = sub_a - 4;
+            sc_a = (scales[ga + 8] & 0x0F) | ((scales[ga]     >> 6) << 4);
+            m_a  = (scales[ga + 8] >> 4)   | ((scales[ga + 4] >> 6) << 4);
+        }
+        if (sub_b < 4) {
+            sc_b = scales[sub_b]     & 0x3F;
+            m_b  = scales[sub_b + 4] & 0x3F;
+        } else {
+            int gb = sub_b - 4;
+            sc_b = (scales[gb + 8] & 0x0F) | ((scales[gb]     >> 6) << 4);
+            m_b  = (scales[gb + 8] >> 4)   | ((scales[gb + 4] >> 6) << 4);
+        }
+        float scale_a = d    * (float)sc_a;
+        float min_a   = dmin * (float)m_a;
+        float scale_b = d    * (float)sc_b;
+        float min_b   = dmin * (float)m_b;
+
+        const unsigned char* qs = blk + 16;
+        unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
+
+        const __nv_bfloat16* xa_ptr = x + b * 256 + sub_a * 32 + pos_base;
+        const __nv_bfloat16* xb_ptr = x + b * 256 + sub_b * 32 + pos_base;
+        uint2 xa = *(const uint2*)xa_ptr;
+        uint2 xb = *(const uint2*)xb_ptr;
+        float xa0 = (float)__ushort_as_bfloat16((unsigned short)(xa.x & 0xFFFFu));
+        float xa1 = (float)__ushort_as_bfloat16((unsigned short)(xa.x >> 16));
+        float xa2 = (float)__ushort_as_bfloat16((unsigned short)(xa.y & 0xFFFFu));
+        float xa3 = (float)__ushort_as_bfloat16((unsigned short)(xa.y >> 16));
+        float xb0 = (float)__ushort_as_bfloat16((unsigned short)(xb.x & 0xFFFFu));
+        float xb1 = (float)__ushort_as_bfloat16((unsigned short)(xb.x >> 16));
+        float xb2 = (float)__ushort_as_bfloat16((unsigned short)(xb.y & 0xFFFFu));
+        float xb3 = (float)__ushort_as_bfloat16((unsigned short)(xb.y >> 16));
+
+        unsigned char by0 = (qbytes      ) & 0xFFu;
+        unsigned char by1 = (qbytes >>  8) & 0xFFu;
+        unsigned char by2 = (qbytes >> 16) & 0xFFu;
+        unsigned char by3 = (qbytes >> 24) & 0xFFu;
+        int na0 = by0 & 0x0F, na1 = by1 & 0x0F, na2 = by2 & 0x0F, na3 = by3 & 0x0F;
+        int nb0 = by0 >>   4, nb1 = by1 >>   4, nb2 = by2 >>   4, nb3 = by3 >>   4;
+
+        acc += (scale_a * (float)na0 - min_a) * xa0;
+        acc += (scale_a * (float)na1 - min_a) * xa1;
+        acc += (scale_a * (float)na2 - min_a) * xa2;
+        acc += (scale_a * (float)na3 - min_a) * xa3;
+        acc += (scale_b * (float)nb0 - min_b) * xb0;
+        acc += (scale_b * (float)nb1 - min_b) * xb1;
+        acc += (scale_b * (float)nb2 - min_b) * xb2;
+        acc += (scale_b * (float)nb3 - min_b) * xb3;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        y[slot * N + row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_Q4_K_Q8_1_DP4A_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void mul_mm_id_q4_k_q8_1_dp4a_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices,
+    const unsigned char*      __restrict__ x_q8_1,
+    __nv_bfloat16*            __restrict__ y,
+    int N,
+    int K
+) {
+    int slot = blockIdx.y;
+    int e_idx = topk_indices[slot];
+    const unsigned char* __restrict__ w_q4k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
+
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+
+    int blocks_per_row = K / 256;
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += 32) {
+        const unsigned char* blk = w_q4k + (row * blocks_per_row + b) * 144;
+
+        float d    = __half2float(*(const __half*)(blk + 0));
+        float dmin = __half2float(*(const __half*)(blk + 2));
+
+        const unsigned char* sr = blk + 4;
+        unsigned char sc[8], m[8];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sc[i]     = sr[i]     & 0x3F;
+            m[i]      = sr[i + 4] & 0x3F;
+            sc[i + 4] = (sr[i + 8] & 0x0F) | ((sr[i]     >> 6) << 4);
+            m[i  + 4] = (sr[i + 8] >>   4) | ((sr[i + 4] >> 6) << 4);
+        }
+
+        const unsigned char* qs = blk + 16;
+
+        #pragma unroll
+        for (int bp = 0; bp < 4; ++bp) {
+            int bq8_offset = 2 * bp;
+            #pragma unroll
+            for (int qc = 0; qc < 4; ++qc) {
+                int v0 = *(const int*)(qs + 32 * bp +  4 * qc);
+                int v1 = *(const int*)(qs + 32 * bp + 16 + 4 * qc);
+
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    unsigned int v0i = (v0 >> (4 * i)) & 0x0F0F0F0Fu;
+                    unsigned int v1i = (v1 >> (4 * i)) & 0x0F0F0F0Fu;
+
+                    int sb_idx = b * 8 + bq8_offset + i;
+                    const unsigned char* x_blk = x_q8_1 + sb_idx * 36;
+                    float xd = __half2float(*(const __half*)x_blk);
+
+                    int u0 = *(const int*)(x_blk + 4      + 4 * qc);
+                    int u1 = *(const int*)(x_blk + 4 + 16 + 4 * qc);
+
+                    int dot1 = __dp4a((int)v1i, u1, __dp4a((int)v0i, u0, 0));
+                    int dot2 = __dp4a((int)0x01010101u, u1,
+                               __dp4a((int)0x01010101u, u0, 0));
+
+                    acc += d    * xd * (float)(dot1 * (int)sc[bq8_offset + i])
+                         - dmin * xd * (float)(dot2 * (int)m [bq8_offset + i]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, o);
+    }
+
+    if (tid == 0) {
+        y[slot * N + row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_Q5_K_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(128, 8)
+__global__ void mul_mm_id_q5_k_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices,
+    const __nv_bfloat16*      __restrict__ x,
+    __nv_bfloat16*            __restrict__ y,
+    int N,
+    int K
+) {
+    int slot = blockIdx.y;
+    int e_idx = topk_indices[slot];
+    const unsigned char* __restrict__ w_q5k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 176;
+
+    int group     = lane >> 3;
+    int pos_base  = (lane & 7) << 2;
+    int byte_base = (group << 5) + pos_base;
+    unsigned int qh_mask_a = 1u << (2 * group);
+    unsigned int qh_mask_b = 1u << (2 * group + 1);
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 176;
+        const unsigned char* blk = w_q5k + blk_off;
+
+        unsigned short d_bits    = blk[0] | (blk[1] << 8);
+        unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_bits));
+        float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+        const unsigned char* scales = blk + 4;
+        int sub_a = group * 2;
+        int sub_b = sub_a + 1;
+        unsigned char sc_a, m_a, sc_b, m_b;
+        if (sub_a < 4) {
+            sc_a = scales[sub_a]     & 0x3F;
+            m_a  = scales[sub_a + 4] & 0x3F;
+        } else {
+            int ga = sub_a - 4;
+            sc_a = (scales[ga + 8] & 0x0F) | ((scales[ga]     >> 6) << 4);
+            m_a  = (scales[ga + 8] >> 4)   | ((scales[ga + 4] >> 6) << 4);
+        }
+        if (sub_b < 4) {
+            sc_b = scales[sub_b]     & 0x3F;
+            m_b  = scales[sub_b + 4] & 0x3F;
+        } else {
+            int gb = sub_b - 4;
+            sc_b = (scales[gb + 8] & 0x0F) | ((scales[gb]     >> 6) << 4);
+            m_b  = (scales[gb + 8] >> 4)   | ((scales[gb + 4] >> 6) << 4);
+        }
+        float scale_a = d    * (float)sc_a;
+        float min_a   = dmin * (float)m_a;
+        float scale_b = d    * (float)sc_b;
+        float min_b   = dmin * (float)m_b;
+
+        const unsigned char* qh = blk + 16;
+        const unsigned char* ql = blk + 16 + 32;
+
+        unsigned int qlbytes = *(const unsigned int*)(ql + byte_base);
+        unsigned int qhbytes = *(const unsigned int*)(qh + pos_base);
+
+        const __nv_bfloat16* xa_ptr = x + b * 256 + sub_a * 32 + pos_base;
+        const __nv_bfloat16* xb_ptr = x + b * 256 + sub_b * 32 + pos_base;
+        uint2 xa = *(const uint2*)xa_ptr;
+        uint2 xb = *(const uint2*)xb_ptr;
+        float xa0 = (float)__ushort_as_bfloat16((unsigned short)(xa.x & 0xFFFFu));
+        float xa1 = (float)__ushort_as_bfloat16((unsigned short)(xa.x >> 16));
+        float xa2 = (float)__ushort_as_bfloat16((unsigned short)(xa.y & 0xFFFFu));
+        float xa3 = (float)__ushort_as_bfloat16((unsigned short)(xa.y >> 16));
+        float xb0 = (float)__ushort_as_bfloat16((unsigned short)(xb.x & 0xFFFFu));
+        float xb1 = (float)__ushort_as_bfloat16((unsigned short)(xb.x >> 16));
+        float xb2 = (float)__ushort_as_bfloat16((unsigned short)(xb.y & 0xFFFFu));
+        float xb3 = (float)__ushort_as_bfloat16((unsigned short)(xb.y >> 16));
+
+        unsigned char qb0 = (qlbytes      ) & 0xFFu;
+        unsigned char qb1 = (qlbytes >>  8) & 0xFFu;
+        unsigned char qb2 = (qlbytes >> 16) & 0xFFu;
+        unsigned char qb3 = (qlbytes >> 24) & 0xFFu;
+        unsigned char hb0 = (qhbytes      ) & 0xFFu;
+        unsigned char hb1 = (qhbytes >>  8) & 0xFFu;
+        unsigned char hb2 = (qhbytes >> 16) & 0xFFu;
+        unsigned char hb3 = (qhbytes >> 24) & 0xFFu;
+
+        int qa0 = (qb0 & 0x0F) + ((hb0 & qh_mask_a) ? 16 : 0);
+        int qa1 = (qb1 & 0x0F) + ((hb1 & qh_mask_a) ? 16 : 0);
+        int qa2 = (qb2 & 0x0F) + ((hb2 & qh_mask_a) ? 16 : 0);
+        int qa3 = (qb3 & 0x0F) + ((hb3 & qh_mask_a) ? 16 : 0);
+        int qbq0 = (qb0 >>   4) + ((hb0 & qh_mask_b) ? 16 : 0);
+        int qbq1 = (qb1 >>   4) + ((hb1 & qh_mask_b) ? 16 : 0);
+        int qbq2 = (qb2 >>   4) + ((hb2 & qh_mask_b) ? 16 : 0);
+        int qbq3 = (qb3 >>   4) + ((hb3 & qh_mask_b) ? 16 : 0);
+
+        acc += (scale_a * (float)qa0  - min_a) * xa0;
+        acc += (scale_a * (float)qa1  - min_a) * xa1;
+        acc += (scale_a * (float)qa2  - min_a) * xa2;
+        acc += (scale_a * (float)qa3  - min_a) * xa3;
+        acc += (scale_b * (float)qbq0 - min_b) * xb0;
+        acc += (scale_b * (float)qbq1 - min_b) * xb1;
+        acc += (scale_b * (float)qbq2 - min_b) * xb2;
+        acc += (scale_b * (float)qbq3 - min_b) * xb3;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        y[slot * N + row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_Q6_K_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __launch_bounds__(128, 8)
+__global__ void mul_mm_id_q6_k_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices,
+    const __nv_bfloat16*      __restrict__ x,
+    __nv_bfloat16*            __restrict__ y,
+    int N,
+    int K
+) {
+    int slot = blockIdx.y;
+    int e_idx = topk_indices[slot];
+    const unsigned char* __restrict__ w_q6k =
+        (const unsigned char* __restrict__)expert_ptrs[e_idx];
+
+    int row0 = blockIdx.x * 4;
+    int tid  = threadIdx.x;
+    int row_in_block = tid >> 5;
+    int lane         = tid & 31;
+    int row          = row0 + row_in_block;
+    if (row >= N) return;
+
+    int blocks_per_row = K / 256;
+    int row_offset     = row * blocks_per_row * 210;
+    int l16            = lane >> 4;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int blk_off = row_offset + b * 210;
+        const unsigned char* blk = w_q6k + blk_off;
+
+        unsigned short d_bits = blk[208] | (blk[209] << 8);
+        float d = __half2float(__ushort_as_half(d_bits));
+
+        const signed char* scales = (const signed char*)(blk + 192);
+        float sc0_a = d * (float)scales[0 + l16];
+        float sc2_a = d * (float)scales[2 + l16];
+        float sc4_a = d * (float)scales[4 + l16];
+        float sc6_a = d * (float)scales[6 + l16];
+        float sc0_b = d * (float)scales[8 + l16];
+        float sc2_b = d * (float)scales[10 + l16];
+        float sc4_b = d * (float)scales[12 + l16];
+        float sc6_b = d * (float)scales[14 + l16];
+
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+
+        unsigned char ql_a0 = ql[0 + lane];
+        unsigned char ql_b0 = ql[0 + lane + 32];
+        unsigned char qh_0  = qh[0 + lane];
+        int q0a = (ql_a0 & 0x0F) | (((qh_0)      & 0x03) << 4);
+        int q1a = (ql_b0 & 0x0F) | (((qh_0 >> 2) & 0x03) << 4);
+        int q2a = (ql_a0 >> 4)   | (((qh_0 >> 4) & 0x03) << 4);
+        int q3a = (ql_b0 >> 4)   | (((qh_0 >> 6) & 0x03) << 4);
+
+        const __nv_bfloat16* x_ptr_a = x + b * 256 + 0;
+        float x0a = (float)x_ptr_a[lane];
+        float x1a = (float)x_ptr_a[lane + 32];
+        float x2a = (float)x_ptr_a[lane + 64];
+        float x3a = (float)x_ptr_a[lane + 96];
+
+        acc += sc0_a * (float)(q0a - 32) * x0a;
+        acc += sc2_a * (float)(q1a - 32) * x1a;
+        acc += sc4_a * (float)(q2a - 32) * x2a;
+        acc += sc6_a * (float)(q3a - 32) * x3a;
+
+        unsigned char ql_a1 = ql[64 + lane];
+        unsigned char ql_b1 = ql[64 + lane + 32];
+        unsigned char qh_1  = qh[32 + lane];
+        int q0b = (ql_a1 & 0x0F) | (((qh_1)      & 0x03) << 4);
+        int q1b = (ql_b1 & 0x0F) | (((qh_1 >> 2) & 0x03) << 4);
+        int q2b = (ql_a1 >> 4)   | (((qh_1 >> 4) & 0x03) << 4);
+        int q3b = (ql_b1 >> 4)   | (((qh_1 >> 6) & 0x03) << 4);
+
+        const __nv_bfloat16* x_ptr_b = x + b * 256 + 128;
+        float x0b = (float)x_ptr_b[lane];
+        float x1b = (float)x_ptr_b[lane + 32];
+        float x2b = (float)x_ptr_b[lane + 64];
+        float x3b = (float)x_ptr_b[lane + 96];
+
+        acc += sc0_b * (float)(q0b - 32) * x0b;
+        acc += sc2_b * (float)(q1b - 32) * x1b;
+        acc += sc4_b * (float)(q2b - 32) * x2b;
+        acc += sc6_b * (float)(q3b - 32) * x3b;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        y[slot * N + row] = (__nv_bfloat16)acc;
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+const MUL_MM_ID_BF16_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void mul_mm_id_bf16_bf16(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int*                __restrict__ topk_indices,
+    const __nv_bfloat16*      __restrict__ x,
+    __nv_bfloat16*            __restrict__ y,
+    int N,
+    int K
+) {
+    int slot = blockIdx.y;
+    int e_idx = topk_indices[slot];
+    const __nv_bfloat16* __restrict__ w =
+        (const __nv_bfloat16* __restrict__)expert_ptrs[e_idx];
+
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+
+    extern __shared__ float shmem[];
+
+    float acc = 0.0f;
+    int blocks_per_row = K / 256;
+    int pos_base = tid * 4;
+    int row_offset = row * K;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int k_off = b * 256 + pos_base;
+        const __nv_bfloat16* w_ptr = w + row_offset + k_off;
+        const __nv_bfloat16* x_ptr = x + k_off;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float wv = (float)w_ptr[i];
+            float xv = (float)x_ptr[i];
+            acc += wv * xv;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    if (lane_id == 0) {
+        shmem[warp_id] = acc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float total = shmem[0] + shmem[1];
+        y[slot * N + row] = (__nv_bfloat16)total;
+    }
+}
+"#;
+
+// T246.8 A4 — fused routed reduce :
+//
+//   y[i] += sum_{slot=0..K-1} alpha_dev[slot] * x[slot, i]
+//
+// Replaces the K-iteration `scaled_add_inplace_bf16_devscalar` epilogue
+// loop in the routed-MoE down path. Equivalent (in float-precision
+// accumulator) to the per-slot loop, modulo intra-row reduction order
+// (sum across slots is performed in a single thread, low-to-high slot
+// index — same as the per-slot host loop).
+//
+// Each thread accumulates over the slot axis in float, then writes back
+// once per output element. K_MAX = 16 covers Qwen3-MoE (k=8) and any
+// reasonable extension.
+#[cfg(feature = "cuda")]
+const SCALED_ADD_ROUTED_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void scaled_add_routed_bf16(
+    __nv_bfloat16*       __restrict__ y,            // [N]
+    const __nv_bfloat16* __restrict__ x,            // [K, N] slot-major
+    const __nv_bfloat16* __restrict__ alpha_dev,    // [K]
+    int n,
+    int k_used
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float yi = (float)y[i];
+    for (int s = 0; s < k_used; ++s) {
+        float a = (float)alpha_dev[s];
+        float xi = (float)x[s * n + i];
+        yi += a * xi;
+    }
+    y[i] = (__nv_bfloat16)yi;
+}
+"#;
+
 // T244.3 — sgemv_q5k_bf16 — direct Q5_K matmul (Qwen 3.6 needs this:
 // 12% of weights are Q5_K, 76% Q4_K, 12% Q6_K).
 //
@@ -4787,6 +5573,17 @@ pub struct LlmKernels {
     scaled_add_inplace_devscalar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     scaled_add_sigmoid_devscalar: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     zero_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.8 A4 — mul_mm_id mega-kernels (one launch per gate/up/down matmul)
+    mul_mm_id_q4_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mm_id_q4_k_q8_1_dp4a_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mm_id_q5_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mm_id_q6_k_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    mul_mm_id_bf16_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    scaled_add_routed_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.9 NVFP4.2 — indexed NVFP4 SGEMV for MoE FFN forward (single-token decode)
+    sgemv_nvfp4_bf16_indexed: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.9 NVFP4.2 — non-indexed NVFP4 SGEMV (single-Linear decode, no expert dispatch)
+    sgemv_nvfp4_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -4869,6 +5666,16 @@ impl LlmKernels {
             scaled_add_inplace_devscalar: std::sync::OnceLock::new(),
             scaled_add_sigmoid_devscalar: std::sync::OnceLock::new(),
             zero_bf16: std::sync::OnceLock::new(),
+            // T246.8 A4 — mul_mm_id mega-kernels
+            mul_mm_id_q4_k_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_q4_k_q8_1_dp4a_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_q5_k_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_q6_k_bf16: std::sync::OnceLock::new(),
+            mul_mm_id_bf16_bf16: std::sync::OnceLock::new(),
+            scaled_add_routed_bf16: std::sync::OnceLock::new(),
+            // T246.9 NVFP4.2 — indexed/non-indexed NVFP4 SGEMV
+            sgemv_nvfp4_bf16_indexed: std::sync::OnceLock::new(),
+            sgemv_nvfp4_bf16: std::sync::OnceLock::new(),
         }
     }
 
@@ -7699,6 +8506,292 @@ impl LlmKernels {
         Ok(())
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // T246.8 A4 — mul_mm_id mega-kernel wrappers
+    //
+    // Each wrapper replaces a `for slot in 0..k_used` loop of the
+    // corresponding `sgemv_*_indexed` call with a single launch whose
+    // grid covers all (row_tile, slot) pairs. Output `y` has shape
+    // `[k_used, N]` BF16 (slot-major). Per-slot row body is byte-for-byte
+    // the same as the indexed kernel — A3 demonstrated reduction-order
+    // changes break model decode bit-parity even when synthetic parity holds.
+
+    /// Mega-kernel : `y[slot, :] = expert[topk_indices[slot]] @ x` for all
+    /// `slot in 0..k_used` in one launch.
+    ///
+    /// # Safety  See `sgemv_q4k_bf16_v3_indexed` — `expert_ptrs` is a
+    /// device array of `n_experts` u64 base pointers, `topk_indices` is a
+    /// device array of `k_used` i32 expert IDs, `y` must be at least
+    /// `k_used * N` BF16 elements.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_q4_k_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_q4_k_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_q4_k_bf16,
+            MUL_MM_ID_Q4_K_BF16_SRC,
+            "mul_mm_id_q4_k_bf16",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, k_used as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_q4_k_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q4_K dp4a mega-kernel : `y[slot, :] = expert[topk[slot]] @ x_q8_1`.
+    ///
+    /// # Safety  See `sgemv_q4k_q8_1_dp4a_bf16_indexed`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_q4_k_q8_1_dp4a_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x_q8_1: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_q4_k_q8_1_dp4a_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_q4_k_q8_1_dp4a_bf16,
+            MUL_MM_ID_Q4_K_Q8_1_DP4A_BF16_SRC,
+            "mul_mm_id_q4_k_q8_1_dp4a_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, k_used as u32, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x_q8_1)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_q4_k_q8_1_dp4a_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q5_K mega-kernel.
+    ///
+    /// # Safety  See `sgemv_q5k_bf16_v3_indexed`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_q5_k_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_q5_k_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_q5_k_bf16,
+            MUL_MM_ID_Q5_K_BF16_SRC,
+            "mul_mm_id_q5_k_bf16",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, k_used as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_q5_k_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q6_K mega-kernel.
+    ///
+    /// # Safety  See `sgemv_q6k_bf16_v3_indexed`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_q6_k_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_q6_k_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_q6_k_bf16,
+            MUL_MM_ID_Q6_K_BF16_SRC,
+            "mul_mm_id_q6_k_bf16",
+        )?;
+        const ROWS_PER_BLOCK: i32 = 4;
+        let n_blocks = ((n + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks, k_used as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_q6_k_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// BF16 mega-kernel.
+    ///
+    /// # Safety  See `sgemv_bf16_bf16_indexed` — expert weights are `[N, K]`
+    /// row-major BF16.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mul_mm_id_bf16_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        topk_indices: u64,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        if k % 256 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("mul_mm_id_bf16_bf16: K={k} must be multiple of 256"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.mul_mm_id_bf16_bf16,
+            MUL_MM_ID_BF16_BF16_SRC,
+            "mul_mm_id_bf16_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, k_used as u32, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 64 * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&topk_indices)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "mul_mm_id_bf16_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Routed reduce : `y[i] += sum_{slot} alpha_dev[slot] * x[slot, i]`.
+    /// Replaces the K-iteration `scaled_add_inplace_bf16_devscalar` epilogue.
+    ///
+    /// # Safety  `y` is `[N]` BF16 device, `x` is `[k_used, N]` BF16 device,
+    /// `alpha_dev` is `[k_used]` BF16 device.
+    pub unsafe fn scaled_add_routed_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        y: u64,
+        x: u64,
+        alpha_dev: u64,
+        n: i32,
+        k_used: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.scaled_add_routed_bf16,
+            SCALED_ADD_ROUTED_BF16_SRC,
+            "scaled_add_routed_bf16",
+        )?;
+        let block_dim: u32 = 256;
+        let grid_dim: u32 = (n as u32).div_ceil(block_dim);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid_dim, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&y)
+            .arg(&x)
+            .arg(&alpha_dev)
+            .arg(&n)
+            .arg(&k_used);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "scaled_add_routed_bf16::launch",
+        })?;
+        Ok(())
+    }
+
     /// `y[i] += alpha_dev[slot] * x[i]`. `alpha_dev` is a device-resident
     /// BF16 vector (top-K weights for routed experts, or 1-elem post-sigmoid
     /// shared-expert weight). Eliminates the host readback that the
@@ -7793,6 +8886,126 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "zero_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // T246.9 NVFP4.2 — NVFP4 SGEMV (vLLM nvfp4-pack-quantized layout)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Indexed NVFP4 SGEMV : `y = expert_ptrs[topk_indices[slot]] @ x`.
+    ///
+    /// Weight layout per expert :
+    /// - `weight_packed [N, K/2]` U8 — 2 FP4 (E2M1) per byte, low nibble = even index
+    /// - `weight_scale [N, K/16]` U8 (UE4M3) — 1 byte per micro-block of 16 elements
+    /// - `alpha = 1 / (weight_global_scale * input_global_scale)` — applied at the end
+    ///
+    /// `expert_ptrs` is `[n_experts]` u64 of weight_packed base pointers.
+    /// `expert_scale_ptrs` is `[n_experts]` u64 of weight_scale base pointers.
+    /// `expert_alphas` is `[n_experts]` f32 of per-expert alpha scalars.
+    ///
+    /// `K` must be a multiple of 16. `N` is arbitrary.
+    ///
+    /// # Safety
+    /// All `expert_ptrs[*]` and `expert_scale_ptrs[*]` must be valid for
+    /// `(N*K/2)` and `(N*K/16)` bytes respectively. `topk_indices[slot]
+    /// ∈ [0, n_experts)`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sgemv_nvfp4_bf16_indexed(
+        &self,
+        stream: &Arc<CudaStream>,
+        expert_ptrs: u64,
+        expert_scale_ptrs: u64,
+        expert_alphas: u64,
+        topk_indices: u64,
+        slot: i32,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 16 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_nvfp4_bf16_indexed: K={k} must be multiple of 16"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_nvfp4_bf16_indexed,
+            SGEMV_NVFP4_BF16_INDEXED_SRC,
+            "sgemv_nvfp4_bf16_indexed",
+        )?;
+        // 1 row per block, 32 threads (1 warp) — like q4k_dp4a_indexed,
+        // K-loop split across 32 lanes via stride-32.
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&expert_ptrs)
+            .arg(&expert_scale_ptrs)
+            .arg(&expert_alphas)
+            .arg(&topk_indices)
+            .arg(&slot)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_nvfp4_bf16_indexed::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Non-indexed NVFP4 SGEMV : `y = W @ x` (single Linear, no MoE
+    /// dispatch). Used by attention QKV/O projections and shared-expert
+    /// matmuls in `Qwen35ModelCudaNVFP4`.
+    ///
+    /// # Safety
+    /// `weight_packed` is `(N*K/2)` bytes ; `weight_scale` is `(N*K/16)`
+    /// bytes ; `alpha = 1 / (weight_global * input_global)` applied at end.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sgemv_nvfp4_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        weight_packed: u64,
+        weight_scale: u64,
+        alpha: f32,
+        x: u64,
+        y: u64,
+        n: i32,
+        k: i32,
+    ) -> Result<(), CudaError> {
+        if k % 16 != 0 {
+            return Err(CudaError::Unsupported {
+                msg: format!("sgemv_nvfp4_bf16: K={k} must be multiple of 16"),
+            });
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.sgemv_nvfp4_bf16,
+            SGEMV_NVFP4_BF16_SRC,
+            "sgemv_nvfp4_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&weight_packed)
+            .arg(&weight_scale)
+            .arg(&alpha)
+            .arg(&x)
+            .arg(&y)
+            .arg(&n)
+            .arg(&k);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "sgemv_nvfp4_bf16::launch",
         })?;
         Ok(())
     }
