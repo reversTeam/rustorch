@@ -30,6 +30,14 @@ const GQA_N_SPLIT: usize = 4;
 /// at most 21 tree nodes (1 + W*(L-1)). 32 leaves room for (W=5, L=7) and
 /// future tweaks without re-allocating the tree scratch buffers.
 pub const MAX_TREE_SIZE: usize = 32;
+
+/// T246.8 A5 — number of K-direction chunks used by the split-K lm_head
+/// kernel when enabled (`RUSTORCH_LM_HEAD_SPLIT=1`). For Qwen3.6-35B-A3B
+/// the lm_head shape is (N=152064, K=2048) → blocks_per_row=8 → one
+/// super-block per chunk. Smaller K's (or non-multiples) fall back to V2.
+/// Sized as `_MAX` because the scratch buffer is pre-allocated for the
+/// worst case at model load.
+const LM_HEAD_K_CHUNKS_MAX: usize = 8;
 use cudarc::driver::{CudaContext, CudaGraph, CudaSlice, CudaStream, PinnedHostSlice};
 use rustorch_cuda::cublas_lt::LtSession;
 use rustorch_cuda::llm_kernels::LlmKernels;
@@ -689,6 +697,16 @@ pub(crate) struct DecodeScratch {
     /// `[MAX_TREE_SIZE]` i32 — depth-wave indices buffer used by the
     /// `delta_net_step_tree_bf16` launcher (one launch per BFS depth).
     pub(crate) tree_ssm_wave_indices: CudaSlice<i32>,
+
+    // ── T246.8 A5 — lm_head split-K staging buffer ──
+    /// `[LM_HEAD_K_CHUNKS, vocab]` FP32 — partial sums for the split-K
+    /// Q6_K SGEMV used by `dispatch_lm_head` when `RUSTORCH_LM_HEAD_SPLIT=1`
+    /// is set AND the lm_head is large enough (N >= 100k). Sized for the
+    /// max K_CHUNKS=8 supported (the lm_head case on Qwen3.6-35B-A3B
+    /// K=2048 → blocks_per_row=8 → K_CHUNKS=8). For Dense/non-MoE models
+    /// where the lm_head is smaller this buffer is still allocated but
+    /// unused.
+    pub(crate) lm_head_split_partial: CudaSlice<f32>,
 }
 
 /// CUDA-resident Qwen3.5/3.6 hybrid model with Q4_K_M weights.
@@ -1410,6 +1428,13 @@ impl Qwen35ModelCudaQ4K {
             tree_ssm_wave_indices: stream
                 .alloc_zeros::<i32>(MAX_TREE_SIZE)
                 .map_err(|e| LlmError::Backend(format!("scratch tree_ssm_wave: {e:?}")))?,
+            // T246.8 A5 — staging for split-K lm_head. Sized for max
+            // K_CHUNKS=8 (lm_head K=2048 case). For Qwen3.6-35B-A3B
+            // vocab=152064 → 8 * 152064 * 4 = ~4.9 MB. Allocated even when
+            // not used (zero cost at runtime unless RUSTORCH_LM_HEAD_SPLIT=1).
+            lm_head_split_partial: stream
+                .alloc_zeros::<f32>(LM_HEAD_K_CHUNKS_MAX * cfg.vocab)
+                .map_err(|e| LlmError::Backend(format!("scratch lm_head_split: {e:?}")))?,
         };
 
         // T246.5.3 — device-resident counters for CUDA Graph capture.
@@ -1490,6 +1515,73 @@ impl Qwen35ModelCudaQ4K {
         // It will be re-captured on the 2nd decode_step after this reset.
         self.decode_graph = None;
         Ok(())
+    }
+
+    /// T246.8 A5 — Dispatch the lm_head matmul. By default uses the
+    /// standard `QuantTensor::dispatch_matmul_m1` (V2 for Q6_K). When
+    /// `RUSTORCH_LM_HEAD_SPLIT=1` AND the lm_head is large enough
+    /// (`N >= 100_000`) AND stored as Q6_K AND `K` is divisible by
+    /// `LM_HEAD_K_CHUNKS_MAX * 256`, the split-K kernel
+    /// (`sgemv_q6k_bf16_split_k`) is used instead — targets the 3 ms/tok
+    /// floor identified by A3 (note 8e23a850).
+    ///
+    /// Per-token env-var read is acceptable : called 1-32× per decode and
+    /// `std::env::var` is ~150 ns each.
+    #[inline]
+    fn dispatch_lm_head(&mut self, h_p: u64, logits_p: u64, x_q8_p: u64) -> Result<(), LlmError> {
+        // Hot-path : check env once per call (negligible — 150 ns × few/token).
+        let split_on = std::env::var("RUSTORCH_LM_HEAD_SPLIT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        // Decide split-K eligibility + extract weight pointer before any
+        // &mut self borrow on scratch.
+        let split_args: Option<(u64, i32, i32)> = if split_on {
+            match &self.lm_head {
+                QuantTensor::Q6K { bytes, n, k } => {
+                    let blocks_per_row = *k / 256;
+                    if *n >= 100_000 && blocks_per_row % LM_HEAD_K_CHUNKS_MAX == 0 && *k % 256 == 0
+                    {
+                        use cudarc::driver::DevicePtr;
+                        // SAFETY : device_ptr returns a u64 valid for the
+                        // lifetime of the guard ; guard dropped at end of
+                        // this expression. Kernel reads only.
+                        let (w, _g) = bytes.device_ptr(&self.stream);
+                        Some((w, *n as i32, *k as i32))
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((w, n, k)) = split_args {
+            use cudarc::driver::DevicePtrMut;
+            unsafe {
+                let (partial_p, _g1) = self
+                    .scratch
+                    .lm_head_split_partial
+                    .device_ptr_mut(&self.stream);
+                self.kernels
+                    .sgemv_q6k_bf16_split_k(
+                        &self.stream,
+                        w,
+                        h_p,
+                        partial_p,
+                        logits_p,
+                        n,
+                        k,
+                        LM_HEAD_K_CHUNKS_MAX as i32,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("lm_head split_k: {e:?}")))?;
+            }
+            return Ok(());
+        }
+        // Default path (A4 baseline) — preserved bit-identical when
+        // RUSTORCH_LM_HEAD_SPLIT=0 (or unset).
+        self.lm_head
+            .dispatch_matmul_m1(&self.kernels, &self.stream, h_p, logits_p, x_q8_p)
     }
 
     /// Decode one token. T246.2-4 implementation : full Qwen3.6 forward
@@ -2396,8 +2488,8 @@ impl Qwen35ModelCudaQ4K {
                 .rms_norm_bf16(&self.stream, h_p, final_norm_p, eps, d as i32, 1)
                 .map_err(|e| LlmError::Backend(format!("final_norm: {e:?}")))?;
         }
-        self.lm_head
-            .dispatch_matmul_m1(&self.kernels, &self.stream, h_p, logits_p, x_q8_p)?;
+        // T246.8 A5 — split-K dispatch (env-gated via RUSTORCH_LM_HEAD_SPLIT=1).
+        self.dispatch_lm_head(h_p, logits_p, x_q8_p)?;
 
         // ---- Sample (argmax for now) ----
         unsafe {
@@ -2958,8 +3050,8 @@ impl Qwen35ModelCudaQ4K {
         for r in 0..tree_size {
             let h_r = th_p + (r as u64) * row_h;
             let logits_r = tlogits_p + (r as u64) * row_logits;
-            self.lm_head
-                .dispatch_matmul_m1(&self.kernels, &self.stream, h_r, logits_r, x_q8_p)?;
+            // T246.8 A5 — split-K dispatch (env-gated).
+            self.dispatch_lm_head(h_r, logits_r, x_q8_p)?;
         }
 
         // ── 6. Argmax + DtoH ──────────────────────────────────────────────
@@ -4253,8 +4345,8 @@ impl Qwen35ModelCudaQ4K {
         for r in 0..tree_size {
             let h_r = th_p + (r as u64) * row_h;
             let logits_r = tlogits_p + (r as u64) * row_logits;
-            self.lm_head
-                .dispatch_matmul_m1(&self.kernels, &self.stream, h_r, logits_r, x_q8_p)?;
+            // T246.8 A5 — split-K dispatch (env-gated).
+            self.dispatch_lm_head(h_r, logits_r, x_q8_p)?;
         }
 
         // ── 5. Argmax over all tree_size logits rows ──────────────────────
