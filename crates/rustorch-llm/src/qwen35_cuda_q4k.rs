@@ -3631,11 +3631,31 @@ impl Qwen35ModelCudaQ4K {
                 .rms_norm_bf16(&self.stream, th_p, fn_p, eps, d as i32, tree_size as i32)
                 .map_err(|e| LlmError::Backend(format!("hyb final_norm: {e:?}")))?;
         }
-        for r in 0..tree_size {
-            let h_r = th_p + (r as u64) * row_h;
-            let logits_r = tlogits_p + (r as u64) * row_logits;
-            // T246.8 A5 — split-K dispatch (env-gated).
-            self.dispatch_lm_head(h_r, logits_r, x_q8_p)?;
+        // T246.10 HOTFIX-A6b — batch lm_head through dispatch_matmul_mvar when
+        // in GEMM prefill mode. lm_head is Q6_K on Qwen3.6 ; the per-row
+        // SGEMV path was firing tree_size copies of sgemv_q6k_bf16_v2 = 1835 ms
+        // per pp512 (19% of GPU time, PRE-FLIGHT note 1ac7de4a). The row stride
+        // of tree_logits is vocab × bf16 (= N × bf16), matching the mvar layout
+        // y[M, N] row-major. The lm_head K = hidden_size = d (multiple of 256
+        // for Qwen3.6 : d = 2048). Falls back to per-row dispatch when K%256 != 0
+        // or use_gemm is false (preserving bit-exact parity for decode and
+        // legacy paths).
+        let lm_k_ok = self.lm_head.shape().1 % 256 == 0;
+        if use_gemm && lm_k_ok {
+            self.lm_head.dispatch_matmul_mvar(
+                &self.kernels,
+                &self.stream,
+                tree_size,
+                th_p,
+                tlogits_p,
+            )?;
+        } else {
+            for r in 0..tree_size {
+                let h_r = th_p + (r as u64) * row_h;
+                let logits_r = tlogits_p + (r as u64) * row_logits;
+                // T246.8 A5 — split-K dispatch (env-gated).
+                self.dispatch_lm_head(h_r, logits_r, x_q8_p)?;
+            }
         }
 
         // ── 6. Argmax + DtoH ──────────────────────────────────────────────
@@ -5168,11 +5188,27 @@ impl Qwen35ModelCudaQ4K {
                 .rms_norm_bf16(&self.stream, th_p, fn_p, eps, d as i32, tree_size as i32)
                 .map_err(|e| LlmError::Backend(format!("tree final_norm: {e:?}")))?;
         }
-        for r in 0..tree_size {
-            let h_r = th_p + (r as u64) * row_h;
-            let logits_r = tlogits_p + (r as u64) * row_logits;
-            // T246.8 A5 — split-K dispatch (env-gated).
-            self.dispatch_lm_head(h_r, logits_r, x_q8_p)?;
+        // T246.10 HOTFIX-A6b — batch lm_head through dispatch_matmul_mvar when
+        // in GEMM prefill mode. See decode_step_tree_hybrid_inner for full
+        // rationale. Falls back to the per-row split-K dispatch when use_gemm
+        // is false or K%256 != 0 (preserves bit-exact parity for decode and
+        // legacy paths).
+        let lm_k_ok = self.lm_head.shape().1 % 256 == 0;
+        if use_gemm && lm_k_ok {
+            self.lm_head.dispatch_matmul_mvar(
+                &self.kernels,
+                &self.stream,
+                tree_size,
+                th_p,
+                tlogits_p,
+            )?;
+        } else {
+            for r in 0..tree_size {
+                let h_r = th_p + (r as u64) * row_h;
+                let logits_r = tlogits_p + (r as u64) * row_logits;
+                // T246.8 A5 — split-K dispatch (env-gated).
+                self.dispatch_lm_head(h_r, logits_r, x_q8_p)?;
+            }
         }
 
         // ── 5. Argmax over all tree_size logits rows ──────────────────────
