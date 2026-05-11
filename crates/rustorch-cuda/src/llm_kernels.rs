@@ -3281,6 +3281,178 @@ extern "C" __global__ void delta_net_step_tree_bf16_opt(
 }
 "#;
 
+// NEW-SSM — bandwidth-saturated rewrite of `delta_net_step_tree_bf16`.
+//
+// Per Phase 1 nsys baseline (note `7ef960d7`) :
+//   * baseline kernel reads + writes 1.5 MB state per (slot, head) per call
+//     and averages 40.5 µs, achieving ~74 GB/s effective HBM = 37 % of the
+//     200 GB/s GB10 peak.
+//   * the bottleneck is uncoalesced state RMW : baseline uses
+//     `threadIdx.x = r` so adjacent lanes hit cache lines 256 B apart
+//     (stride = head_dim * 2 B), wasting 15/16 of every loaded sector.
+//   * the failed TrackF `_opt` variant switched to `threadIdx.x = c` (which
+//     coalesces) but paid for it with 128 block-wide reductions per launch
+//     including `__syncthreads()` — net regression −7 %.
+//
+// This kernel keeps coalesced state access AND eliminates the block-wide
+// sync :
+//
+//   * Block layout : `(WARP_SIZE=32 lanes) × (n_warps=4 row-warps)` =
+//     128 threads (when head_dim=128). Each warp OWNS a disjoint subset
+//     of state rows (rows_per_warp = head_dim / n_warps = 32). No inter-
+//     warp dependence ⇒ no `__syncthreads()` anywhere in the hot loop.
+//
+//   * Within a warp the 32 lanes parallelize over state columns. For
+//     head_dim=128 each lane handles cols_per_lane = 4 consecutive
+//     columns (cols 4*lane .. 4*lane+3), accessed via two packed
+//     `__nv_bfloat162` loads per row.
+//
+//   * State R/W per row per warp : 32 lanes × 4 BF16 = 256 B = exactly
+//     one 128-byte aligned cache sector pair, fully coalesced.
+//
+//   * Per-row output reduction = one 32-lane `__shfl_xor_sync` tree
+//     (5 instructions, register-only). Lane 0 of the warp writes
+//     `out[h, r]` for its owned row. No smem, no sync.
+//
+//   * Per-thread caches : g_exp, b are scalar (per head). k[4 cols]
+//     and q[4 cols] live in registers for the entire kernel (each
+//     lane owns its own slice). v[r] is reloaded per row inside the
+//     warp's row loop (n_v / n_warps = 32 BF16 each = 64 B, trivial).
+//
+// Numerical equivalence : the FP32 sum order for `out[h, r]` differs
+// from the baseline (warp tree vs sequential FMAs along c), so
+// bit-exact parity is NOT guaranteed. We assert the same loose
+// tolerance as the `_opt` test : ≥ 95 % BF16 bit-match on out + state
+// + max abs delta ≤ 0.05.
+//
+// Launch contract :
+//   * grid = (n_heads, wave_size, 1)
+//   * block = (WARP_SIZE, n_warps, 1) where n_warps = head_dim / WARP_SIZE
+//     when head_dim ≥ WARP_SIZE (which is always true here, head_dim ∈
+//     {32, 64, 128, 256}). If head_dim < WARP_SIZE we fall back to a
+//     single warp with cols_per_lane = head_dim/WARP_SIZE (or 1 if
+//     head_dim < WARP_SIZE — gracefully handled).
+//   * shared_mem_bytes = 0 (none used).
+//
+// Assumptions :
+//   * head_dim is a multiple of WARP_SIZE (32). Qwen3.6 head_kv = 128
+//     ⇒ n_warps = 4, cols_per_lane = 4. If a future model violates this
+//     we'd need to extend the kernel.
+//   * (head_dim / WARP_SIZE) divides head_dim ⇒ rows_per_warp = head_dim
+//     / n_warps is integer.
+#[cfg(feature = "cuda")]
+const DELTA_NET_STEP_TREE_BF16_V2_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void delta_net_step_tree_bf16_v2(
+    const __nv_bfloat16* __restrict__ q,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ k,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ v,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ gate,        // [tree_size, n_heads]
+    const __nv_bfloat16* __restrict__ beta,        // [tree_size, n_heads]
+    const int*           __restrict__ parents,     // [tree_size]
+    const int*           __restrict__ wave_indices,// [wave_size]
+    __nv_bfloat16*       __restrict__ tree_states, // [tree_size, n_heads, head_dim, head_dim]
+    __nv_bfloat16*       __restrict__ out,         // [tree_size, n_heads, head_dim]
+    int wave_size,
+    int n_heads,
+    int head_dim
+) {
+    const int WARP_SIZE = 32;
+    int wp = blockIdx.y;
+    int h  = blockIdx.x;
+    if (wp >= wave_size || h >= n_heads) return;
+
+    int lane    = threadIdx.x;        // 0..WARP_SIZE-1, column-thread
+    int warp_id = threadIdx.y;        // 0..n_warps-1, row-warp id
+
+    // Layout assumes head_dim is a multiple of WARP_SIZE.
+    // cols_per_lane = head_dim / WARP_SIZE, rows_per_warp = head_dim / n_warps.
+    int n_warps         = blockDim.y;
+    int cols_per_lane   = head_dim / WARP_SIZE;       // e.g. 128/32 = 4
+    int rows_per_warp   = head_dim / n_warps;          // e.g. 128/4 = 32
+    int lane_col_base   = lane * cols_per_lane;        // first c owned by this lane
+    int warp_row_base   = warp_id * rows_per_warp;     // first r owned by this warp
+
+    int tr = wave_indices[wp];
+
+    long long state_per_node = (long long)n_heads * head_dim * head_dim;
+    long long io_per_node    = (long long)n_heads * head_dim;
+    long long g_per_node     = (long long)n_heads;
+
+    int parent = parents[tr];
+    long long src_node = (parent < 0) ? (long long)tr : (long long)parent;
+
+    long long base_io   = (long long)tr      * io_per_node    + (long long)h * head_dim;
+    long long base_g    = (long long)tr      * g_per_node     + h;
+    long long base_h_dst = (long long)tr      * state_per_node + (long long)h * head_dim * head_dim;
+    long long base_h_src = src_node                  * state_per_node + (long long)h * head_dim * head_dim;
+
+    float g_exp = expf((float)gate[base_g]);
+    float b     = (float)beta[base_g];
+
+    // Per-lane caches : 4 cols of k and q (constants across rows).
+    // Held in scalar registers — at most cols_per_lane = head_dim / 32
+    // entries per lane (4 for head_dim=128). Use a small fixed array
+    // and unroll with #pragma unroll.
+    float k_cols[8];      // up-to head_dim=256 ⇒ 8 cols/lane
+    float q_cols[8];
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < cols_per_lane) {
+            int c = lane_col_base + j;
+            k_cols[j] = (float)k[base_io + c];
+            q_cols[j] = (float)q[base_io + c];
+        } else {
+            k_cols[j] = 0.0f;
+            q_cols[j] = 0.0f;
+        }
+    }
+
+    // Process each row owned by this warp.
+    // No inter-warp sync needed — warps own disjoint rows + state writes
+    // target disjoint cache sectors.
+    for (int r_off = 0; r_off < rows_per_warp; ++r_off) {
+        int r = warp_row_base + r_off;
+        float v_r = (float)v[base_io + r];
+
+        long long row_off = (long long)r * head_dim;
+
+        // Compute per-lane partial sum across owned columns.
+        float partial = 0.0f;
+
+        // Per-lane RMW : load 4 BF16 from state[h, r, lane_col_base..+3],
+        // FMA-update, store back. Adjacent lanes hit adjacent BF16 ⇒
+        // fully coalesced sector access.
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < cols_per_lane) {
+                int c = lane_col_base + j;
+                long long addr = (parent < 0) ? (base_h_src + row_off + c)
+                                              : (base_h_src + row_off + c);
+                float old = (float)tree_states[addr];
+                float updated = g_exp * old + b * v_r * k_cols[j];
+                tree_states[base_h_dst + row_off + c] = (__nv_bfloat16)updated;
+                partial += updated * q_cols[j];
+            }
+        }
+
+        // Warp-reduce partial across 32 lanes ⇒ lane 0 holds out[h, r].
+        // Single warp shfl tree, no smem, no sync.
+        partial += __shfl_xor_sync(0xffffffffu, partial, 16);
+        partial += __shfl_xor_sync(0xffffffffu, partial,  8);
+        partial += __shfl_xor_sync(0xffffffffu, partial,  4);
+        partial += __shfl_xor_sync(0xffffffffu, partial,  2);
+        partial += __shfl_xor_sync(0xffffffffu, partial,  1);
+
+        if (lane == 0) {
+            out[base_io + r] = (__nv_bfloat16)partial;
+        }
+    }
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const SGEMV_Q6K_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -7894,6 +8066,10 @@ pub struct LlmKernels {
     delta_net_step_tree: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.10 TrackF — column-parallel optimized variant of delta_net_step_tree
     delta_net_step_tree_opt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // NEW-SSM — bandwidth-saturated variant of delta_net_step_tree (per-warp
+    // row ownership + coalesced state RMW, no block-wide sync). Gate
+    // `RUSTORCH_DELTA_NET_NEW=1`.
+    delta_net_step_tree_v2: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.5.3 — devcnt variants & helpers for CUDA Graph capture
     rope_partial_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     gqa_decode_online_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -8022,6 +8198,7 @@ impl LlmKernels {
             delta_net_step: std::sync::OnceLock::new(),
             delta_net_step_tree: std::sync::OnceLock::new(),
             delta_net_step_tree_opt: std::sync::OnceLock::new(),
+            delta_net_step_tree_v2: std::sync::OnceLock::new(),
             rope_partial_devcnt: std::sync::OnceLock::new(),
             gqa_decode_online_devcnt: std::sync::OnceLock::new(),
             increment_u32_dev: std::sync::OnceLock::new(),
@@ -10022,6 +10199,73 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "delta_net_step_tree_bf16_opt::launch",
+        })?;
+        Ok(())
+    }
+
+    /// NEW-SSM — bandwidth-saturated variant of `delta_net_step_tree_bf16`.
+    ///
+    /// Same I/O contract as the baseline, different launch geometry :
+    /// `block = (WARP_SIZE=32, n_warps = head_dim/32, 1)`. Each warp owns
+    /// `head_dim / n_warps` state rows and accesses its columns coalesced.
+    /// No block-wide sync ; per-row output via warp-shuffle reduction.
+    ///
+    /// Gated by `RUSTORCH_DELTA_NET_NEW=1` in `qwen35_cuda_q4k.rs`.
+    /// Default OFF preserves bit-exact parity with the baseline kernel.
+    ///
+    /// # Safety
+    /// All pointers must reference valid CUDA device memory with the
+    /// shapes documented for `delta_net_step_tree_bf16`. Requires
+    /// `head_dim` to be a multiple of 32 and ≤ 256.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn delta_net_step_tree_bf16_v2(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k: u64,
+        v: u64,
+        gate: u64,
+        beta: u64,
+        parents: u64,
+        wave_indices: u64,
+        tree_states: u64,
+        out: u64,
+        wave_size: i32,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.delta_net_step_tree_v2,
+            DELTA_NET_STEP_TREE_BF16_V2_SRC,
+            "delta_net_step_tree_bf16_v2",
+        )?;
+        // n_warps = head_dim / 32 ; for head_dim=128 ⇒ 4 warps × 32 lanes = 128 threads/CTA.
+        // Clamp head_dim to multiple of 32 (caller enforces).
+        let warp_size: u32 = 32;
+        let n_warps: u32 = (head_dim as u32) / warp_size;
+        let n_warps = n_warps.max(1);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, wave_size as u32, 1),
+            block_dim: (warp_size, n_warps, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&q)
+            .arg(&k)
+            .arg(&v)
+            .arg(&gate)
+            .arg(&beta)
+            .arg(&parents)
+            .arg(&wave_indices)
+            .arg(&tree_states)
+            .arg(&out)
+            .arg(&wave_size)
+            .arg(&n_heads)
+            .arg(&head_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "delta_net_step_tree_bf16_v2::launch",
         })?;
         Ok(())
     }

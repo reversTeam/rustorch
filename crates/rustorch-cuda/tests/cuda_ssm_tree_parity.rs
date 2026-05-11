@@ -615,3 +615,290 @@ fn delta_net_step_tree_bf16_opt_matches_baseline_hd128() {
         "out leaf max abs delta too large: {out_max_abs}"
     );
 }
+
+/// NEW-SSM — v2 kernel parity vs baseline on the production Qwen3.6 shape.
+///
+/// `delta_net_step_tree_bf16_v2` is the bandwidth-saturated rewrite
+/// (per-warp row ownership + coalesced state RMW). Reduction order
+/// differs from baseline (warp shfl tree vs sequential FMA chain along
+/// `c`) ⇒ bit-exact parity not guaranteed ; tolerance ≥ 95 % BF16
+/// bit-match and max abs delta ≤ 0.05.
+///
+/// Test mirrors `delta_net_step_tree_bf16_opt_matches_baseline_hd128`
+/// — n_heads=48, head_dim=128, linear chain of 8 nodes.
+#[test]
+fn delta_net_step_tree_bf16_v2_matches_baseline_hd128() {
+    let n_heads = 48usize;
+    let head_dim = 128usize;
+    let io_per_node = n_heads * head_dim;
+    let state_per_node = n_heads * head_dim * head_dim;
+    let g_per_node = n_heads;
+    let tree_size = 8usize;
+
+    let mut q_all = Vec::with_capacity(tree_size * io_per_node);
+    let mut k_all = Vec::with_capacity(tree_size * io_per_node);
+    let mut v_all = Vec::with_capacity(tree_size * io_per_node);
+    let mut g_all = Vec::with_capacity(tree_size * g_per_node);
+    let mut b_all = Vec::with_capacity(tree_size * g_per_node);
+    for tr in 0..tree_size {
+        q_all.extend(bf16_vec(io_per_node, 0.013 + tr as f32 * 0.001));
+        k_all.extend(bf16_vec(io_per_node, 0.017 + tr as f32 * 0.001));
+        v_all.extend(bf16_vec(io_per_node, 0.019 + tr as f32 * 0.001));
+        g_all.extend(bf16_vec(g_per_node, 0.07 + tr as f32 * 0.001));
+        b_all.extend(bf16_vec(g_per_node, 0.11 + tr as f32 * 0.001));
+    }
+    let mut state_init = vec![half::bf16::ZERO; tree_size * state_per_node];
+    let slot0 = bf16_vec(state_per_node, 0.0005);
+    state_init[..state_per_node].copy_from_slice(&slot0);
+
+    let ctx = CudaContext::new(0).expect("ctx");
+    let stream = ctx.default_stream();
+    let kernels = LlmKernels::new(ctx);
+
+    let q_dev = stream.memcpy_stod(&q_all).expect("q");
+    let k_dev = stream.memcpy_stod(&k_all).expect("k");
+    let v_dev = stream.memcpy_stod(&v_all).expect("v");
+    let g_dev = stream.memcpy_stod(&g_all).expect("g");
+    let b_dev = stream.memcpy_stod(&b_all).expect("b");
+    let parents: Vec<i32> = (0..tree_size as i32)
+        .map(|i| if i == 0 { -1 } else { i - 1 })
+        .collect();
+    let parents_dev = stream.memcpy_stod(&parents).expect("parents");
+
+    let run_kernel = |use_v2: bool| -> (Vec<half::bf16>, Vec<half::bf16>) {
+        let mut state_dev = stream.memcpy_stod(&state_init).expect("state");
+        let mut out_dev = stream
+            .alloc_zeros::<half::bf16>(tree_size * io_per_node)
+            .expect("out");
+        for d in 0..tree_size {
+            let wave_dev = stream.memcpy_stod(&[d as i32]).expect("wave");
+            unsafe {
+                let (qp, _g0) = q_dev.device_ptr(&stream);
+                let (kp, _g1) = k_dev.device_ptr(&stream);
+                let (vp, _g2) = v_dev.device_ptr(&stream);
+                let (gp, _g3) = g_dev.device_ptr(&stream);
+                let (bp, _g4) = b_dev.device_ptr(&stream);
+                let (par_p, _g5) = parents_dev.device_ptr(&stream);
+                let (wav_p, _g6) = wave_dev.device_ptr(&stream);
+                let (sp, _g7) = state_dev.device_ptr_mut(&stream);
+                let (op, _g8) = out_dev.device_ptr_mut(&stream);
+                if use_v2 {
+                    kernels
+                        .delta_net_step_tree_bf16_v2(
+                            &stream,
+                            qp,
+                            kp,
+                            vp,
+                            gp,
+                            bp,
+                            par_p,
+                            wav_p,
+                            sp,
+                            op,
+                            1,
+                            n_heads as i32,
+                            head_dim as i32,
+                        )
+                        .unwrap();
+                } else {
+                    kernels
+                        .delta_net_step_tree_bf16(
+                            &stream,
+                            qp,
+                            kp,
+                            vp,
+                            gp,
+                            bp,
+                            par_p,
+                            wav_p,
+                            sp,
+                            op,
+                            1,
+                            n_heads as i32,
+                            head_dim as i32,
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        let state_host: Vec<half::bf16> = stream.memcpy_dtov(&state_dev).expect("state dtoh");
+        let out_host: Vec<half::bf16> = stream.memcpy_dtov(&out_dev).expect("out dtoh");
+        (state_host, out_host)
+    };
+
+    let (state_base, out_base) = run_kernel(false);
+    let (state_v2, out_v2) = run_kernel(true);
+
+    let leaf_base = &state_base[(tree_size - 1) * state_per_node..tree_size * state_per_node];
+    let leaf_v2 = &state_v2[(tree_size - 1) * state_per_node..tree_size * state_per_node];
+
+    let mut state_match = 0usize;
+    let mut state_max_abs = 0.0f32;
+    for (a, b) in leaf_base.iter().zip(leaf_v2.iter()) {
+        if a.to_bits() == b.to_bits() {
+            state_match += 1;
+        }
+        let d = (a.to_f32() - b.to_f32()).abs();
+        if d > state_max_abs {
+            state_max_abs = d;
+        }
+    }
+    let state_match_pct = state_match as f32 / leaf_base.len() as f32 * 100.0;
+    eprintln!(
+        "[v2 parity] state leaf : bit-match={state_match_pct:.2}% max_abs_delta={state_max_abs}"
+    );
+
+    let mut out_match = 0usize;
+    let mut out_max_abs = 0.0f32;
+    let leaf_out_base = &out_base[(tree_size - 1) * io_per_node..tree_size * io_per_node];
+    let leaf_out_v2 = &out_v2[(tree_size - 1) * io_per_node..tree_size * io_per_node];
+    for (a, b) in leaf_out_base.iter().zip(leaf_out_v2.iter()) {
+        if a.to_bits() == b.to_bits() {
+            out_match += 1;
+        }
+        let d = (a.to_f32() - b.to_f32()).abs();
+        if d > out_max_abs {
+            out_max_abs = d;
+        }
+    }
+    let out_match_pct = out_match as f32 / leaf_out_base.len() as f32 * 100.0;
+    eprintln!("[v2 parity] out leaf : bit-match={out_match_pct:.2}% max_abs_delta={out_max_abs}");
+
+    assert!(
+        state_match_pct >= 95.0,
+        "v2 state leaf bit-match below 95%: {state_match_pct:.2}%"
+    );
+    assert!(
+        state_max_abs <= 0.05,
+        "v2 state leaf max abs delta too large: {state_max_abs}"
+    );
+    assert!(
+        out_match_pct >= 95.0,
+        "v2 out leaf bit-match below 95%: {out_match_pct:.2}%"
+    );
+    assert!(
+        out_max_abs <= 0.05,
+        "v2 out leaf max abs delta too large: {out_max_abs}"
+    );
+}
+
+/// NEW-SSM — v2 kernel parity on tree_size=1 wave_size=1 path
+/// (single-token decode equivalent shape). Same loose tolerance.
+#[test]
+fn delta_net_step_tree_bf16_v2_wave1_matches_baseline_hd128() {
+    let n_heads = 48usize;
+    let head_dim = 128usize;
+    let io_per_node = n_heads * head_dim;
+    let state_per_node = n_heads * head_dim * head_dim;
+    let g_per_node = n_heads;
+
+    let q = bf16_vec(io_per_node, 0.013);
+    let k = bf16_vec(io_per_node, 0.017);
+    let v = bf16_vec(io_per_node, 0.019);
+    let gate = bf16_vec(g_per_node, 0.07);
+    let beta = bf16_vec(g_per_node, 0.11);
+    let state_init = bf16_vec(state_per_node, 0.0005);
+    let parents = vec![-1i32];
+
+    let ctx = CudaContext::new(0).expect("ctx");
+    let stream = ctx.default_stream();
+    let kernels = LlmKernels::new(ctx);
+
+    let q_dev = stream.memcpy_stod(&q).expect("q");
+    let k_dev = stream.memcpy_stod(&k).expect("k");
+    let v_dev = stream.memcpy_stod(&v).expect("v");
+    let g_dev = stream.memcpy_stod(&gate).expect("g");
+    let b_dev = stream.memcpy_stod(&beta).expect("b");
+    let parents_dev = stream.memcpy_stod(&parents).expect("par");
+    let wave_dev = stream.memcpy_stod(&[0i32]).expect("wave");
+
+    let run_kernel = |use_v2: bool| -> (Vec<half::bf16>, Vec<half::bf16>) {
+        let mut state_dev = stream.memcpy_stod(&state_init).expect("state");
+        let mut out_dev = stream.alloc_zeros::<half::bf16>(io_per_node).expect("out");
+        unsafe {
+            let (qp, _g0) = q_dev.device_ptr(&stream);
+            let (kp, _g1) = k_dev.device_ptr(&stream);
+            let (vp, _g2) = v_dev.device_ptr(&stream);
+            let (gp, _g3) = g_dev.device_ptr(&stream);
+            let (bp, _g4) = b_dev.device_ptr(&stream);
+            let (par_p, _g5) = parents_dev.device_ptr(&stream);
+            let (wav_p, _g6) = wave_dev.device_ptr(&stream);
+            let (sp, _g7) = state_dev.device_ptr_mut(&stream);
+            let (op, _g8) = out_dev.device_ptr_mut(&stream);
+            if use_v2 {
+                kernels
+                    .delta_net_step_tree_bf16_v2(
+                        &stream,
+                        qp,
+                        kp,
+                        vp,
+                        gp,
+                        bp,
+                        par_p,
+                        wav_p,
+                        sp,
+                        op,
+                        1,
+                        n_heads as i32,
+                        head_dim as i32,
+                    )
+                    .unwrap();
+            } else {
+                kernels
+                    .delta_net_step_tree_bf16(
+                        &stream,
+                        qp,
+                        kp,
+                        vp,
+                        gp,
+                        bp,
+                        par_p,
+                        wav_p,
+                        sp,
+                        op,
+                        1,
+                        n_heads as i32,
+                        head_dim as i32,
+                    )
+                    .unwrap();
+            }
+        }
+        let s: Vec<half::bf16> = stream.memcpy_dtov(&state_dev).expect("s dtoh");
+        let o: Vec<half::bf16> = stream.memcpy_dtov(&out_dev).expect("o dtoh");
+        (s, o)
+    };
+
+    let (state_base, out_base) = run_kernel(false);
+    let (state_v2, out_v2) = run_kernel(true);
+
+    let mut s_match = 0usize;
+    let mut s_max = 0.0f32;
+    for (a, b) in state_base.iter().zip(state_v2.iter()) {
+        if a.to_bits() == b.to_bits() {
+            s_match += 1;
+        }
+        let d = (a.to_f32() - b.to_f32()).abs();
+        if d > s_max {
+            s_max = d;
+        }
+    }
+    let s_pct = s_match as f32 / state_base.len() as f32 * 100.0;
+    let mut o_match = 0usize;
+    let mut o_max = 0.0f32;
+    for (a, b) in out_base.iter().zip(out_v2.iter()) {
+        if a.to_bits() == b.to_bits() {
+            o_match += 1;
+        }
+        let d = (a.to_f32() - b.to_f32()).abs();
+        if d > o_max {
+            o_max = d;
+        }
+    }
+    let o_pct = o_match as f32 / out_base.len() as f32 * 100.0;
+    eprintln!("[v2 wave1] state bit-match={s_pct:.2}% max_abs={s_max} ; out bit-match={o_pct:.2}% max_abs={o_max}");
+
+    assert!(s_pct >= 95.0, "v2 wave1 state bit-match: {s_pct:.2}%");
+    assert!(s_max <= 0.05, "v2 wave1 state max abs: {s_max}");
+    assert!(o_pct >= 95.0, "v2 wave1 out bit-match: {o_pct:.2}%");
+    assert!(o_max <= 0.05, "v2 wave1 out max abs: {o_max}");
+}
