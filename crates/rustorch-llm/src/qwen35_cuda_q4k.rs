@@ -64,6 +64,21 @@ fn moe_graph_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// T246.8 A4 — runtime gate for the mul_mm_id mega-kernel MoE path.
+/// Only valid when `RUSTORCH_MOE_ASYNC=1` (the mega-kernels are an
+/// optimisation OF the async/zero-host-sync path). Default OFF — flip
+/// to `RUSTORCH_MOE_MEGA=1` to fuse the K=8 per-expert SGEMV launches
+/// of gate/up into single kernels, plus a fused routed-reduce epilogue.
+fn moe_mega_enabled() -> bool {
+    if !moe_async_enabled() {
+        return false;
+    }
+    std::env::var("RUSTORCH_MOE_MEGA")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// One matmul weight on GPU. Qwen3.6 Q4_K_M uses a mix of Q4_K / Q5_K /
 /// Q6_K for big matmuls and F32 (→ BF16) for small ones (ssm_alpha, ssm_beta
 /// when n_v_heads is small : n=48 typical, K=hidden_size, ≈1 MB each).
@@ -327,6 +342,71 @@ pub(crate) enum ExpertQuantKind {
     Q5K,
     Q6K,
     Bf16,
+}
+
+/// T246.8 A4 — mul_mm_id mega-kernel dispatcher : single launch covers
+/// all `k_used` experts. Output `y` is `[k_used, n]` BF16, slot-major.
+/// Replaces the K-iteration `dispatch_indexed_matmul_m1` loop on the
+/// `RUSTORCH_MOE_MEGA=1` path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_indexed_mega(
+    kernels: &LlmKernels,
+    stream: &Arc<CudaStream>,
+    kind: ExpertQuantKind,
+    expert_ptrs_p: u64,
+    topk_indices_p: u64,
+    x: u64,
+    y: u64,
+    n: i32,
+    k: i32,
+    k_used: i32,
+    x_q8_staging: u64,
+) -> Result<(), LlmError> {
+    unsafe {
+        match kind {
+            ExpertQuantKind::Q4K => {
+                if x_q8_staging != 0 {
+                    kernels
+                        .quantize_q8_1_bf16(stream, x, x_q8_staging, k)
+                        .map_err(|e| LlmError::Backend(format!("q8_1 quant mega: {e:?}")))?;
+                    kernels
+                        .mul_mm_id_q4_k_q8_1_dp4a_bf16(
+                            stream,
+                            expert_ptrs_p,
+                            topk_indices_p,
+                            x_q8_staging,
+                            y,
+                            n,
+                            k,
+                            k_used,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("mul_mm_id q4k_dp4a: {e:?}")))
+                } else {
+                    kernels
+                        .mul_mm_id_q4_k_bf16(
+                            stream,
+                            expert_ptrs_p,
+                            topk_indices_p,
+                            x,
+                            y,
+                            n,
+                            k,
+                            k_used,
+                        )
+                        .map_err(|e| LlmError::Backend(format!("mul_mm_id q4k: {e:?}")))
+                }
+            },
+            ExpertQuantKind::Q5K => kernels
+                .mul_mm_id_q5_k_bf16(stream, expert_ptrs_p, topk_indices_p, x, y, n, k, k_used)
+                .map_err(|e| LlmError::Backend(format!("mul_mm_id q5k: {e:?}"))),
+            ExpertQuantKind::Q6K => kernels
+                .mul_mm_id_q6_k_bf16(stream, expert_ptrs_p, topk_indices_p, x, y, n, k, k_used)
+                .map_err(|e| LlmError::Backend(format!("mul_mm_id q6k: {e:?}"))),
+            ExpertQuantKind::Bf16 => kernels
+                .mul_mm_id_bf16_bf16(stream, expert_ptrs_p, topk_indices_p, x, y, n, k, k_used)
+                .map_err(|e| LlmError::Backend(format!("mul_mm_id bf16: {e:?}"))),
+        }
+    }
 }
 
 /// MoE FFN weights for one layer (Qwen3.6-35B-A3B). Top-K routed experts +
@@ -1198,14 +1278,17 @@ impl Qwen35ModelCudaQ4K {
             moe_topk_w: stream
                 .alloc_zeros::<half::bf16>(cfg.n_experts_used.max(1))
                 .map_err(|e| LlmError::Backend(format!("scratch moe_w: {e:?}")))?,
+            // T246.8 A4 — sized for the mega-kernel `[k_used, expert_f]`
+            // and `[k_used, d]` outputs. Backwards-compatible : the legacy
+            // per-slot path uses only the first slot's slice.
             moe_expert_gate: stream
-                .alloc_zeros::<half::bf16>(cfg.expert_f.max(1))
+                .alloc_zeros::<half::bf16>(cfg.expert_f.max(1) * cfg.n_experts_used.max(1))
                 .map_err(|e| LlmError::Backend(format!("scratch moe_gate: {e:?}")))?,
             moe_expert_up: stream
-                .alloc_zeros::<half::bf16>(cfg.expert_f.max(1))
+                .alloc_zeros::<half::bf16>(cfg.expert_f.max(1) * cfg.n_experts_used.max(1))
                 .map_err(|e| LlmError::Backend(format!("scratch moe_up: {e:?}")))?,
             moe_expert_out: stream
-                .alloc_zeros::<half::bf16>(cfg.d)
+                .alloc_zeros::<half::bf16>(cfg.d * cfg.n_experts_used.max(1))
                 .map_err(|e| LlmError::Backend(format!("scratch moe_out: {e:?}")))?,
             moe_shexp_dot: stream
                 .alloc_zeros::<half::bf16>(1)
@@ -2242,7 +2325,24 @@ impl Qwen35ModelCudaQ4K {
                     down.dispatch_matmul_m1(&self.kernels, &self.stream, gate_p, h_p, x_q8_p)?;
                 },
                 FfnQ4K::Moe(moe) => {
-                    if moe_async_enabled() {
+                    if moe_mega_enabled() {
+                        moe_ffn_forward_step_mega(
+                            moe,
+                            &self.kernels,
+                            &self.stream,
+                            &cfg,
+                            h_norm_p,
+                            h_p,
+                            x_q8_p,
+                            moe_router_p,
+                            moe_idx_p,
+                            moe_w_p,
+                            moe_egate_p,
+                            moe_eup_p,
+                            moe_eout_p,
+                            moe_sd_p,
+                        )?;
+                    } else if moe_async_enabled() {
                         moe_ffn_forward_step_async(
                             moe,
                             &self.kernels,
@@ -4596,6 +4696,170 @@ fn moe_ffn_forward_step_async(
         kernels
             .scaled_add_sigmoid_devscalar_bf16(stream, h_p, expert_out_p, shexp_dot_p, d)
             .map_err(|e| LlmError::Backend(format!("scaled_add_sigmoid shexp: {e:?}")))?;
+    }
+
+    Ok(())
+}
+
+/// T246.8 A4 — MoE FFN forward using the mul_mm_id mega-kernels.
+///
+/// Drop-in replacement for `moe_ffn_forward_step_async` when
+/// `RUSTORCH_MOE_MEGA=1`. The K=8 per-expert SGEMV launches of
+/// gate/up/down and their scaled_add epilogue are replaced by :
+///   - mul_mm_id gate           : 1 launch, computes `[k_used, ef]`
+///   - mul_mm_id up             : 1 launch, computes `[k_used, ef]`
+///   - swiglu over k_used*ef    : 1 launch (already elementwise)
+///   - per-slot down            : K iterations of indexed sgemv (each
+///                                slot has its own gate output → cannot
+///                                yet be collapsed without an x-stride
+///                                variant of mul_mm_id)
+///   - scaled_add_routed        : 1 launch, h += Σ topk_w[s]*down[s,:]
+///
+/// Net launch reduction per layer (Qwen3.6-A3B, k=8) :
+///   before : 8 gate + 8 up + 8 swiglu + 8 down + 8 scaled_add = 40
+///   after  : 1 + 1 + 1 + 8 + 1 = 12
+/// Saved : ~28 launches × 64 MoE layers ≈ 1800 launches/token.
+///
+/// NOTE on parity : the per-slot SGEMV body inside the mega-kernel is
+/// byte-for-byte identical to the indexed kernel (A3 lesson) so gate/up
+/// outputs are BIT-EXACT vs the loop. The fused `scaled_add_routed_bf16`
+/// reduces in fp32 then down-casts once — vs the per-slot path which
+/// down-casts BF16 between each step → ~1 BF16 ULP drift per element,
+/// equivalent to A2's drift-from-token-48+ behaviour.
+#[allow(clippy::too_many_arguments)]
+fn moe_ffn_forward_step_mega(
+    moe: &MoeFfnQ4K,
+    kernels: &LlmKernels,
+    stream: &Arc<CudaStream>,
+    cfg: &Qwen35Config,
+    h_norm_p: u64,
+    h_p: u64,
+    x_q8_p: u64,
+    router_logits_p: u64,
+    topk_idx_p: u64,
+    topk_w_p: u64,
+    expert_gate_p: u64, // [k_used, ef]
+    expert_up_p: u64,   // [k_used, ef]
+    expert_out_p: u64,  // [k_used, d]
+    shexp_dot_p: u64,
+) -> Result<(), LlmError> {
+    use cudarc::driver::DevicePtr;
+    let d = cfg.d as i32;
+    let ef = cfg.expert_f as i32;
+    let n_e = cfg.n_experts as i32;
+    let k = cfg.n_experts_used as i32;
+
+    // ---- 1. Router logits ----
+    moe.gate_inp
+        .dispatch_matmul_m1(kernels, stream, h_norm_p, router_logits_p, x_q8_p)?;
+
+    // ---- 2. Top-K softmax → indices + renormalized weights on device ----
+    unsafe {
+        kernels
+            .topk_softmax_bf16(stream, router_logits_p, topk_idx_p, topk_w_p, n_e, k)
+            .map_err(|e| LlmError::Backend(format!("topk_softmax mega: {e:?}")))?;
+    }
+
+    // ---- 3. Zero h_p ----
+    unsafe {
+        kernels
+            .zero_bf16(stream, h_p, d)
+            .map_err(|e| LlmError::Backend(format!("zero h_p mega: {e:?}")))?;
+    }
+
+    // ---- 4. Mega gate / up / swiglu / per-slot down / routed-add ----
+    let (g_ptrs_p, _gg) = moe.gate_exp_ptrs_dev.device_ptr(stream);
+    let (u_ptrs_p, _gu) = moe.up_exp_ptrs_dev.device_ptr(stream);
+    let (d_ptrs_p, _gd) = moe.down_exp_ptrs_dev.device_ptr(stream);
+
+    // gate[k_used, ef] = w_gate[topk[s]] @ h_norm  (single launch)
+    dispatch_indexed_mega(
+        kernels,
+        stream,
+        moe.gate_exp_kind,
+        g_ptrs_p,
+        topk_idx_p,
+        h_norm_p,
+        expert_gate_p,
+        ef,
+        d,
+        k,
+        x_q8_p,
+    )?;
+    // up[k_used, ef]   = w_up[topk[s]]   @ h_norm  (single launch)
+    dispatch_indexed_mega(
+        kernels,
+        stream,
+        moe.up_exp_kind,
+        u_ptrs_p,
+        topk_idx_p,
+        h_norm_p,
+        expert_up_p,
+        ef,
+        d,
+        k,
+        x_q8_p,
+    )?;
+    // swiglu over the entire k_used * ef element block (elementwise — same
+    // kernel as the per-slot variant just with a larger n).
+    unsafe {
+        kernels
+            .swiglu_bf16(stream, expert_gate_p, expert_up_p, expert_gate_p, ef * k)
+            .map_err(|e| LlmError::Backend(format!("swiglu mega: {e:?}")))?;
+    }
+    // Per-slot down : each slot has its own gate output ; the current
+    // `mul_mm_id_*` kernels take a single `x[K]` shared across all slots
+    // so they can't be used here without a stride-x variant. Even with
+    // the per-slot loop, gate/up/swiglu have collapsed (24 → 3 launches)
+    // and the scaled_add routed-reduce will collapse 8 → 1.
+    let elem_size = std::mem::size_of::<half::bf16>() as u64;
+    for slot in 0..k {
+        let x_slot_p = expert_gate_p + (slot as u64) * (ef as u64) * elem_size;
+        let y_slot_p = expert_out_p + (slot as u64) * (d as u64) * elem_size;
+        dispatch_indexed_matmul_m1(
+            kernels,
+            stream,
+            moe.down_exp_kind,
+            d_ptrs_p,
+            topk_idx_p,
+            slot,
+            x_slot_p,
+            y_slot_p,
+            d,
+            ef,
+            x_q8_p,
+        )?;
+    }
+    // h_p += Σ_{s} topk_w[s] * down[s, :]  (single fused launch — replaces
+    // the K-iteration scaled_add_inplace_bf16_devscalar loop).
+    unsafe {
+        kernels
+            .scaled_add_routed_bf16(stream, h_p, expert_out_p, topk_w_p, d, k)
+            .map_err(|e| LlmError::Backend(format!("scaled_add_routed: {e:?}")))?;
+    }
+
+    // ---- 5. Shared expert (parallel path, identical to async variant) ----
+    unsafe {
+        let (gip_p, _g) = moe.gate_inp_shexp.device_ptr(stream);
+        kernels
+            .sgemv_bf16_bf16(stream, gip_p, h_norm_p, shexp_dot_p, 1, d)
+            .map_err(|e| LlmError::Backend(format!("shexp dot mega: {e:?}")))?;
+    }
+    moe.gate_shexp
+        .dispatch_matmul_m1(kernels, stream, h_norm_p, expert_gate_p, x_q8_p)?;
+    moe.up_shexp
+        .dispatch_matmul_m1(kernels, stream, h_norm_p, expert_up_p, x_q8_p)?;
+    unsafe {
+        kernels
+            .swiglu_bf16(stream, expert_gate_p, expert_up_p, expert_gate_p, ef)
+            .map_err(|e| LlmError::Backend(format!("swiglu shexp mega: {e:?}")))?;
+    }
+    moe.down_shexp
+        .dispatch_matmul_m1(kernels, stream, expert_gate_p, expert_out_p, x_q8_p)?;
+    unsafe {
+        kernels
+            .scaled_add_sigmoid_devscalar_bf16(stream, h_p, expert_out_p, shexp_dot_p, d)
+            .map_err(|e| LlmError::Backend(format!("scaled_add_sigmoid shexp mega: {e:?}")))?;
     }
 
     Ok(())
