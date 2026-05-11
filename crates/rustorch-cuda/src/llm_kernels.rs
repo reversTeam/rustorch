@@ -3124,6 +3124,163 @@ extern "C" __global__ void delta_net_step_tree_bf16(
 }
 "#;
 
+// T246.10 TrackF — Column-parallel variant of `delta_net_step_tree_bf16`.
+//
+// Mathematically identical to the baseline. The baseline uses
+// `threadIdx.x = r` (state row), which produces strided global accesses
+// to `tree_states[h, r, c]` because adjacent threads differ in `r`
+// (256-byte stride) — for each `c` iteration the 128 threads in a warp
+// touch 128 separate cache lines, wasting most of the BW.
+//
+// This kernel swaps the role : `threadIdx.x = c` (state column). For
+// each `r` in the inner loop, the 128 threads read state[h, r, 0..127]
+// at adjacent addresses (stride = 1 BF16) → fully coalesced (8 sectors
+// for one row). The same applies to k[c], q[c] (now per-thread instead
+// of broadcast through shared memory) and the writeback.
+//
+// To produce `out[h, r] = Σ_c state[h, r, c] * q[c]` we still need a
+// block-wide reduction across the 128 column-threads. The reduction is
+// done per row via warp-shuffle + small shared-mem inter-warp combine,
+// then thread 0 writes the final out value for row `r`. The cost of
+// 128 small reductions (one per row) is amortized by the 8× BW saving
+// on the state RMW, which is the dominant term.
+//
+// Output behavior, parents traversal, root-state read-from-self and
+// out tensor aliasing semantics MATCH the baseline kernel exactly.
+//
+// Bit-exact parity vs baseline is NOT guaranteed because the reduction
+// is performed in a different order (warp-shuffle tree vs per-row
+// sequential FMAs) ; FP32 add is non-associative, so the last few
+// mantissa bits of `out` may differ. We assert a `≥ 99.5 %` BF16 bit-
+// match + max abs delta ≤ 0.005 in the parity test.
+#[cfg(feature = "cuda")]
+const DELTA_NET_STEP_TREE_BF16_OPT_SRC: &str = r#"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void delta_net_step_tree_bf16_opt(
+    const __nv_bfloat16* __restrict__ q,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ k,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ v,           // [tree_size, n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ gate,        // [tree_size, n_heads]
+    const __nv_bfloat16* __restrict__ beta,        // [tree_size, n_heads]
+    const int*           __restrict__ parents,     // [tree_size]
+    const int*           __restrict__ wave_indices,// [wave_size]
+    __nv_bfloat16*       __restrict__ tree_states, // [tree_size, n_heads, head_dim, head_dim]
+    __nv_bfloat16*       __restrict__ out,         // [tree_size, n_heads, head_dim]
+    int wave_size,
+    int n_heads,
+    int head_dim
+) {
+    int wp = blockIdx.y;
+    int h  = blockIdx.x;
+    if (wp >= wave_size || h >= n_heads) return;
+    int tr = wave_indices[wp];
+    int c  = threadIdx.x;
+    if (c >= head_dim) return;
+
+    long long state_per_node = (long long)n_heads * head_dim * head_dim;
+    long long io_per_node    = (long long)n_heads * head_dim;
+    long long g_per_node     = (long long)n_heads;
+
+    int parent = parents[tr];
+    long long src_node = (parent < 0) ? (long long)tr : (long long)parent;
+
+    long long base_io  = (long long)tr * io_per_node + (long long)h * head_dim;
+    long long base_g   = (long long)tr * g_per_node  + h;
+    long long base_h_dst = (long long)tr       * state_per_node + (long long)h * head_dim * head_dim;
+    long long base_h_src = src_node            * state_per_node + (long long)h * head_dim * head_dim;
+
+    float g_exp = expf((float)gate[base_g]);
+    float b     = (float)beta[base_g];
+
+    // Each thread caches its own k[c] and q[c] in registers.
+    float k_c = (float)k[base_io + c];
+    float q_c = (float)q[base_io + c];
+
+    // Inter-warp reduction scratchpad (one float per warp ≤ 4 warps
+    // for head_dim=128). 4 × 4 = 16 bytes ; we allocate `head_dim/32`
+    // dynamically via the shared_mem_bytes launch param.
+    extern __shared__ float warp_sums[];
+
+    const int lane    = c & 31;
+    const int warp_id = c >> 5;
+    const int n_warps = (head_dim + 31) >> 5;
+    const int warp_size = 32;
+
+    // Active mask + effective lane count for the intra-warp reduction.
+    // For head_dim ≥ 32 the warp is fully populated → full mask.
+    // For head_dim < 32 only the first head_dim lanes participate.
+    // NOTE : `1u << 32` is undefined behavior in C — guard explicitly.
+    unsigned int warp_active;
+    int warp_eff;
+    if (head_dim >= warp_size) {
+        warp_active = 0xffffffffu;
+        warp_eff = warp_size;
+    } else if (head_dim == 0) {
+        warp_active = 0u;
+        warp_eff = 0;
+    } else {
+        warp_active = (1u << head_dim) - 1u;
+        warp_eff = head_dim;
+    }
+
+    // Walk all rows ; for each row, this thread reads its (r, c) state cell
+    // — addresses are consecutive across threads → coalesced.
+    for (int r = 0; r < head_dim; ++r) {
+        long long addr_src = base_h_src + (long long)r * head_dim + c;
+        long long addr_dst = base_h_dst + (long long)r * head_dim + c;
+
+        float v_r = (float)v[base_io + r];
+        float old = (float)tree_states[addr_src];
+
+        float updated = g_exp * old + b * v_r * k_c;
+        tree_states[addr_dst] = (__nv_bfloat16)updated;
+
+        // partial contribution to out[h, r] from this column.
+        float partial = updated * q_c;
+
+        // Warp-reduce within the warp. Use the active mask so that
+        // shuffles are well-defined when head_dim < 32.
+        for (int off = warp_eff >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(warp_active, partial, off);
+        }
+        // lane 0 of each warp holds the warp sum.
+        if (lane == 0) {
+            warp_sums[warp_id] = partial;
+        }
+        __syncthreads();
+
+        // Warp 0 finalizes : lane i loads warp_sums[i] for i in 0..n_warps,
+        // (lanes beyond n_warps load 0.0f) and lane 0 writes out[h, r].
+        //
+        // Only warp 0 executes this path. If head_dim < 32 then we never
+        // launched a second warp at all — warp 0 still has `warp_size`
+        // active lanes thanks to block_dim ≤ head_dim and head_dim ≤
+        // warp_size in that case (we'd be in the "single warp" regime
+        // already accounted for above).
+        if (warp_id == 0 && warp_eff == warp_size) {
+            float ws = (lane < n_warps) ? warp_sums[lane] : 0.0f;
+            // All 32 lanes of warp 0 participate ; lanes ≥ n_warps just
+            // contribute 0 to the reduction. We can therefore use a full
+            // 32-lane shuffle mask safely.
+            for (int off = 16; off > 0; off >>= 1) {
+                ws += __shfl_xor_sync(0xffffffffu, ws, off);
+            }
+            if (lane == 0) {
+                out[base_io + r] = (__nv_bfloat16)ws;
+            }
+        } else if (warp_id == 0) {
+            // Single-warp case (head_dim ≤ 32) : the warp reduction above
+            // already produced the final sum in lane 0. Just write it.
+            if (lane == 0) {
+                out[base_io + r] = (__nv_bfloat16)partial;
+            }
+        }
+        __syncthreads();
+    }
+}
+"#;
+
 #[cfg(feature = "cuda")]
 const SGEMV_Q6K_BF16_SRC: &str = r#"
 #include <cuda_bf16.h>
@@ -7348,6 +7505,8 @@ pub struct LlmKernels {
     delta_net_step: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.7 TrackC.1 — tree-aware DeltaNet step for SSM-hybrid Lookahead
     delta_net_step_tree: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.10 TrackF — column-parallel optimized variant of delta_net_step_tree
+    delta_net_step_tree_opt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     // T246.5.3 — devcnt variants & helpers for CUDA Graph capture
     rope_partial_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     gqa_decode_online_devcnt: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
@@ -7472,6 +7631,7 @@ impl LlmKernels {
             l2_norm_per_head: std::sync::OnceLock::new(),
             delta_net_step: std::sync::OnceLock::new(),
             delta_net_step_tree: std::sync::OnceLock::new(),
+            delta_net_step_tree_opt: std::sync::OnceLock::new(),
             rope_partial_devcnt: std::sync::OnceLock::new(),
             gqa_decode_online_devcnt: std::sync::OnceLock::new(),
             increment_u32_dev: std::sync::OnceLock::new(),
@@ -9397,6 +9557,78 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "delta_net_step_tree_bf16::launch",
+        })?;
+        Ok(())
+    }
+
+    /// T246.10 TrackF — Column-parallel optimized variant of
+    /// `delta_net_step_tree_bf16`.
+    ///
+    /// Same algorithm, same I/O contract, same launch dimensions
+    /// (block = head_dim threads, grid = (n_heads, wave_size, 1)).
+    /// The only differences are :
+    ///   * `threadIdx.x` indexes the state column `c` rather than the
+    ///     state row `r` → coalesced global memory access on the
+    ///     `tree_states` RMW (which is the dominant cost).
+    ///   * Each row's output is computed via a block-wide warp-shuffle
+    ///     reduction over the column-threads.
+    ///
+    /// Numerically equivalent up to FP32 reduction-order : results may
+    /// differ in the last few BF16 ULPs from the baseline. The dispatch
+    /// gate `RUSTORCH_DELTA_NET_OPT=1` in `qwen35_cuda_q4k.rs` controls
+    /// adoption ; default OFF preserves bit-exact parity with the
+    /// baseline kernel.
+    ///
+    /// # Safety
+    /// All pointers must reference valid CUDA device memory with the
+    /// shapes documented for `delta_net_step_tree_bf16`. `head_dim` must
+    /// be a multiple of 32 and ≤ 1024.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn delta_net_step_tree_bf16_opt(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        k: u64,
+        v: u64,
+        gate: u64,
+        beta: u64,
+        parents: u64,
+        wave_indices: u64,
+        tree_states: u64,
+        out: u64,
+        wave_size: i32,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), CudaError> {
+        let (_module, func) = self.compile_or_get(
+            &self.delta_net_step_tree_opt,
+            DELTA_NET_STEP_TREE_BF16_OPT_SRC,
+            "delta_net_step_tree_bf16_opt",
+        )?;
+        // Dynamic smem : one float per warp for inter-warp reduction.
+        let n_warps = ((head_dim as u32) + 31) / 32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_heads as u32, wave_size as u32, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: n_warps * 4,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher
+            .arg(&q)
+            .arg(&k)
+            .arg(&v)
+            .arg(&gate)
+            .arg(&beta)
+            .arg(&parents)
+            .arg(&wave_indices)
+            .arg(&tree_states)
+            .arg(&out)
+            .arg(&wave_size)
+            .arg(&n_heads)
+            .arg(&head_dim);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "delta_net_step_tree_bf16_opt::launch",
         })?;
         Ok(())
     }
