@@ -220,6 +220,23 @@ fn delta_net_opt_enabled() -> bool {
 /// tensor-core compute on broadcast (A3 negative result confirmed).
 pub(crate) const GEMM_BF16_MMA_MIN_M: usize = 16;
 
+/// T246.10 MMQ-WHOLESALE — env gate for the Q8_1-packed INT8-staged Q4_K
+/// matmul path (kernels landed in 4206d2d). Default OFF preserves bit-exact
+/// parity with TrackG-lite. Set `RUSTORCH_MMQ_WHOLESALE=1` to route the
+/// batched shared-expert Q4_K matmuls through `quantize_mmq_q8_1_bf16_ds4` +
+/// `mul_mat_q4_k_q8_1_mma` (Phase 6a — Option A : shared expert only).
+fn mmq_wholesale_enabled() -> bool {
+    std::env::var("RUSTORCH_MMQ_WHOLESALE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Minimum M below which the MMQ-WHOLESALE path is NOT used. The kernel
+/// instantiation is mmq_x=64, so M < 64 wastes tile compute. Below this
+/// threshold we fall back to the existing per-token shared-expert loop.
+pub(crate) const MMQ_WHOLESALE_MIN_M: i32 = 64;
+
 /// One matmul weight on GPU. Qwen3.6 Q4_K_M uses a mix of Q4_K / Q5_K /
 /// Q6_K for big matmuls and F32 (→ BF16) for small ones (ssm_alpha, ssm_beta
 /// when n_v_heads is small : n=48 typical, K=hidden_size, ≈1 MB each).
@@ -1061,6 +1078,16 @@ pub(crate) struct DecodeScratch {
     /// `[MAX_TREE_SIZE, K/32 * 36]` u8 — per-token Q8_1 staging for dp4a.
     pub(crate) moe_x_q8_m: CudaSlice<u8>,
 
+    // ── T246.10 MMQ-WHOLESALE — packed Q8_1 staging for the INT8-staged Q4_K
+    // matmul path. Sized to hold the worst-case M × (K/128) × 144 B payload
+    // (= K_max chosen as max(d, expert_f) since the shared expert runs both
+    // gate/up at K=d AND down at K=expert_f). For Qwen3.6-A3B at
+    // MAX_TREE_SIZE=512, max(d=5120, ef=18944)=18944 → 512 × 148 × 144 ≈
+    // 10.9 MB. Zero-sized for non-MoE / decode-only variants.
+    /// `[MAX_TREE_SIZE * (max(d, ef) / 128) * 144]` u8 — packed Q8_1 input
+    /// for `quantize_mmq_q8_1_bf16_ds4` + `mul_mat_q4_k_q8_1_mma`.
+    pub(crate) moe_x_q8_mmq_m: CudaSlice<u8>,
+
     // ── T246.10 TrackE.3 — sort-permutation Group-GEMM scratch ──
     //
     // Used only when `RUSTORCH_MOE_GROUP_GEMM_SORTED=1` is also set on top of
@@ -1857,6 +1884,19 @@ impl Qwen35ModelCudaQ4K {
                 stream
                     .alloc_zeros::<u8>(total_pseudo_tok * staging_bytes_per_pseudo_tok)
                     .map_err(|e| LlmError::Backend(format!("scratch moe_x_q8_m: {e:?}")))?
+            },
+            moe_x_q8_mmq_m: {
+                // MMQ-WHOLESALE packed Q8_1 layout : 144 B per 128-elem K-block.
+                // The shared-expert gate/up run at K=d, the down at K=ef ; size
+                // for the max so the same scratch covers both. For Qwen3.6-A3B
+                // (MAX_TREE_SIZE=512, max(d=5120, ef=18944)=18944) this is
+                // 512 * (18944/128) * 144 ≈ 10.9 MB. Sized to ceil so K
+                // multiples of 128 always fit.
+                let k_max = cfg.d.max(cfg.expert_f.max(1));
+                let k_blocks_128 = (k_max + 127) / 128;
+                stream
+                    .alloc_zeros::<u8>(MAX_TREE_SIZE * k_blocks_128 * 144)
+                    .map_err(|e| LlmError::Backend(format!("scratch moe_x_q8_mmq_m: {e:?}")))?
             },
 
             // ── T246.10 TrackE.3 — sort-permutation Group-GEMM scratch ──
@@ -4052,6 +4092,12 @@ impl Qwen35ModelCudaQ4K {
                         // TrackE.3 — env-gated sort-permutation Group-GEMM.
                         // Only valid on top of the unsorted Group-GEMM path.
                         let use_sorted = moe_group_gemm_sorted_enabled();
+                        // MMQ-WHOLESALE.6a — packed Q8_1 staging pointer for
+                        // the shared-expert MMQ path (0 = skip, fall back to
+                        // per-token loop). Gated downstream by the env flag
+                        // + minimum M + Q4_K weight kind.
+                        let (mxq8mmq_p, _g11) =
+                            self.scratch.moe_x_q8_mmq_m.device_ptr_mut(&self.stream);
                         moe_ffn_forward_step_group_gemm(
                             moe,
                             &self.kernels,
@@ -4076,6 +4122,7 @@ impl Qwen35ModelCudaQ4K {
                             ids_dst_m_p,
                             expert_bounds_p,
                             use_sorted,
+                            mxq8mmq_p,
                         )?;
                     } else {
                         for r in 0..tree_size {
@@ -6534,6 +6581,7 @@ fn moe_ffn_forward_step_mega(
 ///   `ids_dst_m_p`        : [M*k_used] i32 scratch (TrackE.3)
 ///   `expert_bounds_p`    : [n_experts+1] i32 scratch (TrackE.3)
 ///   `use_sorted`         : TrackE.3 gate, requires Q4_K-BF16 gate/up
+///   `x_q8_mmq_m_p`       : [M, (max(d,ef)/128)*144] u8 scratch (MMQ-WHOLESALE, 0 to skip)
 #[allow(clippy::too_many_arguments)]
 fn moe_ffn_forward_step_group_gemm(
     moe: &MoeFfnQ4K,
@@ -6561,6 +6609,9 @@ fn moe_ffn_forward_step_group_gemm(
     ids_dst_m_p: u64,
     expert_bounds_p: u64,
     use_sorted: bool,
+    // MMQ-WHOLESALE.6a — packed Q8_1 staging for the shared-expert MMQ path
+    // (0 to skip, falls back to per-token loop).
+    x_q8_mmq_m_p: u64,
 ) -> Result<(), LlmError> {
     use cudarc::driver::DevicePtr;
     let d = cfg.d as i32;
@@ -6848,32 +6899,176 @@ fn moe_ffn_forward_step_group_gemm(
     // launches × (gate + up + swiglu + down + scaled_add) = 5M launches.
     // For M=512 that's 2560 launches — vs the 4 launches gain on routed
     // experts being 16320 saved (from 16384 to 64). Net : huge win.
-    for m in 0..m_tokens {
-        let h_norm_row_p = h_norm_m_p + (m as u64) * (d as u64) * bf16_sz;
-        let h_row_p = h_m_p + (m as u64) * (d as u64) * bf16_sz;
+
+    // ── T246.10 MMQ-WHOLESALE.6a — batched shared-expert MMQ fast-path ──
+    //
+    // When `RUSTORCH_MMQ_WHOLESALE=1` AND `m_tokens >= MMQ_WHOLESALE_MIN_M`
+    // AND the shared-expert weights are all Q4_K (the only kind the MMQ
+    // kernel supports), replace the 3 per-token Q4_K SGEMVs (gate/up/down)
+    // with a single quantize + 3 batched `mul_mat_q4_k_q8_1_mma` launches.
+    //
+    // Buffer reuse strategy (no extra allocation needed for the BF16 sides
+    // because the routed-expert scratch is FREE after step 8 closes) :
+    //   - `expert_gate_m_p[0 : M*ef]` → batched gate output [M, ef]
+    //   - `expert_up_m_p[0 : M*ef]`   → batched up output  [M, ef]
+    //   - `expert_out_m_p[0 : M*d]`   → batched down output [M, d]
+    //   - `x_q8_mmq_m_p[0 : M*(K/128)*144]` → packed Q8_1 of h_norm_m
+    //                                         (overwritten between gate/up
+    //                                         and down because K differs).
+    //
+    // The two per-token small kernels (sigmoid `sgemv_bf16_bf16` and the
+    // `scaled_add_sigmoid_devscalar_bf16` epilogue) stay in their own loop ;
+    // they're cheap (M scalar reads). The big matmuls dominate cost.
+    let mmq_shexp_active = mmq_wholesale_enabled()
+        && m_tokens >= MMQ_WHOLESALE_MIN_M
+        && x_q8_mmq_m_p != 0
+        && matches!(&moe.gate_shexp, QuantTensor::Q4K { .. })
+        && matches!(&moe.up_shexp, QuantTensor::Q4K { .. })
+        && matches!(&moe.down_shexp, QuantTensor::Q4K { .. })
+        && (d as usize) % 256 == 0
+        && (ef as usize) % 256 == 0;
+
+    if mmq_shexp_active {
+        // Step 9a — batched gate matmul : [M, d] × W_gate [ef, d] → [M, ef].
+        // 1. Quantize h_norm_m_p (BF16) → x_q8_mmq_m_p (packed Q8_1).
+        // 2. mul_mat_q4_k_q8_1_mma over [M, ef] with K=d.
         unsafe {
-            let (gip_p, _g) = moe.gate_inp_shexp.device_ptr(stream);
             kernels
-                .sgemv_bf16_bf16(stream, gip_p, h_norm_row_p, shexp_dot_p, 1, d)
-                .map_err(|e| LlmError::Backend(format!("shexp dot group m={m}: {e:?}")))?;
+                .quantize_mmq_q8_1_bf16_ds4(stream, h_norm_m_p, x_q8_mmq_m_p, m_tokens, d)
+                .map_err(|e| LlmError::Backend(format!("MMQ quantize shexp gate K={d}: {e:?}")))?;
         }
-        moe.gate_shexp
-            .dispatch_matmul_m1(kernels, stream, h_norm_row_p, expert_gate_p, x_q8_p)?;
-        moe.up_shexp
-            .dispatch_matmul_m1(kernels, stream, h_norm_row_p, expert_up_p, x_q8_p)?;
-        unsafe {
-            kernels
-                .swiglu_bf16(stream, expert_gate_p, expert_up_p, expert_gate_p, ef)
-                .map_err(|e| LlmError::Backend(format!("swiglu shexp group m={m}: {e:?}")))?;
+        if let QuantTensor::Q4K { bytes, .. } = &moe.gate_shexp {
+            use cudarc::driver::DevicePtr;
+            let (w_p, _g) = bytes.device_ptr(stream);
+            unsafe {
+                kernels
+                    .mul_mat_q4_k_q8_1_mma(
+                        stream,
+                        w_p,
+                        x_q8_mmq_m_p,
+                        expert_gate_m_p,
+                        m_tokens,
+                        ef,
+                        d,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("MMQ shexp gate: {e:?}")))?;
+            }
         }
-        moe.down_shexp
-            .dispatch_matmul_m1(kernels, stream, expert_gate_p, expert_out_p, x_q8_p)?;
+        // Step 9c — batched up matmul (reuse the same Q8_1 staging — same K=d).
+        if let QuantTensor::Q4K { bytes, .. } = &moe.up_shexp {
+            use cudarc::driver::DevicePtr;
+            let (w_p, _g) = bytes.device_ptr(stream);
+            unsafe {
+                kernels
+                    .mul_mat_q4_k_q8_1_mma(
+                        stream,
+                        w_p,
+                        x_q8_mmq_m_p,
+                        expert_up_m_p,
+                        m_tokens,
+                        ef,
+                        d,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("MMQ shexp up: {e:?}")))?;
+            }
+        }
+        // Step 9d — batched SwiGLU over [M, ef] in-place into expert_gate_m_p.
         unsafe {
             kernels
-                .scaled_add_sigmoid_devscalar_bf16(stream, h_row_p, expert_out_p, shexp_dot_p, d)
-                .map_err(|e| {
-                    LlmError::Backend(format!("scaled_add_sigmoid shexp group m={m}: {e:?}"))
-                })?;
+                .swiglu_bf16(
+                    stream,
+                    expert_gate_m_p,
+                    expert_up_m_p,
+                    expert_gate_m_p,
+                    m_tokens * ef,
+                )
+                .map_err(|e| LlmError::Backend(format!("MMQ shexp swiglu: {e:?}")))?;
+        }
+        // Step 9e — batched down matmul : [M, ef] × W_down [d, ef] → [M, d].
+        // Re-quantize the SwiGLU output (K=ef this time).
+        unsafe {
+            kernels
+                .quantize_mmq_q8_1_bf16_ds4(stream, expert_gate_m_p, x_q8_mmq_m_p, m_tokens, ef)
+                .map_err(|e| LlmError::Backend(format!("MMQ quantize shexp down K={ef}: {e:?}")))?;
+        }
+        if let QuantTensor::Q4K { bytes, .. } = &moe.down_shexp {
+            use cudarc::driver::DevicePtr;
+            let (w_p, _g) = bytes.device_ptr(stream);
+            unsafe {
+                kernels
+                    .mul_mat_q4_k_q8_1_mma(
+                        stream,
+                        w_p,
+                        x_q8_mmq_m_p,
+                        expert_out_m_p,
+                        m_tokens,
+                        d,
+                        ef,
+                    )
+                    .map_err(|e| LlmError::Backend(format!("MMQ shexp down: {e:?}")))?;
+            }
+        }
+        // Step 9f — per-token sigmoid gate + sigmoid-scaled add (small kernels,
+        // kept per-row to preserve bit-exact parity with the baseline epilogue).
+        for m in 0..m_tokens {
+            let h_norm_row_p = h_norm_m_p + (m as u64) * (d as u64) * bf16_sz;
+            let h_row_p = h_m_p + (m as u64) * (d as u64) * bf16_sz;
+            let eo_row_p = expert_out_m_p + (m as u64) * (d as u64) * bf16_sz;
+            unsafe {
+                let (gip_p, _g) = moe.gate_inp_shexp.device_ptr(stream);
+                kernels
+                    .sgemv_bf16_bf16(stream, gip_p, h_norm_row_p, shexp_dot_p, 1, d)
+                    .map_err(|e| LlmError::Backend(format!("MMQ shexp dot m={m}: {e:?}")))?;
+                kernels
+                    .scaled_add_sigmoid_devscalar_bf16(stream, h_row_p, eo_row_p, shexp_dot_p, d)
+                    .map_err(|e| LlmError::Backend(format!("MMQ shexp sigadd m={m}: {e:?}")))?;
+            }
+        }
+    } else {
+        // Baseline per-token shared-expert loop (unchanged).
+        for m in 0..m_tokens {
+            let h_norm_row_p = h_norm_m_p + (m as u64) * (d as u64) * bf16_sz;
+            let h_row_p = h_m_p + (m as u64) * (d as u64) * bf16_sz;
+            unsafe {
+                let (gip_p, _g) = moe.gate_inp_shexp.device_ptr(stream);
+                kernels
+                    .sgemv_bf16_bf16(stream, gip_p, h_norm_row_p, shexp_dot_p, 1, d)
+                    .map_err(|e| LlmError::Backend(format!("shexp dot group m={m}: {e:?}")))?;
+            }
+            moe.gate_shexp.dispatch_matmul_m1(
+                kernels,
+                stream,
+                h_norm_row_p,
+                expert_gate_p,
+                x_q8_p,
+            )?;
+            moe.up_shexp
+                .dispatch_matmul_m1(kernels, stream, h_norm_row_p, expert_up_p, x_q8_p)?;
+            unsafe {
+                kernels
+                    .swiglu_bf16(stream, expert_gate_p, expert_up_p, expert_gate_p, ef)
+                    .map_err(|e| LlmError::Backend(format!("swiglu shexp group m={m}: {e:?}")))?;
+            }
+            moe.down_shexp.dispatch_matmul_m1(
+                kernels,
+                stream,
+                expert_gate_p,
+                expert_out_p,
+                x_q8_p,
+            )?;
+            unsafe {
+                kernels
+                    .scaled_add_sigmoid_devscalar_bf16(
+                        stream,
+                        h_row_p,
+                        expert_out_p,
+                        shexp_dot_p,
+                        d,
+                    )
+                    .map_err(|e| {
+                        LlmError::Backend(format!("scaled_add_sigmoid shexp group m={m}: {e:?}"))
+                    })?;
+            }
         }
     }
 
