@@ -6116,6 +6116,105 @@ extern "C" __global__ void mul_mm_id_gemm_q4_k_sorted_bf16(
 }
 "#;
 
+// Q4K-MOE-CUBLAS.1 — Q4_K -> BF16 dequant device kernel.
+//
+// Used by the Phase 1 validation bench (dequant + cuBLASLt) and by the Phase 2
+// MoE dispatch when RUSTORCH_Q4K_MOE_CUBLAS=1.
+//
+// Layout : Q4_K super-block = 144 bytes for 256 elements. Each super-block has
+//   - 2 bytes d (f16)
+//   - 2 bytes dmin (f16)
+//   - 12 bytes packed (sc, m) for 8 sub-blocks of 32 elements each
+//   - 128 bytes quants (4 bits per element)
+//
+// Each thread block dequantizes ONE super-block (256 BF16 outputs). Grid is
+// 1-D : total_blocks = (total_elements / 256). Block size = 64 threads, each
+// thread emits 4 BF16 outputs (the 4 nibbles of 2 packed bytes).
+//
+// The FP arithmetic mirrors `sgemv_q4k_bf16` / `mul_mm_id_gemm_q4_k_*` :
+//     value = d * sc[sub] * nibble - dmin * m[sub]
+#[cfg(feature = "cuda")]
+const DEQUANT_Q4_K_TO_BF16_SRC: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+extern "C" __global__ void dequant_q4_k_to_bf16(
+    const unsigned char* __restrict__ w_q4k, // [n_blocks * 144]
+    __nv_bfloat16*       __restrict__ out,   // [n_blocks * 256]
+    long long                          n_blocks
+) {
+    long long blk_idx = (long long)blockIdx.x;
+    if (blk_idx >= n_blocks) return;
+    int tid = threadIdx.x;
+
+    const unsigned char* blk = w_q4k + blk_idx * 144;
+
+    unsigned short d_bits    = blk[0] | (blk[1] << 8);
+    unsigned short dmin_bits = blk[2] | (blk[3] << 8);
+    float d    = __half2float(__ushort_as_half(d_bits));
+    float dmin = __half2float(__ushort_as_half(dmin_bits));
+
+    // Decode 8 (sc, m) pairs from the 12 packed scale bytes.
+    // (Stored as __shared__ float so threads in the same block share the
+    // decode work — 16 values × 4 bytes = 64 B, well within shmem budget.)
+    __shared__ float scale[8];
+    __shared__ float min_v[8];
+    if (tid < 8) {
+        const unsigned char* scales = blk + 4;
+        unsigned char sc, m;
+        if (tid < 4) {
+            sc = scales[tid]     & 0x3F;
+            m  = scales[tid + 4] & 0x3F;
+        } else {
+            int g = tid - 4;
+            sc = (scales[g + 8] & 0x0F) | ((scales[g]     >> 6) << 4);
+            m  = (scales[g + 8] >> 4)   | ((scales[g + 4] >> 6) << 4);
+        }
+        scale[tid] = d    * (float)sc;
+        min_v[tid] = dmin * (float)m;
+    }
+    __syncthreads();
+
+    // Each thread emits 4 outputs : 2 from the low nibble (sub_a) and
+    // 2 from the high nibble (sub_b) of 2 consecutive packed bytes.
+    // tid in [0, 64) maps to :
+    //   group   = tid >> 3   ∈ [0, 8)  — which (sub_a, sub_b) pair
+    //   pos_lo  = (tid & 7) << 2       — byte offset within the group's 32-byte qs slice
+    //   byte_base = (group << 5) + pos_lo
+    const unsigned char* qs = blk + 16;
+    int group     = tid >> 3;
+    int pos_base  = (tid & 7) << 2;
+    int byte_base = (group << 5) + pos_base;
+    int sub_a = group * 2;
+    int sub_b = sub_a + 1;
+    float sa = scale[sub_a], ma = min_v[sub_a];
+    float sb = scale[sub_b], mb = min_v[sub_b];
+
+    unsigned int qbytes = *(const unsigned int*)(qs + byte_base);
+    unsigned char by0 = (qbytes      ) & 0xFFu;
+    unsigned char by1 = (qbytes >>  8) & 0xFFu;
+    unsigned char by2 = (qbytes >> 16) & 0xFFu;
+    unsigned char by3 = (qbytes >> 24) & 0xFFu;
+    int na0 = by0 & 0x0F, na1 = by1 & 0x0F, na2 = by2 & 0x0F, na3 = by3 & 0x0F;
+    int nb0 = by0 >>   4, nb1 = by1 >>   4, nb2 = by2 >>   4, nb3 = by3 >>   4;
+
+    long long out_base = blk_idx * 256;
+
+    // Layout of the dequantized super-block matches the natural quantizer
+    // layout — sub-block i occupies elements [i*32, (i+1)*32).
+    long long off_a = out_base + (long long)sub_a * 32 + pos_base;
+    long long off_b = out_base + (long long)sub_b * 32 + pos_base;
+    out[off_a + 0] = (__nv_bfloat16)(sa * (float)na0 - ma);
+    out[off_a + 1] = (__nv_bfloat16)(sa * (float)na1 - ma);
+    out[off_a + 2] = (__nv_bfloat16)(sa * (float)na2 - ma);
+    out[off_a + 3] = (__nv_bfloat16)(sa * (float)na3 - ma);
+    out[off_b + 0] = (__nv_bfloat16)(sb * (float)nb0 - mb);
+    out[off_b + 1] = (__nv_bfloat16)(sb * (float)nb1 - mb);
+    out[off_b + 2] = (__nv_bfloat16)(sb * (float)nb2 - mb);
+    out[off_b + 3] = (__nv_bfloat16)(sb * (float)nb3 - mb);
+}
+"#;
+
 // T246.10 TrackE.4 — Q5_K sort-permutation Group-GEMM (cache reuse).
 //
 // Same per-(slot, row) inner body as `mul_mm_id_gemm_q5_k_bf16`, but iterates
@@ -8253,6 +8352,8 @@ pub struct LlmKernels {
     // T246.10 MMQ-WHOLESALE — Q4_K × Q8_1 packed mma-staged kernel.
     quantize_mmq_q8_1_ds4: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     mul_mat_q4_k_q8_1_mma: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    // T246.10 Q4K-MOE-CUBLAS — Q4_K -> BF16 device-side dequant.
+    dequant_q4_k_to_bf16: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -8368,6 +8469,8 @@ impl LlmKernels {
             // T246.10 MMQ-WHOLESALE.
             quantize_mmq_q8_1_ds4: std::sync::OnceLock::new(),
             mul_mat_q4_k_q8_1_mma: std::sync::OnceLock::new(),
+            // T246.10 Q4K-MOE-CUBLAS.
+            dequant_q4_k_to_bf16: std::sync::OnceLock::new(),
         }
     }
 
@@ -12798,6 +12901,51 @@ impl LlmKernels {
         launcher.launch(cfg).map_err(|e| CudaError::Driver {
             code: format!("{e:?}").len() as i32,
             location: "mul_mat_q4_k_q8_1_mma::launch",
+        })?;
+        Ok(())
+    }
+
+    /// Q4K-MOE-CUBLAS.1 — Q4_K → BF16 device-side dequant.
+    ///
+    /// Dequantizes a contiguous Q4_K buffer of `n_blocks` 144-byte super-blocks
+    /// into a flat BF16 buffer of `n_blocks * 256` elements. Layout is the
+    /// natural per-super-block order (sub-block `i` occupies elements
+    /// `[i*32, (i+1)*32)`), matching what `dequant_q4_k` in `rustorch-gguf`
+    /// produces row-major when called per row.
+    ///
+    /// For a Q4_K weight tensor `W[N, K]` stored as `N * (K/256)` super-blocks
+    /// in row-major order, the output is `W_bf16[N, K]` in the SAME row-major
+    /// layout — so cuBLASLt can consume it as `[N, K] ld=K` directly.
+    ///
+    /// # Safety
+    /// `w_q4k_dev` must point to a Q4_K buffer of at least `n_blocks * 144`
+    /// bytes ; `out_bf16_dev` must point to at least `n_blocks * 256` BF16
+    /// elements.
+    pub unsafe fn dequant_q4_k_to_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_q4k_dev: u64,
+        out_bf16_dev: u64,
+        n_blocks: i64,
+    ) -> Result<(), CudaError> {
+        if n_blocks <= 0 {
+            return Ok(());
+        }
+        let (_module, func) = self.compile_or_get(
+            &self.dequant_q4_k_to_bf16,
+            DEQUANT_Q4_K_TO_BF16_SRC,
+            "dequant_q4_k_to_bf16",
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n_blocks as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&func);
+        launcher.arg(&w_q4k_dev).arg(&out_bf16_dev).arg(&n_blocks);
+        launcher.launch(cfg).map_err(|e| CudaError::Driver {
+            code: format!("{e:?}").len() as i32,
+            location: "dequant_q4_k_to_bf16::launch",
         })?;
         Ok(())
     }
