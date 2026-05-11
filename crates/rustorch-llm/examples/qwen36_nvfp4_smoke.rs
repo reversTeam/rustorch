@@ -98,19 +98,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Decode N tokens ------------------------------------------------
     let mut tokens: Vec<u32> = Vec::with_capacity(n_tokens + prompt_ids.len());
 
-    // Prefill : push every prompt token through decode_step to grow the KV
-    // cache + SSM state. Only the predicted next-token after the LAST
-    // prompt token is kept as the first auto-regressive output.
-    println!(
-        "[qwen36_nvfp4_smoke] prefilling {} prompt token(s)...",
-        prompt_ids.len()
-    );
+    // Prefill : either via decode_step loop (legacy) or via
+    // `prefill_tokens` API (TrackK.1 + TrackK.b). When
+    // `RUSTORCH_NVFP4_PREFILL_API=1` we exercise the tree-batched
+    // prefill path on the user-supplied prompt (`RUSTORCH_NVFP4_PROMPT_IDS`).
+    // Coherence requirement is the same : auto-regressive decode after the
+    // prefill should produce in-vocab, non-collapsing tokens.
+    let use_prefill_api = std::env::var("RUSTORCH_NVFP4_PREFILL_API").ok().as_deref() == Some("1");
     let mut last_pred: u32 = 0;
-    for (i, &pid) in prompt_ids.iter().enumerate() {
-        tokens.push(pid);
+    if use_prefill_api {
+        println!(
+            "[qwen36_nvfp4_smoke] prefilling {} prompt token(s) via prefill_tokens API...",
+            prompt_ids.len()
+        );
+        tokens.extend_from_slice(&prompt_ids);
         last_pred = model
-            .decode_step(pid)
-            .map_err(|e| format!("decode_step prefill #{i}: {e:?}"))?;
+            .prefill_tokens(&prompt_ids, 0)
+            .map_err(|e| format!("prefill_tokens: {e:?}"))?;
+    } else {
+        println!(
+            "[qwen36_nvfp4_smoke] prefilling {} prompt token(s) via decode_step loop...",
+            prompt_ids.len()
+        );
+        for (i, &pid) in prompt_ids.iter().enumerate() {
+            tokens.push(pid);
+            last_pred = model
+                .decode_step(pid)
+                .map_err(|e| format!("decode_step prefill #{i}: {e:?}"))?;
+        }
     }
     // First auto-regressive token = prediction after the last prompt token.
     tokens.push(last_pred);

@@ -2150,7 +2150,7 @@ impl Qwen35ModelCudaNVFP4 {
 
         // ── 1. Upload tree descriptors (outside capture, pinned drafts) ─
         {
-            let mut drafts_pinned = self
+            let drafts_pinned = self
                 .prefill_drafts_host_pinned
                 .as_mut_slice()
                 .map_err(|e| LlmError::Backend(format!("drafts_pinned as_mut_slice: {e:?}")))?;
