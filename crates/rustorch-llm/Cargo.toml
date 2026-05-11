@@ -141,3 +141,10 @@ required-features = ["cuda"]
 name = "qwen36_hybrid_tree_smoke"
 path = "examples/qwen36_hybrid_tree_smoke.rs"
 required-features = ["cuda"]
+
+# T246.9 NVFP4.4 — load + per-layer inventory smoke test for the
+# Qwen3.6-A3B-NVFP4 vLLM-quantized safetensors checkpoint.
+[[example]]
+name = "qwen36_nvfp4_smoke"
+path = "examples/qwen36_nvfp4_smoke.rs"
+required-features = ["cuda"]
