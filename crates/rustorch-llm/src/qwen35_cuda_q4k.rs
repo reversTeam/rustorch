@@ -3145,24 +3145,45 @@ impl Qwen35ModelCudaQ4K {
                     // call `moe_ffn_forward_step_*` once per BFS row,
                     // reading `h_norm[r]` and writing `h[r]`.
                     //
-                    // Picks the same async/mega/sync variant as
-                    // `decode_step` based on env gates. Per-row dispatch
-                    // means router/topk run N× per layer ; for N≤512 on a
-                    // 64-MoE-layer model that's ~32K extra small launches
-                    // — acceptable for prefill since the matmul fan-out
-                    // amortizes to dominate.
+                    // Picks the async or mega variant based on env gates
+                    // (both reduce to zero-host-sync per-token MoE ; mega
+                    // also collapses the K=8 expert sgemv launches). The
+                    // legacy SYNC path (host memcpy_dtov per layer per row)
+                    // is NOT supported in prefill mode : at N=512 it would
+                    // issue ~N × 64 layers × 2 syncs = 65 k host syncs,
+                    // serializing the entire pipeline. The caller must set
+                    // `RUSTORCH_MOE_ASYNC=1` (or `RUSTORCH_MOE_MEGA=1`).
+                    if !moe_mega_enabled() && !moe_async_enabled() {
+                        return Err(LlmError::Backend(
+                            "decode_step_tree_hybrid_inner: MoE FFN at layer ".to_string()
+                                + &li.to_string()
+                                + " requires RUSTORCH_MOE_ASYNC=1 or \
+                                   RUSTORCH_MOE_MEGA=1 for tree/prefill mode \
+                                   (legacy sync path would serialize \
+                                   ~N×64 layers host syncs).",
+                        ));
+                    }
                     use cudarc::driver::DevicePtrMut;
-                    let (moe_router_p, _gmr) =
-                        self.scratch.moe_router_logits.device_ptr_mut(&self.stream);
-                    let (moe_idx_p, _gmi) = self.scratch.moe_topk_idx.device_ptr_mut(&self.stream);
-                    let (moe_w_p, _gmw) = self.scratch.moe_topk_w.device_ptr_mut(&self.stream);
-                    let (moe_egate_p, _gmeg) =
-                        self.scratch.moe_expert_gate.device_ptr_mut(&self.stream);
-                    let (moe_eup_p, _gmeu) =
-                        self.scratch.moe_expert_up.device_ptr_mut(&self.stream);
-                    let (moe_eout_p, _gmeo) =
-                        self.scratch.moe_expert_out.device_ptr_mut(&self.stream);
-                    let (moe_sd_p, _gmsd) = self.scratch.moe_shexp_dot.device_ptr_mut(&self.stream);
+                    let (
+                        moe_router_p,
+                        moe_idx_p,
+                        moe_w_p,
+                        moe_egate_p,
+                        moe_eup_p,
+                        moe_eout_p,
+                        moe_sd_p,
+                    ) = {
+                        let (mr_, _gmr) =
+                            self.scratch.moe_router_logits.device_ptr_mut(&self.stream);
+                        let (mi_, _gmi) = self.scratch.moe_topk_idx.device_ptr_mut(&self.stream);
+                        let (mw_, _gmw) = self.scratch.moe_topk_w.device_ptr_mut(&self.stream);
+                        let (mg_, _gmeg) =
+                            self.scratch.moe_expert_gate.device_ptr_mut(&self.stream);
+                        let (mu_, _gmeu) = self.scratch.moe_expert_up.device_ptr_mut(&self.stream);
+                        let (mo_, _gmeo) = self.scratch.moe_expert_out.device_ptr_mut(&self.stream);
+                        let (msd_, _gmsd) = self.scratch.moe_shexp_dot.device_ptr_mut(&self.stream);
+                        (mr_, mi_, mw_, mg_, mu_, mo_, msd_)
+                    };
                     for r in 0..tree_size {
                         let hn_r = thn_p + (r as u64) * row_h;
                         let h_r = th_p + (r as u64) * row_h;
@@ -3183,7 +3204,8 @@ impl Qwen35ModelCudaQ4K {
                                 moe_eout_p,
                                 moe_sd_p,
                             )?;
-                        } else if moe_async_enabled() {
+                        } else {
+                            // moe_async_enabled() == true by the guard above.
                             moe_ffn_forward_step_async(
                                 moe,
                                 &self.kernels,
@@ -3199,26 +3221,6 @@ impl Qwen35ModelCudaQ4K {
                                 moe_eup_p,
                                 moe_eout_p,
                                 moe_sd_p,
-                            )?;
-                        } else {
-                            moe_ffn_forward_step(
-                                moe,
-                                &self.kernels,
-                                &self.stream,
-                                &cfg,
-                                hn_r,
-                                h_r,
-                                x_q8_p,
-                                moe_router_p,
-                                moe_idx_p,
-                                &self.scratch.moe_topk_idx,
-                                moe_w_p,
-                                &self.scratch.moe_topk_w,
-                                moe_egate_p,
-                                moe_eup_p,
-                                moe_eout_p,
-                                moe_sd_p,
-                                &self.scratch.moe_shexp_dot,
                             )?;
                         }
                     }
