@@ -1,23 +1,18 @@
-//! T246.8 A3 — Parity tests for `sgemv_bf16_bf16_v2` (mma.sync m16n8k16
-//! tensor-core SGEMV) vs the V1 warp-shuffle reference.
+//! T246.8 A3 — Parity tests for `sgemv_bf16_bf16_v2` (multi-row block
+//! warp-shuffle SGEMV) vs the V1 single-row reference.
 //!
-//! V2 uses BF16 tensor cores (mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32)
-//! to amortize 16 output rows per warp per mma. V1 is a 64-thread warp-shuffle
-//! kernel that processes one row per block.
+//! V2 uses 4 rows per block × 64 threads per row (256 threads/block, V1's
+//! exact per-thread MAC sequence preserved → BIT-EXACT with V1). V1 is the
+//! original 64-thread, 1-row-per-block warp-shuffle kernel.
 //!
-//! Both use FP32 accumulator and produce the same final BF16 down-cast. The
-//! difference is the order of summation (V1 accumulates K/256 super-blocks
-//! sequentially per thread then warp-reduces ; V2 issues K/16 mma instructions
-//! and the tensor-core hardware does the dot product in a different order).
-//! For BF16 output this is *typically* bit-exact for K up to a few thousand
-//! but can drift by 1-2 ULP at K=8192+ due to FP non-associativity.
+//! Both use FP32 accumulator and produce the same final BF16 down-cast.
+//! The mma.sync m16n8k16 tensor-core variant was abandoned (see
+//! llm_kernels.rs SGEMV_BF16_BF16_V2_SRC docstring & note 0418e02c) — it
+//! was 30% slower end-to-end due to the 87.5% wasted-N broadcast pattern.
 //!
-//! These tests verify :
-//! 1. V2 matches V1 within tight tolerance on 4 representative shapes
-//!    including the lm_head matmul (152064 × 5120) and Qwen3.6-35B-A3B
-//!    attention/FFN-shexp shapes.
-//! 2. The dispatch helper (`sgemv_bf16_bf16_dispatch`) routes correctly
-//!    between V1/V2 based on the N>=128 + K%16==0 heuristic.
+//! V2 final design is BIT-EXACT with V1 by construction (same per-thread
+//! MAC count, same warp-shuffle reduction order). All assertions check
+//! bit-exact equality.
 //!
 //! Run on GB10 (DGX Spark) :
 //!   PATH=/usr/local/cuda-13.0/bin:$PATH \
@@ -36,10 +31,9 @@ fn bf16_vec(n: usize, seed: f32, off: f32) -> Vec<half::bf16> {
         .collect()
 }
 
-/// Tolerance for BF16 SGEMV outputs. V1 uses sequential-warp-reduce in FP32 ;
-/// V2 uses tensor-core m16n8k16 mma hardware reduce. Both down-cast to BF16
-/// at the end. We allow up to 4 BF16 ULP per element OR 1% relative — whichever
-/// is greater — and a max-overall-drift threshold of 2% of elements > 4 ULP.
+/// V2 is bit-exact with V1 by construction. We still allow up to 4 BF16 ULP
+/// drift in case future V2 reformulations introduce non-associativity ;
+/// fail if more than 2% of elements drift > 4 ULP & > 1% relative.
 fn assert_close(label: &str, ref_v1: &[half::bf16], v2: &[half::bf16]) {
     assert_eq!(ref_v1.len(), v2.len(), "{label}: length mismatch");
     let mut max_abs = 0.0f32;
