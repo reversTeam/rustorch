@@ -3199,6 +3199,23 @@ impl Qwen35ModelCudaQ4K {
     /// and `prefill_tokens` (hybrid path). When `force_accept_all` is true,
     /// skip the acceptance walk and force-accept every BFS-ordered tree node.
     /// This is the prefill mode (linear-chain trees committed verbatim).
+    ///
+    /// T246.10 TrackI — when `in_prefill_capture` is true (only valid with
+    /// `force_accept_all`), the function executes the *capturable body
+    /// only* :
+    ///
+    /// - Tree-descriptor HtoD uploads (drafts/parents/depths) are skipped
+    ///   (the caller pre-uploaded them OUTSIDE the capture region into
+    ///   the same scratch buffers).
+    /// - Per-wave `memcpy_htod` chains in the SSM path are replaced by
+    ///   pointer offsets into the pre-baked `tree_ssm_wave_indices_linear`
+    ///   buffer (valid only for linear-chain prefill : wave[d] = [d]).
+    /// - The final argmax DtoH + host accept walk are skipped : the
+    ///   caller reads `tree_argmax_host_pinned` AFTER `end_capture`. The
+    ///   function returns `Ok(vec![])`.
+    /// - All other operations (kernel launches, device-side counter
+    ///   advances, SSM/conv state commits) remain inside the captured
+    ///   body and are replayed bit-identically on each replay.
     #[allow(clippy::too_many_lines)]
     fn decode_step_tree_hybrid_inner(
         &mut self,
@@ -3207,6 +3224,24 @@ impl Qwen35ModelCudaQ4K {
         depths: &[u16],
         force_accept_all: bool,
     ) -> Result<Vec<u32>, LlmError> {
+        self.decode_step_tree_hybrid_inner_capture(drafts, parents, depths, force_accept_all, false)
+    }
+
+    /// T246.10 TrackI — full implementation with explicit capture-mode
+    /// flag. See `decode_step_tree_hybrid_inner` for the contract.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn decode_step_tree_hybrid_inner_capture(
+        &mut self,
+        drafts: &[u32],
+        parents: &[i32],
+        depths: &[u16],
+        force_accept_all: bool,
+        in_prefill_capture: bool,
+    ) -> Result<Vec<u32>, LlmError> {
+        debug_assert!(
+            !in_prefill_capture || force_accept_all,
+            "in_prefill_capture requires force_accept_all"
+        );
         use cudarc::driver::{DevicePtr, DevicePtrMut};
 
         let cfg = self.config.clone();
@@ -3241,15 +3276,22 @@ impl Qwen35ModelCudaQ4K {
         let base_position = self.position;
 
         // ── 0. Upload tree descriptors ────────────────────────────────────
-        self.stream
-            .memcpy_htod(drafts, &mut self.scratch.tree_drafts)
-            .map_err(|e| LlmError::Backend(format!("upload tree_drafts: {e:?}")))?;
-        self.stream
-            .memcpy_htod(parents, &mut self.scratch.tree_parents)
-            .map_err(|e| LlmError::Backend(format!("upload tree_parents: {e:?}")))?;
-        self.stream
-            .memcpy_htod(depths, &mut self.scratch.tree_depths)
-            .map_err(|e| LlmError::Backend(format!("upload tree_depths: {e:?}")))?;
+        // T246.10 TrackI — in capture mode the caller has already uploaded
+        // these descriptors OUTSIDE the capture region (so the HtoD does
+        // not abort the in-progress stream capture). The device buffers
+        // are the same `scratch.tree_*` slots — the captured graph reads
+        // them by pointer.
+        if !in_prefill_capture {
+            self.stream
+                .memcpy_htod(drafts, &mut self.scratch.tree_drafts)
+                .map_err(|e| LlmError::Backend(format!("upload tree_drafts: {e:?}")))?;
+            self.stream
+                .memcpy_htod(parents, &mut self.scratch.tree_parents)
+                .map_err(|e| LlmError::Backend(format!("upload tree_parents: {e:?}")))?;
+            self.stream
+                .memcpy_htod(depths, &mut self.scratch.tree_depths)
+                .map_err(|e| LlmError::Backend(format!("upload tree_depths: {e:?}")))?;
+        }
 
         // ── 1. Group tree nodes by BFS depth wave ─────────────────────────
         // Used by the SSM `delta_net_step_tree_bf16` launches : one launch
@@ -3477,6 +3519,7 @@ impl Qwen35ModelCudaQ4K {
                     conv_kernel,
                     d,
                     use_gemm,
+                    in_prefill_capture,
                 )?;
             }
 
@@ -3808,57 +3851,77 @@ impl Qwen35ModelCudaQ4K {
                 )
                 .map_err(|e| LlmError::Backend(format!("hyb argmax: {e:?}")))?;
         }
-        self.stream
-            .memcpy_dtoh(
-                &self.scratch.tree_argmax,
-                &mut self.scratch.tree_argmax_host_pinned,
-            )
-            .map_err(|e| LlmError::Backend(format!("hyb dtoh argmax: {e:?}")))?;
-        let argmax_host = self
-            .scratch
-            .tree_argmax_host_pinned
-            .as_slice()
-            .map_err(|e| LlmError::Backend(format!("hyb pinned argmax: {e:?}")))?;
 
-        // ── 7. CPU acceptance walk (same as pure-transformer path) ────────
-        // T246.10 A6 — prefill mode (`force_accept_all = true`) bypasses
-        // the acceptance walk and force-accepts every BFS-ordered node.
-        // For a linear-chain prefill the BFS order is the chain itself, so
-        // `accepted_indices[i] = i`, the compaction loop (step 8) is a no-op
-        // (each `src == i`), and the counter advance writes all N positions.
-        let (accepted_indices, accepted_tokens): (Vec<usize>, Vec<u32>) = if force_accept_all {
+        // ── 6. DtoH the argmax tokens to pinned host buffer ───────────────
+        //
+        // T246.10 TrackI — in capture mode the DtoH + host accept walk
+        // MUST happen AFTER `end_capture` (we can't read host-side
+        // pinned memory from inside a capturing stream). The caller
+        // (`prefill_tokens`) does this read post-replay. For linear-
+        // chain prefill the accept walk degenerates to
+        // `accepted_indices = [0..tree_size]` and the compact loop is
+        // a no-op (each `src == i`), so we can shortcut the entire
+        // host-side logic here.
+        let (accepted_indices, accepted_tokens): (Vec<usize>, Vec<u32>) = if in_prefill_capture {
+            // Linear chain : accept all, tokens are filled by caller
+            // post-replay (an empty Vec is returned and the caller
+            // ignores it — `prefill_tokens` reads the argmax directly).
             let idx: Vec<usize> = (0..tree_size).collect();
-            let tok: Vec<u32> = (0..tree_size).map(|r| argmax_host[r]).collect();
-            (idx, tok)
+            (idx, Vec::new())
         } else {
-            let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
-            for (r, &p) in parents.iter().enumerate().skip(1) {
-                children[p as usize].push(r);
-            }
-            let mut a_indices: Vec<usize> = vec![0];
-            let mut a_tokens: Vec<u32> = vec![argmax_host[0]];
-            let mut cur = 0usize;
-            loop {
-                let next_tok = argmax_host[cur];
-                let mut found: Option<usize> = None;
-                for &c in &children[cur] {
-                    if drafts[c] == next_tok {
-                        found = Some(c);
-                        break;
+            self.stream
+                .memcpy_dtoh(
+                    &self.scratch.tree_argmax,
+                    &mut self.scratch.tree_argmax_host_pinned,
+                )
+                .map_err(|e| LlmError::Backend(format!("hyb dtoh argmax: {e:?}")))?;
+            let argmax_host = self
+                .scratch
+                .tree_argmax_host_pinned
+                .as_slice()
+                .map_err(|e| LlmError::Backend(format!("hyb pinned argmax: {e:?}")))?;
+
+            // ── 7. CPU acceptance walk (same as pure-transformer path) ────
+            // T246.10 A6 — prefill mode (`force_accept_all = true`) bypasses
+            // the acceptance walk and force-accepts every BFS-ordered node.
+            // For a linear-chain prefill the BFS order is the chain itself,
+            // so `accepted_indices[i] = i`, the compaction loop (step 8)
+            // is a no-op (each `src == i`), and the counter advance writes
+            // all N positions.
+            if force_accept_all {
+                let idx: Vec<usize> = (0..tree_size).collect();
+                let tok: Vec<u32> = (0..tree_size).map(|r| argmax_host[r]).collect();
+                (idx, tok)
+            } else {
+                let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
+                for (r, &p) in parents.iter().enumerate().skip(1) {
+                    children[p as usize].push(r);
+                }
+                let mut a_indices: Vec<usize> = vec![0];
+                let mut a_tokens: Vec<u32> = vec![argmax_host[0]];
+                let mut cur = 0usize;
+                loop {
+                    let next_tok = argmax_host[cur];
+                    let mut found: Option<usize> = None;
+                    for &c in &children[cur] {
+                        if drafts[c] == next_tok {
+                            found = Some(c);
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(c) => {
+                            a_indices.push(c);
+                            a_tokens.push(argmax_host[c]);
+                            cur = c;
+                        },
+                        None => break,
                     }
                 }
-                match found {
-                    Some(c) => {
-                        a_indices.push(c);
-                        a_tokens.push(argmax_host[c]);
-                        cur = c;
-                    },
-                    None => break,
-                }
+                (a_indices, a_tokens)
             }
-            (a_indices, a_tokens)
         };
-        let accept_len = accepted_tokens.len();
+        let accept_len = accepted_indices.len();
         debug_assert!(accept_len >= 1);
 
         // ── 8. Compact accepted KV slots (attention layers only) ──────────
@@ -3958,7 +4021,13 @@ impl Qwen35ModelCudaQ4K {
                 .add_u32_dev(&self.stream, kvl_p, accept_len as i32)
                 .map_err(|e| LlmError::Backend(format!("hyb add_u32 kv_len: {e:?}")))?;
         }
-        self.position += accept_len;
+        // T246.10 TrackI — in capture mode the host-side `self.position`
+        // bookkeeping happens in the caller (`prefill_tokens`), not here.
+        // The device-side `position_dev` IS advanced inside the captured
+        // graph above, so each replay correctly steps the device counter.
+        if !in_prefill_capture {
+            self.position += accept_len;
+        }
 
         Ok(accepted_tokens)
     }
@@ -4297,6 +4366,7 @@ impl Qwen35ModelCudaQ4K {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn hybrid_ssm_layer(
         &mut self,
         li: usize,
@@ -4332,6 +4402,7 @@ impl Qwen35ModelCudaQ4K {
         conv_kernel: usize,
         d: usize,
         use_gemm: bool,
+        in_prefill_capture: bool,
     ) -> Result<(), LlmError> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let cfg = &self.config;
@@ -4635,48 +4706,81 @@ impl Qwen35ModelCudaQ4K {
                     .map_err(|e| LlmError::Backend(format!("hyb copy v r{r}: {e:?}")))?;
             }
 
-            // Launch one wave per depth. Upload wave indices via a small
-            // H2D into the scratch buffer.
-            for (depth, wave) in waves.iter().enumerate() {
-                if wave.is_empty() {
-                    continue;
+            // Launch one wave per depth.
+            //
+            // T246.10 TrackI — when in capture mode (linear-chain prefill),
+            // we avoid the per-wave `memcpy_htod` (which is capture-
+            // incompatible) by passing offsets into the pre-baked linear
+            // wave-indices buffer (`tree_ssm_wave_indices_linear` =
+            // `[0, 1, ..., MAX_TREE_SIZE-1]`). For linear-chain prefill
+            // every wave is a single element : wave[d] = [d], so we
+            // launch with `wave_indices = linear_buf + d*4`,
+            // `wave_size = 1`. For non-linear trees (Lookahead verify
+            // path) we still upload per wave.
+            if in_prefill_capture {
+                // Linear-chain : one row per depth, depth = row index.
+                let (lin_p, _gl) = self.tree_ssm_wave_indices_linear.device_ptr(&self.stream);
+                let i32_sz = std::mem::size_of::<i32>() as u64;
+                for d_idx in 0..tree_size {
+                    let wave_p = lin_p + (d_idx as u64) * i32_sz;
+                    self.kernels
+                        .delta_net_step_tree_bf16(
+                            &self.stream,
+                            tssm_qv_p,
+                            tssm_kv_p,
+                            tssm_out_p,   // V
+                            tssm_alpha_p, // gate
+                            tssm_beta_p,  // beta
+                            parents_dev_p,
+                            wave_p,
+                            tree_states_p,
+                            tssm_out_p,
+                            1, // wave_size
+                            n_v as i32,
+                            head_kv as i32,
+                        )
+                        .map_err(|e| {
+                            LlmError::Backend(format!(
+                                "hyb delta_net_tree (capture) d{d_idx} l{li}: {e:?}"
+                            ))
+                        })?;
                 }
-                self.stream
-                    .memcpy_htod(wave, &mut self.scratch.tree_ssm_wave_indices)
-                    .map_err(|e| LlmError::Backend(format!("hyb wave H2D d{depth}: {e:?}")))?;
+            } else {
+                for (depth, wave) in waves.iter().enumerate() {
+                    if wave.is_empty() {
+                        continue;
+                    }
+                    self.stream
+                        .memcpy_htod(wave, &mut self.scratch.tree_ssm_wave_indices)
+                        .map_err(|e| LlmError::Backend(format!("hyb wave H2D d{depth}: {e:?}")))?;
 
-                // delta_net_step_tree_bf16(q, k, v, gate, beta, parents,
-                //   wave_indices, tree_states, out, wave_size, n_heads,
-                //   head_dim).
-                self.kernels
-                    .delta_net_step_tree_bf16(
-                        &self.stream,
-                        tssm_qv_p,
-                        tssm_kv_p,
-                        tssm_out_p,   // V (we copied it above)
-                        tssm_alpha_p, // gate (alpha after softplus*ssm_a)
-                        tssm_beta_p,  // beta
-                        parents_dev_p,
-                        tssm_wave_p,
-                        tree_states_p,
-                        // out destination : we re-use tssm_out_buf since it
-                        // holds the input V which we no longer need after
-                        // the kernel reads it (within the same launch).
-                        // Actually safer : write delta-net output to a
-                        // distinct buffer. Re-use tssm_qv_p (we no longer
-                        // need q after the kernel reads it). Hmm — same
-                        // issue. The cleanest is a dedicated `tree_ssm_y`
-                        // scratch but we don't have one. Use tssm_kv_p
-                        // (k_v values consumed by the kernel input read,
-                        // safe to overwrite for output).
-                        tssm_out_p,
-                        wave.len() as i32,
-                        n_v as i32,
-                        head_kv as i32,
-                    )
-                    .map_err(|e| {
-                        LlmError::Backend(format!("hyb delta_net_tree d{depth} l{li}: {e:?}"))
-                    })?;
+                    // delta_net_step_tree_bf16(q, k, v, gate, beta, parents,
+                    //   wave_indices, tree_states, out, wave_size, n_heads,
+                    //   head_dim).
+                    self.kernels
+                        .delta_net_step_tree_bf16(
+                            &self.stream,
+                            tssm_qv_p,
+                            tssm_kv_p,
+                            tssm_out_p,   // V (we copied it above)
+                            tssm_alpha_p, // gate (alpha after softplus*ssm_a)
+                            tssm_beta_p,  // beta
+                            parents_dev_p,
+                            tssm_wave_p,
+                            tree_states_p,
+                            // out destination : we re-use tssm_out_buf
+                            // since it holds the input V which we no
+                            // longer need after the kernel reads it
+                            // (within the same launch).
+                            tssm_out_p,
+                            wave.len() as i32,
+                            n_v as i32,
+                            head_kv as i32,
+                        )
+                        .map_err(|e| {
+                            LlmError::Backend(format!("hyb delta_net_tree d{depth} l{li}: {e:?}"))
+                        })?;
+                }
             }
         }
 
@@ -4799,6 +4903,32 @@ impl Qwen35ModelCudaQ4K {
         depths: &[u16],
         force_accept_all: bool,
     ) -> Result<Vec<u32>, LlmError> {
+        self.decode_step_tree_pure_transformer_inner_capture(
+            drafts,
+            parents,
+            depths,
+            force_accept_all,
+            false,
+        )
+    }
+
+    /// T246.10 TrackI — full pure-transformer prefill body with explicit
+    /// capture-mode flag. See `decode_step_tree_hybrid_inner_capture` for
+    /// the contract (skip-HtoD-at-top + skip-DtoH-at-bottom + no host
+    /// position bookkeeping when capturing).
+    #[allow(clippy::too_many_lines)]
+    fn decode_step_tree_pure_transformer_inner_capture(
+        &mut self,
+        drafts: &[u32],
+        parents: &[i32],
+        depths: &[u16],
+        force_accept_all: bool,
+        in_prefill_capture: bool,
+    ) -> Result<Vec<u32>, LlmError> {
+        debug_assert!(
+            !in_prefill_capture || force_accept_all,
+            "in_prefill_capture requires force_accept_all"
+        );
         use cudarc::driver::{DevicePtr, DevicePtrMut};
 
         let cfg = self.config.clone();
@@ -4829,15 +4959,19 @@ impl Qwen35ModelCudaQ4K {
         // ── 0. Upload tree descriptors (drafts / parents / depths) ────────
         // `tree_drafts` and friends are sized MAX_TREE_SIZE ; only the
         // first tree_size entries are read by the kernels.
-        self.stream
-            .memcpy_htod(drafts, &mut self.scratch.tree_drafts)
-            .map_err(|e| LlmError::Backend(format!("upload tree_drafts: {e:?}")))?;
-        self.stream
-            .memcpy_htod(parents, &mut self.scratch.tree_parents)
-            .map_err(|e| LlmError::Backend(format!("upload tree_parents: {e:?}")))?;
-        self.stream
-            .memcpy_htod(depths, &mut self.scratch.tree_depths)
-            .map_err(|e| LlmError::Backend(format!("upload tree_depths: {e:?}")))?;
+        // T246.10 TrackI — capture mode caller pre-uploads OUTSIDE the
+        // capture region. See decode_step_tree_hybrid_inner_capture.
+        if !in_prefill_capture {
+            self.stream
+                .memcpy_htod(drafts, &mut self.scratch.tree_drafts)
+                .map_err(|e| LlmError::Backend(format!("upload tree_drafts: {e:?}")))?;
+            self.stream
+                .memcpy_htod(parents, &mut self.scratch.tree_parents)
+                .map_err(|e| LlmError::Backend(format!("upload tree_parents: {e:?}")))?;
+            self.stream
+                .memcpy_htod(depths, &mut self.scratch.tree_depths)
+                .map_err(|e| LlmError::Backend(format!("upload tree_depths: {e:?}")))?;
+        }
 
         // ── 1. Zero per-tree scratch (sized MAX_TREE_SIZE × per-token) ────
         self.stream
@@ -5363,76 +5497,74 @@ impl Qwen35ModelCudaQ4K {
         }
 
         // ── 6. DtoH the argmax tokens to pinned host buffer ───────────────
-        self.stream
-            .memcpy_dtoh(
-                &self.scratch.tree_argmax,
-                &mut self.scratch.tree_argmax_host_pinned,
-            )
-            .map_err(|e| LlmError::Backend(format!("dtoh tree_argmax: {e:?}")))?;
-        let argmax_host = self
-            .scratch
-            .tree_argmax_host_pinned
-            .as_slice()
-            .map_err(|e| LlmError::Backend(format!("read pinned tree_argmax: {e:?}")))?;
-
-        // ── 7. CPU acceptance walk ────────────────────────────────────────
-        // For each tree node r in [0, tree_size), `argmax_host[r]` is the
-        // model's prediction for the next token if it had been fed the
-        // ancestor chain ending at r (root → ... → r).
         //
-        // Acceptance walk : start at root (cur=0). The model's prediction
-        // for the position AFTER the root is `argmax_host[0]`. If any
-        // child of root has token == argmax_host[0], accept that child,
-        // recurse from there. The first accepted token is always
-        // argmax_host[0] (since it's whatever the model would have
-        // sampled with the standard decode_step on `drafts[0]`).
-        //
-        // T246.10 A6 — prefill mode (`force_accept_all = true`) bypasses
-        // the walk and force-accepts every BFS-ordered node. For a
-        // linear-chain prefill the BFS order is the chain itself, so
-        // `accepted_indices[i] = i`, the compaction loop (step 8) is a no-op
-        // (each `src == i`), and step 9 advances counters by N.
-        let (accepted_indices, accepted_tokens): (Vec<usize>, Vec<u32>) = if force_accept_all {
+        // T246.10 TrackI — in capture mode the DtoH + host accept walk
+        // MUST happen AFTER `end_capture` (we can't read host-side
+        // pinned memory from inside a capturing stream). The caller
+        // (`prefill_tokens`) does this read post-replay. For linear-
+        // chain prefill the accept walk degenerates to
+        // `accepted_indices = [0..tree_size]` and the compact loop is
+        // a no-op (each `src == i`).
+        let (accepted_indices, accepted_tokens): (Vec<usize>, Vec<u32>) = if in_prefill_capture {
             let idx: Vec<usize> = (0..tree_size).collect();
-            let tok: Vec<u32> = (0..tree_size).map(|r| argmax_host[r]).collect();
-            (idx, tok)
+            (idx, Vec::new())
         } else {
-            // Build a child-list once : children[parent] = Vec<child_idx>.
-            let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
-            for (r, &p) in parents.iter().enumerate().skip(1) {
-                children[p as usize].push(r);
-            }
+            self.stream
+                .memcpy_dtoh(
+                    &self.scratch.tree_argmax,
+                    &mut self.scratch.tree_argmax_host_pinned,
+                )
+                .map_err(|e| LlmError::Backend(format!("dtoh tree_argmax: {e:?}")))?;
+            let argmax_host = self
+                .scratch
+                .tree_argmax_host_pinned
+                .as_slice()
+                .map_err(|e| LlmError::Backend(format!("read pinned tree_argmax: {e:?}")))?;
 
-            let mut a_indices: Vec<usize> = vec![0]; // root
-            let mut a_tokens: Vec<u32> = vec![argmax_host[0]];
-            let mut cur = 0usize;
-            loop {
-                let next_tok = argmax_host[cur];
-                // Look for a child of cur whose draft token equals next_tok.
-                let mut found: Option<usize> = None;
-                for &c in &children[cur] {
-                    if drafts[c] == next_tok {
-                        found = Some(c);
-                        break;
+            // ── 7. CPU acceptance walk ────────────────────────────────
+            // For each tree node r in [0, tree_size), `argmax_host[r]` is
+            // the model's prediction for the next token if it had been
+            // fed the ancestor chain ending at r (root → ... → r).
+            //
+            // T246.10 A6 — prefill mode (`force_accept_all = true`)
+            // bypasses the walk and force-accepts every BFS-ordered node.
+            if force_accept_all {
+                let idx: Vec<usize> = (0..tree_size).collect();
+                let tok: Vec<u32> = (0..tree_size).map(|r| argmax_host[r]).collect();
+                (idx, tok)
+            } else {
+                // Build a child-list once : children[parent] = Vec<child_idx>.
+                let mut children: Vec<Vec<usize>> = vec![Vec::new(); tree_size];
+                for (r, &p) in parents.iter().enumerate().skip(1) {
+                    children[p as usize].push(r);
+                }
+
+                let mut a_indices: Vec<usize> = vec![0]; // root
+                let mut a_tokens: Vec<u32> = vec![argmax_host[0]];
+                let mut cur = 0usize;
+                loop {
+                    let next_tok = argmax_host[cur];
+                    let mut found: Option<usize> = None;
+                    for &c in &children[cur] {
+                        if drafts[c] == next_tok {
+                            found = Some(c);
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(c) => {
+                            a_indices.push(c);
+                            a_tokens.push(argmax_host[c]);
+                            cur = c;
+                        },
+                        None => break,
                     }
                 }
-                match found {
-                    Some(c) => {
-                        // The child's *own* prediction (argmax_host[c]) is the
-                        // token AFTER c. So push c's index and the prediction
-                        // for one step beyond c.
-                        a_indices.push(c);
-                        a_tokens.push(argmax_host[c]);
-                        cur = c;
-                    },
-                    None => break,
-                }
+                (a_indices, a_tokens)
             }
-            (a_indices, a_tokens)
         };
-        let accept_len = accepted_tokens.len();
+        let accept_len = accepted_indices.len();
         debug_assert!(accept_len >= 1);
-        debug_assert_eq!(accepted_indices.len(), accept_len);
 
         // ── 8. Compact accepted KV slots into [pos_dev .. pos_dev+accept_len)
         // For each i in 1..accept_len, the accepted node's K/V was written
@@ -5488,7 +5620,11 @@ impl Qwen35ModelCudaQ4K {
                 .add_u32_dev(&self.stream, kvl_p, accept_len as i32)
                 .map_err(|e| LlmError::Backend(format!("add_u32_dev kv_len: {e:?}")))?;
         }
-        self.position += accept_len;
+        // T246.10 TrackI — host-side position bookkeeping moves to the
+        // caller (`prefill_tokens`) in capture mode.
+        if !in_prefill_capture {
+            self.position += accept_len;
+        }
 
         // The CUDA Graph (if any was captured for the single-token path) is
         // still valid : we did not modify any buffer it references.
