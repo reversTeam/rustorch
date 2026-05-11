@@ -7100,13 +7100,22 @@ fn moe_ffn_forward_step_group_gemm(
     // Download expert_bounds[n_experts+1] once if we'll need it (gate or up
     // through cuBLASLt). The sync is unavoidable — cuBLASLt host-side
     // launches need per-call M = expert_count_e known on the host.
+    //
+    // CRITICAL : memcpy_dtov is ASYNC w.r.t the host — it queues
+    // memcpy_dtoh_async on the stream and returns a Vec whose contents
+    // are not populated until the stream catches up. We MUST sync the
+    // stream AFTER the copy before reading the Vec, else we read stale
+    // host memory and dispatch cuBLASLt calls with garbage `count_e`
+    // values (which manifests as "expert 1 count=huge-negative" panics).
     let expert_bounds_host: Option<Vec<i32>> = if cublas_gate_active || cublas_up_active {
         let dev = expert_bounds_dev.expect("checked above");
-        Some(
-            stream
-                .memcpy_dtov(dev)
-                .map_err(|e| LlmError::Backend(format!("dtov expert_bounds: {e:?}")))?,
-        )
+        let v = stream
+            .memcpy_dtov(dev)
+            .map_err(|e| LlmError::Backend(format!("dtov expert_bounds: {e:?}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| LlmError::Backend(format!("sync after dtov expert_bounds: {e:?}")))?;
+        Some(v)
     } else {
         None
     };
@@ -7114,6 +7123,13 @@ fn moe_ffn_forward_step_group_gemm(
     if cublas_gate_active {
         let ctx = q4k_cublas.expect("checked above");
         let bounds = expert_bounds_host.as_ref().expect("set above");
+        if std::env::var("RUSTORCH_Q4K_MOE_CUBLAS_DEBUG").is_ok() {
+            eprintln!(
+                "[Q4K-CUBLAS] gate m={m_tokens} k_used={k} bounds[0..16]={:?} last={}",
+                &bounds[..16.min(bounds.len())],
+                bounds.last().copied().unwrap_or(-1)
+            );
+        }
         let mut session = ctx.session.borrow_mut();
         dispatch_q4k_moe_cublas(
             kernels,
@@ -7257,7 +7273,16 @@ fn moe_ffn_forward_step_group_gemm(
         && ids_dst_m_p != 0
         && expert_bounds_p != 0
         && is_sorted_kind(moe.down_exp_kind);
-    let cublas_down_active = q4k_cublas.is_some()
+    // Q4K-MOE-CUBLAS — DOWN path disabled by default. Most Qwen3.6 builds
+    // ship down_exps as Q5_K, not Q4_K. Even when Q4_K, gating it on
+    // separately keeps Phase 2 wiring atomic. Set RUSTORCH_Q4K_MOE_CUBLAS_DOWN=1
+    // to opt in.
+    let cublas_down_enabled = std::env::var("RUSTORCH_Q4K_MOE_CUBLAS_DOWN")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let cublas_down_active = cublas_down_enabled
+        && q4k_cublas.is_some()
         && expert_bounds_dev.is_some()
         && down_sort_active
         && m_tokens >= Q4K_MOE_CUBLAS_MIN_M
@@ -7287,6 +7312,9 @@ fn moe_ffn_forward_step_group_gemm(
         let bounds: Vec<i32> = stream
             .memcpy_dtov(dev)
             .map_err(|e| LlmError::Backend(format!("dtov expert_bounds down: {e:?}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| LlmError::Backend(format!("sync after dtov down: {e:?}")))?;
         let mut session = ctx.session.borrow_mut();
         dispatch_q4k_moe_cublas(
             kernels,

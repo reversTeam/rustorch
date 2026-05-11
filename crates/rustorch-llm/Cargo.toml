@@ -179,3 +179,9 @@ required-features = ["cuda"]
 name = "training_bench_cuda_breakdown"
 path = "examples/training_bench_cuda_breakdown.rs"
 required-features = ["cuda"]
+
+# T246.12 MAX-CAP-TRAIN.1 — max-capacity CUDA training bench.
+[[example]]
+name = "training_bench_max_capacity_cuda"
+path = "examples/training_bench_max_capacity_cuda.rs"
+required-features = ["cuda"]
