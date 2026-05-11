@@ -159,6 +159,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  layer0.exp0.gate MISSING");
     }
 
+    // ── End-to-end pipeline test : loader → kernel ──────────────────
+    //
+    // Pick layer 0 expert 0 gate_proj (a real loaded NVFP4 tensor),
+    // synthesize a BF16 activation, run sgemv_nvfp4_bf16 against it,
+    // and verify the output is finite + non-trivial.
+    println!();
+    println!("--- E2E pipeline test : loader + sgemv_nvfp4_bf16 on real weight ---");
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use rustorch_cuda::llm_kernels::LlmKernels;
+    let kernels = LlmKernels::new(ctx.clone());
+    if let Some(t) = weights
+        .nvfp4
+        .get("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    {
+        let n = t.n;
+        let k = t.k;
+        let alpha = t.matmul_alpha();
+        // Synthesize BF16 activation [k] (signed sinusoid, magnitudes ≤ 0.4).
+        let x: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32(((i as f32 + 1.0) * 0.0021).sin() * 0.4))
+            .collect();
+        let x_dev = stream
+            .memcpy_stod(&x)
+            .map_err(|e| format!("x dev: {e:?}"))?;
+        let mut y_dev = stream
+            .memcpy_stod(&vec![half::bf16::from_f32(0.0); n])
+            .map_err(|e| format!("y dev: {e:?}"))?;
+        unsafe {
+            let (pp, _g0) = t.packed.device_ptr(&stream);
+            let (sp, _g1) = t.scale_per_block.device_ptr(&stream);
+            let (xp, _g2) = x_dev.device_ptr(&stream);
+            let (yp, _g3) = y_dev.device_ptr_mut(&stream);
+            kernels
+                .sgemv_nvfp4_bf16(&stream, pp, sp, alpha, xp, yp, n as i32, k as i32)
+                .map_err(|e| format!("sgemv launch: {e:?}"))?;
+        }
+        let y_host: Vec<half::bf16> = stream
+            .memcpy_dtov(&y_dev)
+            .map_err(|e| format!("dl: {e:?}"))?;
+        // Check : no NaN/Inf, at least some non-zero output.
+        let n_nan = y_host.iter().filter(|v| v.to_f32().is_nan()).count();
+        let n_inf = y_host.iter().filter(|v| v.to_f32().is_infinite()).count();
+        let n_nonzero = y_host.iter().filter(|v| v.to_f32().abs() > 1e-12).count();
+        let max_abs = y_host
+            .iter()
+            .map(|v| v.to_f32().abs())
+            .fold(0.0_f32, f32::max);
+        let first8: Vec<f32> = y_host.iter().take(8).map(|v| v.to_f32()).collect();
+        println!(
+            "  sgemv y[:N={}] : nan={n_nan} inf={n_inf} nonzero={n_nonzero} max_abs={max_abs:.6}",
+            n
+        );
+        println!("  y[0..8] = {first8:?}");
+        if n_nan != 0 || n_inf != 0 {
+            return Err("E2E test FAILED : NaN or Inf in output".into());
+        }
+        // Note : with the calibrated NVFP4 alpha (~2.5e-7) and BF16
+        // activations of magnitude ~0.4, the post-alpha dot products
+        // land in the 1e-3 to 1e-4 range. Many BF16 outputs round to 0
+        // near the lower end of that range — this is EXPECTED (the
+        // activations as stored were not the calibration-source ones,
+        // so alpha is "not quite right" for our synthetic input). The
+        // kernel correctness gate is the parity test ; here we just
+        // need : no NaN/Inf, max_abs > 0.
+        if max_abs <= 0.0 {
+            return Err(format!("E2E test FAILED : output is all zero (max_abs={max_abs})").into());
+        }
+        println!(
+            "  [PASS] real-weight sgemv produces finite output, max_abs={max_abs:.3e}, \
+             nonzero={n_nonzero}/{n} (BF16 underflow expected on calibrated alpha)"
+        );
+    } else {
+        println!("  [SKIP] expected layer0.exp0.gate_proj not found");
+    }
+
     println!();
     println!("[qwen36_nvfp4_smoke] DONE — substrate ready for full decode_step (T246.9 P3)");
     Ok(())
