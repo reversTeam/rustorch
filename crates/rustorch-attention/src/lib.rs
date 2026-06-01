@@ -23,6 +23,8 @@ pub mod cpu_forward;
 pub mod gpu_wgsl;
 pub mod mask;
 pub mod online_softmax;
+// Pulp-dispatched SIMD primitives for Flash inner softmax (T8-new).
+mod simd;
 
 pub use cpu_backward::flash_backward;
 pub use cpu_forward::{

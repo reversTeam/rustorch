@@ -14,22 +14,25 @@ categories.workspace = true
 default = []
 # T241.3 — CUDA backend (LlamaModelCuda). Without this, CPU/Metal still
 # build. Requires CUDA toolkit at compile time and runtime on the host.
-cuda = ["dep:rustorch-cuda", "dep:cudarc", "dep:half"]
+cuda = ["dep:rustorch-cuda", "dep:cudarc"]
 
 [dependencies]
 rustorch-core      = { workspace = true }
 rustorch-serde     = { workspace = true }
 rustorch-nn        = { workspace = true }
+rustorch-autograd  = { workspace = true }
 rustorch-tokenizer = { workspace = true }
 rustorch-fusion    = { workspace = true }
 rustorch-gguf      = { workspace = true }
 serde              = { workspace = true, features = ["derive"] }
 serde_json         = { version = "1" }
+rayon              = { workspace = true }
+gemm               = { version = "0.18", default-features = false, features = ["rayon"] }
+half               = { workspace = true }
 
 # T241.3 — CUDA backend (gated by `cuda` feature).
 rustorch-cuda = { workspace = true, optional = true, features = ["cuda"] }
 cudarc        = { version = "0.17", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "dynamic-loading", "cuda-version-from-build-system", "f16"], optional = true }
-half          = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Used by `qwen_inference_metal` example to wire our T71/T72 Metal
@@ -39,6 +42,10 @@ rustorch-metal = { workspace = true }
 rustorch-cpu   = { workspace = true } # T171 — AMX (Accelerate) path for F32 small matmul
 metal          = "0.29"
 half           = { workspace = true } # T180 — F32 → Q8_0 routing requantization
+
+# T246.11 TRAINING-BENCH.1 — optimizer for the CUDA training bench example.
+[dev-dependencies]
+rustorch-optim = { workspace = true }
 
 [[example]]
 name = "qwen_inference"
@@ -80,4 +87,101 @@ required-features = ["cuda"]
 [[example]]
 name = "qwen_parity_test"
 path = "examples/qwen_parity_test.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen_cuda_inference"
+path = "examples/qwen_cuda_inference.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_cpu_inference"
+path = "examples/qwen35_cpu_inference.rs"
+
+[[example]]
+name = "qwen_q4k_bench"
+path = "examples/qwen_q4k_bench.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen36_cuda_load_test"
+path = "examples/qwen36_cuda_load_test.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen36_cuda_decode_smoke"
+path = "examples/qwen36_cuda_decode_smoke.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen36_cuda_parity_check"
+path = "examples/qwen36_cuda_parity_check.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen36_cuda_determinism_test"
+path = "examples/qwen36_cuda_determinism_test.rs"
+required-features = ["cuda"]
+
+# T246.7 P1.3d — decode_step_tree(tree_size=1) smoke test.
+[[example]]
+name = "qwen36_cuda_decode_step_tree_smoke"
+path = "examples/qwen36_cuda_decode_step_tree_smoke.rs"
+required-features = ["cuda"]
+
+# T246.7 P1.2 — Lookahead Decoding CPU-side microbench.
+[[example]]
+name = "lookahead_pool_microbench"
+path = "examples/lookahead_pool_microbench.rs"
+
+# T246.7 P1.4b — Lookahead-enabled decode bench (baseline vs Lookahead, parity check).
+[[example]]
+name = "qwen2_lookahead_bench"
+path = "examples/qwen2_lookahead_bench.rs"
+required-features = ["cuda"]
+
+# T246.7 TrackC.3 — hybrid (SSM+Attn) decode_step_tree smoke test (Qwen3.6).
+[[example]]
+name = "qwen36_hybrid_tree_smoke"
+path = "examples/qwen36_hybrid_tree_smoke.rs"
+required-features = ["cuda"]
+
+# T246.9 NVFP4.4 — load + per-layer inventory smoke test for the
+# Qwen3.6-A3B-NVFP4 vLLM-quantized safetensors checkpoint.
+[[example]]
+name = "qwen36_nvfp4_smoke"
+path = "examples/qwen36_nvfp4_smoke.rs"
+required-features = ["cuda"]
+
+# T246.10 A6 — batched prefill bench (pp32/128/256/512) on Qwen3.6 Q4_K_M.
+[[example]]
+name = "qwen36_cuda_prefill_bench"
+path = "examples/qwen36_cuda_prefill_bench.rs"
+required-features = ["cuda"]
+
+# T246.10 A6 — prefill_tokens parity test vs N-step decode_step loop.
+[[example]]
+name = "qwen36_cuda_prefill_parity"
+path = "examples/qwen36_cuda_prefill_parity.rs"
+required-features = ["cuda"]
+
+# T246.11 TRAINING-BENCH.1 — rustorch CUDA training throughput bench.
+# Measures fwd+bwd+opt step tokens/sec on a synthetic transformer block
+# (RMSNorm → BF16 GEMM → SwiGLU → BF16 GEMM → residual) for direct
+# comparison against PyTorch CUDA on the same DGX GB10 hardware.
+[[example]]
+name = "training_bench_cuda"
+path = "examples/training_bench_cuda.rs"
+required-features = ["cuda"]
+
+# T246.11 TRAINING-BENCH.3 — per-op breakdown to identify the rustorch slow path.
+[[example]]
+name = "training_bench_cuda_breakdown"
+path = "examples/training_bench_cuda_breakdown.rs"
+required-features = ["cuda"]
+
+# T246.12 MAX-CAP-TRAIN.1 — max-capacity CUDA training bench.
+[[example]]
+name = "training_bench_max_capacity_cuda"
+path = "examples/training_bench_max_capacity_cuda.rs"
 required-features = ["cuda"]

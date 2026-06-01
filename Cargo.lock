@@ -3595,6 +3595,7 @@ dependencies = [
  "gemm 0.18.2",
  "half",
  "proptest",
+ "rayon",
 ]
 
 [[package]]
@@ -3604,6 +3605,7 @@ dependencies = [
  "criterion",
  "gemm 0.18.2",
  "proptest",
+ "pulp 0.22.2",
  "rayon",
 ]
 
@@ -3738,6 +3740,7 @@ dependencies = [
  "cudarc",
  "half",
  "proptest",
+ "rustorch-gguf",
 ]
 
 [[package]]
@@ -3794,14 +3797,20 @@ dependencies = [
 name = "rustorch-llm"
 version = "0.0.1"
 dependencies = [
+ "cudarc",
+ "gemm 0.18.2",
  "half",
  "metal",
+ "rayon",
+ "rustorch-autograd",
  "rustorch-core",
  "rustorch-cpu",
+ "rustorch-cuda",
  "rustorch-fusion",
  "rustorch-gguf",
  "rustorch-metal",
  "rustorch-nn",
+ "rustorch-optim",
  "rustorch-serde",
  "rustorch-tokenizer",
  "serde",

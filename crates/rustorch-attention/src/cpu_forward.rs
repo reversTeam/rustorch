@@ -42,6 +42,8 @@
 use crate::mask::{Mask, MaskError};
 #[cfg(target_arch = "wasm32")]
 use crate::online_softmax::OnlineSoftmaxState;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::simd as simd_inner;
 use rayon::prelude::*;
 
 /// Shape parameters for a single Flash Attention call.
@@ -294,6 +296,12 @@ fn flash_forward_bh_blas(
     let mut m_buf = vec![f32::NEG_INFINITY; br];
     let mut l_buf = vec![0.0_f32; br];
 
+    // T8-new — runtime SIMD dispatch (NEON on aarch64 / AVX2 on x86).
+    // `Arch::new()` is a cheap one-shot CPU-feature probe; the
+    // returned `Arch` is `Copy` and passed by value into each inner
+    // helper, which inlines through `WithSimd::with_simd`.
+    let arch = pulp::Arch::new();
+
     let mut qi = 0;
     while qi < seq {
         let qi_end = (qi + br).min(seq);
@@ -303,10 +311,10 @@ fn flash_forward_bh_blas(
         for r in 0..br_used {
             m_buf[r] = f32::NEG_INFINITY;
             l_buf[r] = 0.0;
-            for d in 0..dim {
-                o_buf[r * dim + d] = 0.0;
-            }
         }
+        // SIMD-fill the per-row output buffer in one pass instead of
+        // br_used × dim scalar stores.
+        simd_inner::fill_zero(arch, &mut o_buf[..br_used * dim]);
 
         let mut kj = 0;
         while kj < seq {
@@ -351,15 +359,22 @@ fn flash_forward_bh_blas(
                 }
             }
 
-            // Per-row online softmax update.
+            // Per-row online softmax update (T8-new — SIMD inner).
+            //
+            // Each row of `S` is a `bc_used`-element vector; we run:
+            //   1. `m_tile = max(s_row)` — SIMD `row_max`
+            //   2. `m_new  = max(m_tile, m_prev)`
+            //   3. `alpha  = exp(m_prev - m_new)`
+            //   4. `o_row *= alpha`  (only if alpha != 1) — SIMD
+            //      `scale_in_place` over `dim` elements
+            //   5. `p_row[i] = exp(s_row[i] - m_new); tile_l = sum p_row`
+            //      — scalar `exp_minus_max_and_sum` (libm path, scalar
+            //      exp is monomorphic and the compiler emits libsystem_m
+            //      vectorised expf on M-series)
+            //   6. `l_buf[r] += tile_l; m_buf[r] = m_new`
             for r in 0..br_used {
                 let s_row = &s_buf[r * bc_used..r * bc_used + bc_used];
-                let mut m_tile = f32::NEG_INFINITY;
-                for &x in s_row {
-                    if x > m_tile {
-                        m_tile = x;
-                    }
-                }
+                let m_tile = simd_inner::row_max(arch, s_row);
                 let m_prev = m_buf[r];
                 let m_new = if m_tile > m_prev { m_tile } else { m_prev };
                 let alpha = if m_prev == f32::NEG_INFINITY {
@@ -369,18 +384,10 @@ fn flash_forward_bh_blas(
                 };
                 if alpha != 1.0 {
                     l_buf[r] *= alpha;
-                    let o_row = &mut o_buf[r * dim..r * dim + dim];
-                    for o in o_row.iter_mut() {
-                        *o *= alpha;
-                    }
+                    simd_inner::scale_in_place(arch, &mut o_buf[r * dim..r * dim + dim], alpha);
                 }
                 let p_row = &mut p_buf[r * bc_used..r * bc_used + bc_used];
-                let mut tile_l = 0.0_f32;
-                for (out_p, &x) in p_row.iter_mut().zip(s_row.iter()) {
-                    let p = (x - m_new).exp();
-                    *out_p = p;
-                    tile_l += p;
-                }
+                let tile_l = simd_inner::exp_minus_max_and_sum(arch, p_row, s_row, m_new);
                 l_buf[r] += tile_l;
                 m_buf[r] = m_new;
             }
@@ -402,17 +409,17 @@ fn flash_forward_bh_blas(
             kj = kj_end;
         }
 
-        // Write back per-row normalised output.
+        // Write back per-row normalised output (T8-new — SIMD).
+        // Final pass: `out[r, :] = o_buf[r, :] / l[r]`. Single splat +
+        // SIMD multiply per row (dim=64 on the bench shape → 16 NEON
+        // f32x4 stores per row, vs 64 scalar stores previously).
         for r in 0..br_used {
             let qi_row = qi + r;
             let dst = &mut out_slab[qi_row * s_n..qi_row * s_n + dim];
             let l = l_buf[r];
             let o_row = &o_buf[r * dim..r * dim + dim];
             if l > 0.0 && l.is_finite() {
-                let inv_l = 1.0 / l;
-                for (out, &o) in dst.iter_mut().zip(o_row.iter()) {
-                    *out = o * inv_l;
-                }
+                simd_inner::mul_scalar(arch, dst, o_row, 1.0 / l);
             } else {
                 for x in dst.iter_mut() {
                     *x = f32::NAN;

@@ -45,10 +45,25 @@ use serde::Deserialize;
 
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+#[cfg(feature = "cuda")]
+pub mod cuda_backend_q4k;
 pub mod gguf_loader;
+pub mod lookahead;
 pub mod model;
 pub mod qwen35;
 pub mod qwen35_cpu;
+pub mod qwen35_cuda;
+#[cfg(feature = "cuda")]
+pub mod qwen35_cuda_q4k;
+// T246.9 — NVFP4 path (vLLM nvfp4-pack-quantized safetensors loader +
+// indexed FP4 MoE kernels + Qwen35ModelCudaNVFP4 model class).
+#[cfg(feature = "cuda")]
+pub mod qwen35_cuda_nvfp4;
+
+// T247 Phase 2 — autograd dispatch wiring for CUDA backward kernels.
+#[cfg(feature = "cuda")]
+pub mod cuda_train;
+
 #[cfg(feature = "cuda")]
 pub use cuda_backend::LlamaModelCuda;
 pub use gguf_loader::{GgufBlockWeights, GgufWeights};

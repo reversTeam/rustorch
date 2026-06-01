@@ -127,6 +127,12 @@ heck        = "0.5"   # case conversions in codegen
 # than pulp but no nightly required).
 wide        = "0.7"
 
+# Portable SIMD via pulp — runtime arch dispatch (NEON / AVX2 / AVX-512) with
+# typed lane registers (`f32s`, `f64s`, ...) and an autovec-friendly inline
+# `dispatch()`. Used by T8-new (Flash Attention softmax inner SIMD) and
+# elementwise kernels where vDSP is unavailable. Stable, no nightly required.
+pulp        = { version = "0.22", default-features = false, features = ["std"] }
+
 # n-dimensional array interop (P1.1 task `Conversions` — feature-gated).
 ndarray     = "0.16"
 

@@ -13,6 +13,13 @@ categories.workspace = true
 [dependencies]
 rayon = { workspace = true }
 
+# Portable SIMD for the Flash inner softmax loops (max-reduce, exp, sum,
+# rescale, write-back normalise). The QK^T and PV matmuls already hit
+# Accelerate AMX peak — what's left scalar between them is per-tile
+# softmax housekeeping, which pulp vectorises with 4-wide NEON on M-series
+# and 8-wide AVX2 on x86 (T8-new).
+pulp = { workspace = true }
+
 # State-of-the-art pure-Rust GEMM (faer-rs ecosystem). Used as the
 # non-macOS f32 path for Flash Attention's tile-level Q@K^T and P@V
 # matmuls. P3.X T6 (flash BLAS path).

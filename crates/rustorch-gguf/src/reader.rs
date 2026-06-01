@@ -285,11 +285,115 @@ pub struct GgufFile {
     alignment: u64,
 }
 
+/// T241.7 — detect multi-shard pattern `*-XXXXX-of-YYYYY.gguf` and
+/// return the ordered list of all shard paths if `path` matches the
+/// pattern AND all siblings exist. Returns None for single-file GGUF.
+fn detect_shards(path: &Path) -> Option<Vec<std::path::PathBuf>> {
+    let stem = path.file_name()?.to_str()?;
+    // Match suffix "-XXXXX-of-YYYYY.gguf"
+    if !stem.ends_with(".gguf") {
+        return None;
+    }
+    let core = &stem[..stem.len() - 5]; // strip ".gguf"
+                                        // Find "-of-" pattern.
+    let of_pos = core.rfind("-of-")?;
+    let cur_str = &core[..of_pos];
+    let total_str = &core[of_pos + 4..];
+    // The cur part must end with "-NNNNN" digits.
+    let dash_pos = cur_str.rfind('-')?;
+    let cur_digits = &cur_str[dash_pos + 1..];
+    if !cur_digits.chars().all(|c| c.is_ascii_digit()) || cur_digits.is_empty() {
+        return None;
+    }
+    if !total_str.chars().all(|c| c.is_ascii_digit()) || total_str.is_empty() {
+        return None;
+    }
+    let total: u32 = total_str.parse().ok()?;
+    if total < 2 {
+        return None;
+    }
+    let prefix = &core[..dash_pos]; // before "-NNNNN-of-..."
+    let parent = path.parent()?;
+    let width = cur_digits.len();
+    let mut shards: Vec<std::path::PathBuf> = Vec::with_capacity(total as usize);
+    for i in 1..=total {
+        let name = format!("{prefix}-{:0width$}-of-{total_str}.gguf", i, width = width);
+        let shard_path = parent.join(name);
+        if !shard_path.exists() {
+            return None;
+        }
+        shards.push(shard_path);
+    }
+    Some(shards)
+}
+
 impl GgufFile {
     /// Read and parse a GGUF file from disk.
+    ///
+    /// T241.7 — auto-detect multi-shard pattern (`*-XXXXX-of-YYYYY.gguf`).
+    /// If the path matches such pattern, all sibling shards are merged
+    /// into a single virtual GgufFile (metadata from shard #1, tensors
+    /// from all shards, contiguous data buffer in memory).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GgufError> {
-        let bytes = fs::read(path.as_ref())?;
+        let p = path.as_ref();
+        if let Some(shards) = detect_shards(p) {
+            return Self::open_multi_shard(&shards);
+        }
+        let bytes = fs::read(p)?;
         Self::from_bytes(bytes)
+    }
+
+    /// Open and merge multi-shard GGUF files into a single virtual file.
+    /// Each shard is a self-contained GGUF with its own header, metadata
+    /// and tensors. We take metadata from shard #1, then concatenate the
+    /// tensor info entries from all shards (re-mapping their data offsets
+    /// to a unified buffer).
+    fn open_multi_shard(paths: &[std::path::PathBuf]) -> Result<Self, GgufError> {
+        if paths.is_empty() {
+            return Err(GgufError::Io(std::io::Error::other("empty shard list")));
+        }
+        let mut merged_tensors: Vec<TensorInfo> = Vec::new();
+        let mut merged_data: Vec<u8> = Vec::new();
+        let mut merged_metadata: Option<Metadata> = None;
+        let mut version: u32 = 3;
+        let mut alignment: u64 = GGUF_DEFAULT_ALIGNMENT;
+        for (idx, p) in paths.iter().enumerate() {
+            let bytes = fs::read(p)?;
+            let shard = Self::from_bytes(bytes)?;
+            if idx == 0 {
+                merged_metadata = Some(shard.metadata.clone());
+                version = shard.version;
+                alignment = shard.alignment;
+            }
+            // Re-base each tensor's offset so it points into the merged
+            // contiguous buffer.
+            let base_offset = merged_data.len() as u64;
+            for t in shard.tensors.iter() {
+                let mut nt = t.clone();
+                nt.offset = base_offset + t.offset;
+                merged_tensors.push(nt);
+            }
+            // Append shard's tensor data section. Pad to alignment so the
+            // next shard's first tensor starts on the right boundary.
+            let data_start = shard.data_offset as usize;
+            merged_data.extend_from_slice(&shard.bytes[data_start..]);
+            // Pad merged_data to alignment for the NEXT shard.
+            let len = merged_data.len() as u64;
+            let pad = (alignment - (len % alignment)) % alignment;
+            merged_data.extend(std::iter::repeat(0u8).take(pad as usize));
+        }
+        // Build a fake bytes buffer with a minimal header so data_offset=0
+        // and our slicing code works. We just prepend the data section.
+        // The simplest representation : `bytes` = data section, and
+        // `data_offset` = 0.
+        Ok(Self {
+            bytes: merged_data,
+            version,
+            metadata: merged_metadata.unwrap_or_default(),
+            tensors: merged_tensors,
+            data_offset: 0,
+            alignment,
+        })
     }
 
     /// Parse from an owned byte buffer (use this with `mmap` slices).

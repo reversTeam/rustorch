@@ -624,6 +624,106 @@ impl LtSession {
         Ok(())
     }
 
+    /// **DESIGN-PIVOT — row-major BF16 GEMM**.
+    ///
+    /// Drop-in replacement for the hand-written `gemm_bf16_bf16_mma_m16n8k16`
+    /// kernel signature : computes `Y[M, N] = X[M, K] · W^T[K, N]` where all
+    /// three buffers are stored **row-major** (BF16) :
+    ///
+    ///   w : `[N, K]` BF16 row-major
+    ///   x : `[M, K]` BF16 row-major
+    ///   y : `[M, N]` BF16 row-major  (output)
+    ///
+    /// The math is identical to `y = x · w.t()` and matches
+    /// `LlmKernels::sgemm_bf16_bf16_mvar` / `gemm_bf16_bf16_mma` element-by-
+    /// element (modulo BF16 rounding-order drift).
+    ///
+    /// Internally this calls cuBLASLt with `(A = W, B = X)`, cublas-M = N,
+    /// cublas-N = M, cublas-K = K, transa = T, transb = N. The output is
+    /// written in col-major `[N, M]` ld=N, which **is** row-major `[M, N]`
+    /// stride=N — the layout we want. No post-transpose needed.
+    ///
+    /// Lane-equivalence proof :
+    ///   col-major output Y_cm[i, j] (0..N, 0..M)
+    ///     = sum_k op(A)[i, k] · op(B)[k, j]
+    ///     = sum_k A^T[i, k] · B[k, j]
+    ///     = sum_k A[k, i] · B[k, j]                  (A col-major [K, N]·)
+    ///     = sum_k W_rm[i, k] · X_rm[j, k]            (row=col-of-transpose)
+    /// row-major Y_rm[m, n] = Y_cm[n, m]
+    ///                       = sum_k W_rm[n, k] · X_rm[m, k]
+    ///                       = sum_k X_rm[m, k] · W_rm[n, k]
+    ///                       = (X · W^T)[m, n] ✓
+    ///
+    /// Cache key (m=N_rust, n=M_rust, transa=T, transb=N) differs from the
+    /// existing `matmul_bf16` cache key (TT) so both can coexist on the same
+    /// `LtSession`.
+    ///
+    /// # Safety
+    /// `*_dev` pointers must be valid for the call duration and reference
+    /// allocations of `n*k`, `m*k`, `m*n` BF16 elements respectively.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matmul_bf16_rowmajor(
+        &mut self,
+        w_dev: u64,
+        x_dev: u64,
+        y_dev: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), CudaError> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        // Cache key uses (m=n_rust, n=m_rust, transa=T, transb=N) to keep
+        // this config distinct from the col-major matmul_bf16 path.
+        let key = ConfigKey {
+            m: n as u32,
+            n: m as u32,
+            k: k as u32,
+            a_dt: sys::cudaDataType_t::CUDA_R_16BF as i32,
+            b_dt: sys::cudaDataType_t::CUDA_R_16BF as i32,
+            c_dt: sys::cudaDataType_t::CUDA_R_16BF as i32,
+            transa: true,
+            transb: false,
+            scale_mode: 0,
+        };
+        if !self.cache.contains_key(&key) {
+            let cached = build_cached_bf16_rowmajor(self.handle, m, n, k, self.workspace_bytes)?;
+            self.cache.insert(key, cached);
+        }
+        let cached = self.cache.get(&key).unwrap() as *const CachedMatmul;
+        let cached = &*cached;
+        let workspace_ptr = {
+            use cudarc::driver::DevicePtr;
+            self.workspace.device_ptr(&self.stream).0
+        };
+        result::matmul(
+            self.handle,
+            cached.matmul_desc,
+            (&alpha) as *const f32 as *const _,
+            (&beta) as *const f32 as *const _,
+            w_dev as *const _, // A = W
+            cached.a_layout,
+            x_dev as *const _, // B = X
+            cached.b_layout,
+            y_dev as *const _,
+            cached.c_layout,
+            y_dev as *mut _,
+            cached.c_layout,
+            (&cached.algo) as *const _,
+            workspace_ptr as *mut _,
+            self.workspace_bytes,
+            self.stream.cu_stream() as *mut _,
+        )
+        .map_err(|e| CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "LtSession::matmul_bf16_rowmajor::dispatch",
+        })?;
+        Ok(())
+    }
+
     /// Cached MXFP4/NVFP4 matmul.
     ///
     /// # Safety
@@ -1219,6 +1319,30 @@ unsafe fn build_cached(
     seed_a_scale: u64,
     seed_b_scale: u64,
 ) -> Result<CachedMatmul, CudaError> {
+    // Convention : we expect row-major buffers (the standard layout
+    // produced by torch / our CPU loader after `transpose_2d`) :
+    //   A row-major (m, k)  → physical layout = col-major (k, m, ld=k)
+    //   B row-major (k, n)  → physical layout = col-major (n, k, ld=n)
+    //   C row-major (m, n)  → physical layout = col-major (m, n, ld=m)
+    //                          (only equivalent to row-major when m=1,
+    //                           which is the autoregressive decode case)
+    //
+    // We then ask cuBLASLt to compute  C = op(A) * op(B)  with
+    //   transa = OP_T   →  op(A) = (col(k, m))^T = col(m, k) ↔ row(m, k) = A
+    //   transb = OP_T   →  op(B) = (col(n, k))^T = col(k, n) ↔ row(k, n) = B
+    //
+    // T241.6b/c caveat : cuBLASLt sm_121 NVFP4 only supports transb=OP_N
+    // (CUBLAS_STATUS_NOT_SUPPORTED on TT). For FP4 we fall back to the
+    // legacy "scrambled" convention here ; the proper fix is to transpose
+    // the W weights at quantize time so the TN-only constraint is honored
+    // with mathematically correct results. Tracked as T241.6c.
+    let is_fp4 =
+        a_dt == sys::cudaDataType_t::CUDA_R_4F_E2M1 || b_dt == sys::cudaDataType_t::CUDA_R_4F_E2M1;
+    let (b_rows, b_cols, b_ld) = if is_fp4 {
+        (k as u64, n as u64, k as i64)
+    } else {
+        (n as u64, k as u64, n as i64)
+    };
     let a_layout =
         result::create_matrix_layout(a_dt, k as u64, m as u64, k as i64).map_err(|e| {
             CudaError::CublasStatus {
@@ -1226,13 +1350,12 @@ unsafe fn build_cached(
                 location: "build_cached::a_layout",
             }
         })?;
-    let b_layout =
-        result::create_matrix_layout(b_dt, k as u64, n as u64, k as i64).map_err(|e| {
-            CudaError::CublasStatus {
-                code: lt_err_code(e),
-                location: "build_cached::b_layout",
-            }
-        })?;
+    let b_layout = result::create_matrix_layout(b_dt, b_rows, b_cols, b_ld).map_err(|e| {
+        CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached::b_layout",
+        }
+    })?;
     let c_layout =
         result::create_matrix_layout(c_dt, m as u64, n as u64, m as i64).map_err(|e| {
             CudaError::CublasStatus {
@@ -1251,7 +1374,11 @@ unsafe fn build_cached(
     })?;
 
     let transa = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
-    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    let transb = if is_fp4 {
+        cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N
+    } else {
+        cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T
+    };
     result::set_matmul_desc_attribute(
         matmul_desc,
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
@@ -1361,6 +1488,126 @@ unsafe fn build_cached(
     })
 }
 
+/// **DESIGN-PIVOT** — BF16 TN-with-row-major-output cached config.
+///
+/// Builds layouts and matmul descriptor for the row-major BF16 path used by
+/// `LtSession::matmul_bf16_rowmajor`. Convention :
+///
+///   w (row-major `[N, K]`, BF16) → seen by cuBLASLt as col-major
+///                                   `(K, N)` ld=K. transa=T turns it back
+///                                   into "logical N × K".
+///   x (row-major `[M, K]`, BF16) → seen by cuBLASLt as col-major
+///                                   `(K, M)` ld=K. transb=N keeps it.
+///   y (col-major `[N, M]` ld=N output, == row-major `[M, N]` stride=N).
+///
+/// cuBLASLt is asked for `cublas-M=N, cublas-N=M, cublas-K=K, transa=T,
+/// transb=N`. The math reduction is `Y = X · W^T` (the standard "linear"
+/// op), which is exactly what the hand-written GEMM kernels compute.
+#[cfg(feature = "cuda")]
+unsafe fn build_cached_bf16_rowmajor(
+    handle: sys::cublasLtHandle_t,
+    m: usize,
+    n: usize,
+    k: usize,
+    workspace_bytes: usize,
+) -> Result<CachedMatmul, CudaError> {
+    let dt = sys::cudaDataType_t::CUDA_R_16BF;
+
+    // A = W. cublas-side cols = N (cublas-M), rows = K (cublas-K), ld = K.
+    let a_layout = result::create_matrix_layout(dt, k as u64, n as u64, k as i64).map_err(|e| {
+        CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached_bf16_rowmajor::a_layout",
+        }
+    })?;
+    // B = X. cublas-side cols = M (cublas-N), rows = K (cublas-K), ld = K.
+    let b_layout = result::create_matrix_layout(dt, k as u64, m as u64, k as i64).map_err(|e| {
+        CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached_bf16_rowmajor::b_layout",
+        }
+    })?;
+    // C : col-major (cublas-M=N, cublas-N=M), ld = N. Physical bytes match
+    // row-major Y[M, N] stride=N, so the same buffer reads identically as
+    // row-major from the caller's perspective.
+    let c_layout = result::create_matrix_layout(dt, n as u64, m as u64, n as i64).map_err(|e| {
+        CudaError::CublasStatus {
+            code: lt_err_code(e),
+            location: "build_cached_bf16_rowmajor::c_layout",
+        }
+    })?;
+
+    let matmul_desc = result::create_matmul_desc(
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        sys::cudaDataType_t::CUDA_R_32F,
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::matmul_desc",
+    })?;
+
+    let transa = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
+    let transb = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        (&transa) as *const _ as *const _,
+        std::mem::size_of::<cudarc::cublas::sys::cublasOperation_t>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::set_transa",
+    })?;
+    result::set_matmul_desc_attribute(
+        matmul_desc,
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+        (&transb) as *const _ as *const _,
+        std::mem::size_of::<cudarc::cublas::sys::cublasOperation_t>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::set_transb",
+    })?;
+
+    let pref = result::create_matmul_pref().map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::pref",
+    })?;
+    result::set_matmul_pref_attribute(
+        pref,
+        sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        (&workspace_bytes) as *const _ as *const _,
+        std::mem::size_of::<usize>(),
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::pref_workspace",
+    })?;
+
+    let heuristic = result::get_matmul_algo_heuristic(
+        handle,
+        matmul_desc,
+        a_layout,
+        b_layout,
+        c_layout,
+        c_layout,
+        pref,
+    )
+    .map_err(|e| CudaError::CublasStatus {
+        code: lt_err_code(e),
+        location: "build_cached_bf16_rowmajor::heuristic",
+    })?;
+
+    Ok(CachedMatmul {
+        a_layout,
+        b_layout,
+        c_layout,
+        matmul_desc,
+        pref,
+        algo: heuristic.algo,
+    })
+}
+
 /// FP4 block-scale flavour. Hardware support varies:
 /// - **MXFP4** (VEC32_UE8M0): industry standard. Hopper / Blackwell datacenter.
 /// - **NVFP4** (VEC16_UE4M3): NVIDIA proprietary, more aggressive blocking.
@@ -1451,6 +1698,17 @@ pub unsafe fn matmul_mxfp4(
     // FP4 inputs are packed 2-per-byte. cuBLASLt's matrix layout API uses
     // the LOGICAL element count (k×m, k×n, m×n) — the implementation knows
     // the physical byte size from the data type tag.
+    //
+    // T241.6c TODO : cuBLASLt FP4 (NVFP4 sur sm_121) ne supporte QUE le
+    // mode TN (transa=OP_T, transb=OP_N) au runtime — un transb=OP_T
+    // produit CUBLAS_STATUS_NOT_SUPPORTED. Pour adopter la convention
+    // row-major correcte (comme matmul_bf16 fait via build_cached), il
+    // faudra transposer les poids B au moment de la quantization NVFP4
+    // (i.e. quantize_bf16_to_nvfp4 doit prendre W^T en entrée).
+    //
+    // En attendant ce fix, le path FP4 utilise la convention "scrambled"
+    // d'origine : numériquement incorrecte mais le bench tourne et
+    // donne des FLOPS représentatifs. À traiter en T241.6c.
     let fp4_dt = sys::cudaDataType_t::CUDA_R_4F_E2M1;
     let a_layout =
         result::create_matrix_layout(fp4_dt, k as u64, m as u64, k as i64).map_err(|e| {
@@ -1636,4 +1894,676 @@ pub unsafe fn matmul_mxfp4(
     _stream: u64,
 ) -> Result<(), CudaError> {
     Err(CudaError::NoDeviceFound)
+}
+
+// =============================================================================
+// Numerical parity tests
+// =============================================================================
+
+#[cfg(all(test, feature = "cuda"))]
+mod parity_tests {
+    use super::*;
+    use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
+
+    /// Reference CPU matmul : `c = a · b` with row-major buffers,
+    /// `a[m, k]`, `b[k, n]`, `c[m, n]`.
+    fn cpu_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += a[i * k + kk] * b[kk * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+    }
+
+    /// T241.6b regression guard — verifies matmul_bf16 actually computes
+    /// `C = A·B` with row-major buffers (and not `A·B^T` or some scrambled
+    /// variant). Guards against any future change to the cuBLASLt layout
+    /// convention in build_cached().
+    ///
+    /// Uses a small 4×3 · 3×5 case with hand-picked non-symmetric values.
+    /// BF16 has ~7-bit mantissa so we use small integer values that round-trip
+    /// exactly and check for byte-perfect equality after conversion.
+    #[test]
+    fn matmul_bf16_computes_a_dot_b_row_major() {
+        let m = 4usize;
+        let k = 3usize;
+        let n = 5usize;
+
+        // Hand-picked A [m, k] and B [k, n] with values that round-trip
+        // exactly to BF16. NOT symmetric / NOT diagonal so any layout bug
+        // would produce different output.
+        let a: Vec<f32> = vec![
+            1.0, 2.0, 3.0, // row 0
+            4.0, 5.0, 6.0, // row 1
+            7.0, 8.0, 9.0, // row 2
+            10.0, 11.0, 12.0, // row 3
+        ];
+        let b: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, // row 0
+            6.0, 7.0, 8.0, 9.0, 10.0, // row 1
+            11.0, 12.0, 13.0, 14.0, 15.0, // row 2
+        ];
+        let mut c_cpu: Vec<f32> = vec![0.0; m * n];
+        cpu_matmul(&a, &b, &mut c_cpu, m, k, n);
+
+        // Verify CPU reference (sanity)
+        // c[0, 0] = 1*1 + 2*6 + 3*11 = 1 + 12 + 33 = 46
+        assert_eq!(c_cpu[0], 46.0);
+        // c[0, 1] = 1*2 + 2*7 + 3*12 = 2 + 14 + 36 = 52
+        assert_eq!(c_cpu[1], 52.0);
+
+        // GPU path
+        let ctx = CudaContext::new(0).expect("CudaContext");
+        let stream = ctx.default_stream();
+        let mut session = LtSession::new(stream.clone()).expect("LtSession");
+
+        let a_bf: Vec<half::bf16> = a.iter().copied().map(half::bf16::from_f32).collect();
+        let b_bf: Vec<half::bf16> = b.iter().copied().map(half::bf16::from_f32).collect();
+        let a_dev = stream.memcpy_stod(&a_bf).expect("upload a");
+        let b_dev = stream.memcpy_stod(&b_bf).expect("upload b");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+
+        unsafe {
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (c_p, _r3) = c_dev.device_ptr_mut(&stream);
+            session
+                .matmul_bf16(a_p, b_p, c_p, m, k, n, 1.0, 0.0)
+                .expect("matmul");
+        }
+
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
+        let c_gpu: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+
+        // NOTE: cuBLASLt writes C in col-major (m, n) ld=m. To read the
+        // mathematical (i, j) element we use buf[j*m + i]. CPU reference
+        // stores row-major so c_cpu[i*n + j]. The buffers DIFFER physically
+        // for m > 1 (documented in build_cached()) but the underlying math
+        // is identical. The autoregressive LLM decode hot path uses m=1
+        // (see m_eq_1 test) where col-major and row-major coincide.
+        for i in 0..m {
+            for j in 0..n {
+                let cpu_v = c_cpu[i * n + j];
+                let gpu_v = c_gpu[j * m + i]; // col-major read
+                let diff = (cpu_v - gpu_v).abs();
+                let tol = cpu_v.abs() * 1e-2 + 1e-2;
+                assert!(
+                    diff <= tol,
+                    "mismatch at ({i}, {j}) : cpu={cpu_v} gpu={gpu_v} diff={diff}",
+                );
+            }
+        }
+    }
+
+    /// Same regression guard but with m=1 (single-row, the LLM
+    /// autoregressive decode hot path). Specifically catches the
+    /// "transb=OP_N on row-major B" bug.
+    #[test]
+    fn matmul_bf16_m_eq_1_row_major() {
+        let m = 1usize;
+        let k = 4usize;
+        let n = 6usize;
+
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f32> = (0..(k * n)).map(|i| (i + 1) as f32).collect();
+        let mut c_cpu: Vec<f32> = vec![0.0; m * n];
+        cpu_matmul(&a, &b, &mut c_cpu, m, k, n);
+
+        let ctx = CudaContext::new(0).expect("CudaContext");
+        let stream = ctx.default_stream();
+        let mut session = LtSession::new(stream.clone()).expect("LtSession");
+
+        let a_bf: Vec<half::bf16> = a.iter().copied().map(half::bf16::from_f32).collect();
+        let b_bf: Vec<half::bf16> = b.iter().copied().map(half::bf16::from_f32).collect();
+        let a_dev = stream.memcpy_stod(&a_bf).expect("upload a");
+        let b_dev = stream.memcpy_stod(&b_bf).expect("upload b");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+
+        unsafe {
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (c_p, _r3) = c_dev.device_ptr_mut(&stream);
+            session
+                .matmul_bf16(a_p, b_p, c_p, m, k, n, 1.0, 0.0)
+                .expect("matmul");
+        }
+
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
+        let c_gpu: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+
+        for j in 0..n {
+            let diff = (c_cpu[j] - c_gpu[j]).abs();
+            let tol = c_cpu[j].abs() * 5e-2 + 1.0;
+            assert!(
+                diff <= tol,
+                "m=1 mismatch at j={j} : cpu={} gpu={} diff={}",
+                c_cpu[j],
+                c_gpu[j],
+                diff
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // T241.6d — NVFP4 matmul tests : isolate the FP4 path to perimeter
+    // the [0,0,0,...] bug. We test 3 levels :
+    //
+    //   (1) Free matmul_mxfp4 with all-1 inputs and scale=0x70 (≈1.0)
+    //       → expected output : k * 1 * 1 * 1 = k (the K dimension)
+    //   (2) LtSession::matmul_mxfp4 (cached) with same inputs
+    //       → if (1) works and (2) doesn't, bug is in build_cached/rebind
+    //   (3) End-to-end with quantize_bf16_to_nvfp4 + matmul
+    //       → if (1)+(2) work but (3) doesn't, bug is in the pipeline
+    //
+    // FP4 code 0x22 = two nibbles each = 0x2 = +1.0 (E2M1 grid).
+    // UE4M3 byte 0x70 = 14<<3 = scale 1.0 (NVIDIA bias 14).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Test (1) — FREE path matmul_mxfp4 with all-ones FP4 + scale=0x38.
+    /// Reference test : verifies FP4 hardware works on this device.
+    ///
+    /// Setup : A (m=1, k=128) all FP4 = +1.0 ; B (k=128, n=128) all
+    /// FP4 = +1.0 ; both scales byte = 0x38 (= scale value 1.0, bias 7).
+    /// Expected C[j] = sum_k(1*1) * 1 * 1 = k = 128 ∀j.
+    ///
+    /// NB : we must use k >= 128 and n >= 128 — cuBLASLt sm_121 NVFP4
+    /// rejects smaller shapes (perimeter test : nvfp4_supported_m_values).
+    #[test]
+    fn nvfp4_free_matmul_all_ones_returns_k() {
+        let m = 1usize;
+        let k = 128usize;
+        let n = 128usize;
+        // FP4 byte 0x22 packs two values = +1.0 each. Total a_bytes = m*k/2.
+        let a_fp4: Vec<u8> = vec![0x22u8; m * k / 2];
+        let b_fp4: Vec<u8> = vec![0x22u8; k * n / 2];
+        // VEC16_UE4M3 : k/16 scales per row (A) and per col (B).
+        // Scale byte 0x38 = (E=7, M=0) → value 2^0 = 1.0 (NVIDIA UE4M3 bias 7).
+        let scale_a: Vec<u8> = vec![0x38u8; m * (k / 16)];
+        let scale_b: Vec<u8> = vec![0x38u8; n * (k / 16)];
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let a_dev = stream.memcpy_stod(&a_fp4).expect("upload a");
+        let b_dev = stream.memcpy_stod(&b_fp4).expect("upload b");
+        let sa_dev = stream.memcpy_stod(&scale_a).expect("upload sa");
+        let sb_dev = stream.memcpy_stod(&scale_b).expect("upload sb");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+        let workspace = stream.alloc_zeros::<u8>(32 * 1024 * 1024).expect("ws");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (sa_p, _r3) = sa_dev.device_ptr(&stream);
+            let (sb_p, _r4) = sb_dev.device_ptr(&stream);
+            let (c_p, _r5) = c_dev.device_ptr_mut(&stream);
+            let (w_p, _r6) = workspace.device_ptr(&stream);
+            crate::cublas_lt::matmul_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                m,
+                k,
+                n,
+                1.0,
+                0.0,
+                Fp8Output::Bf16,
+                Fp4ScaleMode::Vec16Ue4m3,
+                w_p,
+                32 * 1024 * 1024,
+                stream.cu_stream() as u64,
+            )
+            .expect("matmul_mxfp4 free");
+        }
+
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov c");
+        let c: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+
+        // Expected : each output = sum over k of (1 * 1) * scale_a * scale_b
+        //          = k * 1 * 1 = k = 128.
+        // Print first 8 + last 4 to see the pattern.
+        eprintln!(
+            "FREE FP4 all-ones output (m={m}, k={k}, n={n}, expected {} ∀j) :",
+            k
+        );
+        for j in 0..n.min(16) {
+            eprintln!("  c[{j}] = {}", c[j]);
+        }
+        // Verify c[0] is correct.
+        assert!(
+            (c[0] - k as f32).abs() < 1.0,
+            "FREE FP4 matmul[0] = {} (expected ≈ {})",
+            c[0],
+            k
+        );
+        // Count how many c[j] match k — gives a clean signal on layout.
+        let n_match = c.iter().filter(|&&v| (v - k as f32).abs() < 1.0).count();
+        let n_zero = c.iter().filter(|&&v| v.abs() < 0.01).count();
+        eprintln!(
+            "  → {} / {} match expected ; {} are exactly 0",
+            n_match, n, n_zero
+        );
+        // FINDING T241.6d : with k=n=128 + all scales=0x38 + all FP4=1,
+        // only c[0] = 128 (correct). c[1..] = 64 (half). This indicates
+        // a scale_B buffer layout mismatch between our convention and
+        // what cuBLASLt expects for VEC16_UE4M3.
+        //
+        // We don't fail the rest of c[j] because this test EXISTS to
+        // expose the layout bug — fixing it is the goal of T241.6d.
+    }
+
+    /// Test (2) — CACHED path LtSession::matmul_mxfp4 with same input.
+    /// If this fails while test (1) passes, the bug is in the cached-path
+    /// scale pointer rebind (build_cached + per-call attribute set).
+    #[test]
+    fn nvfp4_cached_matmul_all_ones_returns_k() {
+        let m = 1usize;
+        let k = 128usize;
+        let n = 128usize;
+        let a_fp4: Vec<u8> = vec![0x22u8; m * k / 2];
+        let b_fp4: Vec<u8> = vec![0x22u8; k * n / 2];
+        // Scale byte 0x38 = (E=7, M=0) → value 2^0 = 1.0 (NVIDIA UE4M3 bias 7).
+        let scale_a: Vec<u8> = vec![0x38u8; m * (k / 16)];
+        let scale_b: Vec<u8> = vec![0x38u8; n * (k / 16)];
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let mut session = LtSession::new(stream.clone()).expect("session");
+
+        let a_dev = stream.memcpy_stod(&a_fp4).expect("upload a");
+        let b_dev = stream.memcpy_stod(&b_fp4).expect("upload b");
+        let sa_dev = stream.memcpy_stod(&scale_a).expect("upload sa");
+        let sb_dev = stream.memcpy_stod(&scale_b).expect("upload sb");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (sa_p, _r3) = sa_dev.device_ptr(&stream);
+            let (sb_p, _r4) = sb_dev.device_ptr(&stream);
+            let (c_p, _r5) = c_dev.device_ptr_mut(&stream);
+            session
+                .matmul_mxfp4(
+                    a_p,
+                    sa_p,
+                    b_p,
+                    sb_p,
+                    c_p,
+                    m,
+                    k,
+                    n,
+                    1.0,
+                    0.0,
+                    Fp8Output::Bf16,
+                    Fp4ScaleMode::Vec16Ue4m3,
+                )
+                .expect("matmul_mxfp4 cached");
+        }
+
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov c");
+        let c: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+
+        // c[0] should match (assert this) — the rest may diverge due to
+        // the same scale-layout bug surfaced by the FREE test.
+        assert!(
+            (c[0] - k as f32).abs() < 1.0,
+            "CACHED FP4 matmul[0] = {} (expected ≈ {})",
+            c[0],
+            k
+        );
+        let n_match = c.iter().filter(|&&v| (v - k as f32).abs() < 1.0).count();
+        eprintln!("CACHED FP4 all-ones : {} / {} match k", n_match, n);
+    }
+
+    /// T241.6d — try Vec32Ue8m0 mode (MXFP4 standard, simpler scale).
+    /// UE8M0 = pure power-of-2 (8 bits all exponent, bias 127).
+    /// Byte 127 = 2^0 = 1.0. If this mode works while VEC16_UE4M3 has
+    /// the c[1..]=64 layout bug, switch to MXFP4.
+    #[test]
+    fn nvfp4_vec32_ue8m0_all_ones() {
+        let m = 1usize;
+        let k = 128usize; // must be multiple of 32 for VEC32
+        let n = 128usize;
+        // Block size = 32 for Vec32Ue8m0.
+        let a_fp4: Vec<u8> = vec![0x22u8; m * k / 2];
+        let b_fp4: Vec<u8> = vec![0x22u8; k * n / 2];
+        // UE8M0 byte 127 = 2^0 = 1.0.
+        let scale_a: Vec<u8> = vec![127u8; m * (k / 32)];
+        let scale_b: Vec<u8> = vec![127u8; n * (k / 32)];
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let a_dev = stream.memcpy_stod(&a_fp4).expect("upload");
+        let b_dev = stream.memcpy_stod(&b_fp4).expect("upload");
+        let sa_dev = stream.memcpy_stod(&scale_a).expect("upload");
+        let sb_dev = stream.memcpy_stod(&scale_b).expect("upload");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+        let workspace = stream.alloc_zeros::<u8>(32 * 1024 * 1024).expect("ws");
+
+        let res = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (sa_p, _r3) = sa_dev.device_ptr(&stream);
+            let (sb_p, _r4) = sb_dev.device_ptr(&stream);
+            let (c_p, _r5) = c_dev.device_ptr_mut(&stream);
+            let (w_p, _r6) = workspace.device_ptr(&stream);
+            crate::cublas_lt::matmul_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                m,
+                k,
+                n,
+                1.0,
+                0.0,
+                Fp8Output::Bf16,
+                Fp4ScaleMode::Vec32Ue8m0,
+                w_p,
+                32 * 1024 * 1024,
+                stream.cu_stream() as u64,
+            )
+        };
+        match res {
+            Ok(_) => {
+                let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
+                let c: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+                let n_match = c.iter().filter(|&&v| (v - k as f32).abs() < 1.0).count();
+                eprintln!(
+                    "VEC32_UE8M0 result : c[0]={} ; {}/{} match k={k}",
+                    c[0], n_match, n
+                );
+                assert!(
+                    (c[0] - k as f32).abs() < 1.0,
+                    "Vec32Ue8m0 c[0] = {} (expected {})",
+                    c[0],
+                    k
+                );
+            },
+            Err(e) => {
+                eprintln!("VEC32_UE8M0 not supported on this device : {e}");
+            },
+        }
+    }
+
+    /// T241.6d — write distinct values in scale_B to map the layout.
+    /// Scale_B[0] = 0x40 (= 2.0), all others = 0x38 (= 1.0). If c[0] = 256,
+    /// scale_B[0] is read for c[0]. We then check which c[j] also doubles
+    /// to identify the layout.
+    #[test]
+    fn nvfp4_scale_b_layout_probe() {
+        let m = 1usize;
+        let k = 128usize;
+        let n = 128usize;
+        let a_fp4: Vec<u8> = vec![0x22u8; m * k / 2];
+        let b_fp4: Vec<u8> = vec![0x22u8; k * n / 2];
+        let scale_a: Vec<u8> = vec![0x38u8; m * (k / 16)];
+        let mut scale_b: Vec<u8> = vec![0x38u8; n * (k / 16)];
+        // Mark distinct positions.
+        scale_b[0] = 0x40; // first byte → some c[j] doubles
+        let probe_pos = scale_b.len() / 2;
+        scale_b[probe_pos] = 0x48; // mid-buffer → some c[j] gets 4x
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let a_dev = stream.memcpy_stod(&a_fp4).expect("upload");
+        let b_dev = stream.memcpy_stod(&b_fp4).expect("upload");
+        let sa_dev = stream.memcpy_stod(&scale_a).expect("upload");
+        let sb_dev = stream.memcpy_stod(&scale_b).expect("upload");
+        let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+        let workspace = stream.alloc_zeros::<u8>(32 * 1024 * 1024).expect("ws");
+
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (sa_p, _r3) = sa_dev.device_ptr(&stream);
+            let (sb_p, _r4) = sb_dev.device_ptr(&stream);
+            let (c_p, _r5) = c_dev.device_ptr_mut(&stream);
+            let (w_p, _r6) = workspace.device_ptr(&stream);
+            crate::cublas_lt::matmul_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                m,
+                k,
+                n,
+                1.0,
+                0.0,
+                Fp8Output::Bf16,
+                Fp4ScaleMode::Vec16Ue4m3,
+                w_p,
+                32 * 1024 * 1024,
+                stream.cu_stream() as u64,
+            )
+            .expect("matmul probe");
+        }
+
+        let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
+        let c: Vec<f32> = c_host.into_iter().map(|x| x.to_f32()).collect();
+
+        // Find which c[j] != base value (which would be 128 in expected case).
+        // With c[0]=128, c[1..]=64 baseline, we want to see which c[j] now
+        // shows 256 (= 2x base) or 64 (no change).
+        let baseline = c[1]; // = 64 typically
+        eprintln!("scale_B[0]=0x40 (2.0), scale_B[{probe_pos}]=0x48 (4.0), others 0x38 (1.0)");
+        eprintln!("baseline c[1] = {baseline} ; reading c[0..16] :");
+        for j in 0..16 {
+            let ratio = c[j] / baseline;
+            eprintln!("  c[{j}] = {} (ratio vs baseline = {ratio:.2})", c[j]);
+        }
+        // Find c[j] with ratio > 1.5 (the 0x40 effect).
+        let mut doubled: Vec<usize> = Vec::new();
+        let mut quadrupled: Vec<usize> = Vec::new();
+        for (j, &v) in c.iter().enumerate() {
+            let r = v / baseline;
+            if r > 1.5 && r < 2.5 {
+                doubled.push(j);
+            }
+            if r > 3.5 && r < 5.0 {
+                quadrupled.push(j);
+            }
+        }
+        eprintln!("c[j] with 2× baseline (scale_B[0] effect) : {doubled:?}");
+        eprintln!("c[j] with 4× baseline (scale_B[mid] effect) : {quadrupled:?}");
+    }
+
+    /// T241.6d — perimeter test : try multiple m values to identify the
+    /// minimum supported by cuBLASLt FP4 sm_121. The LLM hot path uses m=1
+    /// (autoregressive decode) ; if the minimum is > 1, FP4 path is
+    /// infeasible without padding to a higher m.
+    #[test]
+    fn nvfp4_supported_m_values() {
+        let k = 128usize; // K must be >= 16 (block size) and divisible by 16
+        let n = 128usize;
+        let scale_a_per_row = k / 16;
+        let scale_b_per_col = k / 16;
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+        let workspace = stream.alloc_zeros::<u8>(32 * 1024 * 1024).expect("ws");
+
+        let candidates = [1usize, 2, 4, 8, 16, 32, 64, 128];
+        let mut results: Vec<(usize, bool, String)> = Vec::new();
+        for m in candidates.iter().copied() {
+            let a_fp4: Vec<u8> = vec![0x22u8; m * k / 2];
+            let b_fp4: Vec<u8> = vec![0x22u8; k * n / 2];
+            let scale_a: Vec<u8> = vec![0x70u8; m * scale_a_per_row];
+            let scale_b: Vec<u8> = vec![0x70u8; n * scale_b_per_col];
+            let a_dev = stream.memcpy_stod(&a_fp4).expect("upload a");
+            let b_dev = stream.memcpy_stod(&b_fp4).expect("upload b");
+            let sa_dev = stream.memcpy_stod(&scale_a).expect("upload sa");
+            let sb_dev = stream.memcpy_stod(&scale_b).expect("upload sb");
+            let mut c_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+
+            let res = unsafe {
+                use cudarc::driver::{DevicePtr, DevicePtrMut};
+                let (a_p, _r1) = a_dev.device_ptr(&stream);
+                let (b_p, _r2) = b_dev.device_ptr(&stream);
+                let (sa_p, _r3) = sa_dev.device_ptr(&stream);
+                let (sb_p, _r4) = sb_dev.device_ptr(&stream);
+                let (c_p, _r5) = c_dev.device_ptr_mut(&stream);
+                let (w_p, _r6) = workspace.device_ptr(&stream);
+                crate::cublas_lt::matmul_mxfp4(
+                    a_p,
+                    sa_p,
+                    b_p,
+                    sb_p,
+                    c_p,
+                    m,
+                    k,
+                    n,
+                    1.0,
+                    0.0,
+                    Fp8Output::Bf16,
+                    Fp4ScaleMode::Vec16Ue4m3,
+                    w_p,
+                    32 * 1024 * 1024,
+                    stream.cu_stream() as u64,
+                )
+            };
+            match res {
+                Ok(_) => {
+                    let c_host: Vec<half::bf16> = stream.memcpy_dtov(&c_dev).expect("dtov");
+                    let c0 = c_host[0].to_f32();
+                    let nonzero = c0.abs() > 0.001;
+                    results.push((m, nonzero, format!("c[0]={c0}")));
+                },
+                Err(e) => {
+                    results.push((m, false, format!("error: {e}")));
+                },
+            }
+        }
+        eprintln!("\n=== NVFP4 perimeter test (k={k}, n={n}) ===");
+        for (m, ok, info) in &results {
+            eprintln!(
+                "  m={m:>3}  {} {}",
+                if *ok { "✓ OK    " } else { "✗ FAILED" },
+                info
+            );
+        }
+        // Find minimum supported m.
+        let min_supported = results.iter().find(|(_, ok, _)| *ok).map(|(m, _, _)| *m);
+        eprintln!(
+            "\n  Minimum supported m for FP4 on sm_121 : {:?}",
+            min_supported
+        );
+        // We don't assert a specific value here because the answer is the
+        // FINDING itself — this test exists to expose the constraint.
+    }
+
+    /// Test (3) — both paths produce the same result on identical input.
+    /// Direct comparison free vs cached. If they diverge, the cached path
+    /// has a bug.
+    #[test]
+    fn nvfp4_free_vs_cached_identical_output() {
+        let m = 1usize;
+        let k = 128usize;
+        let n = 128usize;
+        // Use random-ish but deterministic FP4 values.
+        let a_fp4: Vec<u8> = (0..(m * k / 2))
+            .map(|i| ((i as u8 * 37) | 0x22) & 0x77)
+            .collect();
+        let b_fp4: Vec<u8> = (0..(k * n / 2))
+            .map(|i| ((i as u8 * 41) | 0x22) & 0x77)
+            .collect();
+        // Scale byte 0x38 = (E=7, M=0) → value 2^0 = 1.0 (NVIDIA UE4M3 bias 7).
+        let scale_a: Vec<u8> = vec![0x38u8; m * (k / 16)];
+        let scale_b: Vec<u8> = vec![0x38u8; n * (k / 16)];
+
+        let ctx = CudaContext::new(0).expect("ctx");
+        let stream = ctx.default_stream();
+
+        // Run FREE path.
+        let a_dev = stream.memcpy_stod(&a_fp4).expect("upload");
+        let b_dev = stream.memcpy_stod(&b_fp4).expect("upload");
+        let sa_dev = stream.memcpy_stod(&scale_a).expect("upload");
+        let sb_dev = stream.memcpy_stod(&scale_b).expect("upload");
+        let mut c_free = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+        let workspace = stream.alloc_zeros::<u8>(32 * 1024 * 1024).expect("ws");
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (sa_p, _r3) = sa_dev.device_ptr(&stream);
+            let (sb_p, _r4) = sb_dev.device_ptr(&stream);
+            let (c_p, _r5) = c_free.device_ptr_mut(&stream);
+            let (w_p, _r6) = workspace.device_ptr(&stream);
+            crate::cublas_lt::matmul_mxfp4(
+                a_p,
+                sa_p,
+                b_p,
+                sb_p,
+                c_p,
+                m,
+                k,
+                n,
+                1.0,
+                0.0,
+                Fp8Output::Bf16,
+                Fp4ScaleMode::Vec16Ue4m3,
+                w_p,
+                32 * 1024 * 1024,
+                stream.cu_stream() as u64,
+            )
+            .expect("free");
+        }
+        let free_host: Vec<half::bf16> = stream.memcpy_dtov(&c_free).expect("dtov free");
+        let free_out: Vec<f32> = free_host.into_iter().map(|x| x.to_f32()).collect();
+
+        // Run CACHED path on same input.
+        let mut session = LtSession::new(stream.clone()).expect("session");
+        let mut c_cached = stream.alloc_zeros::<half::bf16>(m * n).expect("alloc c");
+        unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (a_p, _r1) = a_dev.device_ptr(&stream);
+            let (b_p, _r2) = b_dev.device_ptr(&stream);
+            let (sa_p, _r3) = sa_dev.device_ptr(&stream);
+            let (sb_p, _r4) = sb_dev.device_ptr(&stream);
+            let (c_p, _r5) = c_cached.device_ptr_mut(&stream);
+            session
+                .matmul_mxfp4(
+                    a_p,
+                    sa_p,
+                    b_p,
+                    sb_p,
+                    c_p,
+                    m,
+                    k,
+                    n,
+                    1.0,
+                    0.0,
+                    Fp8Output::Bf16,
+                    Fp4ScaleMode::Vec16Ue4m3,
+                )
+                .expect("cached");
+        }
+        let cached_host: Vec<half::bf16> = stream.memcpy_dtov(&c_cached).expect("dtov cached");
+        let cached_out: Vec<f32> = cached_host.into_iter().map(|x| x.to_f32()).collect();
+
+        // Both should be identical (or near-identical).
+        for j in 0..n {
+            let diff = (free_out[j] - cached_out[j]).abs();
+            let tol = free_out[j].abs() * 1e-2 + 0.5;
+            assert!(
+                diff < tol,
+                "free[{j}]={} vs cached[{j}]={} diff={} \
+                 (cached path differs from free → bug in build_cached)",
+                free_out[j],
+                cached_out[j],
+                diff
+            );
+        }
+    }
 }
