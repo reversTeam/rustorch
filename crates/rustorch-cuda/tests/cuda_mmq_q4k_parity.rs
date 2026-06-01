@@ -353,3 +353,141 @@ fn mul_mat_q4_k_q8_1_mma_smoke_64x2048x2048() {
     );
     assert!(!has_bad, "NaN/Inf in output");
 }
+
+/// CPU-side dequant of an entire `[M, K]` packed `block_q8_1_mmq` buffer
+/// (the layout produced by `quantize_mmq_q8_1_bf16_ds4`) back to FP32.
+///
+/// Per 128-element block : 4 half2 (d, sum) scales at byte 0, then 128 int8
+/// quants at byte 16. Sub-block `s` (32 quants) uses scale `ds[s].x = d`, so
+/// `x[block*128 + s*32 + i] = d_s * qs[s*32 + i]`. The K layout is linear
+/// (the prepass is K-contiguous), so the result is natural `[M, K]` order.
+fn dequant_q8_1_mmq_buffer(buf: &[u8], m: usize, k: usize) -> Vec<f32> {
+    assert!(k % 128 == 0);
+    let blocks_per_row = k / 128;
+    let mut out = vec![0.0f32; m * k];
+    for mi in 0..m {
+        for pb in 0..blocks_per_row {
+            let blk = &buf[(mi * blocks_per_row + pb) * 144..];
+            for sub in 0..4 {
+                let ds_lo = u16::from_le_bytes([blk[sub * 4], blk[sub * 4 + 1]]);
+                let d = half::f16::from_bits(ds_lo).to_f32();
+                let qs = unsafe {
+                    std::slice::from_raw_parts(blk[16 + sub * 32..].as_ptr() as *const i8, 32)
+                };
+                let base = mi * k + pb * 128 + sub * 32;
+                for i in 0..32 {
+                    out[base + i] = d * (qs[i] as f32);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// **The acceptance gate promised in this module's doc-comment.**
+///
+/// Numerical parity for `mul_mat_q4_k_q8_1_mma` against an independent
+/// reference built from the *trusted* `dequant_q4_k_to_bf16` kernel (the
+/// natural-order Q4_K dequant already used by the Q4K-MOE-CUBLAS path).
+///
+/// Why this is the right gate : the existing `_smoke_` tests only assert
+/// outputs are non-zero + finite — they PASS even if the kernel's Q4_K
+/// nibble→K interleave (`w_int_base` in `mul_mat_q4_k_q8_1_mma_kernel`) is
+/// wrong, because a wrong interleave still emits non-zero garbage. This test
+/// dequantizes BOTH operands consistently (W via the trusted kernel ; the
+/// activation via the *same* Q8_1 buffer the mma kernel consumes, so the
+/// 1/127 quantization error is shared and cancels), runs a CPU GEMM, and
+/// compares via relative-L2. A correct kernel lands well under 5% ; a wrong
+/// K-interleave produces ~uncorrelated output → relative-L2 ≈ 1.41.
+fn run_mma_vs_dequant_parity(m: usize, n: usize, k: usize, seed: u64) {
+    let ctx = CudaContext::new(0).expect("ctx");
+    let stream = ctx.default_stream();
+    let kernels = LlmKernels::new(ctx);
+
+    // Q4_K weights W[N, K] (row-major super-blocks) + BF16 activation X[M, K].
+    let w_q4k = synth_q4k_weights(n, k, seed);
+    let w_dev = stream.memcpy_stod(&w_q4k).expect("w");
+    let x = fill_bf16(m * k, 0.01f32, seed ^ 0x5555_5555);
+    let x_dev = stream.memcpy_stod(&x).expect("x");
+
+    // --- GPU path under test : quantize → staged Q4_K×Q8_1 mma matmul.
+    let blocks_per_row = k / 128;
+    let mut x_q8_1_dev = stream
+        .alloc_zeros::<u8>(m * blocks_per_row * 144)
+        .expect("x_q8_1");
+    let mut y_dev = stream.alloc_zeros::<half::bf16>(m * n).expect("y");
+    unsafe {
+        let (x_p, _g1) = x_dev.device_ptr(&stream);
+        let (xq_p, _g2) = x_q8_1_dev.device_ptr_mut(&stream);
+        kernels
+            .quantize_mmq_q8_1_bf16_ds4(&stream, x_p, xq_p, m as i32, k as i32)
+            .expect("quantize");
+    }
+    unsafe {
+        let (w_p, _g1) = w_dev.device_ptr(&stream);
+        let (xq_p, _g2) = x_q8_1_dev.device_ptr(&stream);
+        let (y_p, _g3) = y_dev.device_ptr_mut(&stream);
+        kernels
+            .mul_mat_q4_k_q8_1_mma(&stream, w_p, xq_p, y_p, m as i32, n as i32, k as i32)
+            .expect("mma");
+    }
+    let y_mma: Vec<half::bf16> = stream.memcpy_dtov(&y_dev).expect("dl y");
+
+    // --- Reference path : dequant W with the trusted kernel + dequant the
+    //     SAME Q8_1 activation buffer on CPU, then plain CPU GEMM.
+    let n_blocks = (n * (k / 256)) as i64;
+    let mut w_bf16_dev = stream.alloc_zeros::<half::bf16>(n * k).expect("w_bf16");
+    unsafe {
+        let (w_p, _g1) = w_dev.device_ptr(&stream);
+        let (wb_p, _g2) = w_bf16_dev.device_ptr_mut(&stream);
+        kernels
+            .dequant_q4_k_to_bf16(&stream, w_p, wb_p, n_blocks)
+            .expect("dequant_w");
+    }
+    let w_bf16: Vec<half::bf16> = stream.memcpy_dtov(&w_bf16_dev).expect("dl w");
+    let x_q8_1_host: Vec<u8> = stream.memcpy_dtov(&x_q8_1_dev).expect("dl xq");
+    let x_deq = dequant_q8_1_mmq_buffer(&x_q8_1_host, m, k);
+
+    // Y_ref[m, n] = Σ_k X_deq[m, k] * W_bf16[n, k]   (W stored [N, K] row-major).
+    let mut diff_sq = 0.0f64;
+    let mut ref_sq = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut mma_sq = 0.0f64;
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for ki in 0..k {
+                acc += x_deq[mi * k + ki] * w_bf16[ni * k + ki].to_f32();
+            }
+            let got = y_mma[mi * n + ni].to_f32();
+            let d = (got - acc) as f64;
+            diff_sq += d * d;
+            ref_sq += (acc as f64) * (acc as f64);
+            mma_sq += (got as f64) * (got as f64);
+            dot += (got as f64) * (acc as f64);
+        }
+    }
+    let rel_l2 = (diff_sq / ref_sq.max(1e-30)).sqrt();
+    let cosine = dot / (ref_sq.sqrt() * mma_sq.sqrt()).max(1e-30);
+    println!(
+        "mul_mat_q4_k_q8_1_mma vs dequant-ref  M={m} N={n} K={k} : rel_l2={rel_l2:.5} cosine={cosine:.6}"
+    );
+    // A correct kernel : rel_l2 well under 5% (only BF16-output + fp-accum
+    // order noise). A wrong Q4_K K-interleave : rel_l2 ≈ 1.41, cosine ≈ 0.
+    assert!(
+        rel_l2 < 0.05,
+        "rel_l2 {rel_l2:.5} >= 0.05 — likely a Q4_K nibble→K interleave bug (w_int_base) \
+         or scale mapping mismatch in mul_mat_q4_k_q8_1_mma_kernel (cosine={cosine:.6})"
+    );
+    assert!(cosine > 0.99, "cosine {cosine:.6} <= 0.99");
+}
+
+#[test]
+fn mul_mat_q4_k_q8_1_mma_vs_dp4a_64x128x512() {
+    run_mma_vs_dequant_parity(64, 128, 512, 0x0F40_0001_u64);
+}
+
+#[test]
+fn mul_mat_q4_k_q8_1_mma_vs_dp4a_128x128x512() {
+    run_mma_vs_dequant_parity(128, 128, 512, 0x00C0_FFEE_u64);
+}
